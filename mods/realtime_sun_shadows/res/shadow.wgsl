@@ -1,7 +1,9 @@
 // Realtime Sun Shadows - deferred shadow composite: reconstructs the world position of every
 // scene pixel from the depth snapshot (CameraService matrices), transforms it into the light's
 // clip space, and PCF-compares against the shadow map rendered earlier this frame. Drawn as a
-// fullscreen triangle with multiply blending (srcFactor = Dst, dstFactor = Zero) before the HUD.
+// fullscreen triangle with multiply blending (srcFactor = Dst, dstFactor = Zero) right after the
+// opaque scene, so translucency and the game's bloom filter layer over an already-shadowed world
+// (debug views instead draw unblended before the HUD, on top of everything).
 //
 // Acne control (on top of the demo this derives from): a constant bias, a SLOPE-SCALED bias that
 // grows with the surface's angle to the light (sloped surfaces alias hardest), and a

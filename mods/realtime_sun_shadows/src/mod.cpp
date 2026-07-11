@@ -15,6 +15,7 @@
 
 #include "global.h"
 
+#include "JSystem/J3DGraphBase/J3DMaterial.h"
 #include "JSystem/J3DGraphBase/J3DShape.h"
 #include "JSystem/J3DU/J3DUClipper.h"
 #include "JSystem/JMath/JMath.h"
@@ -22,8 +23,13 @@
 #include "d/d_kankyo.h"
 #include "d/d_kankyo_rain.h"
 #include "dolphin/gx/GXAurora.h"
+#include "dolphin/gx/GXBump.h"
+#include "dolphin/gx/GXCull.h"
+#include "dolphin/gx/GXGeometry.h"
 #include "dolphin/gx/GXGet.h"
+#include "dolphin/gx/GXLighting.h"
 #include "dolphin/gx/GXPixel.h"
+#include "dolphin/gx/GXTev.h"
 #include "dolphin/gx/GXTransform.h"
 #include "m_Do/m_Do_mtx.h"
 #include "mods/hook.hpp"
@@ -70,10 +76,12 @@ ConfigVarHandle g_cvarNormalOffset = 0;
 ConfigVarHandle g_cvarContactThickness = 0;
 ConfigVarHandle g_cvarContactLength = 0;
 ConfigVarHandle g_cvarIndoorDisable = 0;
+ConfigVarHandle g_cvarTwoSidedCasters = 0;
 
 GfxDrawTypeHandle g_drawType = 0;
 GfxStageHookHandle g_sceneBeginHook = 0;
 GfxStageHookHandle g_sceneAfterTerrainHook = 0;
+GfxStageHookHandle g_sceneAfterOpaqueHook = 0;
 GfxStageHookHandle g_frameBeforeHudHook = 0;
 UiWindowHandle g_controlsWindow = 0;
 ResourceBuffer g_shaderSource = RESOURCE_BUFFER_INIT;
@@ -98,6 +106,7 @@ struct MapPassOutput {
 
 MapPassOutput g_mapPass;
 bool g_replayingSceneLists = false;
+bool g_replayTwoSided = false;  // twoSidedCasters, latched for the current replay
 
 constexpr float kLightDistance = 30000.0f;
 constexpr float kLightNear = 100.0f;
@@ -585,6 +594,45 @@ HookAction on_copy_tex_pre(ModContext*, void*, void*, void*) {
     return g_replayingSceneLists ? HOOK_SKIP_ORIGINAL : HOOK_CONTINUE;
 }
 
+// Two-sided casters: single-sided geometry (level-edge walls, roofs, terrain skirts) faces the
+// player, so from the light's viewpoint it is back-facing and gets culled out of the shadow map,
+// punching light-leak holes wherever no second surface stands behind it. During the replay every
+// caster renders with culling off; depth is still the nearest-to-light surface, so closed meshes
+// are unaffected.
+//
+// Direct GX drawers pick their cull mode up from this call, so rewriting the argument covers them.
+HookAction on_cull_mode_pre(ModContext*, void* args, void*, void*) {
+    if (g_replayingSceneLists && g_replayTwoSided) {
+        dusk::mods::arg_ref<GXCullMode>(args, 0) = GX_CULL_NONE;
+    }
+    return HOOK_CONTINUE;
+}
+
+// J3D materials don't call GXSetCullMode: their cull mode is baked into the genMode BP write of
+// the material display list (J3DGDSetGenMode), replayed through the command processor each draw.
+// Re-issue genMode through the GX shim between the material load and the shape's geometry lists
+// (the shim's deferred write flushes at the shape's first GXCallDisplayList): same stage counts
+// as the material — the whole register is rewritten, and stale counts would break alpha-tested
+// casters like foliage — but with culling forced off.
+HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
+    if (!g_replayingSceneLists || !g_replayTwoSided) {
+        return HOOK_CONTINUE;
+    }
+    const J3DShape* shape = dusk::mods::arg<const J3DShape*>(args, 0);
+    J3DMaterial* material = shape != nullptr ? shape->getMaterial() : nullptr;
+    if (material == nullptr || material->getColorBlock() == nullptr ||
+        material->getIndBlock() == nullptr)
+    {
+        return HOOK_CONTINUE;
+    }
+    GXSetNumTexGens(static_cast<u8>(material->getTexGenNum()));
+    GXSetNumChans(material->getColorBlock()->getColorChanNum());
+    GXSetNumTevStages(material->getTevStageNum());
+    GXSetNumIndStages(material->getIndBlock()->getIndTexStageNum());
+    GXSetCullMode(GX_CULL_NONE);
+    return HOOK_CONTINUE;
+}
+
 void draw_opaque_scene_lists() {
     dComIfGd_drawOpaListBG();
     dComIfGd_drawOpaListDarkBG();
@@ -746,6 +794,7 @@ void render_shadow_map(
     GXSetColorUpdate(GX_TRUE);
     GXSetAlphaUpdate(GX_TRUE);
     GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
+    g_replayTwoSided = get_bool_option(g_cvarTwoSidedCasters, true);
     {
         replay_scope replay;
         draw_opaque_scene_lists();
@@ -781,15 +830,10 @@ void render_shadow_map(
     g_mapPass.ready = true;
 }
 
-// Game thread, after the full 3D scene: deferred composite.
-void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
-    const int64_t debugMode = get_debug_mode();
-    restore_actual_light_debug();
-
+// Game thread: consume the frame's map pass and push the deferred composite draw at the
+// current point in the command stream.
+void composite_map_pass(int64_t debugMode) {
     const MapPassOutput mapPass = std::exchange(g_mapPass, {});
-    if (debugMode == 9) {
-        return;
-    }
     if (!mapPass.ready || mapPass.shadowMap == nullptr || mapPass.lightColor == nullptr) {
         return;
     }
@@ -859,6 +903,29 @@ void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
     svc_gfx->push_draw(mod_ctx, g_drawType, &payload, sizeof(payload));
 }
 
+// Game thread, after the opaque scene but before translucency and the game's bloom filter: the
+// normal composite runs here so shadows darken the world underneath water, particles, and bloom
+// (compositing after bloom visibly dims the glow over shadowed areas).
+void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
+    if (get_debug_mode() != 0) {
+        return;
+    }
+    composite_map_pass(0);
+}
+
+// Game thread, after the full 3D scene: debug views draw here, unobscured by everything the
+// scene layers on after the opaque pass. Also the safety net that clears a map pass the
+// after-opaque composite didn't consume.
+void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
+    const int64_t debugMode = get_debug_mode();
+    restore_actual_light_debug();
+    if (debugMode == 0 || debugMode == 9) {
+        g_mapPass = {};
+        return;
+    }
+    composite_map_pass(debugMode);
+}
+
 void add_control(UiElementHandle pane, const UiControlDesc& desc) {
     svc_ui->pane_add_control(mod_ctx, pane, &desc, nullptr);
 }
@@ -914,6 +981,9 @@ ModResult build_controls_tab(
         "Keeps camera-frustum-culled objects in the draw lists so off-screen objects still cast "
         "shadows. Fixes shadows popping in and out with camera direction (distant mountains, "
         "ceilings) at some GPU cost.");
+    add_toggle(left, "Two-Sided Casters", g_cvarTwoSidedCasters,
+        "Renders shadow casters with backface culling disabled. Fixes light leaking through "
+        "single-sided geometry (level-edge walls, roofs) that faces away from the sun.");
     add_number(left, "Coverage", g_cvarBoxRadius, 1000, 30000, 500, nullptr,
         "Radius of the shadowed area around the camera, in world units. Smaller is sharper for "
         "the same map size; the light volume scales automatically.");
@@ -1088,6 +1158,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
+    result = register_bool_option("twoSidedCasters", true, g_cvarTwoSidedCasters, error);
+    if (result != MOD_OK) {
+        return result;
+    }
 
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to query device info");
@@ -1117,6 +1191,12 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
+    stageDesc.callback = on_scene_after_opaque;
+    if (svc_gfx->register_stage_hook(
+            mod_ctx, GFX_STAGE_SCENE_AFTER_OPAQUE, &stageDesc, &g_sceneAfterOpaqueHook) != MOD_OK)
+    {
+        return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+    }
     stageDesc.callback = on_frame_before_hud;
     if (svc_gfx->register_stage_hook(
             mod_ctx, GFX_STAGE_FRAME_BEFORE_HUD, &stageDesc, &g_frameBeforeHudHook) != MOD_OK)
@@ -1142,6 +1222,17 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     }
     if (dusk::mods::hook_add_pre<GXCopyTex>(svc_hook, on_copy_tex_pre) != MOD_OK) {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to hook GXCopyTex");
+    }
+    // Two-sided casters (see on_shape_draw_pre / on_cull_mode_pre). The J3DShape::drawFast hook
+    // is virtual, so it resolves through the symbol manifest; if that's missing, degrade to
+    // leaky shadows instead of failing the whole mod.
+    if (dusk::mods::hook_add_pre<GXSetCullMode>(svc_hook, on_cull_mode_pre) != MOD_OK) {
+        return dusk::mods::set_error(error, MOD_ERROR, "failed to hook GXSetCullMode");
+    }
+    if (dusk::mods::hook_add_pre<&J3DShape::drawFast>(svc_hook, on_shape_draw_pre) != MOD_OK) {
+        svc_log->warn(mod_ctx,
+            "failed to hook J3DShape::drawFast (missing dusklight.symdb?); Two-Sided Casters "
+            "will not affect J3D geometry");
     }
     UiModsPanelDesc panelDesc = UI_MODS_PANEL_DESC_INIT;
     panelDesc.build = build_panel;
@@ -1177,9 +1268,11 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarStrength = 0;
     g_cvarPcf = g_cvarBias = g_cvarBoxRadius = g_cvarContactShadows = g_cvarDebugView = 0;
     g_cvarSlopeBias = g_cvarNormalOffset = g_cvarContactThickness = g_cvarContactLength = 0;
-    g_cvarIndoorDisable = 0;
-    g_drawType = g_sceneBeginHook = g_sceneAfterTerrainHook = g_frameBeforeHudHook = 0;
+    g_cvarIndoorDisable = g_cvarTwoSidedCasters = 0;
+    g_drawType = g_sceneBeginHook = g_sceneAfterTerrainHook = g_sceneAfterOpaqueHook =
+        g_frameBeforeHudHook = 0;
     g_controlsWindow = 0;
+    g_replayTwoSided = false;
     g_mapPass = {};
     g_sceneCamera.valid = false;
     g_sceneCamera.raw_valid = false;

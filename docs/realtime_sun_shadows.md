@@ -16,18 +16,22 @@ functions, and (on Windows) links the platform release's `dusklight.lib`.
    During replay, hooks bypass `J3DUClipper::clip` (sphere + box overloads) so casters
    outside the *camera* frustum still render, and skip `GXCopyTex`. `resolve_pass` depth =
    the shadow map (reversed light depth: 1 = near light).
-3. **Composite** (`FRAME_BEFORE_HUD`, `res/shadow.wgsl`): unproject scene depth to world,
+3. **Composite** (`SCENE_AFTER_OPAQUE`, `res/shadow.wgsl`): unproject scene depth to world,
    reconstruct a world normal from depth (side-selected crosses), apply slope-scaled bias
    (`bias_eff = bias + slope_bias * tan_t`, tan clamped at 4) and a normal-offset receiver
    (`world + n * normal_offset * texel_world`), project into light space, PCF over
    hardware-bilinear comparison taps, add screen-space contact shadows (short raymarch),
-   darken the scene. Debug views visualize map/coverage/factors.
+   darken the scene. The composite runs right after the opaque scene — before translucency
+   and, critically, before the game's bloom filter (`m_Do_graphic.cpp` draws bloom between
+   `SCENE_AFTER_OPAQUE` and `FRAME_BEFORE_HUD`; compositing at `FRAME_BEFORE_HUD` darkened
+   the bloom glow itself). Debug views visualize map/coverage/factors and still draw at
+   `FRAME_BEFORE_HUD` so nothing the scene layers on afterwards obscures them.
 4. **Game-shadow suppression**: pre-hooks skip `dDlst_shadowControl_c::imageDraw/draw` and
    `drawCloudShadow` while the mod is active (typed hooks only — no symbol manifest needed).
 5. **Indoor auto-disable**: `dKy_Indoor_check() != 0` (+ `indoorDisable` on) gates both map
    rendering and compositing — interiors revert to the vanilla look.
 
-## The five original issues and where their fixes live
+## The original issues and where their fixes live
 
 1. **Shadow acne vs peter-panning** → slope-scaled bias + normal-offset receiver
    (shadow.wgsl) + contact shadows filling the contact gap that bias opens.
@@ -43,6 +47,18 @@ functions, and (on Windows) links the platform release's `dusklight.lib`.
 5. **Shadows popping by camera angle** (Temple of Time ceiling, Lake Hylia mountains) →
    the `J3DUClipper` bypass during replay (the game culls against the *camera* frustum;
    casters behind/above the camera must still cast).
+6. **Light leaking through level edges** → single-sided geometry facing the player is
+   back-facing from the light, so its material's cull mode dropped it from the shadow map.
+   Fix: two-sided casters during replay. Direct GX drawers are covered by a `GXSetCullMode`
+   pre-hook that rewrites the argument to `GX_CULL_NONE`; J3D materials bake their cull mode
+   into the material display list's genMode BP write (and aurora's command processor ignores
+   BP masks), so a `J3DShape::drawFast` pre-hook re-issues genMode through the GX shim —
+   material-correct texgen/chan/TEV/ind counts, cull forced off — which the shim flushes at
+   the shape's first `GXCallDisplayList`, after the material DL and before any geometry.
+   Note the "Light View" debug renders the world through the game's normal path, not the
+   replay, so it still shows backfaces culled.
+7. **Shadows dimming the bloom glow** → the composite ran at `FRAME_BEFORE_HUD`, which is
+   after the game's mid-scene bloom draw; it now runs at `SCENE_AFTER_OPAQUE` (see above).
 
 ## Tunables
 
@@ -59,6 +75,7 @@ functions, and (on Windows) links the platform release's `dusklight.lib`.
 | `contactShadows` | on | screen-space contact raymarch |
 | `contactThickness` / `contactLength` | 25 / 60 | contact ray assumptions |
 | `noFrustumClipping` | on | the anti-popping clipper bypass (issue 5) |
+| `twoSidedCasters` | on | render casters with backface culling off (issue 6) |
 | `indoorDisable` | on | vanilla look indoors (issue 3) |
 | `debugView` | 0 | map/coverage/factor visualizations |
 
