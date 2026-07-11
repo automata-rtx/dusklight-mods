@@ -20,15 +20,28 @@ functions, and (on Windows) links the platform release's `dusklight.lib`.
    reconstruct a world normal from depth (side-selected crosses), apply slope-scaled bias
    (`bias_eff = bias + slope_bias * tan_t`, tan clamped at 4) and a normal-offset receiver
    (`world + n * normal_offset * texel_world`), project into light space, PCF over
-   hardware-bilinear comparison taps, add screen-space contact shadows (short raymarch),
+   hardware-bilinear comparison taps, combine with the screen-space shadow term (below),
    darken the scene. The composite runs right after the opaque scene — before translucency
    and, critically, before the game's bloom filter (`m_Do_graphic.cpp` draws bloom between
    `SCENE_AFTER_OPAQUE` and `FRAME_BEFORE_HUD`; compositing at `FRAME_BEFORE_HUD` darkened
    the bloom glow itself). Debug views visualize map/coverage/factors and still draw at
    `FRAME_BEFORE_HUD` so nothing the scene layers on afterwards obscures them.
-4. **Game-shadow suppression**: pre-hooks skip `dDlst_shadowControl_c::imageDraw/draw` and
+4. **Screen-space shadows** (Bend Studio's Days Gone technique, Apache-2.0): a compute pass
+   (`res/bend_sss.wgsl`) traces the depth snapshot toward the projected sun position and
+   writes a screen-sized visibility texture the composite max-combines with the mapped
+   occlusion. `src/bend_sss_cpu.h` (verbatim Bend) builds up to 8 dispatches per frame from
+   the homogeneous light coordinate `proj_from_world × (dirToLight, 0)`; each dispatch gets
+   its own uniform slot (shared light coordinate + per-dispatch wave offset). Wavefronts of
+   64 threads share one ray segment through workgroup memory — ~1.2–1.6 threads per pixel
+   total. WGSL port deltas: the border-color point sampler becomes a bounds-checked
+   `textureLoad` returning far depth, and the wave-intrinsic early-out is dropped (WGSL
+   uniformity rules); trace length is fixed at 60 pixels (`SAMPLE_COUNT`). Because Bend's
+   thickness threshold is a fraction of the pixel's remaining depth range, the term resolves
+   contact detail and thin casters at *any* distance — it pairs with a reduced `boxRadius`
+   (sharper map texels up close, screen-space detail everywhere).
+5. **Game-shadow suppression**: pre-hooks skip `dDlst_shadowControl_c::imageDraw/draw` and
    `drawCloudShadow` while the mod is active (typed hooks only — no symbol manifest needed).
-5. **Indoor auto-disable**: `dKy_Indoor_check() != 0` (+ `indoorDisable` on) gates both map
+6. **Indoor auto-disable**: `dKy_Indoor_check() != 0` (+ `indoorDisable` on) gates both map
    rendering and compositing — interiors revert to the vanilla look.
 
 ## The original issues and where their fixes live
@@ -72,15 +85,21 @@ functions, and (on Windows) links the platform release's `dusklight.lib`.
 | `slopeBias` | 30 | bias added ∝ surface slope vs light |
 | `normalOffset` | 100 | receiver offset, % of one shadow texel's world size |
 | `pcf` | 2 | PCF kernel: 0=1×1 1=3×3 2=5×5 ... |
-| `contactShadows` | on | screen-space contact raymarch |
-| `contactThickness` / `contactLength` | 25 / 60 | contact ray assumptions |
+| `contactShadows` | on | the Bend screen-space shadow term |
+| `sssThickness` | 50 | assumed caster thickness, 1/100 % of remaining depth (50 = 0.5%) |
+| `sssEdgeThreshold` | 200 | depth delta treated as an edge, 1/100 % (200 = 2%) |
+| `sssContrast` | 4 | contrast boost on the SSS transition (1–8) |
+| `sssIgnoreEdges` | off | edge pixels don't cast (helps grazing-angle aliasing) |
 | `noFrustumClipping` | on | the anti-popping clipper bypass (issue 5) |
 | `twoSidedCasters` | on | render casters with backface culling off (issue 6) |
 | `indoorDisable` | on | vanilla look indoors (issue 3) |
-| `debugView` | 0 | map/coverage/factor visualizations |
+| `debugView` | 0 | map/coverage/factor visualizations + SSS buffer/edge-mask views |
 
 Tuning order for acne: raise `slopeBias` first, then `normalOffset`; lower `bias` if shadows
-detach at feet (contact shadows hide small gaps).
+detach at feet (the screen-space term hides small gaps). Per Bend's guidance, tune
+`sssThickness` in multiples of 2 and scale `sssEdgeThreshold` alongside it; use the "SSS
+Edge Mask" debug view when striated patterns appear on flat surfaces (or turn on
+`sssIgnoreEdges`).
 
 ## Known caveats
 
@@ -88,5 +107,12 @@ detach at feet (contact shadows hide small gaps).
   "lives" during her summon/emergence animation. A retain path (re-enable the game shadow
   for Link only, or anchor her to our sun ground-projection) is a known follow-up.
 - Single map: very large `boxRadius` spreads texels thin → cascades are the planned fix.
+  In the meantime the Bend SSS term works at any distance, so a *smaller* `boxRadius` plus
+  SSS is often the better trade than a huge, blurry map.
+- The SSS trace length is compile-time (`SAMPLE_COUNT` 60 pixels in `res/bend_sss.wgsl`);
+  making it configurable means pipeline variants (workgroup memory is sized by it).
+- The pixel exactly at the light's screen position is never traced (rays converge toward
+  it; inherent to Bend's wavefront projection — verified by a coverage simulation). For a
+  directional sun that pixel is sky, which early-outs anyway.
 - ABI-coupled: after any re-platform this mod must be rebuilt against the new
   `dusklight.lib`; the `GameService` major version rejects a mismatched load cleanly.

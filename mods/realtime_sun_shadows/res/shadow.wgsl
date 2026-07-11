@@ -16,25 +16,20 @@
 // the shadow map, rendered through the game's GX pipeline with a GC-convention light matrix,
 // stores clip.z, i.e. 1.0 nearest to the light and 0.0 at the light frustum far plane.
 //
-// The optional contact-shadow raymarch follows Panos Karabelas' screen-space shadows
-// (https://panoskarabelas.com/blog/posts/screen_space_shadows/, MIT via Spartan Engine):
-// march from the pixel toward the light in view space and mark occlusion when the ray dips
-// behind the depth buffer within a thickness threshold.
+// The optional screen-space shadow term is Bend Studio's Days Gone technique, computed by a
+// separate compute pass (res/bend_sss.wgsl) into a screen-sized visibility texture that this
+// composite combines with the mapped occlusion. Fine contact detail and geometry thinner
+// than a shadow-map texel both come from that term.
 
 struct Uniforms {
     world_from_proj: mat4x4f, // scene depth unproject (camera)
-    view_from_proj: mat4x4f,  // scene depth -> view space (contact shadows)
-    proj_from_view: mat4x4f,  // view -> clip (contact shadows re-projection)
     light_vp: mat4x4f,        // world -> light receiver projection (UV/depth basis)
-    light_dir_view: vec3f,    // direction *toward* the light, view space, normalized
-    bias: f32,                // shadow-map depth bias (reversed-depth units)
     size: vec2f,              // shadow map size in texels
     inv_size: vec2f,
+    bias: f32,                // shadow-map depth bias (reversed-depth units)
     strength: f32,            // final darkening amount, horizon fade baked in
     pcf_taps: f32,            // 0 = single tap, 1 = 3x3, 2 = 5x5
-    contact_enabled: f32,
-    contact_thickness: f32,   // view-space thickness threshold
-    contact_length: f32,      // view-space march distance
+    contact_enabled: f32,     // screen-space shadow term available this frame
     debug_mode: u32,          // 0 = composite; nonzero modes are diagnostic views
     slope_bias: f32,          // extra bias per unit of surface slope (normalized depth units)
     normal_offset: f32,       // receiver offset along the surface normal, in shadow texels
@@ -43,15 +38,13 @@ struct Uniforms {
     light_dir_world_y: f32,
     light_dir_world_z: f32,
     _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
-    _pad3: f32,
 }
 
 @group(0) @binding(0) var scene_depth: texture_2d<f32>;
 @group(0) @binding(1) var shadow_map: texture_2d<f32>;
 @group(0) @binding(2) var<uniform> uniforms: Uniforms;
 @group(0) @binding(3) var light_color: texture_2d<f32>;
+@group(0) @binding(4) var screen_shadow: texture_2d<f32>; // Bend SSS visibility (1 = lit)
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -182,54 +175,12 @@ fn light_depth_debug_at(uv: vec2f) -> vec3f {
     return vec3f(saturate(shade + bands + edge));
 }
 
-fn view_position(uv: vec2f, depth: f32) -> vec3f {
-    let ndc = vec4f(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y, depth, 1.0);
-    let position = uniforms.view_from_proj * ndc;
-    return position.xyz / position.w;
-}
-
-// Interleaved gradient noise (Jimenez); fixed per-pixel dither, no temporal rotation.
-fn ign(pixel: vec2f) -> f32 {
-    return fract(52.9829189 * fract(dot(pixel, vec2f(0.06711056, 0.00583715))));
-}
-
-// Screen-space contact shadows: march toward the light in view space; occluded when the ray
-// passes behind the depth buffer by less than the thickness threshold. Faded out with view
-// distance: position reconstruction error grows with distance while the thickness threshold
-// is fixed, so far surfaces (and anything translucent composited over them - clouds, fog)
-// would otherwise pick up dithered false occlusion. Contact shadows are a near-field effect.
-fn contact_shadow_fade(view_distance: f32) -> f32 {
-    return saturate(1.0 - (view_distance - 3000.0) / 5000.0);
-}
-
-fn contact_shadow(origin: vec3f, pixel: vec2f) -> f32 {
-    let steps = 24;
-    let step_vec = uniforms.light_dir_view * (uniforms.contact_length / f32(steps));
-    var ray = origin + step_vec * ign(pixel);
-    for (var i = 0; i < steps; i += 1) {
-        ray += step_vec;
-        // Project the ray position back to screen space.
-        let clip = uniforms.proj_from_view * vec4f(ray, 1.0);
-        if clip.w <= 0.0 {
-            break;
-        }
-        let ray_ndc = clip.xyz / clip.w;
-        let ray_uv = vec2f(0.5 + 0.5 * ray_ndc.x, 0.5 - 0.5 * ray_ndc.y);
-        if any(ray_uv < vec2f(0.0)) || any(ray_uv > vec2f(1.0)) {
-            break;
-        }
-        let scene = scene_depth_at(ray_uv);
-        if scene <= 0.0 {
-            continue;
-        }
-        // Compare in view space: positive delta = the ray is behind the scene surface.
-        let scene_z = view_position(ray_uv, scene).z;
-        let delta = scene_z - ray.z; // view space looks down -z; larger z = closer
-        if delta > 0.0 && delta < uniforms.contact_thickness {
-            return 1.0;
-        }
-    }
-    return 0.0;
+// Bend SSS visibility for this pixel (1 = lit). The texture matches the scene depth
+// snapshot's dimensions, so the same UV addressing applies.
+fn screen_shadow_at(uv: vec2f) -> f32 {
+    let size = vec2<i32>(textureDimensions(screen_shadow));
+    let texel = clamp(vec2<i32>(uv * vec2f(size)), vec2<i32>(0i), size - 1i);
+    return textureLoad(screen_shadow, texel, 0i).r;
 }
 
 @fragment
@@ -237,6 +188,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     let depth = scene_depth_at(in.uv);
     if uniforms.debug_mode == 1u {
         let value = load_shadow(vec2<i32>(in.uv * uniforms.size));
+        return vec4f(value, value, value, 1.0);
+    }
+    // 11 = the Bend SSS visibility buffer; 12 = its edge-detect mask (written by the compute
+    // pass when this mode is active).
+    if uniforms.debug_mode == 11u || uniforms.debug_mode == 12u {
+        let value = screen_shadow_at(in.uv);
         return vec4f(value, value, value, 1.0);
     }
     if uniforms.debug_mode == 9u || uniforms.debug_mode == 10u {
@@ -323,12 +280,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         return vec4f(occlusion, occlusion, occlusion, 1.0);
     }
 
+    // Combine with the Bend SSS term: it catches contact detail and thin casters the map
+    // misses at any distance (its thickness is depth-relative, not a fixed world size), so
+    // no near-field fade is needed.
     if uniforms.contact_enabled != 0.0 && occlusion < 1.0 {
-        let origin = view_position(in.uv, depth);
-        let fade = contact_shadow_fade(-origin.z);
-        if fade > 0.0 {
-            occlusion = max(occlusion, fade * contact_shadow(origin, in.position.xy));
-        }
+        occlusion = max(occlusion, 1.0 - screen_shadow_at(in.uv));
     }
 
     let value = 1.0 - uniforms.strength * occlusion;
