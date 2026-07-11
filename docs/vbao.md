@@ -42,11 +42,12 @@ Ints are fixed-point (usually /100) unless noted.
 | `customSlices` / `customSteps` | 7 / 3 | used when quality = Custom (1–16 / 1–8) |
 | `radius` | 100 | effect radius, % of view depth (depth-proportional world radius) |
 | `radiusMax` | 40 | screen-space radius cap, % of viewport height |
-| `intensity` | 150 | final strength multiplier ×0.01 |
+| `intensity` | 150 | final strength multiplier ×0.01 (up to 500) |
 | `contrast` | 150 | value power ×0.01 — deepens (>100) or lifts the falloff |
 | `blackPoint` | 0 | % occlusion floor removed then rescaled (cleans flat surfaces) |
 | `thickness` | 150 | occluder thickness ×0.01 (log-scaled internally) |
 | `thickFade` | 150 | thickness fade range, ×0.01 of view radius |
+| `thickDist` | 20 | distance thickness: radius-proportional thickness floor, ‰ of the view radius. The log-scaled base thickness becomes a vanishing fraction of the (depth-proportional) radius with distance and starves mid/far occlusion; this restores it. 0 = old behavior |
 | `depthBias` | 4 | self-occlusion bias, ‰ toward camera |
 | `temporal` | on | temporal accumulation master |
 | `temporalFrames` | 5 | accumulation length → alpha = 1/frames |
@@ -60,6 +61,11 @@ Ints are fixed-point (usually /100) unless noted.
 | `distanceFade` | off | fade AO out toward the far plane |
 | `fadeStart` / `fadeEnd` | 40 / 90 | fade band, % of far plane |
 | `debugMode` | 0 | 0 off, 1 AO, 2 normals, 3 depth, 4 staircase |
+| `debugDepthRange` | 3300 | depth debug view gradient scale in world units (visualization only) |
+
+Debug views draw at `FRAME_BEFORE_HUD` (the normal composite stays at `SCENE_AFTER_OPAQUE`)
+so deferred fog, translucency, and bloom never paint over them — judging AO strength through
+a fogged debug view reads as much weaker than the effect actually is.
 
 ## Defaults rationale + performance notes
 

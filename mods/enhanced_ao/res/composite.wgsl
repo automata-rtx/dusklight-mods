@@ -41,7 +41,11 @@ struct Uniforms {
     debug_view: u32,
     frame_index: u32,
     flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
+    thick_dist_scale: f32, // extra occluder thickness, fraction of the view-space radius
+    inv_debug_depth: f32,  // debug depth view gradient scale (1 / world units)
     _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 @group(0) @binding(0) var ambient_occlusion: texture_2d<f32>;
@@ -166,10 +170,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         return vec4f(normal * 0.5 + 0.5, 1.0);
     }
     if uniforms.debug_view == 3u {
-        // Preprocessed depth as an exponential distance gradient (white = near, black = far)
+        // Preprocessed depth as an exponential distance gradient (white = near, black = far).
+        // The range is adjustable (debugDepthRange, world units) so the gradient can span
+        // whatever scene scale is being inspected.
         let pixel = vec2<i32>(in.uv * uniforms.size);
         let position = view_position_at(pixel);
-        let value = exp(-max(-position.z, 0.0) * 0.0003);
+        let value = exp(-max(-position.z, 0.0) * uniforms.inv_debug_depth);
         return vec4f(value, value, value, 1.0);
     }
     if uniforms.debug_view == 4u {

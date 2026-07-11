@@ -53,6 +53,8 @@ ConfigVarHandle g_cvarContrast = 0;
 ConfigVarHandle g_cvarBlackPoint = 0;
 ConfigVarHandle g_cvarThickness = 0;
 ConfigVarHandle g_cvarThickFade = 0;
+ConfigVarHandle g_cvarThickDist = 0;
+ConfigVarHandle g_cvarDebugDepthRange = 0;
 ConfigVarHandle g_cvarDepthBias = 0;
 ConfigVarHandle g_cvarTemporal = 0;
 ConfigVarHandle g_cvarTemporalFrames = 0;
@@ -70,6 +72,7 @@ ConfigVarHandle g_cvarDebugView = 0;
 GfxComputeTypeHandle g_computeType = 0;
 GfxDrawTypeHandle g_drawType = 0;
 GfxStageHookHandle g_afterOpaqueHook = 0;
+GfxStageHookHandle g_beforeHudHook = 0;
 UiWindowHandle g_controlsWindow = 0;
 
 ResourceBuffer g_preprocessSource = RESOURCE_BUFFER_INIT;
@@ -162,7 +165,11 @@ struct AoUniforms {
     uint32_t debug_view;
     uint32_t frame_index;
     uint32_t flags; // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
+    float thick_dist_scale; // extra occluder thickness, fraction of the view-space radius
+    float inv_debug_depth;  // debug depth view gradient scale (1 / world units)
     float _pad0;
+    float _pad1;
+    float _pad2;
 };
 static_assert(sizeof(AoUniforms) % 16 == 0);
 
@@ -195,6 +202,12 @@ struct CompositePayload {
 };
 static_assert(sizeof(CompositePayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
 static_assert(std::is_trivially_copyable_v<CompositePayload>);
+
+// Debug views draw at FRAME_BEFORE_HUD instead of SCENE_AFTER_OPAQUE so nothing layered on
+// after the opaque scene (deferred fog, bloom, translucency) obscures them; the payload is
+// staged here between the two stages (game thread only; its views live for the frame).
+CompositePayload g_pendingDebugDraw{};
+bool g_debugDrawPending = false;
 
 int64_t get_int_option(ConfigVarHandle handle, int64_t fallback) {
     int64_t value = fallback;
@@ -745,12 +758,20 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.effect_radius =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarRadius, 100), 25, 800)) /
         1000.0f;
-    uniforms.intensity = percent(g_cvarIntensity, 150, 0, 300);
+    uniforms.intensity = percent(g_cvarIntensity, 150, 0, 500);
     uniforms.contrast = percent(g_cvarContrast, 150, 50, 300);
     uniforms.thickness = percent(g_cvarThickness, 150, 25, 400);
     uniforms.black_point = percent(g_cvarBlackPoint, 0, 0, 30);
     uniforms.radius_max = percent(g_cvarRadiusMax, 40, 10, 100);
     uniforms.thick_fade = percent(g_cvarThickFade, 150, 50, 400);
+    // Radius-proportional occluder thickness floor: restores mid/far occlusion that the
+    // log-scaled base thickness starves (the value is per-mille of the view radius).
+    uniforms.thick_dist_scale =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarThickDist, 20), 0, 100)) /
+        1000.0f;
+    uniforms.inv_debug_depth =
+        1.0f / static_cast<float>(
+                   std::clamp<int64_t>(get_int_option(g_cvarDebugDepthRange, 3300), 500, 100000));
     // Self-occlusion bias in permille toward the camera (4 = the 0.996 factor).
     uniforms.depth_bias =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarDepthBias, 4), 0, 20)) /
@@ -816,7 +837,14 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const CompositePayload drawPayload{
         temporal ? g_targets.historyViews[writeIdx] : denoisedView, g_targets.preprocessedDepthAll,
         resolved.depth, uniformRange.offset, uniformRange.size, debugMode};
-    svc_gfx->push_draw(mod_ctx, g_drawType, &drawPayload, sizeof(drawPayload));
+    if (debugMode != 0) {
+        // Debug views draw at FRAME_BEFORE_HUD so deferred fog, translucency, and bloom
+        // don't paint over them (all payload views stay valid for the rest of the frame).
+        g_pendingDebugDraw = drawPayload;
+        g_debugDrawPending = true;
+    } else {
+        svc_gfx->push_draw(mod_ctx, g_drawType, &drawPayload, sizeof(drawPayload));
+    }
 
     // Advance the temporal state for the next frame.
     if (temporal) {
@@ -825,6 +853,16 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     }
     std::memcpy(g_prevProjFromWorld, camera.proj_from_world, sizeof(g_prevProjFromWorld));
     g_prevCameraValid = true;
+}
+
+// Game thread, after the full 3D scene: push the staged debug-view draw, unobscured by
+// everything the scene layered on after the opaque pass.
+void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
+    if (!g_debugDrawPending) {
+        return;
+    }
+    g_debugDrawPending = false;
+    svc_gfx->push_draw(mod_ctx, g_drawType, &g_pendingDebugDraw, sizeof(g_pendingDebugDraw));
 }
 
 void add_control(UiElementHandle pane, const UiControlDesc& desc) {
@@ -876,7 +914,7 @@ ModResult build_controls_tab(
     svc_ui->pane_add_section(mod_ctx, left, "Effect");
     add_toggle(left, "Enabled", g_cvarEnabled, "Enables the ambient occlusion pass.");
     add_number(left, "Intensity", g_cvarIntensity,
-        "How strongly occlusion darkens the scene.", 0, 300, 5, "%");
+        "How strongly occlusion darkens the scene.", 0, 500, 5, "%");
     add_number(left, "Contrast", g_cvarContrast,
         "Contrast of the occlusion falloff. Lower softens the transition; higher sharpens it.",
         50, 300, 10, "%");
@@ -912,6 +950,12 @@ ModResult build_controls_tab(
         "influence fades out. Lower stops halos around silhouettes sooner; higher lets deep "
         "crevices darken further.",
         50, 400, 25, "%");
+    add_number(left, "Distance Thickness", g_cvarThickDist,
+        "Extra occluder thickness that scales with distance (per-mille of the search radius). "
+        "The base thickness grows only logarithmically, which starves mid/far occlusion; raise "
+        "this to keep distant geometry darkening at full strength. 0 restores the old "
+        "behavior.",
+        0, 100, 5, nullptr);
     add_number(left, "Depth Bias", g_cvarDepthBias,
         "Small bias toward the camera that suppresses a surface shadowing itself (speckle/acne "
         "on flat surfaces). Raise if flat surfaces show noise; too high loses fine contact "
@@ -971,8 +1015,14 @@ ModResult build_controls_tab(
         "consumes.<br/>Depth: the preprocessed depth as a distance "
         "gradient.<br/>Staircase: detects quantized depth - smooth depth is "
         "near-black with thin triangle edges, quantized depth lights up across "
-        "surfaces.",
+        "surfaces.<br/>Debug views draw over the finished frame (after fog and bloom), so "
+        "other effects never obscure them.",
         kDebugOptions, 5);
+    add_number(left, "Debug Depth Range", g_cvarDebugDepthRange,
+        "Distance scale of the Depth debug view's gradient, in world units: the view fades "
+        "toward black across roughly 3x this distance. Raise to inspect large scenes; the "
+        "visualization has no effect on the AO itself.",
+        500, 100000, 500, nullptr);
     return MOD_OK;
 }
 
@@ -1089,7 +1139,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"blackPoint", 0, &g_cvarBlackPoint},
         {"thickness", 150, &g_cvarThickness},
         {"thickFade", 150, &g_cvarThickFade},
+        {"thickDist", 20, &g_cvarThickDist},
         {"depthBias", 4, &g_cvarDepthBias},
+        {"debugDepthRange", 3300, &g_cvarDebugDepthRange},
         {"temporalFrames", 5, &g_cvarTemporalFrames},
         {"temporalClamp", 200, &g_cvarTemporalClamp},
         {"motionResponse", 10, &g_cvarMotionResponse},
@@ -1148,6 +1200,12 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     stageDesc.callback = on_scene_after_opaque;
     if (svc_gfx->register_stage_hook(
             mod_ctx, GFX_STAGE_SCENE_AFTER_OPAQUE, &stageDesc, &g_afterOpaqueHook) != MOD_OK)
+    {
+        return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+    }
+    stageDesc.callback = on_frame_before_hud;
+    if (svc_gfx->register_stage_hook(
+            mod_ctx, GFX_STAGE_FRAME_BEFORE_HUD, &stageDesc, &g_beforeHudHook) != MOD_OK)
     {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
@@ -1223,13 +1281,15 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     }
     g_cvarEnabled = g_cvarQuality = g_cvarCustomSlices = g_cvarCustomSteps = 0;
     g_cvarRadius = g_cvarRadiusMax = g_cvarIntensity = g_cvarContrast = 0;
-    g_cvarBlackPoint = g_cvarThickness = g_cvarThickFade = g_cvarDepthBias = 0;
+    g_cvarBlackPoint = g_cvarThickness = g_cvarThickFade = g_cvarThickDist = g_cvarDepthBias = 0;
+    g_cvarDebugDepthRange = 0;
     g_cvarTemporal = g_cvarTemporalFrames = g_cvarTemporalClamp = g_cvarMotionResponse = 0;
     g_cvarContentThresh = g_cvarDisoccTol = g_cvarDenoisePasses = 0;
     g_cvarDistanceFade = g_cvarFadeStart = g_cvarFadeEnd = 0;
     g_cvarHalfRes = g_cvarDebugView = 0;
     g_computeType = g_drawType = 0;
-    g_afterOpaqueHook = 0;
+    g_afterOpaqueHook = g_beforeHudHook = 0;
+    g_debugDrawPending = false;
     g_controlsWindow = 0;
     g_frameIndex = 0;
     g_historyWriteIndex = 0;

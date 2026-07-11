@@ -25,11 +25,16 @@ Any screen-space effect composited after the opaque scene therefore multiplies o
    an immediate `GXSetFog(GX_FOG_NONE)` overrides its fog for that shape's geometry. The
    material's true parameters are read from `material->getPEBlock()->getFog()` for capture.
    Direct drawers are covered by a `GXSetFog` pre-hook that rewrites the type argument.
-3. **Re-apply** as a fullscreen alpha-blended pass over the resolved opaque depth, pushed
-   from a pre-hook on `dDlst_list_c::drawXluDrawList` — the first translucent list. That
-   point is after *every* mod's `SCENE_AFTER_OPAQUE` stage callbacks regardless of mod load
-   order, and before water, particles, DOF, and bloom, which keep their native forward fog
-   (the painter's dedicated particle-fog passes included).
+3. **Re-apply** as a fullscreen alpha-blended pass over the resolved opaque depth, pushed at
+   the first `J3DShape::drawFast` after `SCENE_AFTER_OPAQUE` — i.e. right before the first
+   translucent geometry (water included) rasterizes — with a `FRAME_BEFORE_HUD` fallback for
+   frames with no translucent J3D at all. That lands after *every* mod's
+   `SCENE_AFTER_OPAQUE` stage callbacks regardless of mod load order, and before water,
+   particles, DOF, and bloom, which keep their native forward fog (the painter's dedicated
+   particle-fog passes included). Do NOT anchor this on the painter's own list functions
+   (`dDlst_list_c::drawXluDrawList` etc.): they inline into their callsites, so a detour
+   fires at some unrelated later call — the original implementation did exactly that and the
+   fog landed after bloom.
 4. **Exactness**: aurora's only per-fragment fog input is the raw depth value — the same
    value in the depth snapshot — and `src/fog_math.h` mirrors the full `J3DGDSetFog` BP
    encode → aurora command-processor decode round trip (11-bit mantissa truncation

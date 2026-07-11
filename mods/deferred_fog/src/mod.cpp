@@ -5,11 +5,16 @@
 // direct drawers call GXSetFog), which means any mod compositing over the opaque scene - AO,
 // deferred shadows - darkens the *fogged* color, visibly dimming the fog/aerial perspective
 // instead of the surfaces under it. This mod suppresses fog while the opaque world lists
-// draw, captures the live fog parameters, and re-applies fog as a fullscreen pass pushed at
-// the first translucent list draw - a point guaranteed to fall after every mod's
-// SCENE_AFTER_OPAQUE composites (regardless of mod load order) and before water, particles,
-// and bloom, which keep their native forward fog. Other mods need no changes and no
-// awareness of this mod to benefit.
+// draw, captures the live fog parameters, and re-applies fog as a fullscreen pass pushed
+// right before the first J3D translucent geometry draws (with a FRAME_BEFORE_HUD fallback) -
+// after every mod's SCENE_AFTER_OPAQUE composites regardless of mod load order, and before
+// water, particles, and bloom, which keep their native forward fog. Other mods need no
+// changes and no awareness of this mod to benefit.
+//
+// The re-apply trigger deliberately avoids hooking the painter's own list functions: those
+// are inlinable into their callsites, where a detour never fires. J3DShape::drawFast (already
+// hooked for suppression) is the anchor instead - the first shape drawn after the opaque
+// stage IS the first translucent geometry.
 //
 // The re-applied fog is an exact reproduction, not an approximation: aurora's per-fragment
 // fog input is the raw depth value (the same value in the depth snapshot), and mod.cpp
@@ -30,7 +35,6 @@
 
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
 #include "JSystem/J3DGraphBase/J3DShape.h"
-#include "d/d_drawlist.h"
 #include "dolphin/gx/GXPixel.h"
 #include "mods/hook.hpp"
 #include "mods/service.hpp"
@@ -63,6 +67,7 @@ ConfigVarHandle g_cvarDebugView = 0;
 GfxDrawTypeHandle g_drawType = 0;
 GfxStageHookHandle g_sceneBeginHook = 0;
 GfxStageHookHandle g_sceneAfterOpaqueHook = 0;
+GfxStageHookHandle g_frameBeforeHudHook = 0;
 ResourceBuffer g_shaderSource = RESOURCE_BUFFER_INIT;
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
 WGPURenderPipeline g_fogPipeline = nullptr;       // (srcAlpha, 1-srcAlpha) blend
@@ -82,8 +87,8 @@ struct FogConfig {
 };
 
 // Per-frame suppression state (game thread only).
-bool g_scopeActive = false;      // between SCENE_BEGIN and the first translucent list draw
-bool g_quadArmed = false;        // SCENE_AFTER_OPAQUE passed; push the fog quad at first xlu
+bool g_scopeActive = false;      // between SCENE_BEGIN and SCENE_AFTER_OPAQUE
+bool g_quadArmed = false;        // push the fog quad at the next J3D shape draw (first xlu)
 bool g_suppressAllowed = false;  // last completed frame saw exactly one fog configuration
 bool g_shapeHookOk = false;      // J3DShape::drawFast hook installed (needs the vtable symbol)
 bool g_warnedPushFailure = false;
@@ -175,13 +180,25 @@ bool vote_config(const FogConfig& config) {
     return true;
 }
 
-// Game thread, per shape while the opaque world lists draw. J3D materials never call
-// GXSetFog: their fog is baked into the material display list's BP writes (which aurora's
+void push_fog_quad();
+
+// Game thread, per J3D shape draw.
+//
+// While the opaque world lists draw (the suppression scope): J3D materials never call
+// GXSetFog - their fog is baked into the material display list's BP writes (which aurora's
 // command processor replays into per-draw fog state). The material display list has already
 // executed when the shape draws, so an immediate GXSetFog(GX_FOG_NONE) here overrides it
 // for this shape's geometry - and the material's true parameters are readable off its PE
 // block for capture. Same interception pattern as Realtime Sun Shadows' two-sided casters.
+//
+// After the opaque stage (quad armed): the first shape drawn is the first translucent
+// geometry - water included - so the deferred fog pushes here, under it.
 HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
+    if (g_quadArmed) {
+        g_quadArmed = false;
+        push_fog_quad();
+        return HOOK_CONTINUE;
+    }
     if (!g_scopeActive) {
         return HOOK_CONTINUE;
     }
@@ -309,25 +326,6 @@ void push_fog_quad() {
     svc_gfx->push_draw(mod_ctx, g_drawType, &payload, sizeof(payload));
 }
 
-// Game thread: fires for every translucent list; the first call after SCENE_AFTER_OPAQUE
-// ends the suppression scope and pushes the deferred fog. This point is after every mod's
-// SCENE_AFTER_OPAQUE stage callbacks - whatever the mod load order - and before water,
-// particles, and bloom.
-HookAction on_xlu_list_pre(ModContext*, void*, void*, void*) {
-    if (!g_quadArmed) {
-        return HOOK_CONTINUE;
-    }
-    g_quadArmed = false;
-    g_scopeActive = false;
-    if (g_suppressedCount > 0 && g_reference.valid) {
-        push_fog_quad();
-    }
-    // One configuration this frame -> keep (or start) deferring next frame. Mixed
-    // configurations -> exact vanilla fog from the next frame until the scene is uniform.
-    g_suppressAllowed = g_deviantCount == 0 && effect_enabled();
-    return HOOK_CONTINUE;
-}
-
 void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
     g_reference = FogConfig{};
     g_suppressedCount = 0;
@@ -340,8 +338,30 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
     }
 }
 
+// Game thread, right after the last opaque list: end the suppression scope (the next J3D
+// shape drawn is translucent geometry) and arm the deferred fog push. The quad itself pushes
+// later - at the first translucent shape draw, or the FRAME_BEFORE_HUD fallback - so it
+// lands after every mod's SCENE_AFTER_OPAQUE composites regardless of stage-callback order.
 void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
-    g_quadArmed = g_scopeActive;
+    if (!g_scopeActive) {
+        return;
+    }
+    g_scopeActive = false;
+    g_quadArmed = g_suppressedCount > 0 && g_reference.valid;
+    // One configuration this frame -> keep (or start) deferring next frame. Mixed
+    // configurations -> exact vanilla fog from the next frame until the scene is uniform.
+    g_suppressAllowed = g_deviantCount == 0 && effect_enabled();
+}
+
+// Game thread, after the full 3D scene: fallback for frames without any translucent J3D
+// geometry - late fog (over translucency/bloom, vanilla-incorrect for one frame) beats
+// suppressed fog never coming back. Also guarantees the armed flag never crosses frames.
+void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
+    if (!g_quadArmed) {
+        return;
+    }
+    g_quadArmed = false;
+    push_fog_quad();
 }
 
 void add_control(UiElementHandle panel, const UiControlDesc& desc) {
@@ -481,14 +501,15 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
+    stageDesc.callback = on_frame_before_hud;
+    if (svc_gfx->register_stage_hook(
+            mod_ctx, GFX_STAGE_FRAME_BEFORE_HUD, &stageDesc, &g_frameBeforeHudHook) != MOD_OK)
+    {
+        return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+    }
 
     if (dusk::mods::hook_add_pre<GXSetFog>(svc_hook, on_set_fog_pre) != MOD_OK) {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to hook GXSetFog");
-    }
-    if (dusk::mods::hook_add_pre<&dDlst_list_c::drawXluDrawList>(svc_hook, on_xlu_list_pre) !=
-        MOD_OK)
-    {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to hook translucent list draw");
     }
     // Virtual: resolves through the symbol manifest. Without it, J3D fog can't be deferred,
     // so the mod stays loaded but inert (with vanilla fog) rather than failing.
@@ -529,7 +550,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         g_fogDebugLayout = nullptr;
     }
     g_cvarEnabled = g_cvarDebugView = 0;
-    g_drawType = g_sceneBeginHook = g_sceneAfterOpaqueHook = 0;
+    g_drawType = g_sceneBeginHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;
     g_scopeActive = g_quadArmed = g_suppressAllowed = g_shapeHookOk = false;
     g_reference = FogConfig{};
     g_suppressedCount = g_deviantCount = 0;

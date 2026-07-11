@@ -48,7 +48,11 @@ struct Uniforms {
     debug_view: u32,
     frame_index: u32,
     flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
+    thick_dist_scale: f32, // extra occluder thickness, fraction of the view-space radius
+    inv_debug_depth: f32,  // debug depth view gradient scale (1 / world units)
     _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 @group(0) @binding(0) var ao_current: texture_2d<f32>;   // denoised current AO
