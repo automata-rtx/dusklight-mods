@@ -1,0 +1,7 @@
+{
+  "id": "dev.automata.deferred_fog",
+  "name": "Deferred Fog",
+  "version": "1.0.0",
+  "author": "automata-rtx",
+  "description": "Moves the game's fog to the end of the opaque scene so screen-space effects from other mods (ambient occlusion, shadows) darken the world underneath the fog instead of on top of it. Fog is suppressed during the opaque draw lists, its parameters captured from the live materials, and re-applied as an exact reproduction of the engine's fog math in a fullscreen pass before translucency. Scenes that mix multiple fog configurations (twilight black fog, wolf-senses white fog) automatically fall back to the vanilla fog path."
+}
