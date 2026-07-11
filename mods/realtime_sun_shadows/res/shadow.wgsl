@@ -37,7 +37,11 @@ struct Uniforms {
     light_dir_world_x: f32,   // toward the light, world space
     light_dir_world_y: f32,
     light_dir_world_z: f32,
+    map_enabled: f32,         // 0 = screen-space-only mode (map bindings are stand-ins)
+    normal_smooth: f32,       // normal reconstruction radius in pixels (>= 2 adds a 2nd cross)
     _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 @group(0) @binding(0) var scene_depth: texture_2d<f32>;
@@ -108,13 +112,11 @@ fn world_position_at(uv: vec2f, depth: f32) -> vec3f {
     return position.xyz / position.w;
 }
 
-// World-space surface normal from the depth snapshot: for each axis, pick the neighbor whose
-// depth is closer to the center (side selection keeps the normal from smearing across depth
-// discontinuities), difference the world positions, and cross. Used only for the slope-scaled
-// bias and normal-offset receivers, so a lightweight reconstruction is enough.
-fn world_normal_at(uv: vec2f, world: vec3f, depth: f32, inv_screen: vec2f) -> vec3f {
-    let du = vec2f(inv_screen.x, 0.0);
-    let dv = vec2f(0.0, inv_screen.y);
+// One side-selected depth cross along the axis pair (du, dv): for each axis, pick the
+// neighbor whose depth is closer to the center (side selection keeps the normal from
+// smearing across depth discontinuities), difference the world positions, and cross.
+// Returns the normalized normal, or zero when degenerate.
+fn cross_normal(uv: vec2f, world: vec3f, depth: f32, du: vec2f, dv: vec2f) -> vec3f {
     let d_left = scene_depth_at(uv - du);
     let d_right = scene_depth_at(uv + du);
     let d_top = scene_depth_at(uv - dv);
@@ -132,7 +134,29 @@ fn world_normal_at(uv: vec2f, world: vec3f, depth: f32, inv_screen: vec2f) -> ve
     } else {
         ddy = world_position_at(uv + dv, d_bottom) - world;
     }
-    var normal = cross(ddy, ddx);
+    let normal = cross(ddy, ddx);
+    let len = length(normal);
+    if len < 1.0e-8 {
+        return vec3f(0.0);
+    }
+    return normal / len;
+}
+
+// World-space surface normal from the depth snapshot; drives the slope-scaled bias and the
+// normal-offset receiver, so a lightweight reconstruction is enough - BUT low-poly
+// (GameCube-era) models change facing at every polygon edge, and a raw per-pixel normal
+// makes the bias jump with it, drawing faceted bands into the shadows. normal_smooth widens
+// the cross to `s` pixels and (for s >= 2) averages in a second, diagonal cross, rounding
+// those transitions for a handful of extra depth taps in this one fullscreen pass.
+fn world_normal_at(uv: vec2f, world: vec3f, depth: f32, inv_screen: vec2f) -> vec3f {
+    let s = max(uniforms.normal_smooth, 1.0);
+    var normal =
+        cross_normal(uv, world, depth, vec2f(inv_screen.x * s, 0.0), vec2f(0.0, inv_screen.y * s));
+    if uniforms.normal_smooth >= 2.0 {
+        // Second cross rotated 45 degrees (same radius) averages the 8-neighborhood.
+        let dd = inv_screen * (s * 0.7071);
+        normal += cross_normal(uv, world, depth, dd, vec2f(dd.x, -dd.y));
+    }
     let len = length(normal);
     if len < 1.0e-8 {
         return vec3f(0.0, 1.0, 0.0);
@@ -186,14 +210,20 @@ fn screen_shadow_at(uv: vec2f) -> f32 {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     let depth = scene_depth_at(in.uv);
-    if uniforms.debug_mode == 1u {
-        let value = load_shadow(vec2<i32>(in.uv * uniforms.size));
-        return vec4f(value, value, value, 1.0);
-    }
+    let map_on = uniforms.map_enabled != 0.0;
     // 11 = the Bend SSS visibility buffer; 12 = its edge-detect mask (written by the compute
     // pass when this mode is active).
     if uniforms.debug_mode == 11u || uniforms.debug_mode == 12u {
         let value = screen_shadow_at(in.uv);
+        return vec4f(value, value, value, 1.0);
+    }
+    // Every remaining debug view except Shadow Factor diagnoses the map; without one the
+    // bindings are stand-ins, so show black instead of garbage.
+    if !map_on && uniforms.debug_mode != 0u && uniforms.debug_mode != 2u {
+        return vec4f(0.0, 0.0, 0.0, 1.0);
+    }
+    if uniforms.debug_mode == 1u {
+        let value = load_shadow(vec2<i32>(in.uv * uniforms.size));
         return vec4f(value, value, value, 1.0);
     }
     if uniforms.debug_mode == 9u || uniforms.debug_mode == 10u {
@@ -212,68 +242,70 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         return vec4f(1.0);
     }
 
-    let ndc = vec4f(in.uv.x * 2.0 - 1.0, 1.0 - 2.0 * in.uv.y, depth, 1.0);
-    let world4 = uniforms.world_from_proj * ndc;
-    let world = world4.xyz / world4.w;
-
-    // Receiver-side acne control (see the header): slope-scaled bias + normal-offset lookup.
-    var receiver_world = world;
-    var bias_eff = uniforms.bias;
-    if uniforms.slope_bias > 0.0 || uniforms.normal_offset > 0.0 {
-        let inv_screen = 1.0 / vec2f(textureDimensions(scene_depth));
-        let n = world_normal_at(in.uv, world, depth, inv_screen);
-        let light_dir = vec3f(
-            uniforms.light_dir_world_x, uniforms.light_dir_world_y, uniforms.light_dir_world_z);
-        let cos_t = clamp(dot(n, light_dir), 0.05, 1.0);
-        let tan_t = min(sqrt(max(1.0 - cos_t * cos_t, 0.0)) / cos_t, 4.0);
-        bias_eff = uniforms.bias + uniforms.slope_bias * tan_t;
-        receiver_world = world + n * (uniforms.normal_offset * uniforms.texel_world);
-    }
-
-    let light_clip = uniforms.light_vp * vec4f(receiver_world, 1.0);
-    let light_ndc = light_clip.xyz / light_clip.w;
-    let receiver = light_ndc.z; // reversed light depth, 1 = nearest to the light
-    let light_uv = vec2f(0.5 + 0.5 * light_ndc.x, 0.5 - 0.5 * light_ndc.y);
-    let in_shadow_bounds = all(light_uv >= vec2f(0.0)) && all(light_uv <= vec2f(1.0)) &&
-        receiver > 0.0 && receiver <= 1.0;
-    let shadow_depth = load_shadow(vec2<i32>(light_uv * uniforms.size));
-
-    if uniforms.debug_mode == 4u {
-        let valid = select(0.0, 1.0, in_shadow_bounds);
-        return vec4f(saturate(light_uv.x), saturate(light_uv.y), valid, 1.0);
-    }
-
-    if uniforms.debug_mode == 5u {
-        if !in_shadow_bounds {
-            return vec4f(0.0, 0.0, 0.0, 1.0);
-        }
-        let current_compare = select(0.0, 1.0, shadow_depth > receiver + uniforms.bias);
-        let opposite_compare = select(0.0, 1.0, shadow_depth < receiver - uniforms.bias);
-        return vec4f(current_compare, 0.0, opposite_compare, 1.0);
-    }
-
-    if uniforms.debug_mode == 6u {
-        let valid = select(0.0, 1.0, in_shadow_bounds);
-        return vec4f(saturate(receiver), shadow_depth, valid, 1.0);
-    }
-
-    if uniforms.debug_mode == 7u {
-        let beyond_far = select(0.0, 1.0, receiver <= 0.0);
-        let valid_depth = select(0.0, 1.0, receiver > 0.0 && receiver <= 1.0);
-        let before_near = select(0.0, 1.0, receiver > 1.0);
-        return vec4f(beyond_far, valid_depth, before_near, 1.0);
-    }
-
-    if uniforms.debug_mode == 8u {
-        let valid_x = select(0.0, 1.0, light_uv.x >= 0.0 && light_uv.x <= 1.0);
-        let valid_y = select(0.0, 1.0, light_uv.y >= 0.0 && light_uv.y <= 1.0);
-        let valid_depth = select(0.0, 1.0, receiver > 0.0 && receiver <= 1.0);
-        return vec4f(valid_x, valid_y, valid_depth, 1.0);
-    }
-
     var occlusion = 0.0;
-    if in_shadow_bounds {
-        occlusion = sample_shadow_pcf(light_uv, receiver, bias_eff);
+    if map_on {
+        let ndc = vec4f(in.uv.x * 2.0 - 1.0, 1.0 - 2.0 * in.uv.y, depth, 1.0);
+        let world4 = uniforms.world_from_proj * ndc;
+        let world = world4.xyz / world4.w;
+
+        // Receiver-side acne control (see the header): slope-scaled bias + normal-offset lookup.
+        var receiver_world = world;
+        var bias_eff = uniforms.bias;
+        if uniforms.slope_bias > 0.0 || uniforms.normal_offset > 0.0 {
+            let inv_screen = 1.0 / vec2f(textureDimensions(scene_depth));
+            let n = world_normal_at(in.uv, world, depth, inv_screen);
+            let light_dir = vec3f(
+                uniforms.light_dir_world_x, uniforms.light_dir_world_y, uniforms.light_dir_world_z);
+            let cos_t = clamp(dot(n, light_dir), 0.05, 1.0);
+            let tan_t = min(sqrt(max(1.0 - cos_t * cos_t, 0.0)) / cos_t, 4.0);
+            bias_eff = uniforms.bias + uniforms.slope_bias * tan_t;
+            receiver_world = world + n * (uniforms.normal_offset * uniforms.texel_world);
+        }
+
+        let light_clip = uniforms.light_vp * vec4f(receiver_world, 1.0);
+        let light_ndc = light_clip.xyz / light_clip.w;
+        let receiver = light_ndc.z; // reversed light depth, 1 = nearest to the light
+        let light_uv = vec2f(0.5 + 0.5 * light_ndc.x, 0.5 - 0.5 * light_ndc.y);
+        let in_shadow_bounds = all(light_uv >= vec2f(0.0)) && all(light_uv <= vec2f(1.0)) &&
+            receiver > 0.0 && receiver <= 1.0;
+        let shadow_depth = load_shadow(vec2<i32>(light_uv * uniforms.size));
+
+        if uniforms.debug_mode == 4u {
+            let valid = select(0.0, 1.0, in_shadow_bounds);
+            return vec4f(saturate(light_uv.x), saturate(light_uv.y), valid, 1.0);
+        }
+
+        if uniforms.debug_mode == 5u {
+            if !in_shadow_bounds {
+                return vec4f(0.0, 0.0, 0.0, 1.0);
+            }
+            let current_compare = select(0.0, 1.0, shadow_depth > receiver + uniforms.bias);
+            let opposite_compare = select(0.0, 1.0, shadow_depth < receiver - uniforms.bias);
+            return vec4f(current_compare, 0.0, opposite_compare, 1.0);
+        }
+
+        if uniforms.debug_mode == 6u {
+            let valid = select(0.0, 1.0, in_shadow_bounds);
+            return vec4f(saturate(receiver), shadow_depth, valid, 1.0);
+        }
+
+        if uniforms.debug_mode == 7u {
+            let beyond_far = select(0.0, 1.0, receiver <= 0.0);
+            let valid_depth = select(0.0, 1.0, receiver > 0.0 && receiver <= 1.0);
+            let before_near = select(0.0, 1.0, receiver > 1.0);
+            return vec4f(beyond_far, valid_depth, before_near, 1.0);
+        }
+
+        if uniforms.debug_mode == 8u {
+            let valid_x = select(0.0, 1.0, light_uv.x >= 0.0 && light_uv.x <= 1.0);
+            let valid_y = select(0.0, 1.0, light_uv.y >= 0.0 && light_uv.y <= 1.0);
+            let valid_depth = select(0.0, 1.0, receiver > 0.0 && receiver <= 1.0);
+            return vec4f(valid_x, valid_y, valid_depth, 1.0);
+        }
+
+        if in_shadow_bounds {
+            occlusion = sample_shadow_pcf(light_uv, receiver, bias_eff);
+        }
     }
 
     if uniforms.debug_mode == 3u {

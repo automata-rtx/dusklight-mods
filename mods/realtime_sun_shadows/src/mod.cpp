@@ -70,7 +70,9 @@ IMPORT_SERVICE(LogService, svc_log);
 namespace {
 
 ConfigVarHandle g_cvarEnabled = 0;
+ConfigVarHandle g_cvarShadowMap = 0;
 ConfigVarHandle g_cvarMapSize = 0;
+ConfigVarHandle g_cvarNormalSmooth = 0;
 ConfigVarHandle g_cvarNoFrustumClipping = 0;
 ConfigVarHandle g_cvarStrength = 0;
 ConfigVarHandle g_cvarPcf = 0;
@@ -164,7 +166,11 @@ struct ShadowUniforms {
     float normal_offset;       // receiver offset along the surface normal, in shadow texels
     float texel_world;         // world units per shadow-map texel
     float light_dir_world[3];  // toward the light, world space (slope/offset receivers)
+    float map_enabled;         // 0 = screen-space-only mode (map bindings are stand-ins)
+    float normal_smooth;       // normal reconstruction radius in pixels (>= 2 adds a 2nd cross)
     float _pad0;
+    float _pad1;
+    float _pad2;
 };
 static_assert(sizeof(ShadowUniforms) % 16 == 0);
 
@@ -739,7 +745,11 @@ bool indoor_blocked() {
 }
 
 bool dynamic_shadows_wanted() {
-    if (!get_bool_option(g_cvarEnabled, true) || indoor_blocked()) {
+    // Both gates matter: with the shadow map disabled (screen-space-only mode) the game's
+    // own real/blob shadows must come back, so the skip hooks go inactive.
+    if (!get_bool_option(g_cvarEnabled, true) || !get_bool_option(g_cvarShadowMap, true) ||
+        indoor_blocked())
+    {
         return false;
     }
     if (!g_sceneCamera.raw_valid) {
@@ -904,7 +914,9 @@ void on_scene_after_terrain(ModContext*, const GfxStageContext* stageCtx, void*)
 // geometry from the light's point of view.
 void render_shadow_map(
     const Mtx replayView, const Mtx44 replayProjectionMtx, const f32 replayProjection[7]) {
-    if (g_mapPass.ready || !get_bool_option(g_cvarEnabled, true) || indoor_blocked()) {
+    if (g_mapPass.ready || !get_bool_option(g_cvarEnabled, true) ||
+        !get_bool_option(g_cvarShadowMap, true) || indoor_blocked())
+    {
         return;
     }
     const int64_t debugMode = get_debug_mode();
@@ -1011,7 +1023,7 @@ void render_shadow_map(
 // Game thread: build the Bend dispatch list for this frame's light and queue the SSS compute
 // pass over the scene depth snapshot. Returns false when nothing was dispatched.
 bool push_sss_dispatches(
-    const GfxResolvedTargets& resolved, const MapPassOutput& mapPass, int64_t debugMode) {
+    const GfxResolvedTargets& resolved, const float dirToLightWorld[3], int64_t debugMode) {
     if (g_sssPipeline == nullptr || !ensure_sss_target(resolved.width, resolved.height)) {
         return false;
     }
@@ -1022,9 +1034,9 @@ bool push_sss_dispatches(
     const CameraInfo& camera = g_sceneCamera.info;
     float lightProjection[4];
     for (int r = 0; r < 4; ++r) {
-        lightProjection[r] = camera.proj_from_world[0 * 4 + r] * mapPass.dirToLightWorld[0] +
-                             camera.proj_from_world[1 * 4 + r] * mapPass.dirToLightWorld[1] +
-                             camera.proj_from_world[2 * 4 + r] * mapPass.dirToLightWorld[2];
+        lightProjection[r] = camera.proj_from_world[0 * 4 + r] * dirToLightWorld[0] +
+                             camera.proj_from_world[1 * 4 + r] * dirToLightWorld[1] +
+                             camera.proj_from_world[2 * 4 + r] * dirToLightWorld[2];
     }
     int viewport[2] = {static_cast<int>(resolved.width), static_cast<int>(resolved.height)};
     int minBounds[2] = {0, 0};
@@ -1073,16 +1085,38 @@ bool push_sss_dispatches(
 }
 
 // Game thread: consume the frame's map pass and push the deferred composite draw at the
-// current point in the command stream.
+// current point in the command stream. With the shadow map disabled the composite still runs
+// in screen-space-only mode: the Bend trace supplies the whole occlusion term and the game's
+// own shadows return (dynamic_shadows_wanted is false, so the skip hooks pass through).
 void composite_map_pass(int64_t debugMode) {
     const MapPassOutput mapPass = std::exchange(g_mapPass, {});
-    if (!mapPass.ready || mapPass.shadowMap == nullptr || mapPass.lightColor == nullptr) {
+    const bool mapEnabled = get_bool_option(g_cvarShadowMap, true);
+    const bool mapReady =
+        mapEnabled && mapPass.ready && mapPass.shadowMap != nullptr && mapPass.lightColor != nullptr;
+    if (mapEnabled && !mapReady) {
         return;
     }
     if (!g_sceneCamera.valid) {
         return;
     }
     const CameraInfo& camera = g_sceneCamera.info;
+
+    float dirToLight[3];
+    float fade = 0.0f;
+    if (mapReady) {
+        std::memcpy(dirToLight, mapPass.dirToLightWorld, sizeof(dirToLight));
+        fade = mapPass.fade;
+    } else {
+        // Screen-space-only mode, under the same gates the map path applies at render time.
+        if (!get_bool_option(g_cvarEnabled, true) || indoor_blocked() ||
+            !get_bool_option(g_cvarContactShadows, true))
+        {
+            return;
+        }
+        if (!compute_light(dirToLight, fade)) {
+            return;
+        }
+    }
 
     GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
     resolveDesc.color = false;
@@ -1098,11 +1132,16 @@ void composite_map_pass(int64_t debugMode) {
     // same command stream; its output binds to the composite.
     const bool contactWanted = get_bool_option(g_cvarContactShadows, true) || debugMode == 11 ||
                                debugMode == 12;
-    const bool sssReady = contactWanted && push_sss_dispatches(resolved, mapPass, debugMode);
+    const bool sssReady = contactWanted && push_sss_dispatches(resolved, dirToLight, debugMode);
+    if (!mapReady && !sssReady) {
+        return;
+    }
 
     ShadowUniforms uniforms{};
     std::memcpy(uniforms.world_from_proj, camera.world_from_proj, sizeof(uniforms.world_from_proj));
-    store_column_major(mapPass.lightVp, uniforms.light_vp);
+    if (mapReady) {
+        store_column_major(mapPass.lightVp, uniforms.light_vp);
+    }
     // Bias values are configured in world units along the light direction and normalized by the
     // ortho depth range actually used for this frame's map.
     const float lightRange = std::max(mapPass.lightFar - mapPass.lightNear, 1.0f);
@@ -1116,16 +1155,19 @@ void composite_map_pass(int64_t debugMode) {
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarNormalOffset, 100), 0, 300)) /
         100.0f;
     uniforms.texel_world = mapPass.texelWorld;
-    std::memcpy(uniforms.light_dir_world, mapPass.dirToLightWorld, sizeof(uniforms.light_dir_world));
-    uniforms.size[0] = static_cast<float>(mapPass.mapSize);
-    uniforms.size[1] = static_cast<float>(mapPass.mapSize);
+    std::memcpy(uniforms.light_dir_world, dirToLight, sizeof(uniforms.light_dir_world));
+    uniforms.map_enabled = mapReady ? 1.0f : 0.0f;
+    uniforms.normal_smooth =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarNormalSmooth, 2), 0, 8));
+    uniforms.size[0] = mapReady ? static_cast<float>(mapPass.mapSize) : 1.0f;
+    uniforms.size[1] = uniforms.size[0];
     uniforms.inv_size[0] = 1.0f / uniforms.size[0];
     uniforms.inv_size[1] = 1.0f / uniforms.size[1];
     uniforms.strength =
-        mapPass.fade *
+        fade *
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarStrength, 45), 0, 100)) /
         100.0f;
-    uniforms.pcf_taps = static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarPcf, 1), 0, 2));
+    uniforms.pcf_taps = static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarPcf, 1), 0, 3));
     uniforms.contact_enabled = sssReady ? 1.0f : 0.0f;
     uniforms.debug_mode = static_cast<uint32_t>(debugMode);
 
@@ -1133,9 +1175,11 @@ void composite_map_pass(int64_t debugMode) {
     if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &uniformRange) != MOD_OK) {
         return;
     }
-    // Binding 4 always needs a texture view; the depth snapshot stands in when the SSS pass
-    // didn't run (the shader never reads it with contact_enabled = 0).
-    const DrawPayload payload{resolved.depth, mapPass.shadowMap, mapPass.lightColor,
+    // Every binding needs a texture view; the depth snapshot stands in for the map/light
+    // views in screen-space-only mode and for the SSS view when the trace didn't run (the
+    // shader never reads the stand-ins: map_enabled / contact_enabled gate them).
+    const DrawPayload payload{resolved.depth, mapReady ? mapPass.shadowMap : resolved.depth,
+        mapReady ? mapPass.lightColor : resolved.depth,
         sssReady ? g_sssTarget.view : resolved.depth, uniformRange.offset, uniformRange.size,
         static_cast<uint32_t>(debugMode)};
     svc_gfx->push_draw(mod_ctx, g_drawType, &payload, sizeof(payload));
@@ -1212,6 +1256,9 @@ ModResult build_controls_tab(
 
     svc_ui->pane_add_section(mod_ctx, left, "Shadow Map");
     add_toggle(left, "Enabled", g_cvarEnabled, "Enables realtime sun/moon shadows.");
+    add_toggle(left, "Shadow Map", g_cvarShadowMap,
+        "Renders the sun/moon shadow map. Off: only the screen-space shadows run, and the "
+        "game's own character shadows come back.");
     static const char* kMapSizes[] = {"1024", "2048", "4096", "8192"};
     add_select(left, "Map Size", g_cvarMapSize, kMapSizes, 4,
         "Shadow map resolution. Larger is sharper and slower.");
@@ -1231,9 +1278,10 @@ ModResult build_controls_tab(
 
     svc_ui->pane_add_section(mod_ctx, left, "Appearance");
     add_number(left, "Strength", g_cvarStrength, 0, 100, 5, "%", "How dark shadowed areas become.");
-    static const char* kPcfOptions[] = {"Off", "3x3", "5x5"};
-    add_select(left, "Soft Shadows", g_cvarPcf, kPcfOptions, 3,
-        "Percentage-closer filtering tap pattern; softens shadow edges.");
+    static const char* kPcfOptions[] = {"Off", "3x3", "5x5", "7x7"};
+    add_select(left, "Soft Shadows", g_cvarPcf, kPcfOptions, 4,
+        "Percentage-closer filtering tap pattern; softens shadow edges and hides stair-steps "
+        "on steep terrain.");
     add_number(left, "Bias", g_cvarBias, 0, 200, 5, nullptr,
         "Constant depth bias in world units. Raise to remove shadow acne; lower to reduce "
         "peter-panning. Prefer Slope Bias and Normal Offset for acne on sloped surfaces - they "
@@ -1245,6 +1293,11 @@ ModResult build_controls_tab(
         "Shifts the shadow lookup point along the surface normal, scaled to the size of one "
         "shadow-map texel. The most effective acne fix with the least peter-panning; 100% = one "
         "texel.");
+    add_number(left, "Normal Smoothing", g_cvarNormalSmooth, 0, 8, 1, nullptr,
+        "Radius (in pixels) for reconstructing the surface direction that Slope Bias and "
+        "Normal Offset rely on. Low-poly models change direction at every polygon edge, which "
+        "makes the bias jump and draws faceted bands on characters; smoothing rounds those "
+        "transitions. 2-4 recommended; 0 = off.");
     add_toggle(left, "Screen Space Shadows", g_cvarContactShadows,
         "Bend Studio's Days Gone screen-space shadow trace: per-pixel detail the shadow map "
         "misses (contact darkening, thin geometry, distant fine detail) at any range - also "
@@ -1359,7 +1412,15 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
+    result = register_bool_option("shadowMapEnabled", true, g_cvarShadowMap, error);
+    if (result != MOD_OK) {
+        return result;
+    }
     result = register_int_option("mapSize", 2, g_cvarMapSize, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_int_option("normalSmooth", 2, g_cvarNormalSmooth, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -1549,7 +1610,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         wgpuBindGroupLayoutRelease(g_compositeDebugLayout);
         g_compositeDebugLayout = nullptr;
     }
-    g_cvarEnabled = g_cvarMapSize = g_cvarNoFrustumClipping = 0;
+    g_cvarEnabled = g_cvarShadowMap = g_cvarMapSize = g_cvarNormalSmooth = 0;
+    g_cvarNoFrustumClipping = 0;
     g_cvarStrength = 0;
     g_cvarPcf = g_cvarBias = g_cvarBoxRadius = g_cvarContactShadows = g_cvarDebugView = 0;
     g_cvarSlopeBias = g_cvarNormalOffset = 0;

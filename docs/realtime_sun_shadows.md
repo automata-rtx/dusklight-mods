@@ -78,13 +78,15 @@ functions, and (on Windows) links the platform release's `dusklight.lib`.
 | Var | Default | Meaning |
 |---|---|---|
 | `effectEnabled` | on | master toggle |
+| `shadowMapEnabled` | on | off = screen-space-only mode: no map render/composite, the game's own real/blob shadows return (the skip hooks go inactive), the Bend SSS term still applies |
 | `mapSize` | 2 | shadow map: 0=1024 1=2048 2=4096 3=8192 |
 | `boxRadius` | 8000 | coverage radius in world units (1000–30000) |
 | `strength` | 45 | shadow darkening % |
 | `bias` | 55 | constant depth bias (normalized against light range) |
 | `slopeBias` | 30 | bias added ∝ surface slope vs light |
 | `normalOffset` | 100 | receiver offset, % of one shadow texel's world size |
-| `pcf` | 2 | PCF kernel: 0=1×1 1=3×3 2=5×5 ... |
+| `normalSmooth` | 2 | pixel radius of the depth-normal reconstruction (≥2 adds a diagonal second cross). Smooths the per-facet bias jumps that draw faceted bands on low-poly models; 0 = the old single 1px cross |
+| `pcf` | 2 | PCF kernel: 0=1×1 1=3×3 2=5×5 3=7×7 |
 | `contactShadows` | on | the Bend screen-space shadow term |
 | `sssThickness` | 50 | assumed caster thickness, 1/100 % of remaining depth (50 = 0.5%) |
 | `sssEdgeThreshold` | 200 | depth delta treated as an edge, 1/100 % (200 = 2%) |
@@ -100,6 +102,49 @@ detach at feet (the screen-space term hides small gaps). Per Bend's guidance, tu
 `sssThickness` in multiples of 2 and scale `sssEdgeThreshold` alongside it; use the "SSS
 Edge Mask" debug view when striated patterns appear on flat surfaces (or turn on
 `sssIgnoreEdges`).
+
+## Shadow-map tuning guide (plain language)
+
+Mental model: every frame the mod takes a **depth photo of the world from the sun**, then
+for each screen pixel asks "can the sun's photo see this spot?" — if not, it's shadowed.
+Every artifact comes from that photo having a limited number of pixels: one photo pixel
+covers several world units, so a surface can wrongly shadow *itself* where the photo is too
+coarse ("acne"). Every acne control trades against the opposite failure: pushing the test
+too far makes shadows detach from objects' feet ("peter-panning").
+
+- **Map Size** — the photo's resolution. Bigger = sharper edges and less acne at the source,
+  at GPU cost. Use the biggest that performs well (4096, try 8192).
+- **Coverage** — how wide an area the photo covers. Smaller area = each photo pixel covers
+  less ground = sharper AND less acne. The screen-space shadows fill in fine detail
+  everywhere, so keep this as small as you can tolerate the shadow cutoff distance
+  (4000–6000 works well).
+- **Strength** — plain darkness of the shadows. Pure taste.
+- **Soft Shadows** — averages neighboring photo pixels at the shadow edge. Higher = softer,
+  hides stair-stepping on cliffs. Costs a little GPU. 5×5 or 7×7.
+- **Bias** — moves every comparison a fixed distance toward the sun so surfaces stop
+  shadowing themselves. It's the bluntest tool: enough to kill all acne everywhere will
+  visibly detach shadows. Keep it LOW (30–60) and let the next three do the real work.
+- **Slope Bias** — extra bias applied *only where the surface tilts away from the sun*,
+  which is where acne concentrates (cliffs, rooftops at grazing light). Safe to raise —
+  it does nothing on sun-facing ground. First knob for cliff acne (30–80).
+- **Normal Offset** — instead of changing the depth comparison, nudges the *tested point*
+  slightly off the surface, about one photo-pixel's worth. The most effective acne killer
+  with the least detachment. 100–200%.
+- **Normal Smoothing** — Slope Bias and Normal Offset need to know which way the surface
+  faces. GameCube-era models are low-poly: the facing jumps at every polygon edge, so the
+  bias jumps too and paints *faceted bands* on characters. This rounds the facing over a few
+  screen pixels so the bias varies smoothly. 2–4; it's nearly free.
+- **Two-Sided Casters / No Frustum Clipping / Disable Indoors** — leave on: they fix light
+  leaks at level edges, shadows popping with camera turns, and black interiors respectively.
+- **Shadow Map toggle** — off runs only the screen-space shadows and brings back the game's
+  own character shadows; useful as a comparison baseline and as a cheap mode.
+
+Recommended order: (1) Coverage as low as acceptable + Map Size as high as affordable —
+this shrinks acne at the source before any biasing. (2) Bias down to ~40. (3) Raise Normal
+Offset until flat ground is clean. (4) Raise Slope Bias until cliffs are clean. (5) Normal
+Smoothing 2–4 to remove faceted banding on characters. (6) Soft Shadows to taste. If feet
+shadows detach: lower Bias first, then Normal Offset — the screen-space term re-grounds
+contacts regardless.
 
 ## Known caveats
 
