@@ -85,7 +85,7 @@ functions, and (on Windows) links the platform release's `dusklight.lib`.
 | `bias` | 55 | constant depth bias (normalized against light range) |
 | `slopeBias` | 30 | bias added ∝ surface slope vs light |
 | `normalOffset` | 100 | receiver offset, % of one shadow texel's world size |
-| `normalSmooth` | 2 | pixel radius of the depth-normal reconstruction (≥2 adds a diagonal second cross). Smooths the per-facet bias jumps that draw faceted bands on low-poly models; 0 = the old single 1px cross |
+| `normalSmooth` | 3 | facet-normal blend distance in pixels: four neighborhood taps each reconstruct their own 1px-cross facet normal, averaged with bilateral depth weights (silhouettes never blend). Smooths the per-facet bias jumps that band low-poly models. Do NOT widen a single cross instead: near edges its arms straddle two facets and manufacture garbage normals (shattered-glass artifact). 0 = off |
 | `pcf` | 2 | PCF kernel: 0=1×1 1=3×3 2=5×5 3=7×7 |
 | `contactShadows` | on | the Bend screen-space shadow term |
 | `sssThickness` | 50 | assumed caster thickness, 1/100 % of remaining depth (50 = 0.5%) |

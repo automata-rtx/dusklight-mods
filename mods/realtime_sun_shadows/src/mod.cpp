@@ -167,7 +167,7 @@ struct ShadowUniforms {
     float texel_world;         // world units per shadow-map texel
     float light_dir_world[3];  // toward the light, world space (slope/offset receivers)
     float map_enabled;         // 0 = screen-space-only mode (map bindings are stand-ins)
-    float normal_smooth;       // normal reconstruction radius in pixels (>= 2 adds a 2nd cross)
+    float normal_smooth;       // facet-normal blend tap distance in pixels (0 = off)
     float _pad0;
     float _pad1;
     float _pad2;
@@ -265,7 +265,7 @@ bool get_bool_option(ConfigVarHandle handle, bool fallback) {
 }
 
 int64_t get_debug_mode() {
-    return std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 12);
+    return std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 13);
 }
 
 bool matrix_ready(const Mtx m) {
@@ -1158,7 +1158,7 @@ void composite_map_pass(int64_t debugMode) {
     std::memcpy(uniforms.light_dir_world, dirToLight, sizeof(uniforms.light_dir_world));
     uniforms.map_enabled = mapReady ? 1.0f : 0.0f;
     uniforms.normal_smooth =
-        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarNormalSmooth, 2), 0, 8));
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarNormalSmooth, 3), 0, 8));
     uniforms.size[0] = mapReady ? static_cast<float>(mapPass.mapSize) : 1.0f;
     uniforms.size[1] = uniforms.size[0];
     uniforms.inv_size[0] = 1.0f / uniforms.size[0];
@@ -1294,10 +1294,10 @@ ModResult build_controls_tab(
         "shadow-map texel. The most effective acne fix with the least peter-panning; 100% = one "
         "texel.");
     add_number(left, "Normal Smoothing", g_cvarNormalSmooth, 0, 8, 1, nullptr,
-        "Radius (in pixels) for reconstructing the surface direction that Slope Bias and "
-        "Normal Offset rely on. Low-poly models change direction at every polygon edge, which "
-        "makes the bias jump and draws faceted bands on characters; smoothing rounds those "
-        "transitions. 2-4 recommended; 0 = off.");
+        "Blends the surface directions of neighboring polygons (like smooth shading) for the "
+        "direction Slope Bias and Normal Offset rely on, removing the faceted bias bands that "
+        "low-poly models otherwise show. The value is the blend distance in pixels: higher is "
+        "smoother/rounder. 3-5 recommended; 0 = off.");
     add_toggle(left, "Screen Space Shadows", g_cvarContactShadows,
         "Bend Studio's Days Gone screen-space shadow trace: per-pixel detail the shadow map "
         "misses (contact darkening, thin geometry, distant fine detail) at any range - also "
@@ -1319,8 +1319,8 @@ ModResult build_controls_tab(
     svc_ui->pane_add_section(mod_ctx, left, "Debug");
     static const char* kDebugOptions[] = {"Off", "Shadow Map", "Shadow Factor", "Occlusion",
         "Light UV", "Compare Sign", "Depth Values", "Receiver Range", "Bounds", "Light View",
-        "Camera Replay", "Screen Shadows", "SSS Edge Mask"};
-    add_select(left, "Debug View", g_cvarDebugView, kDebugOptions, 13,
+        "Camera Replay", "Screen Shadows", "SSS Edge Mask", "Receiver Normal"};
+    add_select(left, "Debug View", g_cvarDebugView, kDebugOptions, 14,
         "Shadow Map: light-space depth buffer<br/>Shadow Factor: final "
         "darkening term<br/>Occlusion: map comparison result<br/>Light UV: receiver "
         "projection coverage<br/>Compare Sign: current comparison in red and opposite "
@@ -1330,7 +1330,9 @@ ModResult build_controls_tab(
         "renders the game world directly from the light camera<br/>Camera Replay: "
         "captures the same draw-list replay from the gameplay camera<br/>Screen Shadows: "
         "the Bend SSS visibility buffer (white = lit)<br/>SSS Edge Mask: the SSS edge "
-        "detector, for tuning SSS Edge Threshold");
+        "detector, for tuning SSS Edge Threshold<br/>Receiver Normal: the smoothed surface "
+        "direction Slope Bias / Normal Offset act on - facets should melt together as "
+        "Normal Smoothing rises");
     return MOD_OK;
 }
 
@@ -1420,7 +1422,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
-    result = register_int_option("normalSmooth", 2, g_cvarNormalSmooth, error);
+    result = register_int_option("normalSmooth", 3, g_cvarNormalSmooth, error);
     if (result != MOD_OK) {
         return result;
     }

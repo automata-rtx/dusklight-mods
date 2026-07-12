@@ -38,7 +38,7 @@ struct Uniforms {
     light_dir_world_y: f32,
     light_dir_world_z: f32,
     map_enabled: f32,         // 0 = screen-space-only mode (map bindings are stand-ins)
-    normal_smooth: f32,       // normal reconstruction radius in pixels (>= 2 adds a 2nd cross)
+    normal_smooth: f32,       // facet-normal blend tap distance in pixels (0 = off)
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
@@ -143,21 +143,53 @@ fn cross_normal(uv: vec2f, world: vec3f, depth: f32, du: vec2f, dv: vec2f) -> ve
 }
 
 // World-space surface normal from the depth snapshot; drives the slope-scaled bias and the
-// normal-offset receiver, so a lightweight reconstruction is enough - BUT low-poly
-// (GameCube-era) models change facing at every polygon edge, and a raw per-pixel normal
-// makes the bias jump with it, drawing faceted bands into the shadows. normal_smooth widens
-// the cross to `s` pixels and (for s >= 2) averages in a second, diagonal cross, rounding
-// those transitions for a handful of extra depth taps in this one fullscreen pass.
+// normal-offset receiver. Low-poly (GameCube-era) models change facing at every polygon
+// edge, and a raw per-pixel normal makes the bias jump with it, drawing faceted bands into
+// the shadows.
+//
+// normal_smooth (tap distance in pixels) fixes that by BLENDING FACET NORMALS, the way
+// smooth shading interpolates vertex normals: four neighborhood taps each reconstruct their
+// own tight 1px cross - so every sample is a true single-facet normal - and are averaged
+// with a bilateral depth weight that rejects taps across silhouettes. Near a polygon edge
+// the result rotates smoothly from one facet's normal to the next over ~2x the tap
+// distance.
+//
+// Do NOT widen a single cross instead: near an edge its two arms land on different facets
+// and the cross product belongs to no surface, manufacturing a radius-wide band of garbage
+// normals along every polygon edge (dense models read as shattered glass).
 fn world_normal_at(uv: vec2f, world: vec3f, depth: f32, inv_screen: vec2f) -> vec3f {
-    let s = max(uniforms.normal_smooth, 1.0);
-    var normal =
-        cross_normal(uv, world, depth, vec2f(inv_screen.x * s, 0.0), vec2f(0.0, inv_screen.y * s));
-    if uniforms.normal_smooth >= 2.0 {
-        // Second cross rotated 45 degrees (same radius) averages the 8-neighborhood.
-        let dd = inv_screen * (s * 0.7071);
-        normal += cross_normal(uv, world, depth, dd, vec2f(dd.x, -dd.y));
+    let du = vec2f(inv_screen.x, 0.0);
+    let dv = vec2f(0.0, inv_screen.y);
+    let center = cross_normal(uv, world, depth, du, dv);
+    var normal = center;
+    let s = uniforms.normal_smooth;
+    if s >= 1.0 {
+        // Bilateral tolerance on the raw depth, matching the depth-aware weights used
+        // elsewhere in these mods (relative agreement, silhouette taps fall to ~0).
+        let tolerance = max(depth * 0.05, 1.0e-6);
+        for (var i = 0; i < 4; i += 1) {
+            let sign_x = select(-1.0, 1.0, (i & 1) != 0);
+            let sign_y = select(-1.0, 1.0, (i & 2) != 0);
+            let uv_tap = uv + vec2f(inv_screen.x * s * sign_x, inv_screen.y * s * sign_y);
+            let depth_tap = scene_depth_at(uv_tap);
+            if depth_tap <= 0.0 {
+                continue;
+            }
+            let dz = (depth_tap - depth) / tolerance;
+            let weight = exp2(-dz * dz);
+            if weight < 1.0e-3 {
+                continue;
+            }
+            let world_tap = world_position_at(uv_tap, depth_tap);
+            normal += cross_normal(uv_tap, world_tap, depth_tap, du, dv) * weight;
+        }
     }
-    let len = length(normal);
+    var len = length(normal);
+    if len < 1.0e-8 {
+        // Tap normals cancelled; fall back to this pixel's own facet normal.
+        normal = center;
+        len = length(normal);
+    }
     if len < 1.0e-8 {
         return vec3f(0.0, 1.0, 0.0);
     }
@@ -217,9 +249,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         let value = screen_shadow_at(in.uv);
         return vec4f(value, value, value, 1.0);
     }
-    // Every remaining debug view except Shadow Factor diagnoses the map; without one the
-    // bindings are stand-ins, so show black instead of garbage.
-    if !map_on && uniforms.debug_mode != 0u && uniforms.debug_mode != 2u {
+    // Every remaining debug view except Shadow Factor and Receiver Normal diagnoses the map;
+    // without one the bindings are stand-ins, so show black instead of garbage.
+    if !map_on && uniforms.debug_mode != 0u && uniforms.debug_mode != 2u &&
+        uniforms.debug_mode != 13u
+    {
         return vec4f(0.0, 0.0, 0.0, 1.0);
     }
     if uniforms.debug_mode == 1u {
@@ -240,6 +274,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
             return vec4f(0.0, 0.0, 0.0, 1.0);
         }
         return vec4f(1.0);
+    }
+
+    // 13 = the receiver normal (world space, [-1,1] -> RGB) after Normal Smoothing: shows
+    // exactly the surface direction Slope Bias and Normal Offset act on.
+    if uniforms.debug_mode == 13u {
+        let ndc = vec4f(in.uv.x * 2.0 - 1.0, 1.0 - 2.0 * in.uv.y, depth, 1.0);
+        let world4 = uniforms.world_from_proj * ndc;
+        let world = world4.xyz / world4.w;
+        let inv_screen = 1.0 / vec2f(textureDimensions(scene_depth));
+        let n = world_normal_at(in.uv, world, depth, inv_screen);
+        return vec4f(n * 0.5 + 0.5, 1.0);
     }
 
     var occlusion = 0.0;
