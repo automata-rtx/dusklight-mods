@@ -761,13 +761,13 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.intensity = percent(g_cvarIntensity, 150, 0, 500);
     uniforms.contrast = percent(g_cvarContrast, 150, 50, 300);
     uniforms.thickness = percent(g_cvarThickness, 150, 25, 400);
-    uniforms.black_point = percent(g_cvarBlackPoint, 0, 0, 30);
+    uniforms.black_point = percent(g_cvarBlackPoint, 3, 0, 30);
     uniforms.radius_max = percent(g_cvarRadiusMax, 40, 10, 100);
     uniforms.thick_fade = percent(g_cvarThickFade, 150, 50, 400);
     // Radius-proportional occluder thickness floor: restores mid/far occlusion that the
     // log-scaled base thickness starves (the value is per-mille of the view radius).
     uniforms.thick_dist_scale =
-        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarThickDist, 20), 0, 100)) /
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarThickDist, 60), 0, 100)) /
         1000.0f;
     uniforms.inv_debug_depth =
         1.0f / static_cast<float>(
@@ -783,7 +783,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.temporal_clamp_k = percent(g_cvarTemporalClamp, 200, 100, 300);
     uniforms.velocity_scale = percent(g_cvarMotionResponse, 10, 0, 100);
     uniforms.content_thresh = percent(g_cvarContentThresh, 100, 25, 300);
-    uniforms.disocc_tol = percent(g_cvarDisoccTol, 4, 1, 20);
+    uniforms.disocc_tol = percent(g_cvarDisoccTol, 0, 0, 20);
     const bool distanceFade = get_bool_option(g_cvarDistanceFade, false);
     uniforms.fade_start = percent(g_cvarFadeStart, 40, 5, 95);
     uniforms.fade_end = percent(g_cvarFadeEnd, 90, 10, 100);
@@ -938,8 +938,10 @@ ModResult build_controls_tab(
         "Raise to broaden coverage; lower for tighter contact shadows.",
         25, 800, 25, nullptr);
     add_number(left, "Max Screen Radius", g_cvarRadiusMax,
-        "Caps the search radius as a share of screen height, limiting how large the effect gets "
-        "on very close surfaces. Lowering it also bounds worst-case cost.",
+        "Hard cap on the screen-space search radius, as a share of screen height. The search "
+        "radius is constant in screen space, so at normal Radius values it sits well under this "
+        "cap and the setting has no visible effect - it only engages to bound sampling cost when "
+        "Radius is pushed very high.",
         10, 100, 5, "%");
     add_number(left, "Thickness", g_cvarThickness,
         "How thick occluders are treated. Higher darkens the deepest part of contacts and "
@@ -985,8 +987,9 @@ ModResult build_controls_tab(
     add_number(left, "Disocclusion Tolerance", g_cvarDisoccTol,
         "Depth mismatch (as % of depth) before reprojected history is treated as a different "
         "surface and discarded. Lower rejects more aggressively at silhouettes; higher keeps "
-        "more history.",
-        1, 20, 1, "%");
+        "more history. 0 rejects the most (a small fixed depth floor still admits history on "
+        "matching surfaces), which minimizes distant ghosting.",
+        0, 20, 1, "%");
 
     svc_ui->pane_add_section(mod_ctx, left, "Filtering");
     add_number(left, "Denoise Passes", g_cvarDenoisePasses,
@@ -1136,17 +1139,17 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"radiusMax", 40, &g_cvarRadiusMax},
         {"intensity", 150, &g_cvarIntensity},
         {"contrast", 150, &g_cvarContrast},
-        {"blackPoint", 0, &g_cvarBlackPoint},
+        {"blackPoint", 3, &g_cvarBlackPoint},
         {"thickness", 150, &g_cvarThickness},
         {"thickFade", 150, &g_cvarThickFade},
-        {"thickDist", 20, &g_cvarThickDist},
+        {"thickDist", 60, &g_cvarThickDist},
         {"depthBias", 4, &g_cvarDepthBias},
         {"debugDepthRange", 3300, &g_cvarDebugDepthRange},
         {"temporalFrames", 5, &g_cvarTemporalFrames},
         {"temporalClamp", 200, &g_cvarTemporalClamp},
         {"motionResponse", 10, &g_cvarMotionResponse},
         {"contentThresh", 100, &g_cvarContentThresh},
-        {"disoccTol", 4, &g_cvarDisoccTol},
+        {"disoccTol", 0, &g_cvarDisoccTol},
         {"denoisePasses", 1, &g_cvarDenoisePasses},
         {"fadeStart", 40, &g_cvarFadeStart},
         {"fadeEnd", 90, &g_cvarFadeEnd},

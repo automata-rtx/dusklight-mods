@@ -41,20 +41,20 @@ Ints are fixed-point (usually /100) unless noted.
 | `quality` | 2 (High) | 0 Low 3/2, 1 Med 5/2, 2 High 7/3, 3 Ultra 9/3, 4 Custom — slices/steps |
 | `customSlices` / `customSteps` | 7 / 3 | used when quality = Custom (1–16 / 1–8) |
 | `radius` | 100 | effect radius, % of view depth (depth-proportional world radius) |
-| `radiusMax` | 40 | screen-space radius cap, % of viewport height |
+| `radiusMax` | 40 | screen-space radius cap, % of viewport height. The search radius is constant in screen space, so this only engages (bounding sampling cost) when `radius` is pushed very high; at normal values it has no visible effect |
 | `intensity` | 150 | final strength multiplier ×0.01 (up to 500) |
 | `contrast` | 150 | value power ×0.01 — deepens (>100) or lifts the falloff |
-| `blackPoint` | 0 | % occlusion floor removed then rescaled (cleans flat surfaces) |
+| `blackPoint` | 3 | % occlusion floor removed then rescaled (cleans flat surfaces — VBAO leaves a faint floor on open surfaces that reads as whole-screen darkening; 3 clears it) |
 | `thickness` | 150 | occluder thickness ×0.01 (log-scaled internally) |
 | `thickFade` | 150 | thickness fade range, ×0.01 of view radius |
-| `thickDist` | 20 | distance thickness: radius-proportional thickness floor, ‰ of the view radius. The log-scaled base thickness becomes a vanishing fraction of the (depth-proportional) radius with distance and starves mid/far occlusion; this restores it. 0 = old behavior |
+| `thickDist` | 60 | distance thickness: radius-proportional thickness floor, ‰ of the view radius. The log-scaled base thickness becomes a vanishing fraction of the (depth-proportional) radius with distance and starves mid/far occlusion; this restores it. 0 = old behavior |
 | `depthBias` | 4 | self-occlusion bias, ‰ toward camera |
 | `temporal` | on | temporal accumulation master |
 | `temporalFrames` | 5 | accumulation length → alpha = 1/frames |
 | `temporalClamp` | 200 | neighborhood clamp k ×0.01 |
 | `motionResponse` | 10 | accumulation shortening per pixel of motion ×0.01 |
 | `contentThresh` | 100 | content-mismatch response threshold ×0.01 |
-| `disoccTol` | 4 | disocclusion depth tolerance, % of depth |
+| `disoccTol` | 0 | disocclusion depth tolerance, % of depth (0–20). 0 rejects most aggressively; a small fixed depth floor still admits history on matching surfaces, minimizing distant ghosting |
 | `denoisePasses` | 1 | spatial passes 0–3 (ping-pong parity is mirrored on the CPU side —
   see mod-api-notes) |
 | `halfRes` | off | run the chain at half the snapshot resolution |
