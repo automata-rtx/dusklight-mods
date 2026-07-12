@@ -248,6 +248,14 @@ Normal Offset — the screen-space term re-grounds contacts regardless.
   2× Link Coverage of Link is included (harmless — more detail) and a huge world model
   whose origin happens to sit nearby would be too (its geometry mostly clips out of the
   tiny ortho box).
+- **Stale-model hazard (fixed in 1.6.1, do not reintroduce)**: the filter reads
+  `j3dSys.getModel()`, which `J3DShapePacket::prepareDraw` sets fresh per packet draw — but
+  shapes drawn through any other path leave the LAST value in place, and on the first
+  frames after a stage teardown (loading a save, the attract intro) that stale pointer can
+  reference a model of the destroyed scene → use-after-free crash. The Link replay must
+  clear the current model (`j3dSys.setModel(nullptr)`) before drawing and restore it after,
+  so non-packet draws are skipped rather than dereferenced. The player's position is also
+  finite-checked before use.
 - The SSS trace length is compile-time (`SAMPLE_COUNT` 60 pixels in `res/bend_sss.wgsl`);
   making it configurable means pipeline variants (workgroup memory is sized by it).
 - The pixel exactly at the light's screen position is never traced (rays converge toward

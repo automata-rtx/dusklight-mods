@@ -1251,6 +1251,16 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
     GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
     g_replayTwoSided = get_bool_option(g_cvarTwoSidedCasters, true);
     g_replayLinkOnly = linkOnly;
+    // The Link filter reads j3dSys's current model, which J3DShapePacket::prepareDraw sets
+    // fresh for every packet draw - but shapes drawn through any OTHER path leave the LAST
+    // value in place, and on the first frames after a stage teardown that stale pointer can
+    // reference a model of the destroyed scene (use-after-free when the filter dereferences
+    // it for the anchor test). Clear it for the Link replay so anything that didn't come
+    // through a live packet is skipped instead of dereferenced; restore afterwards.
+    J3DModel* savedModel = j3dSys.getModel();
+    if (linkOnly) {
+        j3dSys.setModel(nullptr);
+    }
     {
         replay_scope replay;
         if (linkOnly) {
@@ -1258,6 +1268,9 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
         } else {
             draw_opaque_scene_lists();
         }
+    }
+    if (linkOnly) {
+        j3dSys.setModel(savedModel);
     }
     g_replayLinkOnly = false;
     j3dSys.reinitGX();
@@ -1360,7 +1373,11 @@ void render_shadow_map(
     // composite (it contains no world geometry), so a failed render just drops the extra detail.
     if (!cameraReplayDebug && get_bool_option(g_cvarLinkCascade, true)) {
         daPy_py_c* player = dComIfGp_getLinkPlayer();
-        if (player != nullptr) {
+        // Guard the position too: on the first frames of a scene the actor can exist before
+        // its placement is meaningful.
+        if (player != nullptr && std::isfinite(player->current.pos.x) &&
+            std::isfinite(player->current.pos.y) && std::isfinite(player->current.pos.z))
+        {
             const float linkRadius = static_cast<float>(
                 std::clamp<int64_t>(get_int_option(g_cvarLinkCoverage, 300), 100, 2000));
             const uint32_t linkMapSize =
