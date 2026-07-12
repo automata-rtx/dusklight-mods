@@ -99,6 +99,7 @@ ConfigVarHandle g_cvarCascadeCount = 0;
 ConfigVarHandle g_cvarCascadeNearPct = 0;
 ConfigVarHandle g_cvarCascadeMidPct = 0;
 ConfigVarHandle g_cvarCascadeBlend = 0;
+ConfigVarHandle g_cvarCascadeCull = 0;
 ConfigVarHandle g_cvarPcfFarStep = 0;
 ConfigVarHandle g_cvarLinkCascade = 0;
 ConfigVarHandle g_cvarLinkMapSize = 0;
@@ -194,6 +195,16 @@ bool g_replayTwoSided = false;   // twoSidedCasters, latched for the current rep
 bool g_replayLinkOnly = false;   // Link cascade replay: only models anchored near the player draw
 float g_linkFilterCenter[3] = {};  // player position, world space
 float g_linkFilterRadiusSq = 0.0f;
+
+// Light-column culling for the current world-cascade replay: shapes whose world bounds fall
+// laterally outside the cascade's ortho box (in light space; the axis toward the light is
+// ignored, since casters anywhere along it matter) are skipped before their geometry is
+// streamed. This is what keeps multiple cascade replays inside aurora's fixed per-frame
+// streaming buffers (5 MB verts / 1 MB indices - overflow is an abort()), and it is also the
+// main cascade cost reduction: the near cascade only streams nearby geometry.
+bool g_replayCullActive = false;
+Mtx g_replayCullLightView;      // light_from_world for the current cascade
+float g_replayCullLimit = 0.0f;  // lateral half-extent + margin, world units
 
 constexpr float kLightDistance = 30000.0f;
 constexpr float kLightNear = 100.0f;
@@ -1069,9 +1080,11 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     }
     // Link-cascade replay: draw only models anchored near the player. J3DShapePacket::
     // prepareDraw sets j3dSys's current model right before every drawFast, so the owning
-    // J3DModel is reliably available here. Filtering by the model's base translation keeps
-    // Link's body + equipment (all anchored at his position, and characters right next to
-    // him) while skipping world geometry, whose models anchor far away or at the origin.
+    // J3DModel is reliably available here (the replay clears it first, so anything not set
+    // by a live packet reads null instead of a stale pointer). Filtering by the model's base
+    // translation keeps Link's body + equipment (all anchored at his position, and characters
+    // right next to him) while skipping world geometry, whose models anchor far away or at
+    // the origin.
     if (g_replayLinkOnly) {
         J3DModel* model = j3dSys.getModel();
         if (model == nullptr) {
@@ -1083,6 +1096,53 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
         const float dz = base[2][3] - g_linkFilterCenter[2];
         if (dx * dx + dy * dy + dz * dz > g_linkFilterRadiusSq) {
             return HOOK_SKIP_ORIGINAL;
+        }
+    }
+    // World-cascade replay: light-column culling. The shape's model-space bounds go to world
+    // via the model's base transform, then laterally into the cascade's light space; a shape
+    // entirely outside the column cannot cast into the cascade's box, so skipping it saves
+    // its whole geometry stream. Conservative on unknowns: no model (a non-packet draw) or
+    // degenerate bounds -> draw.
+    if (g_replayCullActive && !g_replayLinkOnly) {
+        J3DModel* model = j3dSys.getModel();
+        J3DShape* shape = const_cast<J3DShape*>(dusk::mods::arg<const J3DShape*>(args, 0));
+        if (model != nullptr && shape != nullptr) {
+            const Vec* mn = shape->getMin();
+            const Vec* mx = shape->getMax();
+            const float ex = 0.5f * (mx->x - mn->x);
+            const float ey = 0.5f * (mx->y - mn->y);
+            const float ez = 0.5f * (mx->z - mn->z);
+            if (ex >= 0.0f && ey >= 0.0f && ez >= 0.0f && std::isfinite(ex + ey + ez)) {
+                const float cx = mn->x + ex;
+                const float cy = mn->y + ey;
+                const float cz = mn->z + ez;
+                const Mtx& base = model->getBaseTRMtx();
+                const float wx =
+                    base[0][0] * cx + base[0][1] * cy + base[0][2] * cz + base[0][3];
+                const float wy =
+                    base[1][0] * cx + base[1][1] * cy + base[1][2] * cz + base[1][3];
+                const float wz =
+                    base[2][0] * cx + base[2][1] * cy + base[2][2] * cz + base[2][3];
+                // Bounding radius scaled by the largest basis-column length of the base
+                // transform (covers scaled models); skinned shapes get extra slack below.
+                const float s0 = base[0][0] * base[0][0] + base[1][0] * base[1][0] +
+                                 base[2][0] * base[2][0];
+                const float s1 = base[0][1] * base[0][1] + base[1][1] * base[1][1] +
+                                 base[2][1] * base[2][1];
+                const float s2 = base[0][2] * base[0][2] + base[1][2] * base[1][2] +
+                                 base[2][2] * base[2][2];
+                const float scale = std::sqrt(std::max(s0, std::max(s1, s2)));
+                const float radius = std::sqrt(ex * ex + ey * ey + ez * ez) * scale;
+                const Mtx& view = g_replayCullLightView;
+                const float lx = view[0][0] * wx + view[0][1] * wy + view[0][2] * wz + view[0][3];
+                const float ly = view[1][0] * wx + view[1][1] * wy + view[1][2] * wz + view[1][3];
+                const float limit = g_replayCullLimit + radius;
+                if (std::isfinite(lx) && std::isfinite(ly) &&
+                    (std::fabs(lx) > limit || std::fabs(ly) > limit))
+                {
+                    return HOOK_SKIP_ORIGINAL;
+                }
+            }
         }
     }
     if (!g_replayTwoSided) {
@@ -1208,7 +1268,7 @@ void draw_link_scene_lists() {
 // clean between passes.
 bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
     const f32 replayProjection[7], bool cameraReplayDebug, uint32_t mapSize, float radius,
-    bool linkOnly, CascadeSlot& out) {
+    bool linkOnly, bool cull, CascadeSlot& out) {
     Mtx44 lightReplayProjection;
     if (!build_light_replay_projection(lightCamera, replayViewMtx, lightReplayProjection)) {
         return false;
@@ -1251,16 +1311,20 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
     GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
     g_replayTwoSided = get_bool_option(g_cvarTwoSidedCasters, true);
     g_replayLinkOnly = linkOnly;
-    // The Link filter reads j3dSys's current model, which J3DShapePacket::prepareDraw sets
-    // fresh for every packet draw - but shapes drawn through any OTHER path leave the LAST
-    // value in place, and on the first frames after a stage teardown that stale pointer can
-    // reference a model of the destroyed scene (use-after-free when the filter dereferences
-    // it for the anchor test). Clear it for the Link replay so anything that didn't come
-    // through a live packet is skipped instead of dereferenced; restore afterwards.
-    J3DModel* savedModel = j3dSys.getModel();
-    if (linkOnly) {
-        j3dSys.setModel(nullptr);
+    g_replayCullActive = cull;
+    if (cull) {
+        cMtx_copy(lightCamera.view, g_replayCullLightView);
+        g_replayCullLimit = radius * 1.05f + 200.0f;
     }
+    // The Link filter and the culling read j3dSys's current model, which J3DShapePacket::
+    // prepareDraw sets fresh for every packet draw - but shapes drawn through any OTHER path
+    // leave the LAST value in place, and on the first frames after a stage teardown that
+    // stale pointer can reference a model of the destroyed scene (use-after-free when
+    // dereferenced). Clear it for every replay so anything that didn't come through a live
+    // packet reads null (Link filter: skipped; culling: drawn conservatively) instead of
+    // being dereferenced; restore afterwards.
+    J3DModel* savedModel = j3dSys.getModel();
+    j3dSys.setModel(nullptr);
     {
         replay_scope replay;
         if (linkOnly) {
@@ -1269,10 +1333,9 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
             draw_opaque_scene_lists();
         }
     }
-    if (linkOnly) {
-        j3dSys.setModel(savedModel);
-    }
+    j3dSys.setModel(savedModel);
     g_replayLinkOnly = false;
+    g_replayCullActive = false;
     j3dSys.reinitGX();
     J3DShape::resetVcdVatCache();
     restore_game_camera();
@@ -1335,10 +1398,13 @@ void render_shadow_map(
     // Cascade radii from the split percentages (near < mid < far = full coverage). The camera
     // replay debug view renders a single full-coverage cascade.
     int count =
-        static_cast<int>(std::clamp<int64_t>(get_int_option(g_cvarCascadeCount, 2), 0, 2)) + 1;
+        static_cast<int>(std::clamp<int64_t>(get_int_option(g_cvarCascadeCount, 1), 0, 2)) + 1;
     if (cameraReplayDebug) {
         count = 1;
     }
+    // Light-column culling keeps the extra replays inside aurora's fixed per-frame streaming
+    // buffers (overflow is a hard abort); disable only to diagnose missing casters.
+    const bool cull = get_bool_option(g_cvarCascadeCull, true) && !cameraReplayDebug;
     const float nearPct =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarCascadeNearPct, 12), 4, 40)) /
         100.0f;
@@ -1357,7 +1423,7 @@ void render_shadow_map(
         LightCamera lightCamera{};
         if (!build_light_camera(replayViewMtx, mapSize, radii[i], lightCamera) ||
             !replay_cascade(lightCamera, replayViewMtx, replayProjection, cameraReplayDebug,
-                mapSize, radii[i], false, g_mapPass.cascades[i]))
+                mapSize, radii[i], false, cull, g_mapPass.cascades[i]))
         {
             g_mapPass = {};
             return;
@@ -1395,7 +1461,7 @@ void render_shadow_map(
             if (build_light_camera_core(
                     center, linkMapSize, linkRadius, linkRadius * 4.0f + 2000.0f, lightCamera) &&
                 replay_cascade(lightCamera, replayViewMtx, replayProjection, false, linkMapSize,
-                    linkRadius, true, g_mapPass.cascades[kLinkCascade]))
+                    linkRadius, true, false, g_mapPass.cascades[kLinkCascade]))
             {
                 g_mapPass.linkReady = true;
             }
@@ -1776,8 +1842,14 @@ ModResult build_controls_tab(
     add_select(left, "Cascades", g_cvarCascadeCount, kCascadeCounts, 3,
         "Number of shadow map cascades: nested boxes around the camera, each with its own "
         "full-resolution map, so nearby shadows stay sharp while coverage stays wide. Each "
-        "cascade re-renders the scene from the light, so more cascades cost more. 1 = the old "
-        "single-map behavior.");
+        "cascade re-renders the scene from the light, so more cascades cost more - and the "
+        "game engine has a fixed per-frame geometry budget, so 3 can overload very dense "
+        "areas (the game closes instantly if so; use 2 there). 1 = the old single-map "
+        "behavior.");
+    add_toggle(left, "Cascade Culling", g_cvarCascadeCull,
+        "Skips geometry that cannot cast into a cascade's box before it is drawn. Keeps the "
+        "extra cascade passes cheap and inside the engine's per-frame geometry budget - "
+        "leave on. Turn off only to test whether a missing shadow was wrongly culled.");
     add_number(left, "Near Split", g_cvarCascadeNearPct, 4, 40, 1, "%",
         "Radius of the NEAR cascade as a percentage of Coverage (3-cascade mode). Smaller = "
         "sharper close-up shadows but the mid cascade takes over sooner.");
@@ -2077,7 +2149,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
-    result = register_int_option("cascadeCount", 2, g_cvarCascadeCount, error);
+    result = register_int_option("cascadeCount", 1, g_cvarCascadeCount, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -2090,6 +2162,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return result;
     }
     result = register_int_option("cascadeBlend", 20, g_cvarCascadeBlend, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_bool_option("cascadeCull", true, g_cvarCascadeCull, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -2279,6 +2355,9 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarSssFade = g_cvarSssFadeStart = g_cvarSssFadeEnd = 0;
     g_cvarIndoorDisable = g_cvarTwoSidedCasters = 0;
     g_cvarCascadeCount = g_cvarCascadeNearPct = g_cvarCascadeMidPct = g_cvarCascadeBlend = 0;
+    g_cvarCascadeCull = 0;
+    g_replayCullActive = false;
+    g_replayCullLimit = 0.0f;
     g_cvarPcfFarStep = g_cvarLinkCascade = g_cvarLinkMapSize = g_cvarLinkCoverage = 0;
     g_replayLinkOnly = false;
     g_linkFilterRadiusSq = 0.0f;

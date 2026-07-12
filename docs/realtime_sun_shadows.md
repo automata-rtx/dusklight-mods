@@ -110,9 +110,10 @@ Space Shadows" is inert when SSS is off.
 | `shadowMapEnabled` | on | off = screen-space-only mode: no map render/composite, the game's own real/blob shadows return (the skip hooks go inactive), the Bend SSS term still applies |
 | `mapSize` | 2 | EACH world cascade's map: 0=1024 1=2048 2=4096 3=8192 |
 | `boxRadius` | 8000 | full coverage radius in world units (1000–30000) = the FAR cascade |
-| `cascadeCount` | 2 | world cascades minus one (UI select "1/2/3"): 0=single map, 2=three cascades |
+| `cascadeCount` | 1 | world cascades minus one (UI select "1/2/3"): 0=single map, 1=two cascades (default), 2=three. See the streaming-budget caveat before defaulting to 3 |
 | `cascadeNearPct` / `cascadeMidPct` | 12 / 35 | near / mid cascade radii as % of Coverage (log-uniform for 3 cascades) |
 | `cascadeBlend` | 20 | cross-fade band width at each cascade boundary, % of the cascade extent |
+| `cascadeCull` | on | light-column culling of replay geometry per cascade (keeps the passes inside the engine's per-frame streaming budget - leave on) |
 | `pcfFarStep` | 1 | extra PCF kernel steps per cascade beyond the near one (0–2) |
 | `linkCascade` | on | the Link cascade: an extra map covering only the player, combined with max() |
 | `linkMapSize` | 2 | Link cascade resolution (same scale as `mapSize`), independent of it |
@@ -188,6 +189,12 @@ too far makes shadows detach from objects' feet ("peter-panning").
   small/medium ones are, as a percentage of Coverage. Keep them roughly geometric (each
   step ~3x the previous: 12% / 35% / 100%) so each transition steps sharpness evenly. Use
   the **Cascades debug view** (red/green/blue = near/mid/far) to see who covers what.
+  Default is 2 cascades; 3 looks best but can exceed the engine's fixed per-frame geometry
+  budget in the densest areas (instant crash to desktop) — if an area reliably crashes on
+  3, use 2 there until the platform's buffers are raised.
+- **Cascade Culling** — leave on. It skips geometry that can't cast into each cascade's
+  box, which is both the perf win and what keeps multiple cascades inside the engine's
+  geometry budget.
 - **Cascade Blend** — how wide the cross-fade between neighboring cascades is. Raise it if
   you can see a line where sharpness changes; costs extra samples only in the band.
 - **Far Softening** — far cascades have chunkier photo pixels; this widens their smoothing
@@ -238,12 +245,22 @@ Normal Offset — the screen-space term re-grounds contacts regardless.
 - **Midna**: the game's projected blob shadow (which the mod hooks out) is where Midna
   "lives" during her summon/emergence animation. A retain path (re-enable the game shadow
   for Link only, or anchor her to our sun ground-projection) is a known follow-up.
-- Cascade cost: each world cascade is a full draw-list replay per frame (3 cascades ≈ 3×
-  the map cost of one). If that's too heavy, drop to 2 cascades or shrink Map Size — both
-  usually still beat one huge map. The Link cascade is much cheaper (player models only),
-  but it still traverses the Middle/Opa/Dark lists to find them. Known follow-ups if
-  needed: per-cascade draw-list distance culling, updating the far cascade every other
-  frame.
+- **The per-frame streaming budget (the v1.6.0/1.6.1 startup crash)**: aurora streams ALL
+  GX geometry into fixed-size per-frame buffers — 5 MB vertex, **1 MB index**, 8 MB
+  storage, 24 MB uniform (`extern/aurora/lib/gfx/common.hpp:176`) — and these are mapped,
+  non-growable ranges whose overflow is an unconditional `abort()`
+  (`ByteBuffer::resize`, `common.hpp:155`). The game's own draw plus EVERY cascade replay
+  share the same buffers, so uncalled 3-cascade replays (~4× scene geometry, worse with
+  `noFrustumClipping`) blew the index buffer on dense scenes — instantly closing the game
+  on the first frames after loading a save, exactly when geometry volume peaks. Two
+  mitigations ship in 1.6.2: per-cascade **light-column culling** (`cascadeCull`, skips
+  shapes laterally outside a cascade's light box before their geometry streams; the axis
+  toward the light is kept, so tall distant casters still shadow into near boxes) and a
+  default of **2 cascades** (~the proven 1.5.x envelope). 3 cascades works in most areas
+  but can still overflow in the densest ones; the definitive fix is raising the buffer
+  sizes in the platform (a re-platform: new `platform-vN` of `dusklight-ao` + rebuild, see
+  CLAUDE.md). The Link cascade is nearly free vertex-wise: its filter skips at drawFast
+  BEFORE geometry streams.
 - The Link cascade's position filter is by model anchor, so a character standing within
   2× Link Coverage of Link is included (harmless — more detail) and a huge world model
   whose origin happens to sit nearby would be too (its geometry mostly clips out of the
