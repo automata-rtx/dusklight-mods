@@ -114,6 +114,7 @@ Space Shadows" is inert when SSS is off.
 | `cascadeNearPct` / `cascadeMidPct` | 12 / 35 | near / mid cascade radii as % of Coverage (log-uniform for 3 cascades) |
 | `cascadeBlend` | 20 | cross-fade band width at each cascade boundary, % of the cascade extent |
 | `cascadeCull` | on | light-column culling of replay geometry per cascade (keeps the passes inside the engine's per-frame streaming budget - leave on) |
+| `cascadeEdgeFade` | on | fade the widest cascade's shadow out across its outer edge (band = `cascadeBlend`) instead of a hard coverage cutoff |
 | `pcfFarStep` | 1 | extra PCF kernel steps per cascade beyond the near one (0–2) |
 | `linkCascade` | on | the Link cascade: an extra map covering only the player, combined with max() |
 | `linkMapSize` | 2 | Link cascade resolution (same scale as `mapSize`), independent of it |
@@ -233,6 +234,13 @@ Normal Offset — the screen-space term re-grounds contacts regardless.
 
 ## Known caveats
 
+- **2D-menu crash (fixed in 1.6.3)**: with the mod enabled but the shadow map off, the
+  screen-space-only composite path still called `compute_light` → `dKy_getEnvlight` /
+  `dComIfGs_getTime`, which can touch torn-down environment/time state on a geometry-less
+  screen (the file-select menu), crashing the game. `composite_map_pass` now bails early on
+  `!draw_lists_ready()` — no populated 3D scene means nothing to shadow, so it never enters
+  the game-state calls or the offscreen pass there. Same readiness gate the replay already
+  used, so real scenes are unaffected.
 - **Distortion particles vanish with the map on** (heat-haze / steam / wind in Kakariko
   Village, Goron Springs) — *open*. Only the shadow **map** triggers it; screen-space-only
   mode (Shadow Map off) shows the particles normally, so that's the current workaround.

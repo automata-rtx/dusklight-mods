@@ -49,7 +49,7 @@ struct Uniforms {
     camera_eye_z: f32,
     sss_fade_start: f32,      // world units; screen-space shadow full below this distance
     sss_fade_end: f32,        // world units; screen-space shadow gone beyond this distance
-    _pad0: f32,
+    edge_fade: f32,           // 1 = fade the outermost cascade's shadow out at its box edge
     _pad1: f32,
     _pad2: f32,
 }
@@ -410,6 +410,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
             if sel.fit > blend_start && selected + 1u < count {
                 let t = saturate((sel.fit - blend_start) / uniforms.blend_frac);
                 occlusion = mix(occlusion, cascade_occlusion(selected + 1u, world, n, tan_t), t);
+            } else if uniforms.edge_fade != 0.0 && selected + 1u >= count && sel.fit > blend_start {
+                // Outermost cascade: no farther cascade to hand off to, so its box edge is a
+                // hard coverage boundary. Fade the mapped shadow out across the same band so
+                // distant shadows dissolve into unshadowed geometry (and into the fog) instead
+                // of drawing in as a sharp line on far mountains as they enter coverage.
+                let t = saturate((sel.fit - blend_start) / uniforms.blend_frac);
+                occlusion = occlusion * (1.0 - t);
             }
         }
 

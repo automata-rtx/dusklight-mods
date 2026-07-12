@@ -100,6 +100,7 @@ ConfigVarHandle g_cvarCascadeNearPct = 0;
 ConfigVarHandle g_cvarCascadeMidPct = 0;
 ConfigVarHandle g_cvarCascadeBlend = 0;
 ConfigVarHandle g_cvarCascadeCull = 0;
+ConfigVarHandle g_cvarCascadeEdgeFade = 0;
 ConfigVarHandle g_cvarPcfFarStep = 0;
 ConfigVarHandle g_cvarLinkCascade = 0;
 ConfigVarHandle g_cvarLinkMapSize = 0;
@@ -244,7 +245,7 @@ struct ShadowUniforms {
     float camera_eye[3];       // camera world position (screen-space shadow distance fade)
     float sss_fade_start;      // world units; screen-space shadow full below this distance
     float sss_fade_end;        // world units; screen-space shadow gone beyond this distance
-    float _pad0;
+    float edge_fade;           // 1 = fade the outermost cascade's shadow out at its box edge
     float _pad1;
     float _pad2;
 };
@@ -1595,6 +1596,15 @@ bool push_normal_dispatches(const GfxResolvedTargets& resolved, int64_t smoothin
 // own shadows return (dynamic_shadows_wanted is false, so the skip hooks pass through).
 void composite_map_pass(int64_t debugMode) {
     const MapPassOutput mapPass = std::exchange(g_mapPass, {});
+    // No populated 3D scene this frame (a 2D screen like the file-select menu): there is
+    // nothing to shadow, and the screen-space-only path would still call into the game's
+    // environment/time state (compute_light -> dKy_getEnvlight / dComIfGs_getTime), which can
+    // be torn down there. Bail before touching any game state or the offscreen pass. This is
+    // the same readiness gate the shadow-map replay uses, so behavior in real scenes is
+    // unchanged.
+    if (!draw_lists_ready()) {
+        return;
+    }
     // Indoors, the shadow map is suppressed (it reads as fully shadowed under a sky-light
     // map) but the screen-space shadows stay - so indoors is just screen-space-only mode.
     const bool mapWanted = get_bool_option(g_cvarShadowMap, true) && !indoor_blocked();
@@ -1721,6 +1731,10 @@ void composite_map_pass(int64_t debugMode) {
         uniforms.sss_fade_start = 1.0e12f;
         uniforms.sss_fade_end = 1.0e12f;
     }
+    // Coverage-edge fade: dissolve the outermost cascade's shadow across its outer blend band
+    // instead of cutting it at a hard line, so distant shadows on far mountains fade in/out
+    // smoothly (and hide under deferred fog) rather than popping at the coverage boundary.
+    uniforms.edge_fade = get_bool_option(g_cvarCascadeEdgeFade, true) ? 1.0f : 0.0f;
     uniforms.debug_mode = static_cast<uint32_t>(debugMode);
 
     GfxRange uniformRange{0, 0};
@@ -1859,7 +1873,13 @@ ModResult build_controls_tab(
     add_number(left, "Cascade Blend", g_cvarCascadeBlend, 5, 40, 5, "%",
         "Width of the cross-fade band at each cascade boundary, as a fraction of the cascade's "
         "extent. Wider = smoother, less visible transitions; costs extra shadow samples only "
-        "inside the bands. Use the Cascades debug view to see the boundaries.");
+        "inside the bands. Use the Cascades debug view to see the boundaries. Also sets the "
+        "width of the Distance Fade band at the outer coverage edge.");
+    add_toggle(left, "Distance Fade", g_cvarCascadeEdgeFade,
+        "Fades the map shadow out across the outer edge of the widest cascade instead of "
+        "cutting it at a hard line, so shadows on far mountains dissolve smoothly (into the "
+        "fog, ideally) rather than popping in as the coverage boundary sweeps over them. The "
+        "band width is Cascade Blend. Pairs well with the Deferred Fog mod.");
     static const char* kPcfOptions[] = {"Off", "3x3", "5x5", "7x7"};
     add_select(left, "Soft Shadows", g_cvarPcf, kPcfOptions, 4,
         "Shadow-map edge softening (percentage-closer filtering) for the NEAR cascade (and "
@@ -2169,6 +2189,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
+    result = register_bool_option("cascadeEdgeFade", true, g_cvarCascadeEdgeFade, error);
+    if (result != MOD_OK) {
+        return result;
+    }
     result = register_int_option("pcfFarStep", 1, g_cvarPcfFarStep, error);
     if (result != MOD_OK) {
         return result;
@@ -2355,7 +2379,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarSssFade = g_cvarSssFadeStart = g_cvarSssFadeEnd = 0;
     g_cvarIndoorDisable = g_cvarTwoSidedCasters = 0;
     g_cvarCascadeCount = g_cvarCascadeNearPct = g_cvarCascadeMidPct = g_cvarCascadeBlend = 0;
-    g_cvarCascadeCull = 0;
+    g_cvarCascadeCull = g_cvarCascadeEdgeFade = 0;
     g_replayCullActive = false;
     g_replayCullLimit = 0.0f;
     g_cvarPcfFarStep = g_cvarLinkCascade = g_cvarLinkMapSize = g_cvarLinkCoverage = 0;
