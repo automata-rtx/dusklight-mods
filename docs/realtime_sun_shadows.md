@@ -100,7 +100,8 @@ off; anything under "Screen Space Shadows" is inert when SSS is off.
 | `sssThickness` | 50 | assumed caster thickness, 1/100 % of remaining depth (50 = 0.5%) |
 | `sssEdgeThreshold` | 200 | depth delta treated as an edge, 1/100 % (200 = 2%) |
 | `sssContrast` | 4 | contrast boost on the SSS transition (1–8) |
-| `sssBias` | 15 | receiver offset in shadow-window %, pushes the trace off the surface to kill facet self-shadow banding on low-poly casters (SSS counterpart to the map's `bias`) |
+| `sssLength` | 20 | max screen-space shadow length in render pixels, smooth falloff (60 = the full trace). The facet-banding fix - see below |
+| `sssBias` | 0 | receiver offset in shadow-window %, uniformly lightens ALL near-surface SSS detail. Blunt fallback; prefer `sssLength` |
 | `sssIgnoreEdges` | off | edge pixels don't cast (helps grazing-angle aliasing) |
 | `sssFade` | on | fade the screen-space shadows out with distance so distant fogged geometry isn't full-strength shadowed |
 | `sssFadeStart` / `sssFadeEnd` | 8000 / 25000 | world-unit distances where the SSS fade begins / completes (set around where the scene washes into fog) |
@@ -116,12 +117,18 @@ Edge Mask" debug view when striated patterns appear on flat surfaces (or turn on
 `sssIgnoreEdges`).
 
 **SSS facet banding** (Link's cap, hair, cliffs look faceted only with screen-space shadows
-on): raise `sssBias`. The Bend trace runs against the raw depth buffer, so a low-poly caster
-whose facets each tilt a little self-shadows each facet by a slightly different amount and
-the polygon banding shows through. `sssBias` pushes the trace off the receiving surface —
-raise it until the banding disappears. Higher values also soften genuine near-contact
-darkening (the whole point of SSS), so use the lowest value that cleans up the facets. It's
-the exact SSS analogue of the shadow map's constant `bias`.
+on): shorten `sssLength`. The banding is *convex curvature self-occlusion*: on a low-poly
+convex surface the neighboring polygon genuinely rises above the receiver near the light
+terminator, so the trace correctly — but uglily — shadows it facet by facet. That occlusion
+aligns at facet-scale distances (tens of pixels), while genuine micro-detail (the Hylian
+shield insignia, hands, straps) shadows its receiver within a few pixels of contact.
+`sssLength` fades shadows out with caster distance along the ray, so shortening it prunes
+the bands while contact detail keeps full strength (GPU-verified on a synthetic dome +
+micro-ridge). It's in render pixels, so raise it when supersampling. Two things that do
+NOT work, tried and discarded: a constant receiver bias (`sssBias`, kept as a fallback)
+lightens contact micro-detail exactly as fast as the banding; and receiver-plane slope
+compensation targets nothing — Bend's perspective-corrected model already handles planar
+receiver tilt, which a tilted-plane GPU sweep confirmed (no acne at any tilt).
 
 ## Normals, detail, and the screen-space term (important)
 

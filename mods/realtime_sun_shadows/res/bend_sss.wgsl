@@ -42,7 +42,11 @@ struct SssUniforms {
     shadow_contrast: f32,     // contrast boost on the shadow transition (>= 1)
     ignore_edge_pixels: u32,  // 1 = pixels detected as edges do not cast
     debug_mode: u32,          // 1 = write the edge-detect mask instead of the shadow
-    receiver_bias: f32,       // extra receiver offset in shadow-window units; kills facet acne
+    receiver_bias: f32,       // extra receiver offset in shadow-window units; blunt acne knob
+    range_falloff: f32,       // 1 / max shadow length in pixels (0 = full 60px trace)
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 @group(0) @binding(0) var scene_depth: texture_2d<f32>;
@@ -216,34 +220,45 @@ fn cs_main(
         sample_distance[0] / depth_thickness_scale[0];
     start_depth = start_depth * depth_scale - Z_SIGN;
 
-    // Receiver bias: low-poly casters (Link's cap, hair, cliffs) tilt facet-to-facet, so each
-    // facet self-shadows by a slightly different amount and the polygon banding shows through.
-    // Adding a constant to every sample's depth delta (AFTER the abs, so it is strictly one-
-    // sided and can only lighten - never fabricate a shadow on the far side of a sample) pushes
-    // the near-surface response into the fully-lit clamp and erases the banding. Higher =
-    // flatter/cleaner but weaker near-contact darkening (the honest trade).
+    // Receiver bias: blunt fallback knob. Adding a constant to every sample's depth delta
+    // (AFTER the abs, so it is strictly one-sided and can only lighten - never fabricate a
+    // shadow) pushes the near-surface response into the fully-lit clamp. It cannot separate
+    // facet banding from genuine micro-shadows - the shadow-length falloff below is for that.
     let receiver_bias = uniforms.receiver_bias;
+
+    // Shadow-length falloff: forgives depth deltas in proportion to the caster's distance
+    // along the ray, so occlusion aligning within ~1/range_falloff pixels keeps full strength
+    // and occlusion beyond it fades smoothly to nothing (a soft, tunable version of Bend's
+    // own trace-tail fade-out). This is the facet-banding fix: on a low-poly convex surface
+    // (Link's cap) the neighboring polygons genuinely occlude near the light terminator, band
+    // by band, and that alignment happens at facet-scale distances - tens of pixels - while
+    // genuine micro-detail (the Hylian shield insignia) shadows its receiver within a few
+    // pixels of contact. Limiting the shadow length prunes the bands and keeps the detail.
+    let range_falloff = uniforms.range_falloff;
 
     // The first samples produce a hard shadow: a single sample can fully shadow the pixel,
     // trading aliasing for grounding pixels very close to the caster.
     for (var i = 0u; i < HARD_SHADOW_SAMPLES; i++) {
+        let forgive = range_falloff * f32(i + 1u) + receiver_bias;
         let depth_delta =
-            abs(start_depth - depth_data[sample_index + i] * depth_scale) + receiver_bias;
+            abs(start_depth - depth_data[sample_index + i] * depth_scale) + forgive;
         hard_shadow = min(hard_shadow, depth_delta);
     }
 
     // The bulk samples accumulate into four values whose average softens single-pixel
     // shadows.
     for (var i = HARD_SHADOW_SAMPLES; i < SAMPLE_COUNT - FADE_OUT_SAMPLES; i++) {
+        let forgive = range_falloff * f32(i + 1u) + receiver_bias;
         let depth_delta =
-            abs(start_depth - depth_data[sample_index + i] * depth_scale) + receiver_bias;
+            abs(start_depth - depth_data[sample_index + i] * depth_scale) + forgive;
         shadow_value[i & 3u] = min(shadow_value[i & 3u], depth_delta);
     }
 
     // The most distant samples fade out, softening the hard shadow-length cutoff.
     for (var i = SAMPLE_COUNT - FADE_OUT_SAMPLES; i < SAMPLE_COUNT; i++) {
+        let forgive = range_falloff * f32(i + 1u) + receiver_bias;
         let depth_delta =
-            abs(start_depth - depth_data[sample_index + i] * depth_scale) + receiver_bias;
+            abs(start_depth - depth_data[sample_index + i] * depth_scale) + forgive;
         let fade_out = f32(i + 1u - (SAMPLE_COUNT - FADE_OUT_SAMPLES)) /
             f32(FADE_OUT_SAMPLES + 1u) * 0.75;
         shadow_value[i & 3u] = min(shadow_value[i & 3u], depth_delta + fade_out);

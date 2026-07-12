@@ -86,6 +86,7 @@ ConfigVarHandle g_cvarSssThickness = 0;
 ConfigVarHandle g_cvarSssEdgeThreshold = 0;
 ConfigVarHandle g_cvarSssContrast = 0;
 ConfigVarHandle g_cvarSssBias = 0;
+ConfigVarHandle g_cvarSssLength = 0;
 ConfigVarHandle g_cvarSssIgnoreEdges = 0;
 ConfigVarHandle g_cvarSssFade = 0;
 ConfigVarHandle g_cvarSssFadeStart = 0;
@@ -232,6 +233,10 @@ struct SssUniforms {
     uint32_t ignore_edge_pixels;
     uint32_t debug_mode;
     float receiver_bias;
+    float range_falloff;
+    float _pad0;
+    float _pad1;
+    float _pad2;
 };
 static_assert(sizeof(SssUniforms) % 16 == 0);
 
@@ -1268,11 +1273,17 @@ bool push_sss_dispatches(
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarSssContrast, 4), 1, 8));
     sssUniforms.ignore_edge_pixels = get_bool_option(g_cvarSssIgnoreEdges, false) ? 1u : 0u;
     sssUniforms.debug_mode = debugMode == 12 ? 1u : 0u;
-    // Receiver bias in shadow-window units (slider 0-100 -> 0.0-1.0). Raises the near-surface
-    // response toward the lit clamp, removing facet self-shadow banding on low-poly casters.
+    // Receiver bias in shadow-window units (slider 0-100 -> 0.0-1.0): blunt fallback that
+    // lightens everything. Shadow length (slider 4-60 px) is the targeted facet-banding fix:
+    // the falloff (1/length) forgives depth deltas in proportion to the caster's ray distance,
+    // so near-contact micro-shadows keep full strength and facet-scale banding fades out. At
+    // the max (60 = the full trace) the falloff matches Bend's own tail fade and adds nothing.
     sssUniforms.receiver_bias =
-        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarSssBias, 15), 0, 100)) /
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarSssBias, 0), 0, 100)) /
         100.0f;
+    const int64_t sssLength = std::clamp<int64_t>(get_int_option(g_cvarSssLength, 20), 4, 60);
+    sssUniforms.range_falloff =
+        sssLength >= 60 ? 0.0f : 1.0f / static_cast<float>(sssLength);
 
     SssComputePayload payload{};
     payload.sceneDepth = resolved.depth;
@@ -1607,12 +1618,17 @@ ModResult build_controls_tab(
         "appear on flat surfaces.");
     add_number(left, "SSS Contrast", g_cvarSssContrast, 1, 8, 1, nullptr,
         "Contrast boost on the screen-space shadow transition. Higher is harder-edged.");
+    add_number(left, "SSS Shadow Length", g_cvarSssLength, 4, 60, 2, nullptr,
+        "Maximum screen-space shadow length, in render pixels, with a smooth falloff. This is "
+        "the facet-banding fix: the banding on low-poly surfaces (Link's cap, hair) is cast "
+        "polygon-by-polygon from tens of pixels away, while genuine micro-detail (the Hylian "
+        "shield insignia, hands, straps) shadows its receiver within a few pixels of contact. "
+        "Shorten until the cap is clean - micro-detail keeps full strength. 60 = the full "
+        "unrestricted trace. Scales with resolution: raise it when supersampling.");
     add_number(left, "SSS Bias", g_cvarSssBias, 0, 100, 5, "%",
-        "Pushes the screen-space trace off the receiving surface. Low-poly casters (Link's cap, "
-        "hair, cliffs) tilt facet-to-facet, so the trace self-shadows each facet by a different "
-        "amount and the polygon banding shows through. Raise this until the faceted banding "
-        "disappears; higher also softens fine near-contact darkening, so use the lowest value "
-        "that cleans up the facets. This is the SSS counterpart to the shadow map's Bias.");
+        "Blunt fallback: uniformly pushes the screen-space trace off the receiving surface, "
+        "lightening ALL near-surface shadow detail equally. Prefer SSS Shadow Length for "
+        "facet banding; keep this at 0 unless acne survives that the length cannot catch.");
     add_toggle(left, "SSS Ignore Edges", g_cvarSssIgnoreEdges,
         "Pixels detected as geometric edges do not cast screen-space shadows. Helps aliasing "
         "on large flat surfaces lit at grazing angles; can thin out foliage shadows.");
@@ -1788,7 +1804,11 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
-    result = register_int_option("sssBias", 15, g_cvarSssBias, error);
+    result = register_int_option("sssBias", 0, g_cvarSssBias, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_int_option("sssLength", 20, g_cvarSssLength, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -1982,7 +2002,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarPcf = g_cvarBias = g_cvarBoxRadius = g_cvarContactShadows = g_cvarDebugView = 0;
     g_cvarSlopeBias = g_cvarNormalOffset = 0;
     g_cvarSssThickness = g_cvarSssEdgeThreshold = g_cvarSssContrast = g_cvarSssBias =
-        g_cvarSssIgnoreEdges = 0;
+        g_cvarSssLength = g_cvarSssIgnoreEdges = 0;
     g_cvarSssFade = g_cvarSssFadeStart = g_cvarSssFadeEnd = 0;
     g_cvarIndoorDisable = g_cvarTwoSidedCasters = 0;
     g_drawType = g_sssComputeType = g_normalComputeType = g_sceneBeginHook =
