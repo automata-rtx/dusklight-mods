@@ -21,10 +21,12 @@
 
 #include "bend_sss_cpu.h"
 
+#include "JSystem/J3DGraphAnimator/J3DModel.h"
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
 #include "JSystem/J3DGraphBase/J3DShape.h"
 #include "JSystem/J3DU/J3DUClipper.h"
 #include "JSystem/JMath/JMath.h"
+#include "d/actor/d_a_player.h"
 #include "d/d_com_inf_game.h"
 #include "d/d_kankyo.h"
 #include "d/d_kankyo_rain.h"
@@ -93,6 +95,14 @@ ConfigVarHandle g_cvarSssFadeStart = 0;
 ConfigVarHandle g_cvarSssFadeEnd = 0;
 ConfigVarHandle g_cvarIndoorDisable = 0;
 ConfigVarHandle g_cvarTwoSidedCasters = 0;
+ConfigVarHandle g_cvarCascadeCount = 0;
+ConfigVarHandle g_cvarCascadeNearPct = 0;
+ConfigVarHandle g_cvarCascadeMidPct = 0;
+ConfigVarHandle g_cvarCascadeBlend = 0;
+ConfigVarHandle g_cvarPcfFarStep = 0;
+ConfigVarHandle g_cvarLinkCascade = 0;
+ConfigVarHandle g_cvarLinkMapSize = 0;
+ConfigVarHandle g_cvarLinkCoverage = 0;
 
 GfxDrawTypeHandle g_drawType = 0;
 GfxComputeTypeHandle g_sssComputeType = 0;
@@ -152,22 +162,38 @@ struct RetiredNormalTargets {
 };
 std::vector<RetiredNormalTargets> g_retiredNormalTargets;
 
-struct MapPassOutput {
+// One rendered shadow cascade. Slots 0..2 are the world cascades (near -> far), slot 3 is the
+// optional Link-only cascade (a small box snapped to the player; combined additively in the
+// composite because it contains no world geometry).
+constexpr int kMaxCascades = 4;
+constexpr int kLinkCascade = 3;
+
+struct CascadeSlot {
     bool ready = false;
     WGPUTextureView shadowMap = nullptr;   // frame-pooled
     WGPUTextureView lightColor = nullptr;  // frame-pooled
     uint32_t mapSize = 0;
-    Mtx44 lightVp;             // world -> light receiver projection, row-major game convention
+    Mtx44 lightVp;            // world -> light receiver projection, row-major game convention
+    float texelWorld = 1.0f;  // world units per shadow-map texel (normal-offset scale)
+    float lightNear = 100.0f;  // ortho depth range actually used (bias normalization)
+    float lightFar = 60000.0f;
+};
+
+struct MapPassOutput {
+    bool ready = false;        // all requested world cascades rendered this frame
+    int cascadeCount = 0;      // world cascades rendered (1..3)
+    bool linkReady = false;    // slot kLinkCascade rendered
+    CascadeSlot cascades[kMaxCascades];
     float dirToLightWorld[3];  // toward the light, normalized
     float fade = 0.0f;
-    float lightNear = 100.0f;  // ortho depth range actually used this frame (bias normalization)
-    float lightFar = 60000.0f;
-    float texelWorld = 1.0f;   // world units per shadow-map texel (normal-offset scale)
 };
 
 MapPassOutput g_mapPass;
 bool g_replayingSceneLists = false;
-bool g_replayTwoSided = false;  // twoSidedCasters, latched for the current replay
+bool g_replayTwoSided = false;   // twoSidedCasters, latched for the current replay
+bool g_replayLinkOnly = false;   // Link cascade replay: only models anchored near the player draw
+float g_linkFilterCenter[3] = {};  // player position, world space
+float g_linkFilterRadiusSq = 0.0f;
 
 constexpr float kLightDistance = 30000.0f;
 constexpr float kLightNear = 100.0f;
@@ -181,29 +207,37 @@ using ClipperBoxClip = int (J3DUClipper::*)(f32 const (*)[4], Vec*, Vec*) const;
 constexpr ClipperSphereClip kClipperSphereClip = static_cast<ClipperSphereClip>(&J3DUClipper::clip);
 constexpr ClipperBoxClip kClipperBoxClip = static_cast<ClipperBoxClip>(&J3DUClipper::clip);
 
-// Mirror of the WGSL Uniforms struct (keep in sync with res/shadow.wgsl).
+// Mirror of the WGSL Uniforms struct (keep in sync with res/shadow.wgsl). Per-cascade values
+// are vec4-shaped (index 3 = the Link cascade); biases are normalized by each cascade's own
+// ortho depth range and texel_world differs per cascade, so acne control stays correct at
+// every cascade resolution.
 struct ShadowUniforms {
     float world_from_proj[16];
-    float light_vp[16];
-    float size[2];
-    float inv_size[2];
-    float bias;
+    float light_vp[kMaxCascades][16];
+    float map_size[4];      // per-cascade map size in texels (square)
+    float inv_map_size[4];
+    float bias[4];          // per-cascade constant bias (normalized depth units)
+    float slope_bias[4];    // per-cascade slope-scaled bias (normalized depth units)
+    float texel_world[4];   // per-cascade world units per texel
+    float pcf_taps[4];      // per-cascade PCF kernel radius (0 = single bilinear tap)
     float strength;
-    float pcf_taps;
     float contact_enabled;
-    uint32_t debug_mode;
-    float slope_bias;          // extra bias per unit of surface slope (normalized depth units)
     float normal_offset;       // receiver offset along the surface normal, in shadow texels
-    float texel_world;         // world units per shadow-map texel
-    float light_dir_world[3];  // toward the light, world space (slope/offset receivers)
     float map_enabled;         // 0 = screen-space-only mode (map bindings are stand-ins)
+    uint32_t debug_mode;
+    float cascade_count;       // world cascades bound (1..3)
+    float link_enabled;        // 1 = slot 3 is the Link cascade
+    float blend_frac;          // cascade cross-fade band, fraction of the light NDC half-extent
+    float light_dir_world[3];  // toward the light, world space (slope/offset receivers)
     float smoothed_normals;    // 1 = the smoothed-normal buffer is bound
     float camera_eye[3];       // camera world position (screen-space shadow distance fade)
     float sss_fade_start;      // world units; screen-space shadow full below this distance
     float sss_fade_end;        // world units; screen-space shadow gone beyond this distance
     float _pad0;
     float _pad1;
+    float _pad2;
 };
+static_assert(sizeof(ShadowUniforms) == 496);
 static_assert(sizeof(ShadowUniforms) % 16 == 0);
 
 // Mirror of the WGSL GenUniforms struct (keep in sync with res/normal_smooth.wgsl).
@@ -241,9 +275,9 @@ struct SssUniforms {
 static_assert(sizeof(SssUniforms) % 16 == 0);
 
 struct DrawPayload {
-    WGPUTextureView sceneDepth;    // frame-pooled
-    WGPUTextureView shadowMap;     // frame-pooled
-    WGPUTextureView lightColor;    // frame-pooled
+    WGPUTextureView sceneDepth;                 // frame-pooled
+    WGPUTextureView shadowMap[kMaxCascades];    // frame-pooled (depth stand-ins when unused)
+    WGPUTextureView lightColor;                 // far cascade's color (debug views)
     WGPUTextureView screenShadow;  // Bend SSS output (or the depth view when disabled)
     WGPUTextureView smoothNormal;  // smoothed-normal buffer (or the depth view when disabled)
     uint32_t uniform_offset;
@@ -331,7 +365,7 @@ bool get_bool_option(ConfigVarHandle handle, bool fallback) {
 }
 
 int64_t get_debug_mode() {
-    return std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 13);
+    return std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 14);
 }
 
 bool matrix_ready(const Mtx m) {
@@ -821,19 +855,25 @@ void on_draw(
     WGPURenderPipeline pipeline =
         data.debug_mode != 0 ? g_compositeDebugPipeline : g_compositePipeline;
     WGPUBindGroupLayout layout = data.debug_mode != 0 ? g_compositeDebugLayout : g_compositeLayout;
-    if (data.sceneDepth == nullptr || data.shadowMap == nullptr || data.lightColor == nullptr ||
+    if (data.sceneDepth == nullptr || data.lightColor == nullptr ||
         data.screenShadow == nullptr || data.smoothNormal == nullptr || pipeline == nullptr)
     {
         return;
     }
+    for (const WGPUTextureView view : data.shadowMap) {
+        if (view == nullptr) {
+            return;
+        }
+    }
 
-    WGPUBindGroupEntry entries[6] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+    WGPUBindGroupEntry entries[9] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
         WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
         WGPU_BIND_GROUP_ENTRY_INIT};
     entries[0].binding = 0;
     entries[0].textureView = data.sceneDepth;
     entries[1].binding = 1;
-    entries[1].textureView = data.shadowMap;
+    entries[1].textureView = data.shadowMap[0];
     entries[2].binding = 2;
     entries[2].buffer = ctx->uniform_buffer;
     entries[2].offset = data.uniform_offset;
@@ -844,9 +884,15 @@ void on_draw(
     entries[4].textureView = data.screenShadow;
     entries[5].binding = 5;
     entries[5].textureView = data.smoothNormal;
+    entries[6].binding = 6;
+    entries[6].textureView = data.shadowMap[1];
+    entries[7].binding = 7;
+    entries[7].textureView = data.shadowMap[2];
+    entries[8].binding = 8;
+    entries[8].textureView = data.shadowMap[3];
     WGPUBindGroupDescriptor bindGroupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bindGroupDesc.layout = layout;
-    bindGroupDesc.entryCount = 6;
+    bindGroupDesc.entryCount = 9;
     bindGroupDesc.entries = entries;
     WGPUBindGroup bindGroup = wgpuDeviceCreateBindGroup(ctx->device, &bindGroupDesc);
     if (bindGroup == nullptr) {
@@ -886,13 +932,35 @@ bool compute_light(float outDirToLight[3], float& outFade) {
     return outFade > 0.0f;
 }
 
+// Light camera around an explicit world-space focus point (cascades share the light direction
+// but differ in center, radius, and depth range).
+bool build_light_camera_core(
+    const cXyz& center, uint32_t mapSize, float radius, float lightDistance, LightCamera& out) {
+    if (!compute_light(out.dirToLight, out.fade)) {
+        return false;
+    }
+    out.lightNear = kLightNear;
+    out.lightFar = lightDistance + radius + 20000.0f;
+    const cXyz lightEye{center.x + out.dirToLight[0] * lightDistance,
+        center.y + out.dirToLight[1] * lightDistance,
+        center.z + out.dirToLight[2] * lightDistance};
+    const bool nearlyVertical = std::fabs(out.dirToLight[1]) > 0.99f;
+    cXyz up = nearlyVertical ? cXyz{0.0f, 0.0f, 1.0f} : cXyz{0.0f, 1.0f, 0.0f};
+
+    cMtx_lookAt(out.view, &lightEye, &center, &up, 0);
+    const float unitsPerTexel = (2.0f * radius) / static_cast<float>(mapSize);
+    out.view[0][3] = std::round(out.view[0][3] / unitsPerTexel) * unitsPerTexel;
+    out.view[1][3] = std::round(out.view[1][3] / unitsPerTexel) * unitsPerTexel;
+
+    C_MTXOrtho(out.ortho, radius, -radius, -radius, radius, out.lightNear, out.lightFar);
+    cMtx_concatProjView(out.ortho, out.view, out.vp);
+    return true;
+}
+
 bool build_light_camera(const Mtx cameraView, uint32_t mapSize, float radius, LightCamera& out) {
     Mtx cameraInvView;
     cMtx_inverse(cameraView, cameraInvView);
     if (!matrix_ready(cameraInvView)) {
-        return false;
-    }
-    if (!compute_light(out.dirToLight, out.fade)) {
         return false;
     }
 
@@ -912,22 +980,7 @@ bool build_light_camera(const Mtx cameraView, uint32_t mapSize, float radius, Li
     // Scale the light volume with the coverage radius so large radii stay inside the ortho depth
     // range (terrain headroom included); a fixed distance/far pair clips casters at wide coverage.
     const float lightDistance = std::max(kLightDistance, radius * 1.5f + 10000.0f);
-    out.lightNear = kLightNear;
-    out.lightFar = lightDistance + radius + 20000.0f;
-    const cXyz lightEye{center.x + out.dirToLight[0] * lightDistance,
-        center.y + out.dirToLight[1] * lightDistance,
-        center.z + out.dirToLight[2] * lightDistance};
-    const bool nearlyVertical = std::fabs(out.dirToLight[1]) > 0.99f;
-    cXyz up = nearlyVertical ? cXyz{0.0f, 0.0f, 1.0f} : cXyz{0.0f, 1.0f, 0.0f};
-
-    cMtx_lookAt(out.view, &lightEye, &center, &up, 0);
-    const float unitsPerTexel = (2.0f * radius) / static_cast<float>(mapSize);
-    out.view[0][3] = std::round(out.view[0][3] / unitsPerTexel) * unitsPerTexel;
-    out.view[1][3] = std::round(out.view[1][3] / unitsPerTexel) * unitsPerTexel;
-
-    C_MTXOrtho(out.ortho, radius, -radius, -radius, radius, out.lightNear, out.lightFar);
-    cMtx_concatProjView(out.ortho, out.view, out.vp);
-    return true;
+    return build_light_camera_core(center, mapSize, radius, lightDistance, out);
 }
 
 bool build_light_replay_projection(
@@ -1011,7 +1064,28 @@ HookAction on_cull_mode_pre(ModContext*, void* args, void*, void*) {
 // as the material — the whole register is rewritten, and stale counts would break alpha-tested
 // casters like foliage — but with culling forced off.
 HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
-    if (!g_replayingSceneLists || !g_replayTwoSided) {
+    if (!g_replayingSceneLists) {
+        return HOOK_CONTINUE;
+    }
+    // Link-cascade replay: draw only models anchored near the player. J3DShapePacket::
+    // prepareDraw sets j3dSys's current model right before every drawFast, so the owning
+    // J3DModel is reliably available here. Filtering by the model's base translation keeps
+    // Link's body + equipment (all anchored at his position, and characters right next to
+    // him) while skipping world geometry, whose models anchor far away or at the origin.
+    if (g_replayLinkOnly) {
+        J3DModel* model = j3dSys.getModel();
+        if (model == nullptr) {
+            return HOOK_SKIP_ORIGINAL;
+        }
+        const Mtx& base = model->getBaseTRMtx();
+        const float dx = base[0][3] - g_linkFilterCenter[0];
+        const float dy = base[1][3] - g_linkFilterCenter[1];
+        const float dz = base[2][3] - g_linkFilterCenter[2];
+        if (dx * dx + dy * dy + dz * dz > g_linkFilterRadiusSq) {
+            return HOOK_SKIP_ORIGINAL;
+        }
+    }
+    if (!g_replayTwoSided) {
         return HOOK_CONTINUE;
     }
     const J3DShape* shape = dusk::mods::arg<const J3DShape*>(args, 0);
@@ -1120,36 +1194,24 @@ void on_scene_after_terrain(ModContext*, const GfxStageContext* stageCtx, void*)
     render_shadow_map(replayView, replayProjectionMtx, replayProjection);
 }
 
-// Game thread, after the draw handlers have populated next frame's scene lists: replay opaque scene
-// geometry from the light's point of view.
-void render_shadow_map(
-    const Mtx replayView, const Mtx44 replayProjectionMtx, const f32 replayProjection[7]) {
-    if (g_mapPass.ready || !get_bool_option(g_cvarEnabled, true) ||
-        !get_bool_option(g_cvarShadowMap, true) || indoor_blocked())
-    {
-        return;
-    }
-    const int64_t debugMode = get_debug_mode();
-    if (debugMode == 9) {
-        return;
-    }
-    if (!matrix_ready(replayView)) {
-        return;
-    }
-    Mtx replayViewMtx;
-    cMtx_copy(replayView, replayViewMtx);
+// The Link cascade replays only the lists the player's models enter (body/equipment go to
+// Dark and Opa, held items to Middle) - the position filter in on_shape_draw_pre skips
+// everything else, and skipping the BG lists entirely saves their traversal.
+void draw_link_scene_lists() {
+    dComIfGd_drawOpaListMiddle();
+    dComIfGd_drawOpaList();
+    dComIfGd_drawOpaListDark();
+}
 
-    const uint32_t mapSize = 1024u << std::clamp<int64_t>(get_int_option(g_cvarMapSize, 2), 0, 3);
-    const bool cameraReplayDebug = debugMode == 10;
-    const float radius =
-        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarBoxRadius, 8000), 1000, 30000));
-    LightCamera lightCamera{};
-    if (!build_light_camera(replayViewMtx, mapSize, radius, lightCamera)) {
-        return;
-    }
+// Game thread: one offscreen light-space replay of the scene draw lists into `out`. Every
+// cascade runs the full save-replay-resolve bracket so the game camera and GX state are
+// clean between passes.
+bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
+    const f32 replayProjection[7], bool cameraReplayDebug, uint32_t mapSize, float radius,
+    bool linkOnly, CascadeSlot& out) {
     Mtx44 lightReplayProjection;
     if (!build_light_replay_projection(lightCamera, replayViewMtx, lightReplayProjection)) {
-        return;
+        return false;
     }
     f32 savedProjection[7];
     GXGetProjectionv(savedProjection);
@@ -1168,24 +1230,17 @@ void render_shadow_map(
         GXSetScissor(savedScissor[0], savedScissor[1], savedScissor[2], savedScissor[3]);
         dKy_setLight();
     };
-    auto set_replay_camera = [&]() {
-        j3dSys.setViewMtx(replayViewMtx);
-        if (cameraReplayDebug) {
-            GXSetProjectionv(replayProjection);
-        } else {
-            GXSetProjectionFull(lightReplayProjection);
-        }
-        dKy_setLight();
-    };
-    if (!draw_lists_ready()) {
-        return;
-    }
     if (svc_gfx->create_pass(mod_ctx, mapSize, mapSize) != MOD_OK) {
-        return;
+        return false;
     }
     J3DShape::resetVcdVatCache();
 
-    set_replay_camera();
+    j3dSys.setViewMtx(replayViewMtx);
+    if (cameraReplayDebug) {
+        GXSetProjectionv(replayProjection);
+    } else {
+        GXSetProjectionFull(lightReplayProjection);
+    }
     GXSetViewport(0.0f, 0.0f, static_cast<float>(mapSize), static_cast<float>(mapSize), 0.0f, 1.0f);
     GXSetViewportRender(
         0.0f, 0.0f, static_cast<float>(mapSize), static_cast<float>(mapSize), 0.0f, 1.0f);
@@ -1195,10 +1250,16 @@ void render_shadow_map(
     GXSetAlphaUpdate(GX_TRUE);
     GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
     g_replayTwoSided = get_bool_option(g_cvarTwoSidedCasters, true);
+    g_replayLinkOnly = linkOnly;
     {
         replay_scope replay;
-        draw_opaque_scene_lists();
+        if (linkOnly) {
+            draw_link_scene_lists();
+        } else {
+            draw_opaque_scene_lists();
+        }
     }
+    g_replayLinkOnly = false;
     j3dSys.reinitGX();
     J3DShape::resetVcdVatCache();
     restore_game_camera();
@@ -1210,24 +1271,119 @@ void render_shadow_map(
     if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) != MOD_OK ||
         resolved.color == nullptr || resolved.depth == nullptr)
     {
-        return;
+        return false;
     }
 
     j3dSys.reinitGX();
     J3DShape::resetVcdVatCache();
     restore_game_camera();
 
-    g_mapPass.lightColor = resolved.color;
-    g_mapPass.shadowMap = resolved.depth;
-    g_mapPass.mapSize = mapSize;
-    g_mapPass.lightNear = lightCamera.lightNear;
-    g_mapPass.lightFar = lightCamera.lightFar;
-    g_mapPass.texelWorld = (2.0f * radius) / static_cast<float>(mapSize);
-    copy_projection(lightCamera.vp, g_mapPass.lightVp);
-    std::memcpy(
-        g_mapPass.dirToLightWorld, lightCamera.dirToLight, sizeof(g_mapPass.dirToLightWorld));
-    g_mapPass.fade = lightCamera.fade;
+    out.lightColor = resolved.color;
+    out.shadowMap = resolved.depth;
+    out.mapSize = mapSize;
+    out.lightNear = lightCamera.lightNear;
+    out.lightFar = lightCamera.lightFar;
+    out.texelWorld = (2.0f * radius) / static_cast<float>(mapSize);
+    copy_projection(lightCamera.vp, out.lightVp);
+    out.ready = true;
+    return true;
+}
+
+// Game thread, after the draw handlers have populated next frame's scene lists: replay opaque
+// scene geometry from the light's point of view - once per cascade (near -> far boxes around
+// the camera, radii split from the Coverage setting), plus the optional Link-only cascade (a
+// small box snapped to the player, position-filtered to his models).
+void render_shadow_map(
+    const Mtx replayView, const Mtx44 replayProjectionMtx, const f32 replayProjection[7]) {
+    if (g_mapPass.ready || !get_bool_option(g_cvarEnabled, true) ||
+        !get_bool_option(g_cvarShadowMap, true) || indoor_blocked())
+    {
+        return;
+    }
+    const int64_t debugMode = get_debug_mode();
+    if (debugMode == 9) {
+        return;
+    }
+    if (!matrix_ready(replayView)) {
+        return;
+    }
+    if (!draw_lists_ready()) {
+        return;
+    }
+    (void)replayProjectionMtx;
+    Mtx replayViewMtx;
+    cMtx_copy(replayView, replayViewMtx);
+
+    const uint32_t mapSize = 1024u << std::clamp<int64_t>(get_int_option(g_cvarMapSize, 2), 0, 3);
+    const bool cameraReplayDebug = debugMode == 10;
+    const float coverage =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarBoxRadius, 8000), 1000, 30000));
+
+    // Cascade radii from the split percentages (near < mid < far = full coverage). The camera
+    // replay debug view renders a single full-coverage cascade.
+    int count =
+        static_cast<int>(std::clamp<int64_t>(get_int_option(g_cvarCascadeCount, 2), 0, 2)) + 1;
+    if (cameraReplayDebug) {
+        count = 1;
+    }
+    const float nearPct =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarCascadeNearPct, 12), 4, 40)) /
+        100.0f;
+    const float midPct =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarCascadeMidPct, 35), 15, 70)) /
+        100.0f;
+    float radii[3] = {coverage, coverage, coverage};
+    if (count == 2) {
+        radii[0] = coverage * midPct;
+    } else if (count == 3) {
+        radii[0] = coverage * std::min(nearPct, midPct * 0.9f);
+        radii[1] = coverage * midPct;
+    }
+
+    for (int i = 0; i < count; ++i) {
+        LightCamera lightCamera{};
+        if (!build_light_camera(replayViewMtx, mapSize, radii[i], lightCamera) ||
+            !replay_cascade(lightCamera, replayViewMtx, replayProjection, cameraReplayDebug,
+                mapSize, radii[i], false, g_mapPass.cascades[i]))
+        {
+            g_mapPass = {};
+            return;
+        }
+        std::memcpy(g_mapPass.dirToLightWorld, lightCamera.dirToLight,
+            sizeof(g_mapPass.dirToLightWorld));
+        g_mapPass.fade = lightCamera.fade;
+    }
+    g_mapPass.cascadeCount = count;
     g_mapPass.ready = true;
+
+    // Link cascade: a small high-resolution box snapped to the player. Purely additive in the
+    // composite (it contains no world geometry), so a failed render just drops the extra detail.
+    if (!cameraReplayDebug && get_bool_option(g_cvarLinkCascade, true)) {
+        daPy_py_c* player = dComIfGp_getLinkPlayer();
+        if (player != nullptr) {
+            const float linkRadius = static_cast<float>(
+                std::clamp<int64_t>(get_int_option(g_cvarLinkCoverage, 300), 100, 2000));
+            const uint32_t linkMapSize =
+                1024u << std::clamp<int64_t>(get_int_option(g_cvarLinkMapSize, 2), 0, 3);
+            cXyz center = player->current.pos;
+            center.y += linkRadius * 0.35f;
+            g_linkFilterCenter[0] = player->current.pos.x;
+            g_linkFilterCenter[1] = player->current.pos.y;
+            g_linkFilterCenter[2] = player->current.pos.z;
+            const float filterRadius = linkRadius * 2.0f;
+            g_linkFilterRadiusSq = filterRadius * filterRadius;
+            LightCamera lightCamera{};
+            // A short light distance keeps the ortho depth range tight around the player for
+            // maximum depth discrimination on self-shadowing.
+            if (build_light_camera_core(
+                    center, linkMapSize, linkRadius, linkRadius * 4.0f + 2000.0f, lightCamera) &&
+                replay_cascade(lightCamera, replayViewMtx, replayProjection, false, linkMapSize,
+                    linkRadius, true, g_mapPass.cascades[kLinkCascade]))
+            {
+                g_mapPass.linkReady = true;
+            }
+        }
+    }
 }
 
 // Game thread: build the Bend dispatch list for this frame's light and queue the SSS compute
@@ -1359,8 +1515,13 @@ void composite_map_pass(int64_t debugMode) {
     // Indoors, the shadow map is suppressed (it reads as fully shadowed under a sky-light
     // map) but the screen-space shadows stay - so indoors is just screen-space-only mode.
     const bool mapWanted = get_bool_option(g_cvarShadowMap, true) && !indoor_blocked();
-    const bool mapReady =
-        mapWanted && mapPass.ready && mapPass.shadowMap != nullptr && mapPass.lightColor != nullptr;
+    bool mapReady = mapWanted && mapPass.ready && mapPass.cascadeCount > 0;
+    for (int i = 0; mapReady && i < mapPass.cascadeCount; ++i) {
+        mapReady = mapPass.cascades[i].ready && mapPass.cascades[i].shadowMap != nullptr &&
+                   mapPass.cascades[i].lightColor != nullptr;
+    }
+    const bool linkReady = mapReady && mapPass.linkReady &&
+                           mapPass.cascades[kLinkCascade].shadowMap != nullptr;
     if (mapWanted && !mapReady) {
         // The map should have rendered but didn't (e.g. a lost frame): bail rather than
         // flash the screen-space-only look for one frame.
@@ -1421,34 +1582,48 @@ void composite_map_pass(int64_t debugMode) {
 
     ShadowUniforms uniforms{};
     std::memcpy(uniforms.world_from_proj, camera.world_from_proj, sizeof(uniforms.world_from_proj));
-    if (mapReady) {
-        store_column_major(mapPass.lightVp, uniforms.light_vp);
+    // Bias values are configured in world units along the light direction and normalized by
+    // each cascade's own ortho depth range; texel_world and the PCF kernel are also per
+    // cascade (a fixed kernel is automatically softer in world units on far cascades, and
+    // Far Softening widens it on top of that to hide their lower effective resolution).
+    const float biasWorld =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarBias, 55), 0, 200));
+    const float slopeBiasWorld =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarSlopeBias, 30), 0, 200));
+    const int64_t pcfBase = std::clamp<int64_t>(get_int_option(g_cvarPcf, 1), 0, 3);
+    const int64_t pcfFarStep = std::clamp<int64_t>(get_int_option(g_cvarPcfFarStep, 1), 0, 2);
+    for (int i = 0; i < kMaxCascades; ++i) {
+        const CascadeSlot& slot = mapPass.cascades[i];
+        const bool slotReady =
+            mapReady && (i < mapPass.cascadeCount || (i == kLinkCascade && linkReady));
+        if (slotReady) {
+            store_column_major(slot.lightVp, uniforms.light_vp[i]);
+        }
+        const float lightRange = std::max(slot.lightFar - slot.lightNear, 1.0f);
+        uniforms.bias[i] = biasWorld / lightRange;
+        uniforms.slope_bias[i] = slopeBiasWorld / lightRange;
+        uniforms.texel_world[i] = slot.texelWorld;
+        uniforms.map_size[i] = slotReady ? static_cast<float>(slot.mapSize) : 1.0f;
+        uniforms.inv_map_size[i] = 1.0f / uniforms.map_size[i];
+        // The Link cascade is near-field detail: it uses the base kernel, not the far step.
+        const int64_t step = i == kLinkCascade ? 0 : pcfFarStep * i;
+        uniforms.pcf_taps[i] = static_cast<float>(std::clamp<int64_t>(pcfBase + step, 0, 3));
     }
-    // Bias values are configured in world units along the light direction and normalized by the
-    // ortho depth range actually used for this frame's map.
-    const float lightRange = std::max(mapPass.lightFar - mapPass.lightNear, 1.0f);
-    uniforms.bias =
-        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarBias, 55), 0, 200)) /
-        lightRange;
-    uniforms.slope_bias =
-        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarSlopeBias, 30), 0, 200)) /
-        lightRange;
     uniforms.normal_offset =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarNormalOffset, 100), 0, 300)) /
         100.0f;
-    uniforms.texel_world = mapPass.texelWorld;
     std::memcpy(uniforms.light_dir_world, dirToLight, sizeof(uniforms.light_dir_world));
     uniforms.map_enabled = mapReady ? 1.0f : 0.0f;
+    uniforms.cascade_count = static_cast<float>(std::max(mapPass.cascadeCount, 1));
+    uniforms.link_enabled = linkReady ? 1.0f : 0.0f;
+    uniforms.blend_frac =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarCascadeBlend, 20), 5, 40)) /
+        100.0f;
     uniforms.smoothed_normals = normalsReady ? 1.0f : 0.0f;
-    uniforms.size[0] = mapReady ? static_cast<float>(mapPass.mapSize) : 1.0f;
-    uniforms.size[1] = uniforms.size[0];
-    uniforms.inv_size[0] = 1.0f / uniforms.size[0];
-    uniforms.inv_size[1] = 1.0f / uniforms.size[1];
     uniforms.strength =
         fade *
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarStrength, 45), 0, 100)) /
         100.0f;
-    uniforms.pcf_taps = static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarPcf, 1), 0, 3));
     uniforms.contact_enabled = sssReady ? 1.0f : 0.0f;
     // Screen-space shadow distance fade: ease the SSS term out with world distance so distant,
     // fogged-out geometry isn't full-strength shadowed. Off -> push the band past the far
@@ -1470,13 +1645,23 @@ void composite_map_pass(int64_t debugMode) {
         return;
     }
     // Every binding needs a texture view; the depth snapshot stands in for the map/light
-    // views in screen-space-only mode and for the SSS view when the trace didn't run (the
-    // shader never reads the stand-ins: map_enabled / contact_enabled gate them).
-    const DrawPayload payload{resolved.depth, mapReady ? mapPass.shadowMap : resolved.depth,
-        mapReady ? mapPass.lightColor : resolved.depth,
-        sssReady ? g_sssTarget.view : resolved.depth,
-        normalsReady ? g_normalTargets.views[0] : resolved.depth, uniformRange.offset,
-        uniformRange.size, static_cast<uint32_t>(debugMode)};
+    // views in screen-space-only mode, for cascades that didn't render, and for the SSS view
+    // when the trace didn't run (the shader never reads the stand-ins: map_enabled /
+    // cascade_count / link_enabled / contact_enabled gate them).
+    DrawPayload payload{};
+    payload.sceneDepth = resolved.depth;
+    for (int i = 0; i < kMaxCascades; ++i) {
+        const bool slotReady =
+            mapReady && (i < mapPass.cascadeCount || (i == kLinkCascade && linkReady));
+        payload.shadowMap[i] = slotReady ? mapPass.cascades[i].shadowMap : resolved.depth;
+    }
+    payload.lightColor =
+        mapReady ? mapPass.cascades[mapPass.cascadeCount - 1].lightColor : resolved.depth;
+    payload.screenShadow = sssReady ? g_sssTarget.view : resolved.depth;
+    payload.smoothNormal = normalsReady ? g_normalTargets.views[0] : resolved.depth;
+    payload.uniform_offset = uniformRange.offset;
+    payload.uniform_size = uniformRange.size;
+    payload.debug_mode = static_cast<uint32_t>(debugMode);
     svc_gfx->push_draw(mod_ctx, g_drawType, &payload, sizeof(payload));
 }
 
@@ -1563,15 +1748,37 @@ ModResult build_controls_tab(
         "game's own character shadows come back.");
     static const char* kMapSizes[] = {"1024", "2048", "4096", "8192"};
     add_select(left, "Map Size", g_cvarMapSize, kMapSizes, 4,
-        "Shadow map resolution. Larger is sharper and slower.");
+        "Resolution of EACH cascade's shadow map. Larger is sharper and slower; with cascades "
+        "the near cascade concentrates its whole map on a small area, so 4096 here beats a "
+        "single 8192 map at wide coverage.");
     add_number(left, "Coverage", g_cvarBoxRadius, 1000, 30000, 500, nullptr,
-        "Radius of the shadowed area around the camera, in world units. Smaller is sharper for "
-        "the same map size; the light volume scales automatically. Screen-space shadows fill in "
-        "detail beyond the coverage, so keep this small.");
+        "Radius of the whole shadowed area around the camera, in world units (the FAR "
+        "cascade). The near and mid cascades split this per the settings below, so large "
+        "values no longer blur nearby shadows.");
+    static const char* kCascadeCounts[] = {"1", "2", "3"};
+    add_select(left, "Cascades", g_cvarCascadeCount, kCascadeCounts, 3,
+        "Number of shadow map cascades: nested boxes around the camera, each with its own "
+        "full-resolution map, so nearby shadows stay sharp while coverage stays wide. Each "
+        "cascade re-renders the scene from the light, so more cascades cost more. 1 = the old "
+        "single-map behavior.");
+    add_number(left, "Near Split", g_cvarCascadeNearPct, 4, 40, 1, "%",
+        "Radius of the NEAR cascade as a percentage of Coverage (3-cascade mode). Smaller = "
+        "sharper close-up shadows but the mid cascade takes over sooner.");
+    add_number(left, "Mid Split", g_cvarCascadeMidPct, 15, 70, 5, "%",
+        "Radius of the MID cascade as a percentage of Coverage. Keep roughly the geometric "
+        "middle between Near Split and 100% so the sharpness steps are even.");
+    add_number(left, "Cascade Blend", g_cvarCascadeBlend, 5, 40, 5, "%",
+        "Width of the cross-fade band at each cascade boundary, as a fraction of the cascade's "
+        "extent. Wider = smoother, less visible transitions; costs extra shadow samples only "
+        "inside the bands. Use the Cascades debug view to see the boundaries.");
     static const char* kPcfOptions[] = {"Off", "3x3", "5x5", "7x7"};
     add_select(left, "Soft Shadows", g_cvarPcf, kPcfOptions, 4,
-        "Shadow-map edge softening (percentage-closer filtering). Softens edges and hides "
-        "stair-steps on steep terrain.");
+        "Shadow-map edge softening (percentage-closer filtering) for the NEAR cascade (and "
+        "the Link cascade). Softens edges and hides stair-steps on steep terrain.");
+    static const char* kFarSoftOptions[] = {"Same", "+1 step", "+2 steps"};
+    add_select(left, "Far Softening", g_cvarPcfFarStep, kFarSoftOptions, 3,
+        "Extra softening per cascade step beyond the near one. Far cascades cover more world "
+        "per texel, so extra filtering hides their stair-stepping; +1 step is a good default.");
     add_number(left, "Bias", g_cvarBias, 0, 200, 5, nullptr,
         "Constant depth bias in world units. Raise to remove shadow-map acne; lower to reduce "
         "peter-panning. Prefer Slope Bias and Normal Offset for acne on sloped surfaces - they "
@@ -1600,6 +1807,22 @@ ModResult build_controls_tab(
         "Turns the shadow MAP off in interior spaces (which read as fully shadowed under a "
         "sky-light map) and restores the game's own shadows there. Screen-space shadows still "
         "run indoors.");
+
+    // Link Cascade: the optional player-focused high-resolution map.
+    svc_ui->pane_add_section(mod_ctx, left, "Link Cascade");
+    add_toggle(left, "Link Shadows", g_cvarLinkCascade,
+        "A dedicated extra shadow map covering just Link (and anything right next to him) at "
+        "very high effective resolution - crisp self-shadowing on his model regardless of the "
+        "Coverage setting. Adds one more scene replay per frame, but it only draws the player's "
+        "models. Combines on top of the regular cascades; requires the shadow map to be on.");
+    static const char* kLinkMapSizes[] = {"1024", "2048", "4096", "8192"};
+    add_select(left, "Link Map Size", g_cvarLinkMapSize, kLinkMapSizes, 4,
+        "Resolution of the Link cascade, independent of the main Map Size. 4096 over a "
+        "300-unit box is roughly 40x the texel density of an 8192 map at 16000 coverage.");
+    add_number(left, "Link Coverage", g_cvarLinkCoverage, 100, 2000, 50, nullptr,
+        "Radius of the Link cascade's box around the player, in world units. Smaller is "
+        "sharper; larger catches more of what he's carrying/riding and neighbors standing "
+        "close. 300 fits Link with gear.");
 
     // Screen Space Shadows: the Bend depth-trace term and everything that only affects it.
     svc_ui->pane_add_section(mod_ctx, left, "Screen Space Shadows");
@@ -1645,20 +1868,21 @@ ModResult build_controls_tab(
     svc_ui->pane_add_section(mod_ctx, left, "Debug");
     static const char* kDebugOptions[] = {"Off", "Shadow Map", "Shadow Factor", "Occlusion",
         "Light UV", "Compare Sign", "Depth Values", "Receiver Range", "Bounds", "Light View",
-        "Camera Replay", "Screen Shadows", "SSS Edge Mask", "Receiver Normal"};
-    add_select(left, "Debug View", g_cvarDebugView, kDebugOptions, 14,
-        "Shadow Map: light-space depth buffer<br/>Shadow Factor: final "
-        "darkening term<br/>Occlusion: map comparison result<br/>Light UV: receiver "
-        "projection coverage<br/>Compare Sign: current comparison in red and opposite "
-        "comparison in blue<br/>Depth Values: receiver depth in red and map depth in green<br/>"
-        "Receiver Range: beyond-far in red, valid depth in green, and before-near in blue<br/>"
-        "Bounds: valid X in red, valid Y in green, and valid depth in blue<br/>Light View: "
-        "renders the game world directly from the light camera<br/>Camera Replay: "
-        "captures the same draw-list replay from the gameplay camera<br/>Screen Shadows: "
-        "the Bend SSS visibility buffer (white = lit)<br/>SSS Edge Mask: the SSS edge "
-        "detector, for tuning SSS Edge Threshold<br/>Receiver Normal: the smoothed surface "
-        "direction Slope Bias / Normal Offset act on - facets should melt together as "
-        "Normal Smoothing rises");
+        "Camera Replay", "Screen Shadows", "SSS Edge Mask", "Receiver Normal", "Cascades"};
+    add_select(left, "Debug View", g_cvarDebugView, kDebugOptions, 15,
+        "Shadow Map: the cascade depth buffers tiled 2x2 (near / mid / far / Link)<br/>"
+        "Shadow Factor: final darkening term<br/>Occlusion: map comparison result<br/>Light "
+        "UV: receiver projection coverage in the selected cascade<br/>Compare Sign: current "
+        "comparison in red and opposite comparison in blue<br/>Depth Values: receiver depth "
+        "in red and map depth in green<br/>Receiver Range: beyond-far in red, valid depth in "
+        "green, and before-near in blue<br/>Bounds: valid X in red, valid Y in green, and "
+        "valid depth in blue<br/>Light View: renders the game world directly from the light "
+        "camera<br/>Camera Replay: captures the same draw-list replay from the gameplay "
+        "camera (single cascade)<br/>Screen Shadows: the Bend SSS visibility buffer (white = "
+        "lit)<br/>SSS Edge Mask: the SSS edge detector, for tuning SSS Edge Threshold<br/>"
+        "Receiver Normal: the smoothed surface direction Slope Bias / Normal Offset act on"
+        "<br/>Cascades: which cascade shades each pixel (red = near, green = mid, blue = "
+        "far, white overlay = Link cascade active) - tune the splits and blend with this");
     return MOD_OK;
 }
 
@@ -1836,6 +2060,38 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
+    result = register_int_option("cascadeCount", 2, g_cvarCascadeCount, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_int_option("cascadeNearPct", 12, g_cvarCascadeNearPct, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_int_option("cascadeMidPct", 35, g_cvarCascadeMidPct, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_int_option("cascadeBlend", 20, g_cvarCascadeBlend, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_int_option("pcfFarStep", 1, g_cvarPcfFarStep, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_bool_option("linkCascade", true, g_cvarLinkCascade, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_int_option("linkMapSize", 2, g_cvarLinkMapSize, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_int_option("linkCoverage", 300, g_cvarLinkCoverage, error);
+    if (result != MOD_OK) {
+        return result;
+    }
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to query device info");
     }
@@ -2005,6 +2261,10 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         g_cvarSssLength = g_cvarSssIgnoreEdges = 0;
     g_cvarSssFade = g_cvarSssFadeStart = g_cvarSssFadeEnd = 0;
     g_cvarIndoorDisable = g_cvarTwoSidedCasters = 0;
+    g_cvarCascadeCount = g_cvarCascadeNearPct = g_cvarCascadeMidPct = g_cvarCascadeBlend = 0;
+    g_cvarPcfFarStep = g_cvarLinkCascade = g_cvarLinkMapSize = g_cvarLinkCoverage = 0;
+    g_replayLinkOnly = false;
+    g_linkFilterRadiusSq = 0.0f;
     g_drawType = g_sssComputeType = g_normalComputeType = g_sceneBeginHook =
         g_sceneAfterTerrainHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;
     g_controlsWindow = 0;

@@ -7,11 +7,11 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   depth-aware compositing. **Service-only**: it uses only mod-API services (gfx, camera,
   config, ui, resource, log) — it must NOT include game headers or call game code, which is
   what lets it survive game updates without a rebuild.
-- **`mods/realtime_sun_shadows/`** — "Realtime Sun Shadows": a real-geometry sun/moon shadow
-  map (game draw-list replay into a light-space depth pass) with PCF, slope-scaled bias,
-  normal-offset receiver, two-sided casters, Bend-style screen-space shadows, and indoor
-  auto-disable. **Game-linked**: it includes game headers and hooks game functions, so it is
-  coupled to the pinned game build.
+- **`mods/realtime_sun_shadows/`** — "Realtime Sun Shadows": real-geometry sun/moon cascaded
+  shadow maps (game draw-list replay into up to 3 nested light-space depth passes, plus an
+  optional Link-only cascade) with PCF, slope-scaled bias, normal-offset receiver, two-sided
+  casters, Bend-style screen-space shadows, and indoor auto-disable. **Game-linked**: it
+  includes game headers and hooks game functions, so it is coupled to the pinned game build.
 - **`mods/deferred_fog/`** — "Deferred Fog": suppresses the game's per-draw fog during the
   opaque world lists and re-applies it (bit-exact aurora fog math) as a fullscreen pass after
   every mod's `SCENE_AFTER_OPAQUE` composites, so AO/shadows darken surfaces under the fog

@@ -5,22 +5,40 @@ functions, and (on Windows) links the platform release's `dusklight.lib`.
 
 ## Architecture (based on the upstream `shadow_mod` demo)
 
-1. **Light camera** (`build_light_camera`, game thread at `GFX_STAGE_SCENE_BEGIN`): sun/moon
-   world position from `sun_moon_offset(daytime)`; if the sun is below the horizon, use
+1. **Light cameras** (`build_light_camera` / `build_light_camera_core`): sun/moon world
+   position from `sun_moon_offset(daytime)`; if the sun is below the horizon, use
    daytime+180° (the moon). Horizon fade `clamp((dirY-0.05)/0.15)` softens shadows at
-   dawn/dusk. Ortho box centered near the player with camera-forward lookahead, snapped to
-   whole shadow-map texels (kills crawling); near/far extents scale with the coverage radius.
-2. **Caster capture**: replay the game's own opaque draw lists (`dComIfGd_drawOpaList*`)
-   into a `create_pass` offscreen pass with `GXSetProjectionFull(lightReplayProjection)` +
-   `j3dSys.setViewMtx` — the game re-renders the world from the light, animation included.
-   During replay, hooks bypass `J3DUClipper::clip` (sphere + box overloads) so casters
-   outside the *camera* frustum still render, and skip `GXCopyTex`. `resolve_pass` depth =
-   the shadow map (reversed light depth: 1 = near light).
+   dawn/dusk. One ortho box **per cascade**: nested world boxes centered near the player
+   with camera-forward lookahead (radii = Coverage × the split percentages, near → far),
+   each snapped to whole texels of its own map (kills crawling); near/far extents scale
+   with each radius. The optional **Link cascade** is a small box (`linkCoverage`) snapped
+   to the player's position with a deliberately short light distance for maximum depth
+   discrimination.
+2. **Caster capture** (`replay_cascade`, once per cascade at `SCENE_AFTER_TERRAIN`): replay
+   the game's own opaque draw lists (`dComIfGd_drawOpaList*`) into a `create_pass` offscreen
+   pass with `GXSetProjectionFull(lightReplayProjection)` + `j3dSys.setViewMtx` — the game
+   re-renders the world from the light, animation included. During replay, hooks bypass
+   `J3DUClipper::clip` (sphere + box overloads) so casters outside the *camera* frustum
+   still render, and skip `GXCopyTex`. `resolve_pass` depth = that cascade's shadow map
+   (reversed light depth: 1 = near light). Each cascade is a full save-replay-resolve
+   bracket, so cost scales with cascade count. The Link cascade replays only the lists the
+   player's models enter (Middle/Opa/Dark) with a position filter in the
+   `J3DShape::drawFast` pre-hook: `J3DShapePacket::prepareDraw` sets `j3dSys`'s current
+   model right before every drawFast, so the filter reads `j3dSys.getModel()` and skips
+   models whose base translation is beyond 2× `linkCoverage` from the player — Link's body
+   and equipment all anchor at his position, world geometry anchors far away or at the
+   origin. No private `daAlink_c` fields are touched.
 3. **Composite** (`SCENE_AFTER_OPAQUE`, `res/shadow.wgsl`): unproject scene depth to world,
-   reconstruct a world normal from depth (side-selected crosses), apply slope-scaled bias
-   (`bias_eff = bias + slope_bias * tan_t`, tan clamped at 4) and a normal-offset receiver
-   (`world + n * normal_offset * texel_world`), project into light space, PCF over
-   hardware-bilinear comparison taps, combine with the screen-space shadow term (below),
+   reconstruct a world normal from depth (side-selected crosses), pick the sharpest cascade
+   whose box contains the receiver, apply that cascade's slope-scaled bias
+   (`bias_eff = bias + slope_bias * tan_t`, tan clamped at 4; biases normalized per cascade
+   against its own light range) and normal-offset receiver
+   (`world + n * normal_offset * texel_world[cascade]`), PCF over hardware-bilinear
+   comparison taps (kernel = base + Far Softening × cascade index). Inside the outer
+   `blend_frac` band of a cascade's box the result cross-fades to the next cascade so the
+   resolution step never shows as a line. The Link cascade is evaluated separately and
+   combined with `max()` — its map contains only the player, so it can only add occlusion,
+   never remove world shadows. Then combine with the screen-space shadow term (below) and
    darken the scene. The composite runs right after the opaque scene — before translucency
    and, critically, before the game's bloom filter (`m_Do_graphic.cpp` draws bloom between
    `SCENE_AFTER_OPAQUE` and `FRAME_BEFORE_HUD`; compositing at `FRAME_BEFORE_HUD` darkened
@@ -48,10 +66,12 @@ functions, and (on Windows) links the platform release's `dusklight.lib`.
    indoors. Indoors is therefore just "screen-space-only mode" triggered automatically.
 
 The controls are grouped **General** (Enabled, Strength — affect both methods) / **Shadow
-Map** (map toggle, size, coverage, PCF, bias/slope/offset/normal-smoothing, clipping,
-two-sided, disable-map-indoors) / **Screen Space Shadows** (toggle, thickness, edge, contrast,
-ignore-edges, distance fade) / **Debug**. Anything under "Shadow Map" is inert when the map is
-off; anything under "Screen Space Shadows" is inert when SSS is off.
+Map** (map toggle, size, coverage, cascades/splits/blend, PCF + far softening,
+bias/slope/offset/normal-smoothing, clipping, two-sided, disable-map-indoors) / **Link
+Cascade** (toggle, its own map size, its coverage) / **Screen Space Shadows** (toggle,
+thickness, edge, contrast, shadow length, ignore-edges, distance fade) / **Debug**. Anything
+under "Shadow Map" or "Link Cascade" is inert when the map is off; anything under "Screen
+Space Shadows" is inert when SSS is off.
 
 ## The original issues and where their fixes live
 
@@ -63,9 +83,9 @@ off; anything under "Screen Space Shadows" is inert when SSS is off.
    un-negated game sun/moon. If direction ever looks wrong again, check UV convention
    *first* (`0.5 - ndc.y * 0.5` — WebGPU rasterizes +Y NDC to texture row 0).
 3. **Interiors fully shadowed** → the `dKy_Indoor_check` gate above.
-4. **Draw distance** → coverage radius up to 30000 with light extents scaling; the real fix
-   is cascaded shadow maps (planned next major increment — near cascade sharp, far cascade
-   coarse).
+4. **Draw distance** → cascaded shadow maps: up to 3 nested boxes (radii = Coverage × the
+   split percentages) each with a full-resolution map, so 16000+ coverage no longer blurs
+   nearby shadows, plus the optional Link cascade for player self-shadow detail.
 5. **Shadows popping by camera angle** (Temple of Time ceiling, Lake Hylia mountains) →
    the `J3DUClipper` bypass during replay (the game culls against the *camera* frustum;
    casters behind/above the camera must still cast).
@@ -88,8 +108,15 @@ off; anything under "Screen Space Shadows" is inert when SSS is off.
 |---|---|---|
 | `effectEnabled` | on | master toggle |
 | `shadowMapEnabled` | on | off = screen-space-only mode: no map render/composite, the game's own real/blob shadows return (the skip hooks go inactive), the Bend SSS term still applies |
-| `mapSize` | 2 | shadow map: 0=1024 1=2048 2=4096 3=8192 |
-| `boxRadius` | 8000 | coverage radius in world units (1000–30000) |
+| `mapSize` | 2 | EACH world cascade's map: 0=1024 1=2048 2=4096 3=8192 |
+| `boxRadius` | 8000 | full coverage radius in world units (1000–30000) = the FAR cascade |
+| `cascadeCount` | 2 | world cascades minus one (UI select "1/2/3"): 0=single map, 2=three cascades |
+| `cascadeNearPct` / `cascadeMidPct` | 12 / 35 | near / mid cascade radii as % of Coverage (log-uniform for 3 cascades) |
+| `cascadeBlend` | 20 | cross-fade band width at each cascade boundary, % of the cascade extent |
+| `pcfFarStep` | 1 | extra PCF kernel steps per cascade beyond the near one (0–2) |
+| `linkCascade` | on | the Link cascade: an extra map covering only the player, combined with max() |
+| `linkMapSize` | 2 | Link cascade resolution (same scale as `mapSize`), independent of it |
+| `linkCoverage` | 300 | Link cascade box radius in world units (100–2000) |
 | `strength` | 45 | shadow darkening % |
 | `bias` | 55 | constant depth bias (normalized against light range) |
 | `slopeBias` | 30 | bias added ∝ surface slope vs light |
@@ -151,12 +178,24 @@ covers several world units, so a surface can wrongly shadow *itself* where the p
 coarse ("acne"). Every acne control trades against the opposite failure: pushing the test
 too far makes shadows detach from objects' feet ("peter-panning").
 
-- **Map Size** — the photo's resolution. Bigger = sharper edges and less acne at the source,
-  at GPU cost. Use the biggest that performs well (4096, try 8192).
-- **Coverage** — how wide an area the photo covers. Smaller area = each photo pixel covers
-  less ground = sharper AND less acne. The screen-space shadows fill in fine detail
-  everywhere, so keep this as small as you can tolerate the shadow cutoff distance
-  (4000–6000 works well).
+- **Map Size** — each photo's resolution. Bigger = sharper edges and less acne at the
+  source, at GPU cost. With 3 cascades, 4096 is the sweet spot — the near cascade already
+  concentrates its whole map on a small area.
+- **Coverage** — how wide an area the whole system covers (the far cascade). With cascades
+  on, big values (16000+) are fine: the near cascade keeps close-up shadows sharp.
+- **Cascades / Near Split / Mid Split** — the photo is taken up to 3 times: a small sharp
+  one around you, a medium one, and the full-coverage one. The splits set how big the
+  small/medium ones are, as a percentage of Coverage. Keep them roughly geometric (each
+  step ~3x the previous: 12% / 35% / 100%) so each transition steps sharpness evenly. Use
+  the **Cascades debug view** (red/green/blue = near/mid/far) to see who covers what.
+- **Cascade Blend** — how wide the cross-fade between neighboring cascades is. Raise it if
+  you can see a line where sharpness changes; costs extra samples only in the band.
+- **Far Softening** — far cascades have chunkier photo pixels; this widens their smoothing
+  kernel to hide the stair-steps. +1 step is a good default.
+- **Link Shadows / Link Map Size / Link Coverage** — a fourth tiny photo of just Link (plus
+  whoever stands right next to him). 4096 over a 300-unit box gives him razor-sharp
+  self-shadowing no matter what Coverage is set to. It only draws his models, so it's much
+  cheaper than a full cascade; turn it off if you don't care about character close-ups.
 - **Strength** — plain darkness of the shadows. Pure taste.
 - **Soft Shadows** — averages neighboring photo pixels at the shadow edge. Higher = softer,
   hides stair-stepping on cliffs. Costs a little GPU. 5×5 or 7×7.
@@ -178,12 +217,12 @@ too far makes shadows detach from objects' feet ("peter-panning").
 - **Shadow Map toggle** — off runs only the screen-space shadows and brings back the game's
   own character shadows; useful as a comparison baseline and as a cheap mode.
 
-Recommended order: (1) Coverage as low as acceptable + Map Size as high as affordable —
-this shrinks acne at the source before any biasing. (2) Bias down to ~40. (3) Raise Normal
-Offset until flat ground is clean. (4) Raise Slope Bias until cliffs are clean. (5) Normal
-Smoothing 2–4 to remove faceted banding on characters. (6) Soft Shadows to taste. If feet
-shadows detach: lower Bias first, then Normal Offset — the screen-space term re-grounds
-contacts regardless.
+Recommended order: (1) Coverage wide enough for the landscape (16000 for the big vistas),
+3 cascades, splits near-geometric. (2) Bias down to ~40. (3) Raise Normal Offset until flat
+ground is clean. (4) Raise Slope Bias until cliffs are clean. (5) Normal Smoothing 2–4 to
+remove faceted banding on characters. (6) Soft Shadows + Far Softening to taste; widen
+Cascade Blend if a transition line shows. If feet shadows detach: lower Bias first, then
+Normal Offset — the screen-space term re-grounds contacts regardless.
 
 ## Known caveats
 
@@ -199,9 +238,16 @@ contacts regardless.
 - **Midna**: the game's projected blob shadow (which the mod hooks out) is where Midna
   "lives" during her summon/emergence animation. A retain path (re-enable the game shadow
   for Link only, or anchor her to our sun ground-projection) is a known follow-up.
-- Single map: very large `boxRadius` spreads texels thin → cascades are the planned fix.
-  In the meantime the Bend SSS term works at any distance, so a *smaller* `boxRadius` plus
-  SSS is often the better trade than a huge, blurry map.
+- Cascade cost: each world cascade is a full draw-list replay per frame (3 cascades ≈ 3×
+  the map cost of one). If that's too heavy, drop to 2 cascades or shrink Map Size — both
+  usually still beat one huge map. The Link cascade is much cheaper (player models only),
+  but it still traverses the Middle/Opa/Dark lists to find them. Known follow-ups if
+  needed: per-cascade draw-list distance culling, updating the far cascade every other
+  frame.
+- The Link cascade's position filter is by model anchor, so a character standing within
+  2× Link Coverage of Link is included (harmless — more detail) and a huge world model
+  whose origin happens to sit nearby would be too (its geometry mostly clips out of the
+  tiny ortho box).
 - The SSS trace length is compile-time (`SAMPLE_COUNT` 60 pixels in `res/bend_sss.wgsl`);
   making it configurable means pipeline variants (workgroup memory is sized by it).
 - The pixel exactly at the light's screen position is never traced (rays converge toward
