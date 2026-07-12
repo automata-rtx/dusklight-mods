@@ -91,6 +91,7 @@ ConfigVarHandle g_cvarSssFadeStart = 0;
 ConfigVarHandle g_cvarSssFadeEnd = 0;
 ConfigVarHandle g_cvarIndoorDisable = 0;
 ConfigVarHandle g_cvarTwoSidedCasters = 0;
+ConfigVarHandle g_cvarEarlyShadowPass = 0;
 
 GfxDrawTypeHandle g_drawType = 0;
 GfxComputeTypeHandle g_sssComputeType = 0;
@@ -1064,6 +1065,18 @@ void on_scene_begin(ModContext*, const GfxStageContext* stageCtx, void*) {
     tick_retired_normal_targets();
     restore_actual_light_debug();
     capture_scene_camera(stageCtx);
+
+    // Opt-in: replay the shadow map before the game's main EFB scene pass instead of after the
+    // terrain lists. The offscreen pass at SCENE_AFTER_TERRAIN perturbs the framebuffer-capture
+    // chain that heat-haze/steam distortion particles (Kakariko, Goron Springs) sample from,
+    // making them vanish while the map is enabled. Rendering earlier keeps that capture intact.
+    // render_shadow_map applies all its own guards (enabled/map/indoor/debug/already-built), and
+    // on_scene_after_terrain skips when g_mapPass.ready, so this never double-renders.
+    if (get_bool_option(g_cvarEarlyShadowPass, false) && g_sceneCamera.raw_valid) {
+        render_shadow_map(g_sceneCamera.raw_view, g_sceneCamera.raw_projection_mtx,
+            g_sceneCamera.raw_projection);
+    }
+
     if (!get_bool_option(g_cvarEnabled, true) || get_debug_mode() != 9) {
         return;
     }
@@ -1583,6 +1596,11 @@ ModResult build_controls_tab(
         "Turns the shadow MAP off in interior spaces (which read as fully shadowed under a "
         "sky-light map) and restores the game's own shadows there. Screen-space shadows still "
         "run indoors.");
+    add_toggle(left, "Early Shadow Pass", g_cvarEarlyShadowPass,
+        "Renders the shadow map before the game's main scene pass instead of after the terrain. "
+        "Fixes heat-haze/steam/wind distortion particles (Kakariko Village, Goron Springs) "
+        "disappearing while the shadow map is on. Leave off unless you hit that bug; verify "
+        "shadows still look correct with it enabled.");
 
     // Screen Space Shadows: the Bend depth-trace term and everything that only affects it.
     svc_ui->pane_add_section(mod_ctx, left, "Screen Space Shadows");
@@ -1800,6 +1818,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
+    result = register_bool_option("earlyShadowPass", false, g_cvarEarlyShadowPass, error);
+    if (result != MOD_OK) {
+        return result;
+    }
 
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to query device info");
@@ -1968,7 +1990,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarSlopeBias = g_cvarNormalOffset = 0;
     g_cvarSssThickness = g_cvarSssEdgeThreshold = g_cvarSssContrast = g_cvarSssIgnoreEdges = 0;
     g_cvarSssFade = g_cvarSssFadeStart = g_cvarSssFadeEnd = 0;
-    g_cvarIndoorDisable = g_cvarTwoSidedCasters = 0;
+    g_cvarIndoorDisable = g_cvarTwoSidedCasters = g_cvarEarlyShadowPass = 0;
     g_drawType = g_sssComputeType = g_normalComputeType = g_sceneBeginHook =
         g_sceneAfterTerrainHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;
     g_controlsWindow = 0;

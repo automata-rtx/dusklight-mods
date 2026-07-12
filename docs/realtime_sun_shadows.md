@@ -171,6 +171,16 @@ contacts regardless.
 
 ## Known caveats
 
+- **Distortion particles vanish with the map on** (heat-haze / steam / wind in Kakariko
+  Village, Goron Springs): the offscreen shadow-map replay at `SCENE_AFTER_TERRAIN` runs
+  between the game's framebuffer capture (`GXCopyTex` → `getFrameBufferTex`) and the
+  distortion particles that sample it, so those particles read a stale/empty capture and
+  disappear. The **Early Shadow Pass** toggle (Shadow Map section, `earlyShadowPass`,
+  default off) moves the replay to `SCENE_BEGIN`, before the game's main scene pass, so the
+  capture chain stays intact. It's opt-in because it's a game-linked timing change that can
+  only be validated in-game — enable it if you hit the bug and confirm shadows still render
+  correctly. Immediate workaround without it: run screen-space-only mode (Shadow Map off) in
+  those areas, where the particles show normally.
 - **Midna**: the game's projected blob shadow (which the mod hooks out) is where Midna
   "lives" during her summon/emergence animation. A retain path (re-enable the game shadow
   for Link only, or anchor her to our sun ground-projection) is a known follow-up.
