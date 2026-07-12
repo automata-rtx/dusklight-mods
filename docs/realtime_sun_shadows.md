@@ -100,6 +100,7 @@ off; anything under "Screen Space Shadows" is inert when SSS is off.
 | `sssThickness` | 50 | assumed caster thickness, 1/100 % of remaining depth (50 = 0.5%) |
 | `sssEdgeThreshold` | 200 | depth delta treated as an edge, 1/100 % (200 = 2%) |
 | `sssContrast` | 4 | contrast boost on the SSS transition (1–8) |
+| `sssBias` | 15 | receiver offset in shadow-window %, pushes the trace off the surface to kill facet self-shadow banding on low-poly casters (SSS counterpart to the map's `bias`) |
 | `sssIgnoreEdges` | off | edge pixels don't cast (helps grazing-angle aliasing) |
 | `sssFade` | on | fade the screen-space shadows out with distance so distant fogged geometry isn't full-strength shadowed |
 | `sssFadeStart` / `sssFadeEnd` | 8000 / 25000 | world-unit distances where the SSS fade begins / completes (set around where the scene washes into fog) |
@@ -113,6 +114,14 @@ detach at feet (the screen-space term hides small gaps). Per Bend's guidance, tu
 `sssThickness` in multiples of 2 and scale `sssEdgeThreshold` alongside it; use the "SSS
 Edge Mask" debug view when striated patterns appear on flat surfaces (or turn on
 `sssIgnoreEdges`).
+
+**SSS facet banding** (Link's cap, hair, cliffs look faceted only with screen-space shadows
+on): raise `sssBias`. The Bend trace runs against the raw depth buffer, so a low-poly caster
+whose facets each tilt a little self-shadows each facet by a slightly different amount and
+the polygon banding shows through. `sssBias` pushes the trace off the receiving surface —
+raise it until the banding disappears. Higher values also soften genuine near-contact
+darkening (the whole point of SSS), so use the lowest value that cleans up the facets. It's
+the exact SSS analogue of the shadow map's constant `bias`.
 
 ## Normals, detail, and the screen-space term (important)
 
@@ -172,15 +181,14 @@ contacts regardless.
 ## Known caveats
 
 - **Distortion particles vanish with the map on** (heat-haze / steam / wind in Kakariko
-  Village, Goron Springs): the offscreen shadow-map replay at `SCENE_AFTER_TERRAIN` runs
-  between the game's framebuffer capture (`GXCopyTex` → `getFrameBufferTex`) and the
-  distortion particles that sample it, so those particles read a stale/empty capture and
-  disappear. The **Early Shadow Pass** toggle (Shadow Map section, `earlyShadowPass`,
-  default off) moves the replay to `SCENE_BEGIN`, before the game's main scene pass, so the
-  capture chain stays intact. It's opt-in because it's a game-linked timing change that can
-  only be validated in-game — enable it if you hit the bug and confirm shadows still render
-  correctly. Immediate workaround without it: run screen-space-only mode (Shadow Map off) in
-  those areas, where the particles show normally.
+  Village, Goron Springs) — *open*. Only the shadow **map** triggers it; screen-space-only
+  mode (Shadow Map off) shows the particles normally, so that's the current workaround.
+  An `earlyShadowPass` experiment that moved the offscreen replay from `SCENE_AFTER_TERRAIN`
+  to `SCENE_BEGIN` made *no* difference in-game, which rules out the replay's *timing*
+  relative to the framebuffer capture (`GXCopyTex` → `getFrameBufferTex`) as the cause — it's
+  something the replay *does* (a GX/PE or texture-cache state it leaves dirty), not when it
+  runs. Next step is to widen the GX-state save/restore around the replay. That toggle was
+  removed since it did nothing.
 - **Midna**: the game's projected blob shadow (which the mod hooks out) is where Midna
   "lives" during her summon/emergence animation. A retain path (re-enable the game shadow
   for Link only, or anchor her to our sun ground-projection) is a known follow-up.

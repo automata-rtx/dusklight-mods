@@ -42,7 +42,7 @@ struct SssUniforms {
     shadow_contrast: f32,     // contrast boost on the shadow transition (>= 1)
     ignore_edge_pixels: u32,  // 1 = pixels detected as edges do not cast
     debug_mode: u32,          // 1 = write the edge-detect mask instead of the shadow
-    _pad0: f32,
+    receiver_bias: f32,       // extra receiver offset in shadow-window units; kills facet acne
 }
 
 @group(0) @binding(0) var scene_depth: texture_2d<f32>;
@@ -216,23 +216,34 @@ fn cs_main(
         sample_distance[0] / depth_thickness_scale[0];
     start_depth = start_depth * depth_scale - Z_SIGN;
 
+    // Receiver bias: low-poly casters (Link's cap, hair, cliffs) tilt facet-to-facet, so each
+    // facet self-shadows by a slightly different amount and the polygon banding shows through.
+    // Adding a constant to every sample's depth delta (AFTER the abs, so it is strictly one-
+    // sided and can only lighten - never fabricate a shadow on the far side of a sample) pushes
+    // the near-surface response into the fully-lit clamp and erases the banding. Higher =
+    // flatter/cleaner but weaker near-contact darkening (the honest trade).
+    let receiver_bias = uniforms.receiver_bias;
+
     // The first samples produce a hard shadow: a single sample can fully shadow the pixel,
     // trading aliasing for grounding pixels very close to the caster.
     for (var i = 0u; i < HARD_SHADOW_SAMPLES; i++) {
-        let depth_delta = abs(start_depth - depth_data[sample_index + i] * depth_scale);
+        let depth_delta =
+            abs(start_depth - depth_data[sample_index + i] * depth_scale) + receiver_bias;
         hard_shadow = min(hard_shadow, depth_delta);
     }
 
     // The bulk samples accumulate into four values whose average softens single-pixel
     // shadows.
     for (var i = HARD_SHADOW_SAMPLES; i < SAMPLE_COUNT - FADE_OUT_SAMPLES; i++) {
-        let depth_delta = abs(start_depth - depth_data[sample_index + i] * depth_scale);
+        let depth_delta =
+            abs(start_depth - depth_data[sample_index + i] * depth_scale) + receiver_bias;
         shadow_value[i & 3u] = min(shadow_value[i & 3u], depth_delta);
     }
 
     // The most distant samples fade out, softening the hard shadow-length cutoff.
     for (var i = SAMPLE_COUNT - FADE_OUT_SAMPLES; i < SAMPLE_COUNT; i++) {
-        let depth_delta = abs(start_depth - depth_data[sample_index + i] * depth_scale);
+        let depth_delta =
+            abs(start_depth - depth_data[sample_index + i] * depth_scale) + receiver_bias;
         let fade_out = f32(i + 1u - (SAMPLE_COUNT - FADE_OUT_SAMPLES)) /
             f32(FADE_OUT_SAMPLES + 1u) * 0.75;
         shadow_value[i & 3u] = min(shadow_value[i & 3u], depth_delta + fade_out);
