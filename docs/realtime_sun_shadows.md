@@ -114,6 +114,7 @@ Space Shadows" is inert when SSS is off.
 | `cascadeNearPct` / `cascadeMidPct` | 12 / 35 | near / mid cascade radii as % of Coverage (log-uniform for 3 cascades) |
 | `cascadeBlend` | 20 | cross-fade band width at each cascade boundary, % of the cascade extent |
 | `cascadeCull` | on | light-column culling of replay geometry per cascade (keeps the passes inside the engine's per-frame streaming budget - leave on) |
+| `casterMinTexels` | 2 | skip casters whose world bounding radius is smaller than this many of the cascade's texels (sub-texel shadows); the main lever for the per-frame geometry budget. Raise (4-8) to stay in budget at wide coverage / 3 cascades |
 | `cascadeEdgeFade` | on | fade the widest cascade's shadow out across its outer edge (band = `cascadeBlend`) instead of a hard coverage cutoff |
 | `pcfFarStep` | 1 | extra PCF kernel steps per cascade beyond the near one (0–2) |
 | `linkCascade` | on | the Link cascade: an extra map covering only the player, combined with max() |
@@ -264,11 +265,25 @@ Normal Offset — the screen-space term re-grounds contacts regardless.
   mitigations ship in 1.6.2: per-cascade **light-column culling** (`cascadeCull`, skips
   shapes laterally outside a cascade's light box before their geometry streams; the axis
   toward the light is kept, so tall distant casters still shadow into near boxes) and a
-  default of **2 cascades** (~the proven 1.5.x envelope). 3 cascades works in most areas
-  but can still overflow in the densest ones; the definitive fix is raising the buffer
-  sizes in the platform (a re-platform: new `platform-vN` of `dusklight-ao` + rebuild, see
-  CLAUDE.md). The Link cascade is nearly free vertex-wise: its filter skips at drawFast
-  BEFORE geometry streams.
+  default of **2 cascades** (~the proven 1.5.x envelope). 1.6.4 adds **small-caster
+  culling** (`casterMinTexels`, default 2): a shape whose world bounding radius is under a
+  few of the cascade's texels casts a sub-texel (invisible) shadow, so it is skipped before
+  streaming. Because texel size grows with the cascade, this prunes almost nothing in the
+  near cascade and a large tail of tiny distant props in the wide far cascade — where the
+  budget is actually spent. It is the main mod-side lever for staying in budget; raise it to
+  4-8 to run 3 cascades / high coverage in dense areas.
+
+  **Staying in the per-frame budget without a platform change** — the streaming cost is
+  vertex/index bytes from the *replays*, so it scales with how much geometry each replay
+  streams, NOT with map resolution (Map Size is free). Levers, most effective first: (1)
+  raise `casterMinTexels` (4-8); (2) turn `noFrustumClipping` OFF — on, it forces every
+  replay to include the whole off-screen world, which is the single biggest multiplier in
+  open fields (cost: shadows from off-screen casters pop in as you turn); (3) fewer cascades
+  (2, or 1); (4) smaller `boxRadius` (a smaller far box holds less geometry) paired with
+  `cascadeEdgeFade` + Deferred Fog to hide the nearer cutoff. The definitive fix for
+  unconstrained 3-cascade/high-radius is larger platform buffers (adaptive grow-on-overflow
+  is the intended aurora change; a static bump is a re-platform per CLAUDE.md). The Link
+  cascade is nearly free vertex-wise: its filter skips at drawFast BEFORE geometry streams.
 - The Link cascade's position filter is by model anchor, so a character standing within
   2× Link Coverage of Link is included (harmless — more detail) and a huge world model
   whose origin happens to sit nearby would be too (its geometry mostly clips out of the

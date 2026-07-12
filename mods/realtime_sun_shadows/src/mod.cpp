@@ -101,6 +101,7 @@ ConfigVarHandle g_cvarCascadeMidPct = 0;
 ConfigVarHandle g_cvarCascadeBlend = 0;
 ConfigVarHandle g_cvarCascadeCull = 0;
 ConfigVarHandle g_cvarCascadeEdgeFade = 0;
+ConfigVarHandle g_cvarCasterMinTexels = 0;
 ConfigVarHandle g_cvarPcfFarStep = 0;
 ConfigVarHandle g_cvarLinkCascade = 0;
 ConfigVarHandle g_cvarLinkMapSize = 0;
@@ -206,6 +207,7 @@ float g_linkFilterRadiusSq = 0.0f;
 bool g_replayCullActive = false;
 Mtx g_replayCullLightView;      // light_from_world for the current cascade
 float g_replayCullLimit = 0.0f;  // lateral half-extent + margin, world units
+float g_replayCullMinRadius = 0.0f;  // skip casters with a smaller world bounding radius
 
 constexpr float kLightDistance = 30000.0f;
 constexpr float kLightNear = 100.0f;
@@ -1134,6 +1136,11 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
                                  base[2][2] * base[2][2];
                 const float scale = std::sqrt(std::max(s0, std::max(s1, s2)));
                 const float radius = std::sqrt(ex * ex + ey * ey + ez * ez) * scale;
+                // Sub-texel caster: its shadow is smaller than a shadow-map texel, so it
+                // cannot produce a visible shadow in this cascade - skip before it streams.
+                if (g_replayCullMinRadius > 0.0f && radius < g_replayCullMinRadius) {
+                    return HOOK_SKIP_ORIGINAL;
+                }
                 const Mtx& view = g_replayCullLightView;
                 const float lx = view[0][0] * wx + view[0][1] * wy + view[0][2] * wz + view[0][3];
                 const float ly = view[1][0] * wx + view[1][1] * wy + view[1][2] * wz + view[1][3];
@@ -1316,6 +1323,18 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
     if (cull) {
         cMtx_copy(lightCamera.view, g_replayCullLightView);
         g_replayCullLimit = radius * 1.05f + 200.0f;
+        // Small-caster cull: a shape whose world bounding radius is smaller than a few of
+        // this cascade's texels casts a sub-texel (invisible) shadow, so skip it before its
+        // geometry streams. texel_world = 2*radius/mapSize grows with the cascade, so this
+        // self-scales - it prunes almost nothing in the sharp near cascade and a large tail
+        // of tiny distant props in the wide far cascade, which is exactly where the per-frame
+        // vertex/index budget is spent. This is the biggest streaming reduction available.
+        const float texelWorld = (2.0f * radius) / static_cast<float>(mapSize);
+        const int64_t minTexels =
+            std::clamp<int64_t>(get_int_option(g_cvarCasterMinTexels, 2), 0, 16);
+        g_replayCullMinRadius = static_cast<float>(minTexels) * texelWorld;
+    } else {
+        g_replayCullMinRadius = 0.0f;
     }
     // The Link filter and the culling read j3dSys's current model, which J3DShapePacket::
     // prepareDraw sets fresh for every packet draw - but shapes drawn through any OTHER path
@@ -1864,6 +1883,13 @@ ModResult build_controls_tab(
         "Skips geometry that cannot cast into a cascade's box before it is drawn. Keeps the "
         "extra cascade passes cheap and inside the engine's per-frame geometry budget - "
         "leave on. Turn off only to test whether a missing shadow was wrongly culled.");
+    add_number(left, "Caster Detail", g_cvarCasterMinTexels, 0, 16, 1, nullptr,
+        "Skips casters smaller than this many shadow-map texels, whose shadow would be "
+        "sub-pixel anyway. This is the main control for staying within the engine's per-frame "
+        "geometry budget: RAISE it (4-8) if wide coverage or 3 cascades crashes the game in "
+        "dense areas - it drops the huge tail of tiny distant props from the wide cascades "
+        "with no visible loss. Lower toward 0 for maximum small-object shadow fidelity at "
+        "higher streaming cost. Requires Cascade Culling on.");
     add_number(left, "Near Split", g_cvarCascadeNearPct, 4, 40, 1, "%",
         "Radius of the NEAR cascade as a percentage of Coverage (3-cascade mode). Smaller = "
         "sharper close-up shadows but the mid cascade takes over sooner.");
@@ -2193,6 +2219,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
+    result = register_int_option("casterMinTexels", 2, g_cvarCasterMinTexels, error);
+    if (result != MOD_OK) {
+        return result;
+    }
     result = register_int_option("pcfFarStep", 1, g_cvarPcfFarStep, error);
     if (result != MOD_OK) {
         return result;
@@ -2379,7 +2409,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarSssFade = g_cvarSssFadeStart = g_cvarSssFadeEnd = 0;
     g_cvarIndoorDisable = g_cvarTwoSidedCasters = 0;
     g_cvarCascadeCount = g_cvarCascadeNearPct = g_cvarCascadeMidPct = g_cvarCascadeBlend = 0;
-    g_cvarCascadeCull = g_cvarCascadeEdgeFade = 0;
+    g_cvarCascadeCull = g_cvarCascadeEdgeFade = g_cvarCasterMinTexels = 0;
+    g_replayCullMinRadius = 0.0f;
     g_replayCullActive = false;
     g_replayCullLimit = 0.0f;
     g_cvarPcfFarStep = g_cvarLinkCascade = g_cvarLinkMapSize = g_cvarLinkCoverage = 0;
