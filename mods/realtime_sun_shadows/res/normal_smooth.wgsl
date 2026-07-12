@@ -6,19 +6,27 @@
 // this cleanly: few taps at a fixed pixel distance produce a displaced "ghost" of the
 // surface past a resolution-dependent sweet spot.
 //
-// This pass instead builds a dedicated normal buffer at a RESOLUTION-CAPPED size
-// (<= ~1080p-equivalent, chosen by the host) and smooths it with an iterated, depth-aware
-// separable Gaussian:
-//   - normal_gen: one side-selected 1-buffer-texel cross per texel over the full-res depth
-//     snapshot, oriented toward the camera (approximated by the near-plane center). Output
-//     rgba32float = (normal.xyz, raw depth); sky texels get w = 0.
-//   - normal_blur_h / normal_blur_v: 5-tap [1 4 6 4 1] Gaussian along one axis, each tap
-//     weighted by relative depth agreement so silhouettes never blend. The host ping-pongs
-//     H/V for `iterations` rounds; every round widens the effective radius, and because the
-//     buffer size is capped, a given setting looks the same at any internal resolution.
+// This pass builds a dedicated normal buffer at FULL render resolution and smooths it with a
+// depth-aware separable Gaussian whose radius scales with the render height:
+//   - normal_gen: one side-selected 1-pixel cross per texel over the depth snapshot, oriented
+//     toward the camera (approximated by the near-plane center). Output rgba32float =
+//     (normal.xyz, raw depth); sky texels get w = 0.
+//   - normal_blur_h / normal_blur_v: one variable-radius, DENSE (every pixel is a tap)
+//     Gaussian along one axis, bilaterally weighted so silhouettes never blend. The host sets
+//     the radius as a fraction of the render height, so a given Normal Smoothing setting
+//     covers the same fraction of the screen - and looks the same - at any internal
+//     resolution or supersampling factor.
 //
-// A true dense Gaussian cannot produce the displaced-copy artifact, and the capped buffer
-// makes the whole thing cheaper than per-pixel smoothing at supersampled render sizes.
+// Why this shape, learned the hard way:
+//   - Full resolution (not a capped buffer): a capped buffer blurs fine geometry away before
+//     the composite can use it and needs a lossy upscale; full res keeps everything.
+//   - Dense taps (not a sparse ring): a few taps at a fixed distance average in a displaced
+//     copy of the surface - a visible ghost/after-image past a resolution-dependent sweet
+//     spot. A dense Gaussian cannot do that.
+//   - Radius as a fraction of render height: the sweet spot no longer moves with the user's
+//     internal resolution / supersampling.
+//   - No light-terminator flip (see normal_gen): flipping the normal toward the light
+//     mirrored it across every curved surface's terminator - a hard bias discontinuity.
 
 struct GenUniforms {
     world_from_proj: mat4x4f, // scene depth unproject (camera)
@@ -97,9 +105,28 @@ fn normal_gen(@builtin(global_invocation_id) global_id: vec3u) {
 }
 
 // --- Separable depth-aware blur ---------------------------------------------------------
+//
+// One separable pass with a VARIABLE radius (dense - every pixel out to the radius is a tap -
+// so it is a true Gaussian, never the displaced-copy "ghost" a sparse ring produces). The
+// radius (in pixels) is chosen on the host as a fraction of the render height, so a given
+// Normal Smoothing setting covers the same fraction of the screen at any internal resolution
+// or supersampling factor. The buffer is FULL render resolution: fine geometry survives in
+// the input, and the loose bilateral weight only rejects large depth jumps (silhouettes), so
+// facets - which are depth-continuous, only normal-discontinuous - blend smoothly while the
+// character never bleeds into the background behind it.
+
+struct BlurUniforms {
+    sigma: f32,   // Gaussian standard deviation in pixels
+    radius: f32,  // hard cutoff in pixels (<= MAX_BLUR_RADIUS)
+    _pad0: f32,
+    _pad1: f32,
+}
+
+const MAX_BLUR_RADIUS: i32 = 32;
 
 @group(0) @binding(0) var blur_in: texture_2d<f32>;
 @group(0) @binding(1) var blur_out: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(2) var<uniform> blur: BlurUniforms;
 
 fn blur_axis(texel: vec2<i32>, axis: vec2<i32>) {
     let size = vec2<i32>(textureDimensions(blur_in));
@@ -111,29 +138,35 @@ fn blur_axis(texel: vec2<i32>, axis: vec2<i32>) {
         textureStore(blur_out, texel, center);
         return;
     }
-    let tolerance = max(center.w * 0.05, 1.0e-6);
-    let kernel = array<f32, 5>(1.0, 4.0, 6.0, 4.0, 1.0);
+    // Loose bilateral: reject only silhouette-scale depth jumps, keep facets/curves blending.
+    let tolerance = max(center.w * 0.1, 1.0e-6);
+    let inv_two_sigma2 = 1.0 / (2.0 * max(blur.sigma * blur.sigma, 1.0e-6));
+    let radius = i32(min(blur.radius + 0.5, f32(MAX_BLUR_RADIUS)));
 
-    var sum = vec3f(0.0);
-    var weight_sum = 0.0;
-    for (var i = -2; i <= 2; i += 1) {
-        let tap_texel = clamp(texel + axis * i, vec2<i32>(0i), size - 1i);
-        let tap = textureLoad(blur_in, tap_texel, 0i);
-        if tap.w <= 0.0 {
-            continue;
+    var sum = center.xyz; // i = 0 (weight 1)
+    var weight_sum = 1.0;
+    for (var i = 1; i <= MAX_BLUR_RADIUS; i += 1) {
+        if i > radius {
+            break;
         }
-        let dz = (tap.w - center.w) / tolerance;
-        let weight = kernel[i + 2] * exp2(-dz * dz);
-        sum += tap.xyz * weight;
-        weight_sum += weight;
+        let gaussian = exp2(-f32(i * i) * inv_two_sigma2 * 1.4426950408); // exp2(x*log2 e)=exp(x)
+        for (var s = -1; s <= 1; s += 2) {
+            let tap_texel = clamp(texel + axis * (i * s), vec2<i32>(0i), size - 1i);
+            let tap = textureLoad(blur_in, tap_texel, 0i);
+            if tap.w <= 0.0 {
+                continue;
+            }
+            let dz = (tap.w - center.w) / tolerance;
+            let weight = gaussian * exp2(-dz * dz);
+            sum += tap.xyz * weight;
+            weight_sum += weight;
+        }
     }
     var normal = center.xyz;
-    if weight_sum > 1.0e-6 {
-        let blurred = sum / weight_sum;
-        let len = length(blurred);
-        if len > 1.0e-6 {
-            normal = blurred / len;
-        }
+    let blurred = sum / weight_sum;
+    let len = length(blurred);
+    if len > 1.0e-6 {
+        normal = blurred / len;
     }
     // The depth channel passes through unblurred: it is the bilateral reference.
     textureStore(blur_out, texel, vec4f(normal, center.w));

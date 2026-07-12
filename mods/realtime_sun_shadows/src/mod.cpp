@@ -130,10 +130,10 @@ struct RetiredSssTarget {
 };
 std::vector<RetiredSssTarget> g_retiredSssTargets;
 
-// Smoothed-normal ping-pong buffers (rgba32float: normal.xyz + raw depth), capped at a
-// 1080p-equivalent size so a given Normal Smoothing setting looks identical at any internal
-// render resolution (and stays cheap under supersampling). Same retire-on-resize scheme.
-constexpr uint32_t kNormalBufferMaxHeight = 1080;
+// Smoothed-normal ping-pong buffers (rgba32float: normal.xyz + raw depth) at full render
+// resolution. The blur radius scales with render height (kNormalReferenceHeight) so a given
+// Normal Smoothing setting looks identical at any internal resolution. Same retire scheme.
+constexpr float kNormalReferenceHeight = 1080.0f;
 struct NormalTargets {
     uint32_t width = 0;
     uint32_t height = 0;
@@ -205,6 +205,15 @@ struct NormalGenUniforms {
 };
 static_assert(sizeof(NormalGenUniforms) % 16 == 0);
 
+// Mirror of the WGSL BlurUniforms struct (keep in sync with res/normal_smooth.wgsl).
+struct NormalBlurUniforms {
+    float sigma;
+    float radius;
+    float _pad0;
+    float _pad1;
+};
+static_assert(sizeof(NormalBlurUniforms) % 16 == 0);
+
 // Mirror of the WGSL SssUniforms struct (keep in sync with res/bend_sss.wgsl). One slot is
 // pushed per Bend dispatch: the light coordinate and tuning are shared, the wave offset is
 // per-dispatch.
@@ -235,11 +244,12 @@ static_assert(std::is_trivially_copyable_v<DrawPayload>);
 
 struct NormalComputePayload {
     WGPUTextureView sceneDepth;  // frame-pooled
-    WGPUTextureView normalA;     // mod-owned ping-pong (final result lands in A)
+    WGPUTextureView normalA;     // mod-owned ping-pong (gen writes A, blur H A->B, blur V B->A)
     WGPUTextureView normalB;
-    uint32_t uniformOffset;
-    uint32_t uniformSize;
-    uint32_t iterations;  // depth-aware Gaussian rounds (H+V each)
+    uint32_t genUniformOffset;
+    uint32_t genUniformSize;
+    uint32_t blurUniformOffset;
+    uint32_t blurUniformSize;
     uint32_t width;
     uint32_t height;
 };
@@ -666,8 +676,9 @@ constexpr uint32_t div_ceil(uint32_t numerator, uint32_t denominator) {
     return (numerator + denominator - 1) / denominator;
 }
 
-// Render worker thread: build the smoothed-normal buffer - one gen dispatch over the capped
-// grid, then `iterations` depth-aware Gaussian rounds ping-ponging A -> B -> A.
+// Render worker thread: build the smoothed-normal buffer - gen reconstructs per-pixel normals
+// into A, then one separable depth-aware Gaussian (H: A->B, V: B->A) whose radius came from
+// the host, so A holds the final smoothed normals.
 void on_normal_compute(
     ModContext*, const GfxComputeContext* ctx, const void* payload, size_t payloadSize, void*) {
     if (payloadSize != sizeof(NormalComputePayload)) {
@@ -681,39 +692,32 @@ void on_normal_compute(
         return;
     }
 
-    const auto makeGroup = [&](WGPUBindGroupLayout layout, WGPUTextureView in,
-                               WGPUTextureView out, bool uniform) {
+    const auto makeGroup = [&](WGPUBindGroupLayout layout, WGPUTextureView in, WGPUTextureView out,
+                               uint32_t uniformOffset, uint32_t uniformSize) {
         WGPUBindGroupEntry entries[3] = {
             WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
         entries[0].binding = 0;
         entries[0].textureView = in;
         entries[1].binding = 1;
         entries[1].textureView = out;
-        uint32_t count = 2;
-        if (uniform) {
-            entries[2].binding = 2;
-            entries[2].buffer = ctx->uniform_buffer;
-            entries[2].offset = data.uniformOffset;
-            entries[2].size = data.uniformSize;
-            count = 3;
-        }
+        entries[2].binding = 2;
+        entries[2].buffer = ctx->uniform_buffer;
+        entries[2].offset = uniformOffset;
+        entries[2].size = uniformSize;
         WGPUBindGroupDescriptor bindGroupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
         bindGroupDesc.layout = layout;
-        bindGroupDesc.entryCount = count;
+        bindGroupDesc.entryCount = 3;
         bindGroupDesc.entries = entries;
         return wgpuDeviceCreateBindGroup(ctx->device, &bindGroupDesc);
     };
 
-    WGPUBindGroup genGroup = makeGroup(g_normalGenLayout, data.sceneDepth, data.normalA, true);
-    const uint32_t iterations = std::min(data.iterations, 8u);
-    WGPUBindGroup blurGroups[16] = {};
-    bool ok = genGroup != nullptr;
-    for (uint32_t i = 0; i < iterations && ok; ++i) {
-        blurGroups[i * 2] = makeGroup(g_normalBlurHLayout, data.normalA, data.normalB, false);
-        blurGroups[i * 2 + 1] = makeGroup(g_normalBlurVLayout, data.normalB, data.normalA, false);
-        ok = blurGroups[i * 2] != nullptr && blurGroups[i * 2 + 1] != nullptr;
-    }
-    if (ok) {
+    WGPUBindGroup genGroup = makeGroup(g_normalGenLayout, data.sceneDepth, data.normalA,
+        data.genUniformOffset, data.genUniformSize);
+    WGPUBindGroup blurH = makeGroup(g_normalBlurHLayout, data.normalA, data.normalB,
+        data.blurUniformOffset, data.blurUniformSize);
+    WGPUBindGroup blurV = makeGroup(g_normalBlurVLayout, data.normalB, data.normalA,
+        data.blurUniformOffset, data.blurUniformSize);
+    if (genGroup != nullptr && blurH != nullptr && blurV != nullptr) {
         WGPUComputePassDescriptor passDesc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
         passDesc.label = {"smoothed normals", WGPU_STRLEN};
         WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(ctx->encoder, &passDesc);
@@ -722,21 +726,16 @@ void on_normal_compute(
         wgpuComputePassEncoderSetPipeline(pass, g_normalGenPipeline);
         wgpuComputePassEncoderSetBindGroup(pass, 0, genGroup, 0, nullptr);
         wgpuComputePassEncoderDispatchWorkgroups(pass, groupsX, groupsY, 1);
-        for (uint32_t i = 0; i < iterations; ++i) {
-            wgpuComputePassEncoderSetPipeline(pass, g_normalBlurHPipeline);
-            wgpuComputePassEncoderSetBindGroup(pass, 0, blurGroups[i * 2], 0, nullptr);
-            wgpuComputePassEncoderDispatchWorkgroups(pass, groupsX, groupsY, 1);
-            wgpuComputePassEncoderSetPipeline(pass, g_normalBlurVPipeline);
-            wgpuComputePassEncoderSetBindGroup(pass, 0, blurGroups[i * 2 + 1], 0, nullptr);
-            wgpuComputePassEncoderDispatchWorkgroups(pass, groupsX, groupsY, 1);
-        }
+        wgpuComputePassEncoderSetPipeline(pass, g_normalBlurHPipeline);
+        wgpuComputePassEncoderSetBindGroup(pass, 0, blurH, 0, nullptr);
+        wgpuComputePassEncoderDispatchWorkgroups(pass, groupsX, groupsY, 1);
+        wgpuComputePassEncoderSetPipeline(pass, g_normalBlurVPipeline);
+        wgpuComputePassEncoderSetBindGroup(pass, 0, blurV, 0, nullptr);
+        wgpuComputePassEncoderDispatchWorkgroups(pass, groupsX, groupsY, 1);
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
     }
-    if (genGroup != nullptr) {
-        wgpuBindGroupRelease(genGroup);
-    }
-    for (auto* group : blurGroups) {
+    for (WGPUBindGroup group : {genGroup, blurH, blurV}) {
         if (group != nullptr) {
             wgpuBindGroupRelease(group);
         }
@@ -1284,38 +1283,47 @@ bool push_sss_dispatches(
     return svc_gfx->push_compute(mod_ctx, g_sssComputeType, &payload, sizeof(payload)) == MOD_OK;
 }
 
-// Game thread: build the capped-resolution smoothed-normal buffer for this frame's
-// composite. Returns false when the buffer isn't available (composite falls back to the
-// inline per-pixel cross).
-bool push_normal_dispatches(const GfxResolvedTargets& resolved, uint32_t iterations) {
-    if (g_normalGenPipeline == nullptr || resolved.height == 0) {
-        return false;
-    }
-    const uint32_t bufHeight = std::min(resolved.height, kNormalBufferMaxHeight);
-    const uint32_t bufWidth = std::max<uint32_t>(
-        1, static_cast<uint32_t>((static_cast<uint64_t>(resolved.width) * bufHeight +
-                                     resolved.height / 2) /
-                                 resolved.height));
-    if (!ensure_normal_targets(bufWidth, bufHeight)) {
+// Game thread: build the full-resolution smoothed-normal buffer for this frame's composite.
+// The blur radius scales with render height so `smoothing` covers the same fraction of the
+// screen (and looks the same) at any internal resolution. Returns false when the buffer
+// isn't available (composite falls back to the inline per-pixel cross).
+bool push_normal_dispatches(const GfxResolvedTargets& resolved, int64_t smoothing) {
+    if (g_normalGenPipeline == nullptr || resolved.height == 0 ||
+        !ensure_normal_targets(resolved.width, resolved.height))
+    {
         return false;
     }
 
-    NormalGenUniforms uniforms{};
-    std::memcpy(uniforms.world_from_proj, g_sceneCamera.info.world_from_proj,
-        sizeof(uniforms.world_from_proj));
-    GfxRange range{0, 0};
-    if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &range) != MOD_OK) {
+    NormalGenUniforms genUniforms{};
+    std::memcpy(genUniforms.world_from_proj, g_sceneCamera.info.world_from_proj,
+        sizeof(genUniforms.world_from_proj));
+    GfxRange genRange{0, 0};
+    if (svc_gfx->push_uniform(mod_ctx, &genUniforms, sizeof(genUniforms), &genRange) != MOD_OK) {
         return false;
     }
+
+    // Setting 1 ~ 1 texel of radius at the reference height; scaled to the real height and
+    // capped to the shader's MAX_BLUR_RADIUS (32). sigma = radius/2 (a full Gaussian bell).
+    const float radius = std::min(32.0f,
+        static_cast<float>(smoothing) * static_cast<float>(resolved.height) / kNormalReferenceHeight);
+    NormalBlurUniforms blurUniforms{};
+    blurUniforms.radius = radius;
+    blurUniforms.sigma = std::max(radius * 0.5f, 0.5f);
+    GfxRange blurRange{0, 0};
+    if (svc_gfx->push_uniform(mod_ctx, &blurUniforms, sizeof(blurUniforms), &blurRange) != MOD_OK) {
+        return false;
+    }
+
     NormalComputePayload payload{};
     payload.sceneDepth = resolved.depth;
     payload.normalA = g_normalTargets.views[0];
     payload.normalB = g_normalTargets.views[1];
-    payload.uniformOffset = range.offset;
-    payload.uniformSize = range.size;
-    payload.iterations = iterations;
-    payload.width = bufWidth;
-    payload.height = bufHeight;
+    payload.genUniformOffset = genRange.offset;
+    payload.genUniformSize = genRange.size;
+    payload.blurUniformOffset = blurRange.offset;
+    payload.blurUniformSize = blurRange.size;
+    payload.width = resolved.width;
+    payload.height = resolved.height;
     return svc_gfx->push_compute(mod_ctx, g_normalComputeType, &payload, sizeof(payload)) ==
            MOD_OK;
 }
@@ -1374,15 +1382,15 @@ void composite_map_pass(int64_t debugMode) {
     }
 
     // Smoothed receiver normals feed the slope-bias / normal-offset receivers (and the
-    // Receiver Normal debug view); needed only when those are in play.
-    const auto smoothIterations =
-        static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarNormalSmooth, 3), 0, 8));
+    // Receiver Normal debug view); needed only when those are in play. 0 = off (the composite
+    // then falls back to an inline per-pixel cross for whichever receiver is active).
+    const int64_t smoothing = std::clamp<int64_t>(get_int_option(g_cvarNormalSmooth, 3), 0, 16);
     const bool normalsWanted =
-        smoothIterations > 0 &&
+        smoothing > 0 &&
         (debugMode == 13 ||
             (mapReady && (get_int_option(g_cvarSlopeBias, 30) > 0 ||
                              get_int_option(g_cvarNormalOffset, 100) > 0)));
-    const bool normalsReady = normalsWanted && push_normal_dispatches(resolved, smoothIterations);
+    const bool normalsReady = normalsWanted && push_normal_dispatches(resolved, smoothing);
 
     ShadowUniforms uniforms{};
     std::memcpy(uniforms.world_from_proj, camera.world_from_proj, sizeof(uniforms.world_from_proj));
@@ -1540,11 +1548,14 @@ ModResult build_controls_tab(
         "Shifts the shadow lookup point along the surface normal, scaled to the size of one "
         "shadow-map texel. The most effective acne fix with the least peter-panning; 100% = one "
         "texel.");
-    add_number(left, "Normal Smoothing", g_cvarNormalSmooth, 0, 8, 1, nullptr,
+    add_number(left, "Normal Smoothing", g_cvarNormalSmooth, 0, 16, 1, nullptr,
         "Rounds the surface direction Slope Bias and Normal Offset rely on (like smooth "
-        "shading), removing the faceted bias bands low-poly models otherwise show. Runs on a "
-        "resolution-independent buffer: a given value looks the same at any internal render "
-        "resolution / supersampling factor. Higher = smoother; 0 = off.");
+        "shading), removing the faceted bias bands low-poly models otherwise show. The blur "
+        "radius scales with your render resolution, so one value looks the same at any "
+        "internal resolution / supersampling factor. This only affects the shadow-map bias - "
+        "the fine screen-space shadow detail (shield insignia, sword sheath) comes from a "
+        "separate pass and is never touched, so smoothing costs no visible detail. Higher = "
+        "smoother, up to near fully smooth-shaded; 0 = off.");
     add_toggle(left, "Screen Space Shadows", g_cvarContactShadows,
         "Bend Studio's Days Gone screen-space shadow trace: per-pixel detail the shadow map "
         "misses (contact darkening, thin geometry, distant fine detail) at any range - also "
@@ -1897,7 +1908,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         wgpuBindGroupLayoutRelease(g_compositeDebugLayout);
         g_compositeDebugLayout = nullptr;
     }
-    g_cvarEnabled = g_cvarShadowMap = g_cvarMapSize = g_cvarNormalSmooth = 0;
+    g_cvarEnabled = g_cvarShadowMap = 0;
+    g_cvarMapSize = g_cvarNormalSmooth = 0;
     g_cvarNoFrustumClipping = 0;
     g_cvarStrength = 0;
     g_cvarPcf = g_cvarBias = g_cvarBoxRadius = g_cvarContactShadows = g_cvarDebugView = 0;

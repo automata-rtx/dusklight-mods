@@ -85,7 +85,7 @@ functions, and (on Windows) links the platform release's `dusklight.lib`.
 | `bias` | 55 | constant depth bias (normalized against light range) |
 | `slopeBias` | 30 | bias added ∝ surface slope vs light |
 | `normalOffset` | 100 | receiver offset, % of one shadow texel's world size |
-| `normalSmooth` | 3 | Gaussian rounds over the dedicated smoothed-normal buffer (`res/normal_smooth.wgsl`): side-selected crosses generated at a RESOLUTION-CAPPED size (≤1080p-equivalent), then `normalSmooth` iterations of a separable depth-aware 5-tap blur (silhouettes never blend), sampled by the composite with a depth-weighted bilinear. Capped buffer = a given value looks identical at any internal resolution / supersampling, and a dense Gaussian cannot ghost. History of failed approaches, do not repeat: (1) widening a single cross straddles facets near edges and manufactures garbage normals (shattered glass); (2) sparse taps at render-resolution pixel distances produce a displaced ghost image past a resolution-dependent sweet spot. Also: normals are camera-oriented with NO light-terminator flip — flipping toward the light mirrored the normal across every curved surface's terminator (hard bias discontinuity, e.g. on faces). 0 = off (inline 1px cross) |
+| `normalSmooth` | 3 | smooths the depth-reconstructed normal that Slope Bias / Normal Offset use (`res/normal_smooth.wgsl`): FULL-resolution per-pixel crosses + one separable depth-aware Gaussian whose radius = `normalSmooth * renderHeight / 1080` px (dense, capped 32). Only affects the shadow-MAP bias — SSS fine detail is independent (see note). One value looks the same at any internal resolution. History of failed approaches, do not repeat: (1) widening a single cross straddles facets and manufactures garbage normals (shattered glass); (2) sparse taps at fixed pixel distances ghost past a resolution-dependent sweet spot; (3) a resolution-CAPPED buffer blurs fine geometry away and needs a lossy upscale. NO light-terminator flip (mirrored the normal across curved surfaces' terminator = hard bias discontinuity on faces). 0 = off (inline 1px cross) |
 | `pcf` | 2 | PCF kernel: 0=1×1 1=3×3 2=5×5 3=7×7 |
 | `contactShadows` | on | the Bend screen-space shadow term |
 | `sssThickness` | 50 | assumed caster thickness, 1/100 % of remaining depth (50 = 0.5%) |
@@ -102,6 +102,18 @@ detach at feet (the screen-space term hides small gaps). Per Bend's guidance, tu
 `sssThickness` in multiples of 2 and scale `sssEdgeThreshold` alongside it; use the "SSS
 Edge Mask" debug view when striated patterns appear on flat surfaces (or turn on
 `sssIgnoreEdges`).
+
+## Normals, detail, and the screen-space term (important)
+
+The reconstructed surface normal is used ONLY for the shadow-map receiver's slope bias
+and normal offset. The screen-space shadow term (`screen_shadow_at`) reads the depth
+buffer directly and never touches the normal, so all the fine SSS detail (Hylian shield
+insignia, Master Sword sheath geometry) is independent of how the normal is computed.
+That means smoothing the normal cannot remove that detail — and for the coarse shadow
+map, a smooth normal is actively better (per-facet normal jumps are what band the
+shadows). So `normalSmooth` can go as high as needed for smooth shading with no loss of
+screen-space detail. This is why we use cheap depth-reconstructed normals rather than
+the game's per-vertex normals.
 
 ## Shadow-map tuning guide (plain language)
 
