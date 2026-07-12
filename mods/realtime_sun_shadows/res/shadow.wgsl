@@ -38,7 +38,7 @@ struct Uniforms {
     light_dir_world_y: f32,
     light_dir_world_z: f32,
     map_enabled: f32,         // 0 = screen-space-only mode (map bindings are stand-ins)
-    normal_smooth: f32,       // facet-normal blend tap distance in pixels (0 = off)
+    smoothed_normals: f32,    // 1 = the smoothed-normal buffer is bound (see normal_smooth.wgsl)
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
@@ -49,6 +49,7 @@ struct Uniforms {
 @group(0) @binding(2) var<uniform> uniforms: Uniforms;
 @group(0) @binding(3) var light_color: texture_2d<f32>;
 @group(0) @binding(4) var screen_shadow: texture_2d<f32>; // Bend SSS visibility (1 = lit)
+@group(0) @binding(5) var smooth_normal: texture_2d<f32>; // (normal.xyz, raw depth), capped res
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -142,66 +143,60 @@ fn cross_normal(uv: vec2f, world: vec3f, depth: f32, du: vec2f, dv: vec2f) -> ve
     return normal / len;
 }
 
-// World-space surface normal from the depth snapshot; drives the slope-scaled bias and the
-// normal-offset receiver. Low-poly (GameCube-era) models change facing at every polygon
-// edge, and a raw per-pixel normal makes the bias jump with it, drawing faceted bands into
-// the shadows.
+// World-space surface normal for the slope-scaled bias and the normal-offset receiver.
 //
-// normal_smooth (tap distance in pixels) fixes that by BLENDING FACET NORMALS, the way
-// smooth shading interpolates vertex normals: four neighborhood taps each reconstruct their
-// own tight 1px cross - so every sample is a true single-facet normal - and are averaged
-// with a bilateral depth weight that rejects taps across silhouettes. Near a polygon edge
-// the result rotates smoothly from one facet's normal to the next over ~2x the tap
-// distance.
+// With Normal Smoothing on, the normal comes from the dedicated capped-resolution buffer
+// (res/normal_smooth.wgsl: side-selected crosses + iterated depth-aware Gaussian), sampled
+// with a depth-weighted bilinear so silhouettes stay crisp - the same upscale pattern as
+// Enhanced AO's half-res composite. Off (or when the buffer is unavailable), a single
+// side-selected 1px cross reconstructs the raw facet normal inline.
 //
-// Do NOT widen a single cross instead: near an edge its two arms land on different facets
-// and the cross product belongs to no surface, manufacturing a radius-wide band of garbage
-// normals along every polygon edge (dense models read as shattered glass).
+// The normal is oriented toward the CAMERA (visible surfaces face it). There is
+// deliberately no light-based flip: mirroring the normal wherever the surface crosses the
+// light terminator put a hard, artificial discontinuity into the bias inputs on every
+// curved surface.
 fn world_normal_at(uv: vec2f, world: vec3f, depth: f32, inv_screen: vec2f) -> vec3f {
-    let du = vec2f(inv_screen.x, 0.0);
-    let dv = vec2f(0.0, inv_screen.y);
-    let center = cross_normal(uv, world, depth, du, dv);
-    var normal = center;
-    let s = uniforms.normal_smooth;
-    if s >= 1.0 {
-        // Bilateral tolerance on the raw depth, matching the depth-aware weights used
-        // elsewhere in these mods (relative agreement, silhouette taps fall to ~0).
+    var normal = vec3f(0.0);
+    if uniforms.smoothed_normals != 0.0 {
+        let size = vec2f(textureDimensions(smooth_normal));
+        let coordinates = uv * size - 0.5;
+        let base = floor(coordinates);
+        let fraction = coordinates - base;
+        let max_texel = vec2<i32>(size) - 1i;
         let tolerance = max(depth * 0.05, 1.0e-6);
+        var weight_sum = 0.0;
         for (var i = 0; i < 4; i += 1) {
-            let sign_x = select(-1.0, 1.0, (i & 1) != 0);
-            let sign_y = select(-1.0, 1.0, (i & 2) != 0);
-            let uv_tap = uv + vec2f(inv_screen.x * s * sign_x, inv_screen.y * s * sign_y);
-            let depth_tap = scene_depth_at(uv_tap);
-            if depth_tap <= 0.0 {
+            let corner = vec2<i32>(i & 1, i >> 1);
+            let texel = clamp(vec2<i32>(base) + corner, vec2<i32>(0i), max_texel);
+            let tap = textureLoad(smooth_normal, texel, 0i);
+            if tap.w <= 0.0 {
                 continue;
             }
-            let dz = (depth_tap - depth) / tolerance;
-            let weight = exp2(-dz * dz);
-            if weight < 1.0e-3 {
-                continue;
-            }
-            let world_tap = world_position_at(uv_tap, depth_tap);
-            normal += cross_normal(uv_tap, world_tap, depth_tap, du, dv) * weight;
+            let bilinear = select(1.0 - fraction.x, fraction.x, corner.x == 1) *
+                select(1.0 - fraction.y, fraction.y, corner.y == 1);
+            let dz = (tap.w - depth) / tolerance;
+            let weight = bilinear * exp2(-dz * dz);
+            normal += tap.xyz * weight;
+            weight_sum += weight;
+        }
+        if weight_sum < 1.0e-4 {
+            normal = vec3f(0.0); // all taps rejected (thin silhouette): rebuild inline
         }
     }
-    var len = length(normal);
-    if len < 1.0e-8 {
-        // Tap normals cancelled; fall back to this pixel's own facet normal.
-        normal = center;
-        len = length(normal);
+    if length(normal) < 1.0e-6 {
+        normal = cross_normal(
+            uv, world, depth, vec2f(inv_screen.x, 0.0), vec2f(0.0, inv_screen.y));
+        // Orient toward the camera (the near-plane center approximates its position).
+        let camera = world_position_at(vec2f(0.5, 0.5), 1.0);
+        if dot(normal, world - camera) > 0.0 {
+            normal = -normal;
+        }
     }
+    let len = length(normal);
     if len < 1.0e-8 {
         return vec3f(0.0, 1.0, 0.0);
     }
-    normal /= len;
-    // Face the light side: offsetting the receiver toward the lit side is always the direction
-    // that prevents self-shadowing.
-    let light_dir = vec3f(
-        uniforms.light_dir_world_x, uniforms.light_dir_world_y, uniforms.light_dir_world_z);
-    if dot(normal, light_dir) < 0.0 {
-        normal = -normal;
-    }
-    return normal;
+    return normal / len;
 }
 
 fn scene_depth_at(uv: vec2f) -> f32 {
