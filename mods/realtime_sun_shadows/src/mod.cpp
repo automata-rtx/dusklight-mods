@@ -86,6 +86,9 @@ ConfigVarHandle g_cvarSssThickness = 0;
 ConfigVarHandle g_cvarSssEdgeThreshold = 0;
 ConfigVarHandle g_cvarSssContrast = 0;
 ConfigVarHandle g_cvarSssIgnoreEdges = 0;
+ConfigVarHandle g_cvarSssFade = 0;
+ConfigVarHandle g_cvarSssFadeStart = 0;
+ConfigVarHandle g_cvarSssFadeEnd = 0;
 ConfigVarHandle g_cvarIndoorDisable = 0;
 ConfigVarHandle g_cvarTwoSidedCasters = 0;
 
@@ -193,9 +196,11 @@ struct ShadowUniforms {
     float light_dir_world[3];  // toward the light, world space (slope/offset receivers)
     float map_enabled;         // 0 = screen-space-only mode (map bindings are stand-ins)
     float smoothed_normals;    // 1 = the smoothed-normal buffer is bound
+    float camera_eye[3];       // camera world position (screen-space shadow distance fade)
+    float sss_fade_start;      // world units; screen-space shadow full below this distance
+    float sss_fade_end;        // world units; screen-space shadow gone beyond this distance
     float _pad0;
     float _pad1;
-    float _pad2;
 };
 static_assert(sizeof(ShadowUniforms) % 16 == 0);
 
@@ -1334,10 +1339,14 @@ bool push_normal_dispatches(const GfxResolvedTargets& resolved, int64_t smoothin
 // own shadows return (dynamic_shadows_wanted is false, so the skip hooks pass through).
 void composite_map_pass(int64_t debugMode) {
     const MapPassOutput mapPass = std::exchange(g_mapPass, {});
-    const bool mapEnabled = get_bool_option(g_cvarShadowMap, true);
+    // Indoors, the shadow map is suppressed (it reads as fully shadowed under a sky-light
+    // map) but the screen-space shadows stay - so indoors is just screen-space-only mode.
+    const bool mapWanted = get_bool_option(g_cvarShadowMap, true) && !indoor_blocked();
     const bool mapReady =
-        mapEnabled && mapPass.ready && mapPass.shadowMap != nullptr && mapPass.lightColor != nullptr;
-    if (mapEnabled && !mapReady) {
+        mapWanted && mapPass.ready && mapPass.shadowMap != nullptr && mapPass.lightColor != nullptr;
+    if (mapWanted && !mapReady) {
+        // The map should have rendered but didn't (e.g. a lost frame): bail rather than
+        // flash the screen-space-only look for one frame.
         return;
     }
     if (!g_sceneCamera.valid) {
@@ -1351,8 +1360,9 @@ void composite_map_pass(int64_t debugMode) {
         std::memcpy(dirToLight, mapPass.dirToLightWorld, sizeof(dirToLight));
         fade = mapPass.fade;
     } else {
-        // Screen-space-only mode, under the same gates the map path applies at render time.
-        if (!get_bool_option(g_cvarEnabled, true) || indoor_blocked() ||
+        // Screen-space-only mode (map off, or auto-disabled indoors): the Bend trace supplies
+        // the whole term and the game's own shadows return (dynamic_shadows_wanted is false).
+        if (!get_bool_option(g_cvarEnabled, true) ||
             !get_bool_option(g_cvarContactShadows, true))
         {
             return;
@@ -1423,6 +1433,19 @@ void composite_map_pass(int64_t debugMode) {
         100.0f;
     uniforms.pcf_taps = static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarPcf, 1), 0, 3));
     uniforms.contact_enabled = sssReady ? 1.0f : 0.0f;
+    // Screen-space shadow distance fade: ease the SSS term out with world distance so distant,
+    // fogged-out geometry isn't full-strength shadowed. Off -> push the band past the far
+    // plane so the fade is always 1.
+    std::memcpy(uniforms.camera_eye, camera.eye, sizeof(uniforms.camera_eye));
+    if (get_bool_option(g_cvarSssFade, true)) {
+        uniforms.sss_fade_start =
+            static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarSssFadeStart, 8000), 0, 200000));
+        uniforms.sss_fade_end = static_cast<float>(
+            std::clamp<int64_t>(get_int_option(g_cvarSssFadeEnd, 25000), 0, 300000));
+    } else {
+        uniforms.sss_fade_start = 1.0e12f;
+        uniforms.sss_fade_end = 1.0e12f;
+    }
     uniforms.debug_mode = static_cast<uint32_t>(debugMode);
 
     GfxRange uniformRange{0, 0};
@@ -1509,57 +1532,65 @@ ModResult build_controls_tab(
     ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*, ModError*) {
     (void)right;
 
+    // General: settings that affect both shadowing methods.
+    svc_ui->pane_add_section(mod_ctx, left, "General");
+    add_toggle(left, "Enabled", g_cvarEnabled, "Master toggle for realtime sun/moon shadows.");
+    add_number(left, "Strength", g_cvarStrength, 0, 100, 5, "%",
+        "How dark shadowed areas become. Applies to both the shadow map and the screen-space "
+        "shadows.");
+
+    // Shadow Map: the light-space depth map and everything that only affects it.
     svc_ui->pane_add_section(mod_ctx, left, "Shadow Map");
-    add_toggle(left, "Enabled", g_cvarEnabled, "Enables realtime sun/moon shadows.");
     add_toggle(left, "Shadow Map", g_cvarShadowMap,
         "Renders the sun/moon shadow map. Off: only the screen-space shadows run, and the "
         "game's own character shadows come back.");
     static const char* kMapSizes[] = {"1024", "2048", "4096", "8192"};
     add_select(left, "Map Size", g_cvarMapSize, kMapSizes, 4,
         "Shadow map resolution. Larger is sharper and slower.");
-    add_toggle(left, "No Frustum Clipping", g_cvarNoFrustumClipping,
-        "Keeps camera-frustum-culled objects in the draw lists so off-screen objects still cast "
-        "shadows. Fixes shadows popping in and out with camera direction (distant mountains, "
-        "ceilings) at some GPU cost.");
-    add_toggle(left, "Two-Sided Casters", g_cvarTwoSidedCasters,
-        "Renders shadow casters with backface culling disabled. Fixes light leaking through "
-        "single-sided geometry (level-edge walls, roofs) that faces away from the sun.");
     add_number(left, "Coverage", g_cvarBoxRadius, 1000, 30000, 500, nullptr,
         "Radius of the shadowed area around the camera, in world units. Smaller is sharper for "
-        "the same map size; the light volume scales automatically.");
-    add_toggle(left, "Disable Indoors", g_cvarIndoorDisable,
-        "Automatically turns the effect off in interior spaces (which read as fully shadowed "
-        "under a sky-light map) and restores the game's own shadows there.");
-
-    svc_ui->pane_add_section(mod_ctx, left, "Appearance");
-    add_number(left, "Strength", g_cvarStrength, 0, 100, 5, "%", "How dark shadowed areas become.");
+        "the same map size; the light volume scales automatically. Screen-space shadows fill in "
+        "detail beyond the coverage, so keep this small.");
     static const char* kPcfOptions[] = {"Off", "3x3", "5x5", "7x7"};
     add_select(left, "Soft Shadows", g_cvarPcf, kPcfOptions, 4,
-        "Percentage-closer filtering tap pattern; softens shadow edges and hides stair-steps "
-        "on steep terrain.");
+        "Shadow-map edge softening (percentage-closer filtering). Softens edges and hides "
+        "stair-steps on steep terrain.");
     add_number(left, "Bias", g_cvarBias, 0, 200, 5, nullptr,
-        "Constant depth bias in world units. Raise to remove shadow acne; lower to reduce "
+        "Constant depth bias in world units. Raise to remove shadow-map acne; lower to reduce "
         "peter-panning. Prefer Slope Bias and Normal Offset for acne on sloped surfaces - they "
         "only apply where needed, so the constant bias can stay small.");
     add_number(left, "Slope Bias", g_cvarSlopeBias, 0, 200, 5, nullptr,
         "Extra bias that grows with surface slope relative to the light, in world units. Sloped "
         "surfaces alias the most; this targets them without detaching flat-ground shadows.");
     add_number(left, "Normal Offset", g_cvarNormalOffset, 0, 300, 10, "%",
-        "Shifts the shadow lookup point along the surface normal, scaled to the size of one "
+        "Shifts the shadow-map lookup point along the surface normal, scaled to the size of one "
         "shadow-map texel. The most effective acne fix with the least peter-panning; 100% = one "
         "texel.");
     add_number(left, "Normal Smoothing", g_cvarNormalSmooth, 0, 16, 1, nullptr,
         "Rounds the surface direction Slope Bias and Normal Offset rely on (like smooth "
-        "shading), removing the faceted bias bands low-poly models otherwise show. The blur "
-        "radius scales with your render resolution, so one value looks the same at any "
-        "internal resolution / supersampling factor. This only affects the shadow-map bias - "
-        "the fine screen-space shadow detail (shield insignia, sword sheath) comes from a "
-        "separate pass and is never touched, so smoothing costs no visible detail. Higher = "
-        "smoother, up to near fully smooth-shaded; 0 = off.");
+        "shading), removing the faceted bias bands low-poly models can show. The blur radius "
+        "scales with your render resolution, so one value looks the same at any internal "
+        "resolution / supersampling factor. Only affects the shadow-map bias. Higher = "
+        "smoother; 0 = off.");
+    add_toggle(left, "No Frustum Clipping", g_cvarNoFrustumClipping,
+        "Keeps camera-frustum-culled objects in the draw lists so off-screen objects still cast "
+        "map shadows. Fixes shadows popping in and out with camera direction (distant mountains, "
+        "ceilings) at some GPU cost.");
+    add_toggle(left, "Two-Sided Casters", g_cvarTwoSidedCasters,
+        "Renders map casters with backface culling disabled. Fixes light leaking through "
+        "single-sided geometry (level-edge walls, roofs) that faces away from the sun.");
+    add_toggle(left, "Disable Map Indoors", g_cvarIndoorDisable,
+        "Turns the shadow MAP off in interior spaces (which read as fully shadowed under a "
+        "sky-light map) and restores the game's own shadows there. Screen-space shadows still "
+        "run indoors.");
+
+    // Screen Space Shadows: the Bend depth-trace term and everything that only affects it.
+    svc_ui->pane_add_section(mod_ctx, left, "Screen Space Shadows");
     add_toggle(left, "Screen Space Shadows", g_cvarContactShadows,
         "Bend Studio's Days Gone screen-space shadow trace: per-pixel detail the shadow map "
-        "misses (contact darkening, thin geometry, distant fine detail) at any range - also "
-        "re-grounds objects when bias settings push the mapped shadow away from their base.");
+        "misses (contact darkening, thin geometry, fine detail) at any range - also re-grounds "
+        "objects when bias settings push the mapped shadow away from their base. Runs even when "
+        "the shadow map is off or disabled indoors.");
     add_number(left, "SSS Thickness", g_cvarSssThickness, 5, 500, 5, nullptr,
         "Assumed surface thickness for the screen-space trace, in hundredths of a percent of "
         "the remaining depth range (50 = 0.5%). Tune in steps of 2x: higher grounds more, too "
@@ -1573,6 +1604,15 @@ ModResult build_controls_tab(
     add_toggle(left, "SSS Ignore Edges", g_cvarSssIgnoreEdges,
         "Pixels detected as geometric edges do not cast screen-space shadows. Helps aliasing "
         "on large flat surfaces lit at grazing angles; can thin out foliage shadows.");
+    add_toggle(left, "SSS Distance Fade", g_cvarSssFade,
+        "Fades the screen-space shadows out with distance so distant, fogged-out geometry isn't "
+        "shadowed at full strength. Off applies them at full strength to the horizon.");
+    add_number(left, "SSS Fade Start", g_cvarSssFadeStart, 0, 60000, 1000, nullptr,
+        "Distance from the camera (world units) where the screen-space shadow fade begins. Set "
+        "near where the scene starts washing into fog.");
+    add_number(left, "SSS Fade End", g_cvarSssFadeEnd, 0, 100000, 1000, nullptr,
+        "Distance from the camera (world units) where the screen-space shadows are fully faded "
+        "out. Set around the fog's full-density distance.");
 
     svc_ui->pane_add_section(mod_ctx, left, "Debug");
     static const char* kDebugOptions[] = {"Off", "Shadow Map", "Shadow Factor", "Occlusion",
@@ -1737,6 +1777,18 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return result;
     }
     result = register_bool_option("sssIgnoreEdges", false, g_cvarSssIgnoreEdges, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_bool_option("sssFade", true, g_cvarSssFade, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_int_option("sssFadeStart", 8000, g_cvarSssFadeStart, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_int_option("sssFadeEnd", 25000, g_cvarSssFadeEnd, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -1915,6 +1967,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarPcf = g_cvarBias = g_cvarBoxRadius = g_cvarContactShadows = g_cvarDebugView = 0;
     g_cvarSlopeBias = g_cvarNormalOffset = 0;
     g_cvarSssThickness = g_cvarSssEdgeThreshold = g_cvarSssContrast = g_cvarSssIgnoreEdges = 0;
+    g_cvarSssFade = g_cvarSssFadeStart = g_cvarSssFadeEnd = 0;
     g_cvarIndoorDisable = g_cvarTwoSidedCasters = 0;
     g_drawType = g_sssComputeType = g_normalComputeType = g_sceneBeginHook =
         g_sceneAfterTerrainHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;

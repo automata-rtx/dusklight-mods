@@ -39,9 +39,13 @@ struct Uniforms {
     light_dir_world_z: f32,
     map_enabled: f32,         // 0 = screen-space-only mode (map bindings are stand-ins)
     smoothed_normals: f32,    // 1 = the smoothed-normal buffer is bound (see normal_smooth.wgsl)
+    camera_eye_x: f32,        // camera world position (screen-space shadow distance fade)
+    camera_eye_y: f32,
+    camera_eye_z: f32,
+    sss_fade_start: f32,      // world units; screen-space shadow full below this distance
+    sss_fade_end: f32,        // world units; screen-space shadow gone beyond this distance
     _pad0: f32,
     _pad1: f32,
-    _pad2: f32,
 }
 
 @group(0) @binding(0) var scene_depth: texture_2d<f32>;
@@ -282,12 +286,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         return vec4f(n * 0.5 + 0.5, 1.0);
     }
 
+    // World position of this pixel (both the map receiver and the SSS distance fade use it).
+    let ndc = vec4f(in.uv.x * 2.0 - 1.0, 1.0 - 2.0 * in.uv.y, depth, 1.0);
+    let world4 = uniforms.world_from_proj * ndc;
+    let world = world4.xyz / world4.w;
+
     var occlusion = 0.0;
     if map_on {
-        let ndc = vec4f(in.uv.x * 2.0 - 1.0, 1.0 - 2.0 * in.uv.y, depth, 1.0);
-        let world4 = uniforms.world_from_proj * ndc;
-        let world = world4.xyz / world4.w;
-
         // Receiver-side acne control (see the header): slope-scaled bias + normal-offset lookup.
         var receiver_world = world;
         var bias_eff = uniforms.bias;
@@ -353,10 +358,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     }
 
     // Combine with the Bend SSS term: it catches contact detail and thin casters the map
-    // misses at any distance (its thickness is depth-relative, not a fixed world size), so
-    // no near-field fade is needed.
+    // misses at any distance (its thickness is depth-relative, not a fixed world size). Fade
+    // it out with world distance from the camera so distant, fogged-out geometry isn't
+    // shadowed at full strength (the shadow map, bounded by its coverage radius, is already
+    // near the camera).
     if uniforms.contact_enabled != 0.0 && occlusion < 1.0 {
-        occlusion = max(occlusion, 1.0 - screen_shadow_at(in.uv));
+        let camera = vec3f(uniforms.camera_eye_x, uniforms.camera_eye_y, uniforms.camera_eye_z);
+        let distance = length(world - camera);
+        let fade = 1.0 - smoothstep(
+            uniforms.sss_fade_start, max(uniforms.sss_fade_end, uniforms.sss_fade_start + 1.0),
+            distance);
+        occlusion = max(occlusion, (1.0 - screen_shadow_at(in.uv)) * fade);
     }
 
     let value = 1.0 - uniforms.strength * occlusion;

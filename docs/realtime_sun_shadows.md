@@ -41,8 +41,17 @@ functions, and (on Windows) links the platform release's `dusklight.lib`.
    (sharper map texels up close, screen-space detail everywhere).
 5. **Game-shadow suppression**: pre-hooks skip `dDlst_shadowControl_c::imageDraw/draw` and
    `drawCloudShadow` while the mod is active (typed hooks only — no symbol manifest needed).
-6. **Indoor auto-disable**: `dKy_Indoor_check() != 0` (+ `indoorDisable` on) gates both map
-   rendering and compositing — interiors revert to the vanilla look.
+6. **Indoor auto-disable**: `dKy_Indoor_check() != 0` (+ `indoorDisable` on) suppresses the
+   shadow MAP render and its composite path (interiors read as fully shadowed under a
+   sky-light map), and the suppression hooks go inactive so the game's own shadows return —
+   but the composite still runs its screen-space-only path, so the Bend SSS term persists
+   indoors. Indoors is therefore just "screen-space-only mode" triggered automatically.
+
+The controls are grouped **General** (Enabled, Strength — affect both methods) / **Shadow
+Map** (map toggle, size, coverage, PCF, bias/slope/offset/normal-smoothing, clipping,
+two-sided, disable-map-indoors) / **Screen Space Shadows** (toggle, thickness, edge, contrast,
+ignore-edges, distance fade) / **Debug**. Anything under "Shadow Map" is inert when the map is
+off; anything under "Screen Space Shadows" is inert when SSS is off.
 
 ## The original issues and where their fixes live
 
@@ -87,14 +96,16 @@ functions, and (on Windows) links the platform release's `dusklight.lib`.
 | `normalOffset` | 100 | receiver offset, % of one shadow texel's world size |
 | `normalSmooth` | 3 | smooths the depth-reconstructed normal that Slope Bias / Normal Offset use (`res/normal_smooth.wgsl`): FULL-resolution per-pixel crosses + one separable depth-aware Gaussian whose radius = `normalSmooth * renderHeight / 1080` px (dense, capped 32). Only affects the shadow-MAP bias — SSS fine detail is independent (see note). One value looks the same at any internal resolution. History of failed approaches, do not repeat: (1) widening a single cross straddles facets and manufactures garbage normals (shattered glass); (2) sparse taps at fixed pixel distances ghost past a resolution-dependent sweet spot; (3) a resolution-CAPPED buffer blurs fine geometry away and needs a lossy upscale. NO light-terminator flip (mirrored the normal across curved surfaces' terminator = hard bias discontinuity on faces). 0 = off (inline 1px cross) |
 | `pcf` | 2 | PCF kernel: 0=1×1 1=3×3 2=5×5 3=7×7 |
-| `contactShadows` | on | the Bend screen-space shadow term |
+| `contactShadows` | on | the Bend screen-space shadow term (runs even with the map off / indoors) |
 | `sssThickness` | 50 | assumed caster thickness, 1/100 % of remaining depth (50 = 0.5%) |
 | `sssEdgeThreshold` | 200 | depth delta treated as an edge, 1/100 % (200 = 2%) |
 | `sssContrast` | 4 | contrast boost on the SSS transition (1–8) |
 | `sssIgnoreEdges` | off | edge pixels don't cast (helps grazing-angle aliasing) |
+| `sssFade` | on | fade the screen-space shadows out with distance so distant fogged geometry isn't full-strength shadowed |
+| `sssFadeStart` / `sssFadeEnd` | 8000 / 25000 | world-unit distances where the SSS fade begins / completes (set around where the scene washes into fog) |
 | `noFrustumClipping` | on | the anti-popping clipper bypass (issue 5) |
 | `twoSidedCasters` | on | render casters with backface culling off (issue 6) |
-| `indoorDisable` | on | vanilla look indoors (issue 3) |
+| `indoorDisable` | on | disable the shadow MAP indoors (game shadows return); screen-space shadows still run (issue 3) |
 | `debugView` | 0 | map/coverage/factor visualizations + SSS buffer/edge-mask views |
 
 Tuning order for acne: raise `slopeBias` first, then `normalOffset`; lower `bias` if shadows
