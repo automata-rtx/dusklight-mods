@@ -44,48 +44,63 @@ Any screen-space effect composited after the opaque scene therefore multiplies o
    all five fog curves). GX fog *range adjustment* is set by the game but ignored by
    aurora's command processor, so the deferred pass correctly ignores it too.
 
-## Special fog configurations
+## Mixed fog configurations
 
-Materials are only suppressed when their fog matches the frame's **reference
-configuration** (the first fogged draw of the frame — normally stage geometry), within
-tolerances that absorb per-room palette-blend differences (Δcolor ≤ 6, Δstart/end ≤ 2% of
-the fog span). Anything beyond that is a *deviant*: it keeps its forward fog, and its
-presence turns suppression off from the next frame on — the scene reverts to exact vanilla
-fog until it is uniform again (one transition frame may double-fog deviant pixels). This is
-how the special cases stay correct rather than being flattened:
+Fog configurations are compared with tolerances that absorb per-room palette-blend
+differences (Δcolor ≤ 6, Δstart/end ≤ 2% of the fog span); anything beyond that is a
+distinct configuration. Many areas mix several (rooms lagging the stage's palette blend,
+special-fog materials), and the two modes handle that differently (`mixedMode`):
 
-- **Twilight black fog**: materials authored with fog type 7, converted by `d_kankyo` to
-  linear *black* — color mismatch → vanilla path.
-- **Wolf-senses white fog**: type 6 (REVEXP, forced white) → type mismatch → vanilla path.
-- Room/weather palette transitions where actors lag the stage by more than the tolerance.
+- **Exact (replay), the default**: every fogged draw is suppressed and its configuration
+  captured into a per-frame table (up to 8 distinct). A uniform frame takes the ordinary
+  single-quad path at no extra cost. A mixed frame replays the opaque draw lists once into
+  a mod-owned offscreen pass — same save-replay-resolve bracket as the shadow mod's
+  cascades, but with the game's own camera — with each shape's output forced to a flat
+  sparse-encoded index color (`(index+1)·24` in red; the material display list has already
+  run, so a per-shape TEV/channel override sets it). The resolved buffer selects each
+  pixel's exact fog configuration in `fs_mixed`. Caveats:
+  - One extra opaque scene of vertex/index streaming per mixed frame. With heavy shadow
+    cascade settings this can crowd aurora's fixed per-frame streaming buffers (see the
+    shadow doc's budget section) — use Vanilla mode there until adaptive buffers land.
+  - Alpha-tested cutouts (foliage holes) replay solid, so a hole resolves to its tree's
+    config; pixels not covered by the shape override (rare non-J3D direct drawers) decode
+    as invalid and fall back to config 0 (the frame's reference) — exactly what the
+    single-config quad applied to them before.
+  - MSAA silhouettes may resolve to an invalid ID on 1-px fringes → reference config.
+- **Vanilla**: the original behavior — only draws matching the frame's reference config
+  are suppressed; any deviant reverts the scene to forward fog from the next frame until
+  it is uniform again. Twilight black fog (type 7 → linear black), wolf-senses white fog
+  (type 6), and room transitions all take the vanilla path in this mode.
 
 A scene that uses a special configuration *uniformly* (all draws agree) is deferred
-normally — all five GX fog curves (LIN/EXP/EXP2/REVEXP/REVEXP2) are implemented in
-`res/fog.wgsl`.
+normally in both modes — all five GX fog curves (LIN/EXP/EXP2/REVEXP/REVEXP2) are
+implemented in `res/fog.wgsl`, and in exact mode a mixed twilight scene simply carries the
+special config in its table like any other.
 
-## Diagnosing reverts
+## Diagnosing fog issues
 
-The fall-back to vanilla fog is otherwise invisible, but its symptom is not: with the mod
-"enabled", screen-space AO/shadows suddenly darken the fog itself at range (most visible as
-unnatural darkening on distant fog-washed terrain). Two ways to confirm:
+The symptom of fog NOT being deferred is distinctive: screen-space AO/shadows darken the
+fog itself at range (unnatural darkening on distant fog-washed terrain). Tools:
 
-- The mod panel's **Status** line shows the live state: "Deferring fog (N draws)" is the
-  working state; "REVERTED: mixed fog configs (N matching / M deviant)" means this scene
-  draws with more than one fog configuration and the vanilla path is active.
-- Every revert/re-engage transition is **logged** (warn/info), including both fog
-  configurations (type, range, color) — enough to decide whether the deviant is a real
-  special fog or something the matching tolerances should absorb.
-- The **Fog Factor** debug view showing black while the scene is visibly foggy is the same
-  signal (no deferred quad ran).
+- The mod panel's **Status** line: "Deferring fog (exact: N draws, K configs)" is the
+  working state in exact mode ("... replay failed" indicates the ID replay could not run
+  and mixed pixels got the reference config); "REVERTED: mixed fog configs" appears only
+  in Vanilla mode.
+- Transitions are **logged**: mixed↔uniform in exact mode, revert/re-engage (with both
+  configs' type/range/color) in Vanilla mode.
+- Debug views: **Fog Factor** (the deferred term as grayscale — black while the scene is
+  visibly foggy means no quad ran) and **Config IDs** (exact mode, mixed frames: one gray
+  band per captured config, showing exactly which geometry resolved to which fog).
 
 ## Tunables
 
 | Var | Default | Meaning |
 |---|---|---|
 | `effectEnabled` | on | master toggle (off = vanilla forward fog) |
-| `debugView` | 0 | 1 = deferred fog factor as grayscale |
+| `mixedMode` | 1 (Exact) | mixed-scene handling: 0 = Vanilla (revert to forward fog), 1 = Exact (per-pixel config-ID replay) |
+| `debugView` | 0 | 1 = deferred fog factor as grayscale, 2 = config IDs (exact mode, mixed frames) |
 
-The panel also shows a read-only **Status** line (see "Diagnosing reverts").
+The panel also shows a read-only **Status** line (see "Diagnosing fog issues").
 
 ## Known caveats
 
