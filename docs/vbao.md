@@ -63,7 +63,9 @@ Ints are fixed-point (usually /100) unless noted.
 | `effectEnabled` | on | master toggle |
 | `quality` | 2 (High) | 0 Low 3/2, 1 Med 5/2, 2 High 7/3, 3 Ultra 9/3, 4 Custom — slices/steps |
 | `customSlices` / `customSteps` | 7 / 3 | used when quality = Custom (1–16 / 1–8) |
-| `radius` | 100 | effect radius, % of view depth (depth-proportional world radius) |
+| `radius` | 200 | effect radius up close, % of view depth (depth-proportional world radius) |
+| `radiusFar` | 800 | effect radius at long view distance (same scale). The radius ramps from `radius` to this across the band below — tight contact detail near, broad landmark depth far. 0 disables (constant `radius`) |
+| `radiusRampStart` / `radiusRampEnd` | 10 / 50 | radius ramp band, % of the far plane |
 | `radiusMax` | 40 | screen-space radius cap, % of viewport height. The search radius is constant in screen space, so this only engages (bounding sampling cost) when `radius` is pushed very high; at normal values it has no visible effect |
 | `intensity` | 150 | final strength multiplier ×0.01 (up to 500) |
 | `contrast` | 150 | value power ×0.01 — deepens (>100) or lifts the falloff |
@@ -80,6 +82,7 @@ Ints are fixed-point (usually /100) unless noted.
 | `disoccTol` | 0 | disocclusion depth tolerance, % of depth (0–20). 0 rejects most aggressively; a small fixed depth floor still admits history on matching surfaces, minimizing distant ghosting |
 | `denoisePasses` | 1 | spatial passes 0–3 (ping-pong parity is mirrored on the CPU side —
   see mod-api-notes) |
+| `denoiseStrength` | 60 | per-pass blur blend, % (0 raw, 100 full blur). Lowered from full so the sharper temporal result keeps its detail |
 | `halfRes` | off | compute occlusion at half resolution. With temporal accumulation on, a jittered temporal upsampler reconstructs full-res detail (near-full-res look at ¼ the occlusion cost); with it off, a depth-aware bilinear upscale (softer) |
 | `distanceFade` | off | fade AO out toward the far plane |
 | `fadeStart` / `fadeEnd` | 40 / 90 | fade band, % of far plane |
@@ -93,7 +96,8 @@ a fogged debug view reads as much weaker than the effect actually is.
 ## Defaults rationale + performance notes
 
 Defaults were chosen to match the look the user approved on the aurora branch: High quality,
-radius 100, intensity/contrast 150, thickness 150, 5-frame accumulation, 1 denoise pass.
+intensity/contrast 150, thickness 150, 5-frame accumulation, 1 denoise pass; later in-game
+tuning moved radius to 200 near / 800 far (distance ramp) and denoise strength to 60%.
 Exposing everything costs nothing per frame — values upload in one uniform buffer that is
 written every frame regardless; only `quality`/`halfRes`/`denoisePasses` change the actual
 GPU work. Hardcoding would not measurably help: the shader reads the uniform once per pixel.

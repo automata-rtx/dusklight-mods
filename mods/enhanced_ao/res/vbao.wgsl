@@ -43,8 +43,12 @@ struct Uniforms {
     debug_view: u32,
     frame_index: u32,
     flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
-    thick_dist_scale: f32, // extra occluder thickness, fraction of the view-space radius
-    inv_debug_depth: f32,  // debug depth view gradient scale (1 / world units)
+    thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
+    inv_debug_depth: f32,   // debug depth view gradient scale (1 / world units)
+    radius_far: f32,        // far effect radius (fraction of view depth); 0 disables the ramp
+    radius_ramp_start: f32, // radius ramp band start, fraction of the far plane
+    radius_ramp_end: f32,   // radius ramp band end, fraction of the far plane
+    denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
@@ -257,9 +261,19 @@ fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // radius - so thick_dist_scale adds a radius-PROPORTIONAL floor that keeps mid/far
     // occluders carving meaningful sector spans.
     let abs_z = max(-pixel_position.z, 1.0e-4);
-    let view_radius = abs_z * uniforms.effect_radius;
+    // Distance-scaled radius: ramp the (depth-proportional) radius from effect_radius up to
+    // radius_far across [ramp_start, ramp_end] of the far plane - tight contact detail up close,
+    // broad occlusion that gives distant landmarks depth at range. radius_far 0 disables.
+    var eff_radius = uniforms.effect_radius;
+    if uniforms.radius_far > 0.0 {
+        let dist_norm = clamp(abs_z * uniforms.inv_far, 0.0, 1.0);
+        eff_radius = mix(uniforms.effect_radius, uniforms.radius_far,
+            smoothstep(uniforms.radius_ramp_start,
+                max(uniforms.radius_ramp_end, uniforms.radius_ramp_start + 0.01), dist_norm));
+    }
+    let view_radius = abs_z * eff_radius;
     let proj_scale_y = 0.5 * uniforms.size.y * uniforms.projection[1][1];
-    let radius_pix = clamp(uniforms.effect_radius * proj_scale_y, 4.0, uniforms.radius_max * uniforms.size.y);
+    let radius_pix = clamp(eff_radius * proj_scale_y, 4.0, uniforms.radius_max * uniforms.size.y);
     let t_base = log(1.0 + view_radius) * 0.3333 * uniforms.thickness +
         view_radius * uniforms.thick_dist_scale;
     let depth_range = view_radius * uniforms.thick_fade;

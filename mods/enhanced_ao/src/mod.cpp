@@ -47,6 +47,9 @@ ConfigVarHandle g_cvarQuality = 0;
 ConfigVarHandle g_cvarCustomSlices = 0;
 ConfigVarHandle g_cvarCustomSteps = 0;
 ConfigVarHandle g_cvarRadius = 0;
+ConfigVarHandle g_cvarRadiusFar = 0;
+ConfigVarHandle g_cvarRadiusRampStart = 0;
+ConfigVarHandle g_cvarRadiusRampEnd = 0;
 ConfigVarHandle g_cvarRadiusMax = 0;
 ConfigVarHandle g_cvarIntensity = 0;
 ConfigVarHandle g_cvarContrast = 0;
@@ -63,6 +66,7 @@ ConfigVarHandle g_cvarMotionResponse = 0;
 ConfigVarHandle g_cvarContentThresh = 0;
 ConfigVarHandle g_cvarDisoccTol = 0;
 ConfigVarHandle g_cvarDenoisePasses = 0;
+ConfigVarHandle g_cvarDenoiseStrength = 0;
 ConfigVarHandle g_cvarDistanceFade = 0;
 ConfigVarHandle g_cvarFadeStart = 0;
 ConfigVarHandle g_cvarFadeEnd = 0;
@@ -167,8 +171,12 @@ struct AoUniforms {
     uint32_t debug_view;
     uint32_t frame_index;
     uint32_t flags; // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
-    float thick_dist_scale; // extra occluder thickness, fraction of the view-space radius
-    float inv_debug_depth;  // debug depth view gradient scale (1 / world units)
+    float thick_dist_scale;  // extra occluder thickness, fraction of the view-space radius
+    float inv_debug_depth;   // debug depth view gradient scale (1 / world units)
+    float radius_far;        // far effect radius (fraction of view depth); 0 disables the ramp
+    float radius_ramp_start; // radius ramp band start, fraction of the far plane
+    float radius_ramp_end;   // radius ramp band end, fraction of the far plane
+    float denoise_strength;  // spatial denoise blend, 0 raw .. 1 fully blurred
     float _pad0;
     float _pad1;
     float _pad2;
@@ -771,8 +779,14 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     };
     // Depth-proportional radius: the setting is a permille of the view distance (100 = 10%).
     uniforms.effect_radius =
-        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarRadius, 100), 25, 800)) /
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarRadius, 200), 25, 800)) /
         1000.0f;
+    // Far radius (same scale, 0 = off) ramps in across [rampStart, rampEnd] of the far plane.
+    uniforms.radius_far =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarRadiusFar, 800), 0, 800)) /
+        1000.0f;
+    uniforms.radius_ramp_start = percent(g_cvarRadiusRampStart, 10, 0, 95);
+    uniforms.radius_ramp_end = percent(g_cvarRadiusRampEnd, 50, 5, 100);
     uniforms.intensity = percent(g_cvarIntensity, 150, 0, 500);
     uniforms.contrast = percent(g_cvarContrast, 150, 50, 300);
     uniforms.thickness = percent(g_cvarThickness, 150, 25, 400);
@@ -793,6 +807,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         1000.0f;
     quality_counts(
         get_int_option(g_cvarQuality, 2), uniforms.slice_count, uniforms.steps_per_side);
+    uniforms.denoise_strength = percent(g_cvarDenoiseStrength, 60, 0, 100);
     const int64_t temporalFrames = std::clamp<int64_t>(get_int_option(g_cvarTemporalFrames, 5), 2, 12);
     uniforms.temporal_alpha = 1.0f / static_cast<float>(temporalFrames);
     uniforms.temporal_clamp_k = percent(g_cvarTemporalClamp, 200, 100, 300);
@@ -951,9 +966,20 @@ ModResult build_controls_tab(
     add_number(left, "Custom Steps", g_cvarCustomSteps,
         "Custom quality only: marched samples per slice side.", 1, 8, 1, nullptr);
     add_number(left, "Radius", g_cvarRadius,
-        "How far the occlusion reaches, as a fraction of view distance (100 = 10%). "
+        "How far the occlusion reaches up close, as a fraction of view distance (100 = 10%). "
         "Raise to broaden coverage; lower for tighter contact shadows.",
         25, 800, 25, nullptr);
+    add_number(left, "Far Radius", g_cvarRadiusFar,
+        "Radius at long view distances (same scale as Radius). The radius ramps from Radius up "
+        "to this across the band below, so close-up content keeps tight contact detail while "
+        "distant landmarks gain broad occlusion depth. 0 disables (constant Radius).",
+        0, 800, 25, nullptr);
+    add_number(left, "Far Radius Start", g_cvarRadiusRampStart,
+        "Distance (as % of the far plane) where the radius starts ramping toward Far Radius.",
+        0, 95, 5, "%");
+    add_number(left, "Far Radius End", g_cvarRadiusRampEnd,
+        "Distance (as % of the far plane) where the ramp reaches Far Radius.",
+        5, 100, 5, "%");
     add_number(left, "Max Screen Radius", g_cvarRadiusMax,
         "Hard cap on the screen-space search radius, as a share of screen height. The search "
         "radius is constant in screen space, so at normal Radius values it sits well under this "
@@ -1014,6 +1040,11 @@ ModResult build_controls_tab(
         "(noisy; useful with temporal accumulation on, or for judging the raw kernel). More "
         "passes are smoother but softer.",
         0, 3, 1, nullptr);
+    add_number(left, "Denoise Strength", g_cvarDenoiseStrength,
+        "How strongly each denoise pass blurs (0 = raw estimate, 100 = full blur). Lower "
+        "preserves fine detail - with temporal accumulation carrying the noise reduction, "
+        "moderate values keep the sharper look without visible noise.",
+        0, 100, 5, "%");
     add_toggle(left, "Half Resolution", g_cvarHalfRes,
         "Computes occlusion at half resolution (about a quarter of the cost). With Temporal "
         "Accumulation on, a jittered temporal upsampler reconstructs full-resolution detail across "
@@ -1154,7 +1185,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"quality", 2, &g_cvarQuality},
         {"customSlices", 7, &g_cvarCustomSlices},
         {"customSteps", 3, &g_cvarCustomSteps},
-        {"radius", 100, &g_cvarRadius},
+        {"radius", 200, &g_cvarRadius},
+        {"radiusFar", 800, &g_cvarRadiusFar},
+        {"radiusRampStart", 10, &g_cvarRadiusRampStart},
+        {"radiusRampEnd", 50, &g_cvarRadiusRampEnd},
         {"radiusMax", 40, &g_cvarRadiusMax},
         {"intensity", 150, &g_cvarIntensity},
         {"contrast", 150, &g_cvarContrast},
@@ -1170,6 +1204,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"contentThresh", 100, &g_cvarContentThresh},
         {"disoccTol", 0, &g_cvarDisoccTol},
         {"denoisePasses", 1, &g_cvarDenoisePasses},
+        {"denoiseStrength", 60, &g_cvarDenoiseStrength},
         {"fadeStart", 40, &g_cvarFadeStart},
         {"fadeEnd", 90, &g_cvarFadeEnd},
         {"debugMode", 0, &g_cvarDebugView},
@@ -1302,11 +1337,12 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         g_hilbertLut = nullptr;
     }
     g_cvarEnabled = g_cvarQuality = g_cvarCustomSlices = g_cvarCustomSteps = 0;
-    g_cvarRadius = g_cvarRadiusMax = g_cvarIntensity = g_cvarContrast = 0;
+    g_cvarRadius = g_cvarRadiusFar = g_cvarRadiusRampStart = g_cvarRadiusRampEnd = 0;
+    g_cvarRadiusMax = g_cvarIntensity = g_cvarContrast = 0;
     g_cvarBlackPoint = g_cvarThickness = g_cvarThickFade = g_cvarThickDist = g_cvarDepthBias = 0;
     g_cvarDebugDepthRange = 0;
     g_cvarTemporal = g_cvarTemporalFrames = g_cvarTemporalClamp = g_cvarMotionResponse = 0;
-    g_cvarContentThresh = g_cvarDisoccTol = g_cvarDenoisePasses = 0;
+    g_cvarContentThresh = g_cvarDisoccTol = g_cvarDenoisePasses = g_cvarDenoiseStrength = 0;
     g_cvarDistanceFade = g_cvarFadeStart = g_cvarFadeEnd = 0;
     g_cvarHalfRes = g_cvarDebugView = 0;
     g_computeType = g_drawType = 0;

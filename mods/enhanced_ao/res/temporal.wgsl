@@ -48,8 +48,12 @@ struct Uniforms {
     debug_view: u32,
     frame_index: u32,
     flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
-    thick_dist_scale: f32, // extra occluder thickness, fraction of the view-space radius
-    inv_debug_depth: f32,  // debug depth view gradient scale (1 / world units)
+    thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
+    inv_debug_depth: f32,   // debug depth view gradient scale (1 / world units)
+    radius_far: f32,        // far effect radius (fraction of view depth); 0 disables the ramp
+    radius_ramp_start: f32, // radius ramp band start, fraction of the far plane
+    radius_ramp_end: f32,   // radius ramp band end, fraction of the far plane
+    denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
