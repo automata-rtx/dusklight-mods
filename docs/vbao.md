@@ -20,16 +20,39 @@ gfx service, matrices from the camera service.
 4. **`denoise.wgsl`** — edge-aware 3×3 spatial filter, ping-ponged 0–3 times. With temporal
    ON it softens the residual per-frame noise; with temporal OFF it is the whole denoiser
    (single-frame fallback).
-5. **`temporal.wgsl`** (compute) — reprojects last frame's accumulation
-   (`reproject = prev.proj_from_world × cur.world_from_view`), rejects history on
+5. **`temporal.wgsl`** (compute) — runs at **full render resolution**. Reprojects last frame's
+   accumulation (`reproject = prev.proj_from_world × cur.world_from_view`), rejects history on
    depth disocclusion (expected-prev-depth vs stored depth), clamps history into the local
    mean ± k·σ neighborhood, and shortens accumulation on screen motion and content mismatch.
-   History = rg32float (ao, viewDepth/far), ping-ponged; invalidated on resize/toggle.
-6. **`composite.wgsl`** — depth-aware 4-tap upscale (matters in Half Res mode), black point,
-   contrast power, optional distance fade, multiply over scene color. Debug views 1–4
-   (AO / normals / depth / staircase detector).
+   History = rg32float (ao, viewDepth/far) at full res, ping-ponged; invalidated on resize/toggle.
+   In **Half Res** this pass is also a **temporal upsampler** — see below.
+6. **`composite.wgsl`** — reads the AO source at its native resolution: full-res history 1:1 when
+   temporal accumulation is on, else a depth-aware 4-tap bilinear upscale of the half-res estimate.
+   Then black point, contrast power, optional distance fade, multiply over scene color. Debug
+   views 1–4 (AO / normals / depth / staircase detector).
 
-The chain runs at snapshot resolution, or half of it with **Half Res** on.
+The occlusion estimate runs at snapshot resolution, or half of it with **Half Res** on; the
+temporal history and composite are always full render resolution.
+
+### Half-res temporal upsampling
+
+With **Half Res** and **Temporal Accumulation** both on, the half-res estimate is reconstructed
+back to full resolution rather than blurred up (restores the aurora fork's checkerboard quality):
+
+- The half-res sampling grid is **jittered** through the 4 sub-positions of each 2×2 full-res block
+  (4-phase, keyed off `frame_index`), in `preprocess_depth.wgsl` (`load_input_depth`) and
+  `vbao.wgsl` (`chain_uv`). Each frame therefore estimates a different quarter of the full-res
+  pixels. The jitter is derived shader-side (no uniform-layout change) and is a no-op at full res
+  or with temporal off.
+- `temporal.wgsl` runs at full res: a full-res pixel **covered** by this frame's jitter takes the
+  fresh half-res sample and accumulates it (clamp + content-reject guard ghosting); an **uncovered**
+  pixel carries history forward, falling back to the depth-aware bilinear upscale only when it has
+  no valid history (fresh disocclusion) or camera motion/disocclusion forces it. Full coverage
+  refreshes every ~4 frames. Full-res depth comes from the raw snapshot (the temporal pass reuses
+  the same depth texture the prefilter consumes); the history textures are sized to the full render
+  resolution (`ensure_targets`).
+- At full res every pixel is trivially "covered", so this reduces to the original per-pixel
+  accumulation with no behavior change. GPU-validated in `scratchpad/halfres_taau_test.py`.
 
 ## Tunables (config vars; UI shows them in sections)
 
@@ -57,7 +80,7 @@ Ints are fixed-point (usually /100) unless noted.
 | `disoccTol` | 0 | disocclusion depth tolerance, % of depth (0–20). 0 rejects most aggressively; a small fixed depth floor still admits history on matching surfaces, minimizing distant ghosting |
 | `denoisePasses` | 1 | spatial passes 0–3 (ping-pong parity is mirrored on the CPU side —
   see mod-api-notes) |
-| `halfRes` | off | run the chain at half the snapshot resolution |
+| `halfRes` | off | compute occlusion at half resolution. With temporal accumulation on, a jittered temporal upsampler reconstructs full-res detail (near-full-res look at ¼ the occlusion cost); with it off, a depth-aware bilinear upscale (softer) |
 | `distanceFade` | off | fade AO out toward the far plane |
 | `fadeStart` / `fadeEnd` | 40 / 90 | fade band, % of far plane |
 | `debugMode` | 0 | 0 off, 1 AO, 2 normals, 3 depth, 4 staircase |
@@ -77,8 +100,9 @@ GPU work. Hardcoding would not measurably help: the shader reads the uniform onc
 
 Suggested experiments (from the porting session): Ultra quality; `denoisePasses 0` with
 temporal on (sharpest, tests accumulation quality); `blackPoint` 5–8 to clean broad floors;
-`distanceFade` on with 40/90 against TP's fog; `halfRes` at 6× supersampling (the composite
-upscale is depth-aware, so silhouettes stay crisp).
+`distanceFade` on with 40/90 against TP's fog; `halfRes` with temporal on (the jittered upsampler
+reconstructs full-res detail, so it stays close to full-res at ~¼ the occlusion cost — a strong
+default candidate) or at high supersampling.
 
 ## History / provenance
 

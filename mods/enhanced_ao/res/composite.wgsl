@@ -198,7 +198,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
 
     let full_size = vec2f(textureDimensions(scene_depth_raw));
     let reference_depth = load_raw_depth(vec2<i32>(in.uv * full_size));
-    var visibility = sample_visibility(in.uv, reference_depth);
+    // The AO source is either full-res (temporal history, or full-res mode) or half-res (temporal
+    // off). At full res the reconstruction already happened in the temporal upsampler, so read it
+    // 1:1; at half res do the depth-aware bilinear upscale here.
+    var visibility: f32;
+    if all(textureDimensions(ambient_occlusion) == vec2<u32>(full_size)) {
+        let px = clamp(vec2<i32>(in.uv * full_size), vec2<i32>(0i), vec2<i32>(full_size) - 1i);
+        visibility = textureLoad(ambient_occlusion, px, 0i).r;
+    } else {
+        visibility = sample_visibility(in.uv, reference_depth);
+    }
     // Black point: remove a small uniform occlusion floor so flat, open surfaces read as exactly
     // 1 (no darkening) while real crevices are preserved and rescaled to full range.
     let occlusion = clamp(

@@ -103,8 +103,10 @@ WGPUTextureView g_hilbertLutView = nullptr;
 // for a few frames instead of released immediately: payloads embedding their views may still
 // be in flight on the render worker.
 struct AoTargets {
-    uint32_t width = 0;
+    uint32_t width = 0;   // AO chain resolution (half the render size in Half Res)
     uint32_t height = 0;
+    uint32_t fullWidth = 0;   // full render resolution (temporal history / raw snapshot)
+    uint32_t fullHeight = 0;
     WGPUTexture preprocessedDepth = nullptr;
     WGPUTextureView preprocessedDepthMips[5] = {};
     WGPUTextureView preprocessedDepthAll = nullptr;
@@ -184,8 +186,10 @@ struct ComputePayload {
     WGPUTextureView historyOut;
     uint32_t uniform_offset;
     uint32_t uniform_size;
-    uint32_t width;
+    uint32_t width;         // AO chain (half) resolution
     uint32_t height;
+    uint32_t fullWidth;     // full render resolution (temporal history / raw snapshot)
+    uint32_t fullHeight;
     uint32_t run_temporal;
     uint32_t denoise_passes; // 0-3; ping-pongs aoNoisy <-> aoFinal
 };
@@ -442,7 +446,7 @@ void tick_retired_targets() {
     }
 }
 
-bool ensure_targets(uint32_t width, uint32_t height) {
+bool ensure_targets(uint32_t width, uint32_t height, uint32_t fullWidth, uint32_t fullHeight) {
     if (g_targets.width == width && g_targets.height == height) {
         return true;
     }
@@ -452,29 +456,33 @@ bool ensure_targets(uint32_t width, uint32_t height) {
     g_historyValid = false; // the history lives in the retired set; restart accumulation
 
     const auto createStorageTexture = [&](const char* label, WGPUTextureFormat format,
-                                          uint32_t mipCount, WGPUTexture& outTexture) {
+                                          uint32_t mipCount, uint32_t w, uint32_t h,
+                                          WGPUTexture& outTexture) {
         WGPUTextureDescriptor texDesc = WGPU_TEXTURE_DESCRIPTOR_INIT;
         texDesc.label = {label, WGPU_STRLEN};
         texDesc.usage = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding;
-        texDesc.size = {width, height, 1};
+        texDesc.size = {w, h, 1};
         texDesc.format = format;
         texDesc.mipLevelCount = mipCount;
         outTexture = wgpuDeviceCreateTexture(g_deviceInfo.device, &texDesc);
         return outTexture != nullptr;
     };
 
+    // The AO chain runs at chain (half) res; the temporal history is full render res so the
+    // half-res estimate can be reconstructed into it (temporal upsampling). At full res the two
+    // sizes coincide.
     bool ok = createStorageTexture("Enhanced AO preprocessed depth", WGPUTextureFormat_R32Float, 5,
-                  g_targets.preprocessedDepth) &&
+                  width, height, g_targets.preprocessedDepth) &&
               createStorageTexture(
-                  "Enhanced AO noisy", WGPUTextureFormat_R32Float, 1, g_targets.aoNoisy) &&
+                  "Enhanced AO noisy", WGPUTextureFormat_R32Float, 1, width, height, g_targets.aoNoisy) &&
               createStorageTexture("Enhanced AO depth differences", WGPUTextureFormat_R32Uint, 1,
-                  g_targets.depthDifferences) &&
+                  width, height, g_targets.depthDifferences) &&
               createStorageTexture(
-                  "Enhanced AO final", WGPUTextureFormat_R32Float, 1, g_targets.aoFinal) &&
-              createStorageTexture(
-                  "Enhanced AO history 0", WGPUTextureFormat_RG32Float, 1, g_targets.history[0]) &&
-              createStorageTexture(
-                  "Enhanced AO history 1", WGPUTextureFormat_RG32Float, 1, g_targets.history[1]);
+                  "Enhanced AO final", WGPUTextureFormat_R32Float, 1, width, height, g_targets.aoFinal) &&
+              createStorageTexture("Enhanced AO history 0", WGPUTextureFormat_RG32Float, 1,
+                  fullWidth, fullHeight, g_targets.history[0]) &&
+              createStorageTexture("Enhanced AO history 1", WGPUTextureFormat_RG32Float, 1,
+                  fullWidth, fullHeight, g_targets.history[1]);
     if (ok) {
         for (uint32_t mip = 0; mip < 5 && ok; ++mip) {
             WGPUTextureViewDescriptor viewDesc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
@@ -503,6 +511,8 @@ bool ensure_targets(uint32_t width, uint32_t height) {
     }
     g_targets.width = width;
     g_targets.height = height;
+    g_targets.fullWidth = fullWidth;
+    g_targets.fullHeight = fullHeight;
     return true;
 }
 
@@ -580,10 +590,12 @@ void on_compute(
         denoisePasses == 0 ? data.aoNoisy : ((denoisePasses % 2u) != 0u ? data.aoFinal : data.aoNoisy);
     WGPUBindGroup temporalGroup = nullptr;
     if (data.run_temporal != 0) {
+        // binding 3 (raw_depth) reuses the full-res scene depth snapshot (data.depth), which the
+        // preprocess pass also consumes as its input.
         temporalGroup = makeBindGroup(g_temporalLayout,
             {textureEntry(0, denoisedView), textureEntry(1, data.historyIn),
-                textureEntry(2, data.preprocessedDepthMips[0]), textureEntry(3, data.historyOut),
-                uniformEntry(4)});
+                textureEntry(2, data.preprocessedDepthMips[0]), textureEntry(3, data.depth),
+                textureEntry(4, data.historyOut), uniformEntry(5)});
     }
     if (preprocessGroup == nullptr || mip4Group == nullptr || vbaoGroup == nullptr || !denoiseOk ||
         (data.run_temporal != 0 && temporalGroup == nullptr))
@@ -623,10 +635,12 @@ void on_compute(
         }
     }
     if (temporalGroup != nullptr) {
+        // The temporal pass runs at full render resolution (it reconstructs the half-res estimate
+        // into the full-res history).
         wgpuComputePassEncoderSetPipeline(pass, g_temporalPipeline);
         wgpuComputePassEncoderSetBindGroup(pass, 0, temporalGroup, 0, nullptr);
         wgpuComputePassEncoderDispatchWorkgroups(
-            pass, div_ceil(data.width, 8), div_ceil(data.height, 8), 1);
+            pass, div_ceil(data.fullWidth, 8), div_ceil(data.fullHeight, 8), 1);
     }
     wgpuComputePassEncoderEnd(pass);
     wgpuComputePassEncoderRelease(pass);
@@ -722,7 +736,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const uint32_t divisor = halfRes ? 2 : 1;
     const uint32_t width = resolved.width / divisor;
     const uint32_t height = resolved.height / divisor;
-    if (width < 32 || height < 32 || !ensure_targets(width, height)) {
+    if (width < 32 || height < 32 ||
+        !ensure_targets(width, height, resolved.width, resolved.height)) {
         return;
     }
 
@@ -822,6 +837,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     computePayload.uniform_size = uniformRange.size;
     computePayload.width = width;
     computePayload.height = height;
+    computePayload.fullWidth = resolved.width;
+    computePayload.fullHeight = resolved.height;
     computePayload.run_temporal = temporal ? 1u : 0u;
     computePayload.denoise_passes = denoisePasses;
     if (svc_gfx->push_compute(mod_ctx, g_computeType, &computePayload, sizeof(computePayload)) !=
@@ -998,8 +1015,10 @@ ModResult build_controls_tab(
         "passes are smoother but softer.",
         0, 3, 1, nullptr);
     add_toggle(left, "Half Resolution", g_cvarHalfRes,
-        "Computes AO at half resolution and upscales (depth-aware, so silhouettes stay crisp); "
-        "faster, slightly softer.");
+        "Computes occlusion at half resolution (about a quarter of the cost). With Temporal "
+        "Accumulation on, a jittered temporal upsampler reconstructs full-resolution detail across "
+        "frames, so the result stays close to full-res; with it off, a depth-aware bilinear upscale "
+        "is used instead (silhouettes stay crisp, but softer).");
 
     svc_ui->pane_add_section(mod_ctx, left, "Distance Fade");
     add_toggle(left, "Distance Fade", g_cvarDistanceFade,

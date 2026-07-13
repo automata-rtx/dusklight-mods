@@ -58,11 +58,29 @@ struct Uniforms {
 @group(0) @binding(6) var preprocessed_depth_mip3_in: texture_2d<f32>;
 @group(0) @binding(7) var preprocessed_depth_mip4: texture_storage_2d<r32float, write>;
 
+// 4-phase sub-pixel jitter within each 2x2 full-res block, for half-res temporal upsampling.
+// Active only when the chain is half-res (depth_scale 2) AND temporal accumulation is on;
+// otherwise the offset is (0,0) and sampling reduces to the fixed top-left corner (unchanged).
+// Alternating diagonals converge full-res coverage fastest.
+fn taau_jitter() -> vec2<i32> {
+    if uniforms.depth_scale.x < 1.5 || (uniforms.flags & 1u) == 0u {
+        return vec2<i32>(0i, 0i);
+    }
+    switch uniforms.frame_index & 3u {
+        case 0u: { return vec2<i32>(0i, 0i); }
+        case 1u: { return vec2<i32>(1i, 1i); }
+        case 2u: { return vec2<i32>(1i, 0i); }
+        default: { return vec2<i32>(0i, 1i); }
+    }
+}
+
 // PORT: replaces the textureGather of the input depth with explicit loads (also handles the
-// half-resolution case, where one chain texel covers depth_scale snapshot texels).
+// half-resolution case, where one chain texel covers depth_scale snapshot texels). In half-res
+// temporal upsampling the sample is jittered so each frame decimates a different full-res pixel.
 fn load_input_depth(pixel_coordinates: vec2<i32>) -> f32 {
     let input_size = vec2<i32>(uniforms.size * uniforms.depth_scale);
-    let coordinates = clamp(vec2<i32>(vec2<f32>(pixel_coordinates) * uniforms.depth_scale),
+    let coordinates = clamp(
+        vec2<i32>(vec2<f32>(pixel_coordinates) * uniforms.depth_scale) + taau_jitter(),
         vec2<i32>(0i), input_size - 1i);
     return textureLoad(input_depth, coordinates, 0i).r;
 }

@@ -113,10 +113,33 @@ fn reconstruct_view_space_position(depth: f32, uv: vec2<f32>) -> vec3<f32> {
     return t.xyz / t.w;
 }
 
+// 4-phase sub-pixel jitter within each 2x2 full-res block, matching preprocess_depth.wgsl.
+fn taau_jitter() -> vec2<i32> {
+    if uniforms.depth_scale.x < 1.5 || (uniforms.flags & 1u) == 0u {
+        return vec2<i32>(0i, 0i);
+    }
+    switch uniforms.frame_index & 3u {
+        case 0u: { return vec2<i32>(0i, 0i); }
+        case 1u: { return vec2<i32>(1i, 1i); }
+        case 2u: { return vec2<i32>(1i, 0i); }
+        default: { return vec2<i32>(0i, 1i); }
+    }
+}
+
+// UV of a chain texel. In half-res temporal upsampling each texel stands in for a jittered
+// full-res pixel; anchor its uv there so the (jittered) prefiltered depth and the reconstructed
+// position agree. Otherwise this is the plain chain-space texel center (unchanged behavior).
+fn chain_uv(coord: vec2<i32>) -> vec2<f32> {
+    if uniforms.depth_scale.x >= 1.5 && (uniforms.flags & 1u) != 0u {
+        let full_size = uniforms.size * uniforms.depth_scale;
+        return (vec2<f32>(coord) * uniforms.depth_scale + vec2<f32>(taau_jitter()) + 0.5) / full_size;
+    }
+    return (vec2<f32>(coord) + 0.5) * uniforms.inv_size;
+}
+
 fn view_position_at(pixel_coordinates: vec2<i32>) -> vec3<f32> {
     let depth = load_depth(pixel_coordinates, 0i);
-    let uv = (vec2<f32>(pixel_coordinates) + 0.5) * uniforms.inv_size;
-    return reconstruct_view_space_position(depth, uv);
+    return reconstruct_view_space_position(depth, chain_uv(pixel_coordinates));
 }
 
 // Accurate view-space normal reconstruction from depth (atyuwen's 5-tap method); unchanged
@@ -208,7 +231,7 @@ fn load_sample_position(uv: vec2<f32>, sample_mip_level: f32) -> vec4<f32> {
 @workgroup_size(8, 8, 1)
 fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let pixel_coordinates = vec2<i32>(global_id.xy);
-    let uv = (vec2<f32>(pixel_coordinates) + 0.5) * uniforms.inv_size;
+    let uv = chain_uv(pixel_coordinates);
 
     let raw_depth = calculate_neighboring_depth_differences(pixel_coordinates);
     if raw_depth <= 0.0 {
