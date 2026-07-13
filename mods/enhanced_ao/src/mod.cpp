@@ -25,6 +25,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <initializer_list>
 #include <type_traits>
@@ -140,6 +142,7 @@ float g_prevProjFromWorld[16] = {};
 
 bool g_warnedNoDepth = false;
 bool g_loggedChain = false;
+float g_loggedFarPlane = 1.0f;  // last far plane reported to the log (world-unit calibration)
 std::atomic g_chainExecuted{false};
 
 // Mirror of the WGSL Uniforms struct (keep in sync with res/*.wgsl).
@@ -174,8 +177,8 @@ struct AoUniforms {
     float thick_dist_scale;  // extra occluder thickness, fraction of the view-space radius
     float inv_debug_depth;   // debug depth view gradient scale (1 / world units)
     float radius_far;        // far effect radius (fraction of view depth); 0 disables the ramp
-    float radius_ramp_start; // radius ramp band start, fraction of the far plane
-    float radius_ramp_end;   // radius ramp band end, fraction of the far plane
+    float radius_ramp_start; // radius ramp band start, world units of view depth
+    float radius_ramp_end;   // radius ramp band end, world units of view depth
     float denoise_strength;  // spatial denoise blend, 0 raw .. 1 fully blurred
     float _pad0;
     float _pad1;
@@ -781,12 +784,16 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.effect_radius =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarRadius, 200), 25, 800)) /
         1000.0f;
-    // Far radius (same scale, 0 = off) ramps in across [rampStart, rampEnd] of the far plane.
+    // Far radius (same scale, 0 = off) ramps in across [rampStart, rampEnd] world units of view
+    // depth. World units, not far-plane fractions: TP's far plane is per-stage and far beyond
+    // the visible field, so fractions of it are scene-dependent and absurdly compressed.
     uniforms.radius_far =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarRadiusFar, 800), 0, 800)) /
         1000.0f;
-    uniforms.radius_ramp_start = percent(g_cvarRadiusRampStart, 10, 0, 95);
-    uniforms.radius_ramp_end = percent(g_cvarRadiusRampEnd, 50, 5, 100);
+    uniforms.radius_ramp_start = static_cast<float>(
+        std::clamp<int64_t>(get_int_option(g_cvarRadiusRampStart, 0), 0, 200000));
+    uniforms.radius_ramp_end = static_cast<float>(
+        std::clamp<int64_t>(get_int_option(g_cvarRadiusRampEnd, 10000), 500, 200000));
     uniforms.intensity = percent(g_cvarIntensity, 150, 0, 500);
     uniforms.contrast = percent(g_cvarContrast, 150, 50, 300);
     uniforms.thickness = percent(g_cvarThickness, 150, 25, 400);
@@ -815,9 +822,22 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.content_thresh = percent(g_cvarContentThresh, 100, 25, 300);
     uniforms.disocc_tol = percent(g_cvarDisoccTol, 0, 0, 20);
     const bool distanceFade = get_bool_option(g_cvarDistanceFade, false);
-    uniforms.fade_start = percent(g_cvarFadeStart, 40, 5, 95);
-    uniforms.fade_end = percent(g_cvarFadeEnd, 90, 10, 100);
+    uniforms.fade_start = static_cast<float>(
+        std::clamp<int64_t>(get_int_option(g_cvarFadeStart, 15000), 0, 200000));
+    uniforms.fade_end = static_cast<float>(
+        std::clamp<int64_t>(get_int_option(g_cvarFadeEnd, 40000), 500, 200000));
     uniforms.inv_far = camera.far_plane > 1.0f ? 1.0f / camera.far_plane : 1.0f / 200000.0f;
+    // Calibration aid for the world-unit distance settings above: log the stage's far plane
+    // whenever it changes materially (once per change, not per frame).
+    if (camera.far_plane > 1.0f &&
+        std::fabs(camera.far_plane - g_loggedFarPlane) > g_loggedFarPlane * 0.01f)
+    {
+        g_loggedFarPlane = camera.far_plane;
+        char msg[96];
+        std::snprintf(
+            msg, sizeof(msg), "camera far plane: %.0f world units", camera.far_plane);
+        svc_log->info(mod_ctx, msg);
+    }
     const uint32_t debugMode =
         static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 4));
     uniforms.debug_view = debugMode;
@@ -975,11 +995,13 @@ ModResult build_controls_tab(
         "distant landmarks gain broad occlusion depth. 0 disables (constant Radius).",
         0, 800, 25, nullptr);
     add_number(left, "Far Radius Start", g_cvarRadiusRampStart,
-        "Distance (as % of the far plane) where the radius starts ramping toward Far Radius.",
-        0, 95, 5, "%");
+        "View distance in world units where the radius starts ramping toward Far Radius (the "
+        "shadow mod's Coverage uses the same scale). The log prints the stage's camera far "
+        "plane for reference.",
+        0, 200000, 500, nullptr);
     add_number(left, "Far Radius End", g_cvarRadiusRampEnd,
-        "Distance (as % of the far plane) where the ramp reaches Far Radius.",
-        5, 100, 5, "%");
+        "View distance in world units where the ramp reaches Far Radius.",
+        500, 200000, 500, nullptr);
     add_number(left, "Max Screen Radius", g_cvarRadiusMax,
         "Hard cap on the screen-space search radius, as a share of screen height. The search "
         "radius is constant in screen space, so at normal Radius values it sits well under this "
@@ -1056,9 +1078,10 @@ ModResult build_controls_tab(
         "Fades the AO out with distance so far terrain (already washed toward fog) is not "
         "darkened. Off applies AO at full strength to the horizon.");
     add_number(left, "Fade Start", g_cvarFadeStart,
-        "Distance (as % of the far plane) where the fade begins.", 5, 95, 5, "%");
+        "View distance in world units where the fade begins.", 0, 200000, 500, nullptr);
     add_number(left, "Fade End", g_cvarFadeEnd,
-        "Distance (as % of the far plane) where the AO is fully faded out.", 10, 100, 5, "%");
+        "View distance in world units where the AO is fully faded out.", 500, 200000, 500,
+        nullptr);
 
     svc_ui->pane_add_section(mod_ctx, left, "Debug");
     static const char* kDebugOptions[] = {"Off", "AO", "Normals", "Depth", "Staircase"};
@@ -1187,8 +1210,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"customSteps", 3, &g_cvarCustomSteps},
         {"radius", 200, &g_cvarRadius},
         {"radiusFar", 800, &g_cvarRadiusFar},
-        {"radiusRampStart", 10, &g_cvarRadiusRampStart},
-        {"radiusRampEnd", 50, &g_cvarRadiusRampEnd},
+        {"radiusRampStart", 0, &g_cvarRadiusRampStart},
+        {"radiusRampEnd", 10000, &g_cvarRadiusRampEnd},
         {"radiusMax", 40, &g_cvarRadiusMax},
         {"intensity", 150, &g_cvarIntensity},
         {"contrast", 150, &g_cvarContrast},
@@ -1205,8 +1228,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"disoccTol", 0, &g_cvarDisoccTol},
         {"denoisePasses", 1, &g_cvarDenoisePasses},
         {"denoiseStrength", 60, &g_cvarDenoiseStrength},
-        {"fadeStart", 40, &g_cvarFadeStart},
-        {"fadeEnd", 90, &g_cvarFadeEnd},
+        {"fadeStart", 15000, &g_cvarFadeStart},
+        {"fadeEnd", 40000, &g_cvarFadeEnd},
         {"debugMode", 0, &g_cvarDebugView},
     };
     for (const auto& opt : intOptions) {
@@ -1353,6 +1376,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_historyWriteIndex = 0;
     g_historyValid = false;
     g_prevCameraValid = false;
+    g_loggedFarPlane = 1.0f;
     return MOD_OK;
 }
 }

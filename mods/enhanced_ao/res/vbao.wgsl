@@ -38,16 +38,16 @@ struct Uniforms {
     content_thresh: f32, // content-mismatch response threshold scale (1 = default)
     disocc_tol: f32,     // disocclusion depth tolerance, fraction of depth
     black_point: f32,    // occlusion floor removed in the composite
-    fade_start: f32,     // distance fade start, fraction of far plane
-    fade_end: f32,       // distance fade end, fraction of far plane
+    fade_start: f32,     // distance fade start, world units of view depth
+    fade_end: f32,       // distance fade end, world units of view depth
     debug_view: u32,
     frame_index: u32,
     flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
     thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
     inv_debug_depth: f32,   // debug depth view gradient scale (1 / world units)
     radius_far: f32,        // far effect radius (fraction of view depth); 0 disables the ramp
-    radius_ramp_start: f32, // radius ramp band start, fraction of the far plane
-    radius_ramp_end: f32,   // radius ramp band end, fraction of the far plane
+    radius_ramp_start: f32, // radius ramp band start, world units of view depth
+    radius_ramp_end: f32,   // radius ramp band end, world units of view depth
     denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
     _pad0: f32,
     _pad1: f32,
@@ -262,14 +262,15 @@ fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // occluders carving meaningful sector spans.
     let abs_z = max(-pixel_position.z, 1.0e-4);
     // Distance-scaled radius: ramp the (depth-proportional) radius from effect_radius up to
-    // radius_far across [ramp_start, ramp_end] of the far plane - tight contact detail up close,
-    // broad occlusion that gives distant landmarks depth at range. radius_far 0 disables.
+    // radius_far across [ramp_start, ramp_end] WORLD UNITS of view depth - tight contact detail
+    // up close, broad occlusion that gives distant landmarks depth at range. World units (not a
+    // far-plane fraction): the far plane is per-stage and far beyond the visible field, so
+    // fractions of it are both scene-dependent and absurdly compressed. radius_far 0 disables.
     var eff_radius = uniforms.effect_radius;
     if uniforms.radius_far > 0.0 {
-        let dist_norm = clamp(abs_z * uniforms.inv_far, 0.0, 1.0);
         eff_radius = mix(uniforms.effect_radius, uniforms.radius_far,
             smoothstep(uniforms.radius_ramp_start,
-                max(uniforms.radius_ramp_end, uniforms.radius_ramp_start + 0.01), dist_norm));
+                max(uniforms.radius_ramp_end, uniforms.radius_ramp_start + 1.0), abs_z));
     }
     let view_radius = abs_z * eff_radius;
     let proj_scale_y = 0.5 * uniforms.size.y * uniforms.projection[1][1];

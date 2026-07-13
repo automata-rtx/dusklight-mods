@@ -36,16 +36,16 @@ struct Uniforms {
     content_thresh: f32, // content-mismatch response threshold scale (1 = default)
     disocc_tol: f32,     // disocclusion depth tolerance, fraction of depth
     black_point: f32,    // occlusion floor removed in the composite
-    fade_start: f32,     // distance fade start, fraction of far plane
-    fade_end: f32,       // distance fade end, fraction of far plane
+    fade_start: f32,     // distance fade start, world units of view depth
+    fade_end: f32,       // distance fade end, world units of view depth
     debug_view: u32,
     frame_index: u32,
     flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
     thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
     inv_debug_depth: f32,   // debug depth view gradient scale (1 / world units)
     radius_far: f32,        // far effect radius (fraction of view depth); 0 disables the ramp
-    radius_ramp_start: f32, // radius ramp band start, fraction of the far plane
-    radius_ramp_end: f32,   // radius ramp band end, fraction of the far plane
+    radius_ramp_start: f32, // radius ramp band start, world units of view depth
+    radius_ramp_end: f32,   // radius ramp band end, world units of view depth
     denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
     _pad0: f32,
     _pad1: f32,
@@ -220,14 +220,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     visibility = 1.0 - occlusion;
     // Contrast: final value power - deepens (contrast > 1) or lifts (< 1) the occlusion falloff.
     visibility = pow(clamp(visibility, 0.0, 1.0), uniforms.contrast);
-    // Distance fade: fade the AO out across [fade_start, fade_end] of the far plane. TP washes
+    // Distance fade: fade the AO out across [fade_start, fade_end] WORLD UNITS of view depth
+    // (same scale as the radius ramp; not far-plane fractions - see vbao.wgsl). TP washes
     // distant terrain toward fog, and full-strength AO over the haze reads as harsh shading
     // floating on it; this drives the term back to 1 (no darkening) with distance.
     if (uniforms.flags & 4u) != 0u && reference_depth > 0.0 {
         let view_position = reconstruct_view_space_position(reference_depth, in.uv);
-        let depth_norm = clamp(max(-view_position.z, 0.0) * uniforms.inv_far, 0.0, 1.0);
-        let fade = smoothstep(uniforms.fade_start, max(uniforms.fade_end, uniforms.fade_start + 0.01),
-            depth_norm);
+        let fade = smoothstep(uniforms.fade_start, max(uniforms.fade_end, uniforms.fade_start + 1.0),
+            max(-view_position.z, 0.0));
         visibility = mix(visibility, 1.0, fade);
     }
     let value = clamp(mix(1.0, visibility, uniforms.intensity), 0.0, 1.0);

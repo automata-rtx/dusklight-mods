@@ -36,16 +36,16 @@ struct Uniforms {
     content_thresh: f32, // content-mismatch response threshold scale (1 = default)
     disocc_tol: f32,     // disocclusion depth tolerance, fraction of depth
     black_point: f32,    // occlusion floor removed in the composite
-    fade_start: f32,     // distance fade start, fraction of far plane
-    fade_end: f32,       // distance fade end, fraction of far plane
+    fade_start: f32,     // distance fade start, world units of view depth
+    fade_end: f32,       // distance fade end, world units of view depth
     debug_view: u32,
     frame_index: u32,
     flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
     thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
     inv_debug_depth: f32,   // debug depth view gradient scale (1 / world units)
     radius_far: f32,        // far effect radius (fraction of view depth); 0 disables the ramp
-    radius_ramp_start: f32, // radius ramp band start, fraction of the far plane
-    radius_ramp_end: f32,   // radius ramp band end, fraction of the far plane
+    radius_ramp_start: f32, // radius ramp band start, world units of view depth
+    radius_ramp_end: f32,   // radius ramp band end, world units of view depth
     denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
     _pad0: f32,
     _pad1: f32,
