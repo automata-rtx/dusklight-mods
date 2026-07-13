@@ -63,12 +63,29 @@ A scene that uses a special configuration *uniformly* (all draws agree) is defer
 normally — all five GX fog curves (LIN/EXP/EXP2/REVEXP/REVEXP2) are implemented in
 `res/fog.wgsl`.
 
+## Diagnosing reverts
+
+The fall-back to vanilla fog is otherwise invisible, but its symptom is not: with the mod
+"enabled", screen-space AO/shadows suddenly darken the fog itself at range (most visible as
+unnatural darkening on distant fog-washed terrain). Two ways to confirm:
+
+- The mod panel's **Status** line shows the live state: "Deferring fog (N draws)" is the
+  working state; "REVERTED: mixed fog configs (N matching / M deviant)" means this scene
+  draws with more than one fog configuration and the vanilla path is active.
+- Every revert/re-engage transition is **logged** (warn/info), including both fog
+  configurations (type, range, color) — enough to decide whether the deviant is a real
+  special fog or something the matching tolerances should absorb.
+- The **Fog Factor** debug view showing black while the scene is visibly foggy is the same
+  signal (no deferred quad ran).
+
 ## Tunables
 
 | Var | Default | Meaning |
 |---|---|---|
 | `effectEnabled` | on | master toggle (off = vanilla forward fog) |
 | `debugView` | 0 | 1 = deferred fog factor as grayscale |
+
+The panel also shows a read-only **Status** line (see "Diagnosing reverts").
 
 ## Known caveats
 

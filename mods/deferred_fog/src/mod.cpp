@@ -47,6 +47,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <type_traits>
 #include <webgpu/webgpu.h>
@@ -95,6 +96,13 @@ bool g_warnedPushFailure = false;
 FogConfig g_reference;           // first fogged configuration seen this frame
 uint32_t g_suppressedCount = 0;  // draws whose fog was deferred this frame
 uint32_t g_deviantCount = 0;     // draws whose fog did not match the reference
+
+// Revert diagnostics: the silent fall-back to vanilla fog on mixed configurations is invisible
+// in-game (other mods' effects then darken the fog itself), so surface it - a log line per state
+// transition and a live status string for the panel.
+bool g_wasSuppressing = false;   // previous frame's suppression verdict (transition detection)
+FogConfig g_firstDeviant;        // first non-matching configuration this frame (for the log)
+char g_statusText[160] = "Waiting for first fogged frame";
 
 // Mirror of the WGSL FogUniforms struct (keep in sync with res/fog.wgsl).
 struct FogUniforms {
@@ -170,6 +178,10 @@ bool vote_config(const FogConfig& config) {
         g_reference.valid = true;
     }
     if (!config_matches(g_reference, config)) {
+        if (g_deviantCount == 0) {
+            g_firstDeviant = config;
+            g_firstDeviant.valid = true;
+        }
         ++g_deviantCount;
         return false;
     }
@@ -328,6 +340,7 @@ void push_fog_quad() {
 
 void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
     g_reference = FogConfig{};
+    g_firstDeviant = FogConfig{};
     g_suppressedCount = 0;
     g_deviantCount = 0;
     g_quadArmed = false;
@@ -351,6 +364,41 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
     // One configuration this frame -> keep (or start) deferring next frame. Mixed
     // configurations -> exact vanilla fog from the next frame until the scene is uniform.
     g_suppressAllowed = g_deviantCount == 0 && effect_enabled();
+
+    // Diagnostics: log the revert/re-engage transitions (invisible in-game otherwise) and keep
+    // the panel status line current. Log volume is bounded by transitions, not frames.
+    if (g_wasSuppressing && !g_suppressAllowed && effect_enabled()) {
+        char msg[240];
+        std::snprintf(msg, sizeof(msg),
+            "deferred fog REVERTED to vanilla: mixed fog configs (%u matching, %u deviant); "
+            "reference type %u range %.0f..%.0f rgb(%u,%u,%u) vs deviant type %u range "
+            "%.0f..%.0f rgb(%u,%u,%u). Screen-space AO/shadows will darken the fog until the "
+            "scene is uniform again.",
+            g_suppressedCount, g_deviantCount, static_cast<unsigned>(g_reference.type),
+            g_reference.startZ, g_reference.endZ, static_cast<unsigned>(g_reference.color.r),
+            static_cast<unsigned>(g_reference.color.g), static_cast<unsigned>(g_reference.color.b),
+            static_cast<unsigned>(g_firstDeviant.type), g_firstDeviant.startZ,
+            g_firstDeviant.endZ, static_cast<unsigned>(g_firstDeviant.color.r),
+            static_cast<unsigned>(g_firstDeviant.color.g),
+            static_cast<unsigned>(g_firstDeviant.color.b));
+        svc_log->warn(mod_ctx, msg);
+    } else if (!g_wasSuppressing && g_suppressAllowed) {
+        svc_log->info(mod_ctx, "deferred fog engaged (uniform fog configuration)");
+    }
+    g_wasSuppressing = g_suppressAllowed;
+
+    if (!effect_enabled()) {
+        std::snprintf(g_statusText, sizeof(g_statusText), "Disabled");
+    } else if (g_deviantCount > 0) {
+        std::snprintf(g_statusText, sizeof(g_statusText),
+            "REVERTED: mixed fog configs (%u matching / %u deviant)", g_suppressedCount,
+            g_deviantCount);
+    } else if (!g_reference.valid) {
+        std::snprintf(g_statusText, sizeof(g_statusText), "No fogged draws this frame");
+    } else {
+        std::snprintf(g_statusText, sizeof(g_statusText), "Deferring fog (%u draws this frame)",
+            g_suppressedCount);
+    }
 }
 
 // Game thread, after the full 3D scene: fallback for frames without any translucent J3D
@@ -368,6 +416,15 @@ void add_control(UiElementHandle panel, const UiControlDesc& desc) {
     svc_ui->pane_add_control(mod_ctx, panel, &desc, nullptr);
 }
 
+// Live status readout (game thread; polled per frame while visible).
+void status_get(ModContext*, void*, UiControlValue* outValue) {
+    outValue->string_value = g_statusText;
+}
+void status_set(ModContext*, void*, const UiControlValue*) {}
+bool status_disabled(ModContext*, void*) {
+    return true;
+}
+
 ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     UiControlDesc control = UI_CONTROL_DESC_INIT;
     control.kind = UI_CONTROL_TOGGLE;
@@ -379,6 +436,20 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
         "vanilla fog path automatically.";
     control.binding = UI_BINDING_CONFIG_VAR;
     control.config_var = g_cvarEnabled;
+    add_control(panel, control);
+
+    control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_STRING;
+    control.label = "Status";
+    control.help_rml =
+        "Live suppression state. \"Deferring fog\" is the working state. \"REVERTED: mixed fog "
+        "configs\" means this scene draws with several fog configurations, so the mod fell back "
+        "to vanilla forward fog - AO/shadow darkening will then show on top of the fog at "
+        "range. Each revert/re-engage transition is also logged with the config details.";
+    control.binding = UI_BINDING_CALLBACKS;
+    control.get = status_get;
+    control.set = status_set;
+    control.is_disabled = status_disabled;
     add_control(panel, control);
 
     static const char* kDebugOptions[] = {"Off", "Fog Factor"};
@@ -551,9 +622,11 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     }
     g_cvarEnabled = g_cvarDebugView = 0;
     g_drawType = g_sceneBeginHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;
-    g_scopeActive = g_quadArmed = g_suppressAllowed = g_shapeHookOk = false;
+    g_scopeActive = g_quadArmed = g_suppressAllowed = g_shapeHookOk = g_wasSuppressing = false;
     g_reference = FogConfig{};
+    g_firstDeviant = FogConfig{};
     g_suppressedCount = g_deviantCount = 0;
+    std::snprintf(g_statusText, sizeof(g_statusText), "Waiting for first fogged frame");
     return MOD_OK;
 }
 }
