@@ -192,6 +192,17 @@ struct MapPassOutput {
 };
 
 MapPassOutput g_mapPass;
+
+// Per-frame cache of the game-shadow-skip gate and the frustum-bypass decision. Both are
+// constant across a frame, but J3DUClipper::clip fires hundreds-to-thousands of times per
+// frame during the game's culling and its pre-hook needs the same answer every call.
+// Recomputing it there (three config reads + dKy_Indoor_check + compute_light's envlight/time
+// lookup and trig, per call) was pure waste. Refreshed once in on_scene_begin, before the
+// clip/shadow-control hooks fire (they run after SCENE_BEGIN, ahead of SCENE_AFTER_TERRAIN).
+// Default false so a clip before the first SCENE_BEGIN bypasses nothing.
+bool g_frameShadowsWanted = false;
+bool g_frameFrustumBypass = false;
+
 bool g_replayingSceneLists = false;
 bool g_replayTwoSided = false;   // twoSidedCasters, latched for the current replay
 bool g_replayLinkOnly = false;   // Link cascade replay: only models anchored near the player draw
@@ -1020,7 +1031,7 @@ bool indoor_blocked() {
     return get_bool_option(g_cvarIndoorDisable, true) && dKy_Indoor_check() != 0;
 }
 
-bool dynamic_shadows_wanted() {
+bool compute_dynamic_shadows_wanted() {
     // Both gates matter: with the shadow map disabled (screen-space-only mode) the game's
     // own real/blob shadows must come back, so the skip hooks go inactive.
     if (!get_bool_option(g_cvarEnabled, true) || !get_bool_option(g_cvarShadowMap, true) ||
@@ -1036,15 +1047,25 @@ bool dynamic_shadows_wanted() {
     return compute_light(dirToLight, fade);
 }
 
+// Refresh the per-frame gate cache (see g_frameShadowsWanted). Called once from on_scene_begin,
+// so the clip / shadow-control pre-hooks just read a bool instead of recomputing the gate on
+// every call. g_sceneCamera is captured earlier in the same callback, matching the previous
+// behavior exactly (the hooks already read the scene-begin capture) - only the cost moves.
+void update_frame_shadow_gate() {
+    g_frameShadowsWanted = compute_dynamic_shadows_wanted();
+    g_frameFrustumBypass =
+        g_frameShadowsWanted && get_bool_option(g_cvarNoFrustumClipping, false);
+}
+
 HookAction on_game_shadow_pre(ModContext*, void*, void*, void*) {
-    if (!dynamic_shadows_wanted()) {
+    if (!g_frameShadowsWanted) {
         return HOOK_CONTINUE;
     }
     return HOOK_SKIP_ORIGINAL;
 }
 
 HookAction on_frustum_clip_pre(ModContext*, void*, void* retval, void*) {
-    if (!get_bool_option(g_cvarNoFrustumClipping, false) || !dynamic_shadows_wanted()) {
+    if (!g_frameFrustumBypass) {
         return HOOK_CONTINUE;
     }
     if (retval != nullptr) {
@@ -1212,6 +1233,9 @@ void on_scene_begin(ModContext*, const GfxStageContext* stageCtx, void*) {
     tick_retired_normal_targets();
     restore_actual_light_debug();
     capture_scene_camera(stageCtx);
+    // Refresh the game-shadow-skip / frustum-bypass gate for this frame before the game's
+    // clip and shadow-control calls fire (they run after this SCENE_BEGIN callback).
+    update_frame_shadow_gate();
     if (!get_bool_option(g_cvarEnabled, true) || get_debug_mode() != 9) {
         return;
     }
@@ -1314,8 +1338,15 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
         0.0f, 0.0f, static_cast<float>(mapSize), static_cast<float>(mapSize), 0.0f, 1.0f);
     GXSetScissorRender(0, 0, mapSize, mapSize);
     dKy_setLight();
-    GXSetColorUpdate(GX_TRUE);
-    GXSetAlphaUpdate(GX_TRUE);
+    // A shadow map only needs DEPTH: the resolved color is read solely by the Camera Replay
+    // debug view (fs_main light_color case). For every other frame, disabling color writes
+    // skips the per-pixel color ROP during the replay and lets the resolve below drop the
+    // full-size color copy and its target - the single biggest waste in the map render, and
+    // it scales with map size and cascade count. Alpha TEST still runs (it gates on the shader,
+    // not on color update), so alpha-cut foliage keeps punching holes in the depth map.
+    const GXBool writeColor = cameraReplayDebug ? GX_TRUE : GX_FALSE;
+    GXSetColorUpdate(writeColor);
+    GXSetAlphaUpdate(writeColor);
     GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
     g_replayTwoSided = get_bool_option(g_cvarTwoSidedCasters, true);
     g_replayLinkOnly = linkOnly;
@@ -1361,11 +1392,11 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
     restore_game_camera();
 
     GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
-    resolveDesc.color = true;
+    resolveDesc.color = cameraReplayDebug;  // depth-only except the Camera Replay debug view
     resolveDesc.depth = true;
     GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
     if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) != MOD_OK ||
-        resolved.color == nullptr || resolved.depth == nullptr)
+        resolved.depth == nullptr || (cameraReplayDebug && resolved.color == nullptr))
     {
         return false;
     }
@@ -1627,10 +1658,11 @@ void composite_map_pass(int64_t debugMode) {
     // Indoors, the shadow map is suppressed (it reads as fully shadowed under a sky-light
     // map) but the screen-space shadows stay - so indoors is just screen-space-only mode.
     const bool mapWanted = get_bool_option(g_cvarShadowMap, true) && !indoor_blocked();
+    // Readiness keys off the depth map only: color is resolved just for the Camera Replay
+    // debug view now (depth-only replay otherwise), so lightColor is null in normal frames.
     bool mapReady = mapWanted && mapPass.ready && mapPass.cascadeCount > 0;
     for (int i = 0; mapReady && i < mapPass.cascadeCount; ++i) {
-        mapReady = mapPass.cascades[i].ready && mapPass.cascades[i].shadowMap != nullptr &&
-                   mapPass.cascades[i].lightColor != nullptr;
+        mapReady = mapPass.cascades[i].ready && mapPass.cascades[i].shadowMap != nullptr;
     }
     const bool linkReady = mapReady && mapPass.linkReady &&
                            mapPass.cascades[kLinkCascade].shadowMap != nullptr;
@@ -1771,8 +1803,12 @@ void composite_map_pass(int64_t debugMode) {
             mapReady && (i < mapPass.cascadeCount || (i == kLinkCascade && linkReady));
         payload.shadowMap[i] = slotReady ? mapPass.cascades[i].shadowMap : resolved.depth;
     }
-    payload.lightColor =
-        mapReady ? mapPass.cascades[mapPass.cascadeCount - 1].lightColor : resolved.depth;
+    // Color is resolved only for the Camera Replay debug view (depth-only otherwise), so the
+    // far cascade's lightColor is usually null - stand it in with the scene depth, which the
+    // shader never samples outside the light-color debug modes.
+    const WGPUTextureView farLightColor =
+        mapReady ? mapPass.cascades[mapPass.cascadeCount - 1].lightColor : nullptr;
+    payload.lightColor = farLightColor != nullptr ? farLightColor : resolved.depth;
     payload.screenShadow = sssReady ? g_sssTarget.view : resolved.depth;
     payload.smoothNormal = normalsReady ? g_normalTargets.views[0] : resolved.depth;
     payload.uniform_offset = uniformRange.offset;
@@ -2420,6 +2456,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         g_sceneAfterTerrainHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;
     g_controlsWindow = 0;
     g_replayTwoSided = false;
+    g_frameShadowsWanted = false;
+    g_frameFrustumBypass = false;
     g_mapPass = {};
     g_sceneCamera.valid = false;
     g_sceneCamera.raw_valid = false;

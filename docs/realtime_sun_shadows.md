@@ -21,7 +21,12 @@ functions, and (on Windows) links the platform release's `dusklight.lib`.
    `J3DUClipper::clip` (sphere + box overloads) so casters outside the *camera* frustum
    still render, and skip `GXCopyTex`. `resolve_pass` depth = that cascade's shadow map
    (reversed light depth: 1 = near light). Each cascade is a full save-replay-resolve
-   bracket, so cost scales with cascade count. The Link cascade replays only the lists the
+   bracket, so cost scales with cascade count. The replay is **depth-only**: color writes are
+   disabled (`GXSetColorUpdate(GX_FALSE)`) and the color target is not resolved — a shadow map
+   needs only depth, and the resolved color is read solely by the Camera Replay debug view, so
+   normal frames skip the per-pixel color ROP and a full `mapSize²` color resolve per cascade
+   (the largest single cost in the map render; it scales with map size and cascade count).
+   Alpha *test* still runs, so alpha-cut foliage keeps punching holes in the depth map. The Link cascade replays only the lists the
    player's models enter (Middle/Opa/Dark) with a position filter in the
    `J3DShape::drawFast` pre-hook: `J3DShapePacket::prepareDraw` sets `j3dSys`'s current
    model right before every drawFast, so the filter reads `j3dSys.getModel()` and skips
@@ -88,7 +93,11 @@ Space Shadows" is inert when SSS is off.
    nearby shadows, plus the optional Link cascade for player self-shadow detail.
 5. **Shadows popping by camera angle** (Temple of Time ceiling, Lake Hylia mountains) →
    the `J3DUClipper` bypass during replay (the game culls against the *camera* frustum;
-   casters behind/above the camera must still cast).
+   casters behind/above the camera must still cast). The clip pre-hook fires per clip test
+   (hundreds–thousands per frame), so the bypass gate (enabled + map on + not indoors + sun
+   above the horizon + `noFrustumClipping`) and the game-shadow-skip gate are computed **once
+   per frame** in the `SCENE_BEGIN` callback and cached; the hooks then only read a bool
+   instead of re-running the config reads, indoor check, and sun-position math every call.
 6. **Light leaking through level edges** → single-sided geometry facing the player is
    back-facing from the light, so its material's cull mode dropped it from the shadow map.
    Fix: two-sided casters during replay. Direct GX drawers are covered by a `GXSetCullMode`
