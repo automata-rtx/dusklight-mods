@@ -17,3 +17,7 @@ add_mod(enhanced_ao
     MOD_JSON mod.json
     RES_DIR  res
 )
+
+# Optional integration with the Depth to Normal provider mod (shared service header).
+target_include_directories(enhanced_ao PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../depth_to_normal/include)
