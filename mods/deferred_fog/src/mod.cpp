@@ -36,6 +36,7 @@
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
 #include "JSystem/J3DGraphBase/J3DShape.h"
 #include "d/d_com_inf_game.h"
+#include "dolphin/gf/GFPixel.h"
 #include "dolphin/gx/GXAurora.h"
 #include "dolphin/gx/GXGeometry.h"
 #include "dolphin/gx/GXGet.h"
@@ -72,6 +73,7 @@ ConfigVarHandle g_cvarEnabled = 0;
 ConfigVarHandle g_cvarMixedMode = 0;
 ConfigVarHandle g_cvarDebugView = 0;
 
+UiWindowHandle g_controlsWindow = 0;
 GfxDrawTypeHandle g_drawType = 0;
 GfxStageHookHandle g_sceneBeginHook = 0;
 GfxStageHookHandle g_sceneAfterOpaqueHook = 0;
@@ -716,7 +718,7 @@ bool status_disabled(ModContext*, void*) {
     return true;
 }
 
-ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
+void add_enabled_toggle(UiElementHandle pane) {
     UiControlDesc control = UI_CONTROL_DESC_INIT;
     control.kind = UI_CONTROL_TOGGLE;
     control.label = "Enabled";
@@ -726,10 +728,35 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
         "than the fog itself.";
     control.binding = UI_BINDING_CONFIG_VAR;
     control.config_var = g_cvarEnabled;
-    add_control(panel, control);
+    add_control(pane, control);
+}
+
+void add_status_line(UiElementHandle pane) {
+    UiControlDesc control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_STRING;
+    control.label = "Status";
+    control.help_rml =
+        "Live suppression state. \"Deferring fog\" is the working state (exact mode also shows "
+        "the frame's config count). \"REVERTED: mixed fog configs\" (Vanilla mode) means this "
+        "scene draws with several fog configurations and fell back to forward fog - AO/shadow "
+        "darkening will then show on top of the fog at range. Transitions are logged with the "
+        "config details.";
+    control.binding = UI_BINDING_CALLBACKS;
+    control.get = status_get;
+    control.set = status_set;
+    control.is_disabled = status_disabled;
+    add_control(pane, control);
+}
+
+// The tab's left pane holds the SELECT controls: SELECT is only supported where a help pane
+// exists (window tabs), never in the flat mods panel, so these must live here to render at all.
+ModResult build_controls_tab(
+    ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*, ModError*) {
+    (void)right;
+    add_enabled_toggle(left);
 
     static const char* kMixedOptions[] = {"Vanilla", "Exact (replay)"};
-    control = UI_CONTROL_DESC_INIT;
+    UiControlDesc control = UI_CONTROL_DESC_INIT;
     control.kind = UI_CONTROL_SELECT;
     control.label = "Mixed Scenes";
     control.help_rml =
@@ -744,22 +771,7 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     control.config_var = g_cvarMixedMode;
     control.options = kMixedOptions;
     control.option_count = 2;
-    add_control(panel, control);
-
-    control = UI_CONTROL_DESC_INIT;
-    control.kind = UI_CONTROL_STRING;
-    control.label = "Status";
-    control.help_rml =
-        "Live suppression state. \"Deferring fog\" is the working state (exact mode also shows "
-        "the frame's config count). \"REVERTED: mixed fog configs\" (Vanilla mode) means this "
-        "scene draws with several fog configurations and fell back to forward fog - AO/shadow "
-        "darkening will then show on top of the fog at range. Transitions are logged with the "
-        "config details.";
-    control.binding = UI_BINDING_CALLBACKS;
-    control.get = status_get;
-    control.set = status_set;
-    control.is_disabled = status_disabled;
-    add_control(panel, control);
+    add_control(left, control);
 
     static const char* kDebugOptions[] = {"Off", "Fog Factor", "Config IDs"};
     control = UI_CONTROL_DESC_INIT;
@@ -773,6 +785,38 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     control.config_var = g_cvarDebugView;
     control.options = kDebugOptions;
     control.option_count = 3;
+    add_control(left, control);
+    return MOD_OK;
+}
+
+void on_controls_window_closed(ModContext*, UiWindowHandle, void*) {
+    g_controlsWindow = 0;
+}
+
+void on_open_controls(ModContext*, void*) {
+    if (g_controlsWindow != 0) {
+        return;
+    }
+    UiTabDesc tabs[1] = {UI_TAB_DESC_INIT};
+    tabs[0].title = "Controls";
+    tabs[0].build = build_controls_tab;
+    UiWindowDesc desc = UI_WINDOW_DESC_INIT;
+    desc.tabs = tabs;
+    desc.tab_count = 1;
+    desc.on_closed = on_controls_window_closed;
+    if (svc_ui->window_push(mod_ctx, &desc, &g_controlsWindow) != MOD_OK) {
+        svc_log->error(mod_ctx, "failed to open Deferred Fog controls window");
+    }
+}
+
+ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
+    add_enabled_toggle(panel);
+    add_status_line(panel);
+
+    UiControlDesc control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_BUTTON;
+    control.label = "Open Controls";
+    control.on_pressed = on_open_controls;
     add_control(panel, control);
     return MOD_OK;
 }
@@ -903,6 +947,16 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (dusk::mods::hook_add_pre<GXSetFog>(svc_hook, on_set_fog_pre) != MOD_OK) {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to hook GXSetFog");
     }
+    // Environment/packet fog (grass, flowers, the dKy tevstr path) is programmed through
+    // GFSetFog - a direct BP-register write, not GXSetFog - and the geometry that uses it draws
+    // outside J3DShape::drawFast, so it evades both other interception points. GFSetFog has the
+    // identical signature to GXSetFog, so the same callback captures and suppresses it; without
+    // this hook that geometry keeps its forward fog and the deferred quad double-fogs it. Only
+    // one call site in the game (the grass/flower fog helper), so normal terrain is untouched.
+    if (dusk::mods::hook_add_pre<GFSetFog>(svc_hook, on_set_fog_pre) != MOD_OK) {
+        svc_log->warn(mod_ctx,
+            "failed to hook GFSetFog; grass/flower fog will not be deferred (double-fogged)");
+    }
     // Virtual: resolves through the symbol manifest. Without it, J3D fog can't be deferred,
     // so the mod stays loaded but inert (with vanilla fog) rather than failing.
     g_shapeHookOk =
@@ -946,6 +1000,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     releaseLayout(g_mixedLayout);
     releaseLayout(g_mixedDebugLayout);
     g_cvarEnabled = g_cvarMixedMode = g_cvarDebugView = 0;
+    g_controlsWindow = 0;
     g_drawType = g_sceneBeginHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;
     g_scopeActive = g_quadArmed = g_suppressAllowed = g_shapeHookOk = g_wasSuppressing = false;
     g_fogReplayActive = g_wasMixed = g_warnedReplayFailure = false;

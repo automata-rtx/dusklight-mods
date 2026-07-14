@@ -24,7 +24,14 @@ Any screen-space effect composited after the opaque scene therefore multiplies o
    two-sided casters): the material display list has already executed when a shape draws, so
    an immediate `GXSetFog(GX_FOG_NONE)` overrides its fog for that shape's geometry. The
    material's true parameters are read from `material->getPEBlock()->getFog()` for capture.
-   Direct drawers are covered by a `GXSetFog` pre-hook that rewrites the type argument.
+   Direct drawers are covered by a `GXSetFog` pre-hook that rewrites the type argument, and by
+   an identical `GFSetFog` pre-hook: field/tall grass (`dGrass_packet_c`) and flowers
+   (`dFlower_packet_c`) are self-drawing opaque packets that program per-room fog through
+   `GFSetFog` (a direct BP write, not `GXSetFog`) and never call `J3DShape::drawFast`, so
+   without that hook their fog escapes suppression and the deferred quad double-fogs them.
+   `GFSetFog` has the same signature as `GXSetFog`, so the same callback captures and
+   suppresses it (its only game call site is the grass/flower fog helper, so normal terrain is
+   unaffected).
 3. **Re-apply** as a fullscreen alpha-blended pass over the resolved opaque depth, pushed at
    the first `J3DShape::drawFast` after `SCENE_AFTER_OPAQUE` — i.e. right before the first
    translucent geometry (water included) rasterizes — with a `FRAME_BEFORE_HUD` fallback for
@@ -66,6 +73,12 @@ special-fog materials), and the two modes handle that differently (`mixedMode`):
     config; pixels not covered by the shape override (rare non-J3D direct drawers) decode
     as invalid and fall back to config 0 (the frame's reference) — exactly what the
     single-config quad applied to them before.
+  - Grass/flower packets draw their own geometry (not `J3DShape::drawFast`), so the replay
+    can't force them to a flat ID color — their pixels write real texture colors that decode
+    as invalid and take config 0. Since their (now suppressed + captured) fog is the room's
+    environment fog, config 0 is normally the correct one; only near a room-fog boundary
+    could a grass tuft take a slightly wrong config, and grass sits in light near-camera fog
+    where the difference is imperceptible.
   - MSAA silhouettes may resolve to an invalid ID on 1-px fringes → reference config.
 - **Vanilla**: the original behavior — only draws matching the frame's reference config
   are suppressed; any deviant reverts the scene to forward fog from the next frame until
@@ -100,7 +113,10 @@ fog itself at range (unnatural darkening on distant fog-washed terrain). Tools:
 | `mixedMode` | 1 (Exact) | mixed-scene handling: 0 = Vanilla (revert to forward fog), 1 = Exact (per-pixel config-ID replay) |
 | `debugView` | 0 | 1 = deferred fog factor as grayscale, 2 = config IDs (exact mode, mixed frames) |
 
-The panel also shows a read-only **Status** line (see "Diagnosing fog issues").
+The mods panel shows the **Enabled** toggle, a read-only **Status** line (see "Diagnosing
+fog issues"), and an **Open Controls** button; `mixedMode` and `debugView` are SELECT
+controls, which the UI only renders inside a window tab (not the flat panel), so they live in
+the Open Controls window.
 
 ## Known caveats
 
