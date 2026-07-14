@@ -14,6 +14,7 @@
 
 #include "mods/service.hpp"
 #include "mods/svc/camera.h"
+#include "mods/svc/config.h"
 #include "mods/svc/gfx.h"
 #include "mods/svc/log.h"
 #include "mods/svc/resource.h"
@@ -28,6 +29,7 @@
 DEFINE_MOD();
 IMPORT_SERVICE(GfxService, svc_gfx);
 IMPORT_SERVICE(CameraService, svc_camera);
+IMPORT_SERVICE(ConfigService, svc_config);
 IMPORT_SERVICE(ResourceService, svc_resource);
 IMPORT_SERVICE(UiService, svc_ui);
 IMPORT_SERVICE(LogService, svc_log);
@@ -40,6 +42,16 @@ WGPUComputePipeline g_pipeline = nullptr;
 WGPUBindGroupLayout g_layout = nullptr;
 GfxComputeTypeHandle g_computeType = 0;
 GfxStageHookHandle g_sceneBeginHook = 0;
+
+// Optional debug view: a fullscreen pass that draws the normal buffer over the whole screen at
+// FRAME_BEFORE_HUD (the very end of the frame, after every other mod composites), so nothing
+// conflicts with it. Toggled by the `debugView` config var.
+ResourceBuffer g_debugShaderSource = RESOURCE_BUFFER_INIT;
+WGPURenderPipeline g_debugPipeline = nullptr;
+WGPUBindGroupLayout g_debugLayout = nullptr;
+GfxDrawTypeHandle g_debugDrawType = 0;
+GfxStageHookHandle g_frameBeforeHudHook = 0;
+ConfigVarHandle g_cvarDebugView = 0;
 
 // Output normal buffer (world-space normal + raw depth), screen-sized, recreated on resize. Old
 // targets are retired a few frames rather than released immediately: a consumer's payload may
@@ -88,6 +100,12 @@ struct ComputePayload {
 };
 static_assert(sizeof(ComputePayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
 static_assert(std::is_trivially_copyable_v<ComputePayload>);
+
+struct DebugDrawPayload {
+    WGPUTextureView normal;  // the frame's world-space normal buffer
+};
+static_assert(sizeof(DebugDrawPayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
+static_assert(std::is_trivially_copyable_v<DebugDrawPayload>);
 
 constexpr uint32_t div_ceil(uint32_t n, uint32_t d) { return (n + d - 1) / d; }
 
@@ -160,6 +178,75 @@ bool build_pipeline() {
     }
     g_layout = wgpuComputePipelineGetBindGroupLayout(g_pipeline, 0);
     return g_layout != nullptr;
+}
+
+bool build_debug_pipeline() {
+    WGPUShaderSourceWGSL wgsl = WGPU_SHADER_SOURCE_WGSL_INIT;
+    wgsl.code = {static_cast<const char*>(g_debugShaderSource.data), g_debugShaderSource.size};
+    WGPUShaderModuleDescriptor moduleDesc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+    moduleDesc.nextInChain = &wgsl.chain;
+    moduleDesc.label = {"depth-to-normal debug", WGPU_STRLEN};
+    WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_deviceInfo.device, &moduleDesc);
+    if (module == nullptr) {
+        return false;
+    }
+    // Overwrite the framebuffer (no blend): the debug view replaces the final image so nothing
+    // composites over the normals.
+    WGPUColorTargetState colorTarget = WGPU_COLOR_TARGET_STATE_INIT;
+    colorTarget.format = g_deviceInfo.color_format;
+    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+    fragment.module = module;
+    fragment.entryPoint = {"fs_main", WGPU_STRLEN};
+    fragment.targetCount = 1;
+    fragment.targets = &colorTarget;
+    // The FRAME_BEFORE_HUD pass carries a depth attachment; match it, but never test or write.
+    WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
+    depthStencil.format = g_deviceInfo.depth_format;
+    depthStencil.depthWriteEnabled = WGPUOptionalBool_False;
+    depthStencil.depthCompare = WGPUCompareFunction_Always;
+    WGPURenderPipelineDescriptor pipelineDesc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    pipelineDesc.label = {"depth-to-normal debug", WGPU_STRLEN};
+    pipelineDesc.vertex.module = module;
+    pipelineDesc.vertex.entryPoint = {"vs_main", WGPU_STRLEN};
+    pipelineDesc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+    pipelineDesc.depthStencil = &depthStencil;
+    pipelineDesc.multisample.count = g_deviceInfo.sample_count;
+    pipelineDesc.fragment = &fragment;
+    g_debugPipeline = wgpuDeviceCreateRenderPipeline(g_deviceInfo.device, &pipelineDesc);
+    wgpuShaderModuleRelease(module);
+    if (g_debugPipeline == nullptr) {
+        return false;
+    }
+    g_debugLayout = wgpuRenderPipelineGetBindGroupLayout(g_debugPipeline, 0);
+    return g_debugLayout != nullptr;
+}
+
+// Render worker thread: draw the normal buffer fullscreen.
+void on_debug_draw(
+    ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
+    if (payloadSize != sizeof(DebugDrawPayload)) {
+        return;
+    }
+    DebugDrawPayload data;
+    std::memcpy(&data, payload, sizeof(data));
+    if (data.normal == nullptr || g_debugPipeline == nullptr) {
+        return;
+    }
+    WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
+    entry.binding = 0;
+    entry.textureView = data.normal;
+    WGPUBindGroupDescriptor bgDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    bgDesc.layout = g_debugLayout;
+    bgDesc.entryCount = 1;
+    bgDesc.entries = &entry;
+    WGPUBindGroup group = wgpuDeviceCreateBindGroup(ctx->device, &bgDesc);
+    if (group == nullptr) {
+        return;
+    }
+    wgpuRenderPassEncoderSetPipeline(ctx->pass, g_debugPipeline);
+    wgpuRenderPassEncoderSetBindGroup(ctx->pass, 0, group, 0, nullptr);
+    wgpuRenderPassEncoderDraw(ctx->pass, 3, 1, 0, 0);
+    wgpuBindGroupRelease(group);
 }
 
 // Render worker thread: reconstruct the world-space normal buffer from the depth snapshot.
@@ -278,7 +365,39 @@ ModResult get_frame(ModContext*, DepthToNormalFrame* out) {
     return MOD_OK;
 }
 
+// Game thread, at the very end of the frame: when the debug view is on, draw the normal buffer
+// fullscreen over everything (after all other mods have composited). get_frame is idempotent -
+// if a consumer already triggered the reconstruction this frame this reuses it, otherwise it
+// computes it now.
+void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
+    bool debugOn = false;
+    if (g_cvarDebugView == 0 ||
+        svc_config->get_bool(mod_ctx, g_cvarDebugView, &debugOn) != MOD_OK || !debugOn)
+    {
+        return;
+    }
+    DepthToNormalFrame frame = DEPTH_TO_NORMAL_FRAME_INIT;
+    if (get_frame(mod_ctx, &frame) != MOD_OK || frame.normal == nullptr) {
+        return;
+    }
+    DebugDrawPayload payload{};
+    payload.normal = frame.normal;
+    svc_gfx->push_draw(mod_ctx, g_debugDrawType, &payload, sizeof(payload));
+}
+
 ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
+    svc_ui->pane_add_section(mod_ctx, panel, "Debug");
+    UiControlDesc debugToggle = UI_CONTROL_DESC_INIT;
+    debugToggle.kind = UI_CONTROL_TOGGLE;
+    debugToggle.label = "Show Normals";
+    debugToggle.help_rml =
+        "Draws the reconstructed world-space normal buffer over the whole screen at the very end "
+        "of the frame (after every other effect), as a diagnostic. World normal XYZ maps to RGB; "
+        "sky / invalid pixels are black.";
+    debugToggle.binding = UI_BINDING_CONFIG_VAR;
+    debugToggle.config_var = g_cvarDebugView;
+    svc_ui->pane_add_control(mod_ctx, panel, &debugToggle, nullptr);
+
     svc_ui->pane_add_section(mod_ctx, panel, "About");
     svc_ui->pane_add_text(mod_ctx, panel,
         "Reconstructs a world-space surface normal from the depth buffer once per frame and "
@@ -330,6 +449,36 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
+
+    // Debug view: config toggle + fullscreen draw pipeline + FRAME_BEFORE_HUD hook.
+    ConfigVarDesc cvarDesc = CONFIG_VAR_DESC_INIT;
+    cvarDesc.name = "debugView";
+    cvarDesc.type = CONFIG_VAR_BOOL;
+    cvarDesc.default_bool = false;
+    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarDebugView) != MOD_OK) {
+        return dusk::mods::set_error(error, MOD_ERROR, "failed to register debugView");
+    }
+    result = svc_resource->load(mod_ctx, "debug.wgsl", &g_debugShaderSource);
+    if (result != MOD_OK || g_debugShaderSource.data == nullptr) {
+        return dusk::mods::set_error(error, result, "failed to load debug.wgsl");
+    }
+    if (!build_debug_pipeline()) {
+        return dusk::mods::set_error(error, MOD_ERROR, "failed to create debug pipeline");
+    }
+    GfxDrawTypeDesc drawDesc = GFX_DRAW_TYPE_DESC_INIT;
+    drawDesc.label = "depth-to-normal debug";
+    drawDesc.draw = on_debug_draw;
+    if (svc_gfx->register_draw_type(mod_ctx, &drawDesc, &g_debugDrawType) != MOD_OK) {
+        return dusk::mods::set_error(error, MOD_ERROR, "failed to register debug draw type");
+    }
+    stageDesc = GFX_STAGE_HOOK_DESC_INIT;
+    stageDesc.callback = on_frame_before_hud;
+    if (svc_gfx->register_stage_hook(
+            mod_ctx, GFX_STAGE_FRAME_BEFORE_HUD, &stageDesc, &g_frameBeforeHudHook) != MOD_OK)
+    {
+        return dusk::mods::set_error(error, MOD_ERROR, "failed to register frame hook");
+    }
+
     UiModsPanelDesc panelDesc = UI_MODS_PANEL_DESC_INIT;
     panelDesc.build = build_panel;
     svc_ui->register_mods_panel(mod_ctx, &panelDesc);
@@ -342,6 +491,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
 
 MOD_EXPORT ModResult mod_shutdown(ModError*) {
     svc_resource->free(mod_ctx, &g_shaderSource);
+    svc_resource->free(mod_ctx, &g_debugShaderSource);
     release_target(g_target);
     for (auto& retired : g_retired) {
         release_target(retired.target);
@@ -355,8 +505,19 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         wgpuBindGroupLayoutRelease(g_layout);
         g_layout = nullptr;
     }
+    if (g_debugPipeline != nullptr) {
+        wgpuRenderPipelineRelease(g_debugPipeline);
+        g_debugPipeline = nullptr;
+    }
+    if (g_debugLayout != nullptr) {
+        wgpuBindGroupLayoutRelease(g_debugLayout);
+        g_debugLayout = nullptr;
+    }
     g_computeType = 0;
     g_sceneBeginHook = 0;
+    g_debugDrawType = 0;
+    g_frameBeforeHudHook = 0;
+    g_cvarDebugView = 0;
     g_cameraValid = false;
     g_frameComputed = false;
     g_frameView = nullptr;
