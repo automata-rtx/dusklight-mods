@@ -1,20 +1,28 @@
 # dusklight-mods
 
-Two graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its mod API:
+Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its mod API:
 
 - **`mods/enhanced_ao/`** — "Enhanced Ambient Occlusion" (**VBAO**): a 32-sector
   visibility-bitmask AO estimator with temporal accumulation, edge-aware denoise, and
   depth-aware compositing. **Service-only**: it uses only mod-API services (gfx, camera,
   config, ui, resource, log) — it must NOT include game headers or call game code, which is
   what lets it survive game updates without a rebuild.
-- **`mods/realtime_sun_shadows/`** — "Realtime Sun Shadows": a real-geometry sun/moon shadow
-  map (game draw-list replay into a light-space depth pass) with PCF, slope-scaled bias,
-  normal-offset receiver, contact shadows, and indoor auto-disable. **Game-linked**: it
+- **`mods/realtime_sun_shadows/`** — "Realtime Sun Shadows": real-geometry sun/moon cascaded
+  shadow maps (game draw-list replay into up to 3 nested light-space depth passes, plus an
+  optional Link-only cascade) with PCF, slope-scaled bias, normal-offset receiver, two-sided
+  casters, Bend-style screen-space shadows, and indoor auto-disable. **Game-linked**: it
   includes game headers and hooks game functions, so it is coupled to the pinned game build.
+- **`mods/deferred_fog/`** — "Deferred Fog": suppresses the game's per-draw fog during the
+  opaque world lists and re-applies it (bit-exact aurora fog math) as a fullscreen pass after
+  every mod's `SCENE_AFTER_OPAQUE` composites, so AO/shadows darken surfaces under the fog
+  instead of the fog itself. Standalone: other mods need no changes to benefit. Scenes with
+  mixed fog configurations (twilight/wolf-senses special fog) auto-revert to vanilla fog.
+  **Game-linked**.
 
 Each mod is `src/mod.cpp` (host code: pipelines, config vars, UI panel) plus `res/*.wgsl`
-(shaders). Deep documentation: `docs/vbao.md`, `docs/realtime_sun_shadows.md`, and
-`docs/mod-api-notes.md` (pitfalls — read before touching uniforms or render code).
+(shaders). Deep documentation: `docs/vbao.md`, `docs/realtime_sun_shadows.md`,
+`docs/deferred_fog.md`, and `docs/mod-api-notes.md` (pitfalls — read before touching
+uniforms or render code).
 
 ## First run
 
@@ -26,11 +34,11 @@ building or relying on the game headers. CI already checks out submodules recurs
 
 Editing a shader or tuning a default touches ONE file here. It does **not** require building
 the game, building aurora, or touching `extern/dusklight` (a read-only pinned reference).
-CI compiles both mods and validates every shader in a few minutes.
+CI compiles all mods and validates every shader in a few minutes.
 
 The user typically does not build locally. Iteration loop:
 1. Edit, commit, push (branch per the session's instructions).
-2. GitHub Actions produces `enhanced_ao.dusk` + `realtime_sun_shadows.dusk`
+2. GitHub Actions produces one `.dusk` package per mod
    (artifact `dusklight-mods-win64`).
 3. User downloads them into `%APPDATA%\TwilitRealm\Dusklight\mods`, then uses the in-game
    mod manager's **Reload** button — no game restart needed.

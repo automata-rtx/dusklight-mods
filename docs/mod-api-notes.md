@@ -33,6 +33,12 @@ These notes are the deltas that actually bit us.
   how the shadow map re-renders the world); `resolve_pass` then yields its depth.
 - Check `get_device_info` for `uses_reversed_z` and formats rather than assuming — but note
   the whole codebase currently assumes reversed-Z (1 = near, sky raw depth = 0).
+- **Stage order vs the game's post-processing**: the game draws bloom *mid-scene*, between
+  `GFX_STAGE_SCENE_AFTER_OPAQUE` and `GFX_STAGE_FRAME_BEFORE_HUD` (see `m_Do_graphic.cpp`).
+  A screen-space effect that should sit under bloom (AO, shadows) must push its composite at
+  `SCENE_AFTER_OPAQUE`; a draw pushed at `FRAME_BEFORE_HUD` lands on top of bloom (and DOF,
+  motion blur, and all translucency). `push_draw` encodes at the push point in the command
+  stream, so the stage you push from is the layer you get.
 
 ## Camera service
 

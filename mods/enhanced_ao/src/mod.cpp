@@ -25,6 +25,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <initializer_list>
 #include <type_traits>
@@ -47,12 +49,17 @@ ConfigVarHandle g_cvarQuality = 0;
 ConfigVarHandle g_cvarCustomSlices = 0;
 ConfigVarHandle g_cvarCustomSteps = 0;
 ConfigVarHandle g_cvarRadius = 0;
+ConfigVarHandle g_cvarRadiusFar = 0;
+ConfigVarHandle g_cvarRadiusRampStart = 0;
+ConfigVarHandle g_cvarRadiusRampEnd = 0;
 ConfigVarHandle g_cvarRadiusMax = 0;
 ConfigVarHandle g_cvarIntensity = 0;
 ConfigVarHandle g_cvarContrast = 0;
 ConfigVarHandle g_cvarBlackPoint = 0;
 ConfigVarHandle g_cvarThickness = 0;
 ConfigVarHandle g_cvarThickFade = 0;
+ConfigVarHandle g_cvarThickDist = 0;
+ConfigVarHandle g_cvarDebugDepthRange = 0;
 ConfigVarHandle g_cvarDepthBias = 0;
 ConfigVarHandle g_cvarTemporal = 0;
 ConfigVarHandle g_cvarTemporalFrames = 0;
@@ -61,6 +68,7 @@ ConfigVarHandle g_cvarMotionResponse = 0;
 ConfigVarHandle g_cvarContentThresh = 0;
 ConfigVarHandle g_cvarDisoccTol = 0;
 ConfigVarHandle g_cvarDenoisePasses = 0;
+ConfigVarHandle g_cvarDenoiseStrength = 0;
 ConfigVarHandle g_cvarDistanceFade = 0;
 ConfigVarHandle g_cvarFadeStart = 0;
 ConfigVarHandle g_cvarFadeEnd = 0;
@@ -70,6 +78,7 @@ ConfigVarHandle g_cvarDebugView = 0;
 GfxComputeTypeHandle g_computeType = 0;
 GfxDrawTypeHandle g_drawType = 0;
 GfxStageHookHandle g_afterOpaqueHook = 0;
+GfxStageHookHandle g_beforeHudHook = 0;
 UiWindowHandle g_controlsWindow = 0;
 
 ResourceBuffer g_preprocessSource = RESOURCE_BUFFER_INIT;
@@ -100,8 +109,10 @@ WGPUTextureView g_hilbertLutView = nullptr;
 // for a few frames instead of released immediately: payloads embedding their views may still
 // be in flight on the render worker.
 struct AoTargets {
-    uint32_t width = 0;
+    uint32_t width = 0;   // AO chain resolution (half the render size in Half Res)
     uint32_t height = 0;
+    uint32_t fullWidth = 0;   // full render resolution (temporal history / raw snapshot)
+    uint32_t fullHeight = 0;
     WGPUTexture preprocessedDepth = nullptr;
     WGPUTextureView preprocessedDepthMips[5] = {};
     WGPUTextureView preprocessedDepthAll = nullptr;
@@ -131,6 +142,7 @@ float g_prevProjFromWorld[16] = {};
 
 bool g_warnedNoDepth = false;
 bool g_loggedChain = false;
+float g_loggedFarPlane = 1.0f;  // last far plane reported to the log (world-unit calibration)
 std::atomic g_chainExecuted{false};
 
 // Mirror of the WGSL Uniforms struct (keep in sync with res/*.wgsl).
@@ -162,7 +174,15 @@ struct AoUniforms {
     uint32_t debug_view;
     uint32_t frame_index;
     uint32_t flags; // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
+    float thick_dist_scale;  // extra occluder thickness, fraction of the view-space radius
+    float inv_debug_depth;   // debug depth view gradient scale (1 / world units)
+    float radius_far;        // far effect radius (fraction of view depth); 0 disables the ramp
+    float radius_ramp_start; // radius ramp band start, world units of view depth
+    float radius_ramp_end;   // radius ramp band end, world units of view depth
+    float denoise_strength;  // spatial denoise blend, 0 raw .. 1 fully blurred
     float _pad0;
+    float _pad1;
+    float _pad2;
 };
 static_assert(sizeof(AoUniforms) % 16 == 0);
 
@@ -177,8 +197,10 @@ struct ComputePayload {
     WGPUTextureView historyOut;
     uint32_t uniform_offset;
     uint32_t uniform_size;
-    uint32_t width;
+    uint32_t width;         // AO chain (half) resolution
     uint32_t height;
+    uint32_t fullWidth;     // full render resolution (temporal history / raw snapshot)
+    uint32_t fullHeight;
     uint32_t run_temporal;
     uint32_t denoise_passes; // 0-3; ping-pongs aoNoisy <-> aoFinal
 };
@@ -195,6 +217,12 @@ struct CompositePayload {
 };
 static_assert(sizeof(CompositePayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
 static_assert(std::is_trivially_copyable_v<CompositePayload>);
+
+// Debug views draw at FRAME_BEFORE_HUD instead of SCENE_AFTER_OPAQUE so nothing layered on
+// after the opaque scene (deferred fog, bloom, translucency) obscures them; the payload is
+// staged here between the two stages (game thread only; its views live for the frame).
+CompositePayload g_pendingDebugDraw{};
+bool g_debugDrawPending = false;
 
 int64_t get_int_option(ConfigVarHandle handle, int64_t fallback) {
     int64_t value = fallback;
@@ -429,7 +457,7 @@ void tick_retired_targets() {
     }
 }
 
-bool ensure_targets(uint32_t width, uint32_t height) {
+bool ensure_targets(uint32_t width, uint32_t height, uint32_t fullWidth, uint32_t fullHeight) {
     if (g_targets.width == width && g_targets.height == height) {
         return true;
     }
@@ -439,29 +467,33 @@ bool ensure_targets(uint32_t width, uint32_t height) {
     g_historyValid = false; // the history lives in the retired set; restart accumulation
 
     const auto createStorageTexture = [&](const char* label, WGPUTextureFormat format,
-                                          uint32_t mipCount, WGPUTexture& outTexture) {
+                                          uint32_t mipCount, uint32_t w, uint32_t h,
+                                          WGPUTexture& outTexture) {
         WGPUTextureDescriptor texDesc = WGPU_TEXTURE_DESCRIPTOR_INIT;
         texDesc.label = {label, WGPU_STRLEN};
         texDesc.usage = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding;
-        texDesc.size = {width, height, 1};
+        texDesc.size = {w, h, 1};
         texDesc.format = format;
         texDesc.mipLevelCount = mipCount;
         outTexture = wgpuDeviceCreateTexture(g_deviceInfo.device, &texDesc);
         return outTexture != nullptr;
     };
 
+    // The AO chain runs at chain (half) res; the temporal history is full render res so the
+    // half-res estimate can be reconstructed into it (temporal upsampling). At full res the two
+    // sizes coincide.
     bool ok = createStorageTexture("Enhanced AO preprocessed depth", WGPUTextureFormat_R32Float, 5,
-                  g_targets.preprocessedDepth) &&
+                  width, height, g_targets.preprocessedDepth) &&
               createStorageTexture(
-                  "Enhanced AO noisy", WGPUTextureFormat_R32Float, 1, g_targets.aoNoisy) &&
+                  "Enhanced AO noisy", WGPUTextureFormat_R32Float, 1, width, height, g_targets.aoNoisy) &&
               createStorageTexture("Enhanced AO depth differences", WGPUTextureFormat_R32Uint, 1,
-                  g_targets.depthDifferences) &&
+                  width, height, g_targets.depthDifferences) &&
               createStorageTexture(
-                  "Enhanced AO final", WGPUTextureFormat_R32Float, 1, g_targets.aoFinal) &&
-              createStorageTexture(
-                  "Enhanced AO history 0", WGPUTextureFormat_RG32Float, 1, g_targets.history[0]) &&
-              createStorageTexture(
-                  "Enhanced AO history 1", WGPUTextureFormat_RG32Float, 1, g_targets.history[1]);
+                  "Enhanced AO final", WGPUTextureFormat_R32Float, 1, width, height, g_targets.aoFinal) &&
+              createStorageTexture("Enhanced AO history 0", WGPUTextureFormat_RG32Float, 1,
+                  fullWidth, fullHeight, g_targets.history[0]) &&
+              createStorageTexture("Enhanced AO history 1", WGPUTextureFormat_RG32Float, 1,
+                  fullWidth, fullHeight, g_targets.history[1]);
     if (ok) {
         for (uint32_t mip = 0; mip < 5 && ok; ++mip) {
             WGPUTextureViewDescriptor viewDesc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
@@ -490,6 +522,8 @@ bool ensure_targets(uint32_t width, uint32_t height) {
     }
     g_targets.width = width;
     g_targets.height = height;
+    g_targets.fullWidth = fullWidth;
+    g_targets.fullHeight = fullHeight;
     return true;
 }
 
@@ -567,10 +601,12 @@ void on_compute(
         denoisePasses == 0 ? data.aoNoisy : ((denoisePasses % 2u) != 0u ? data.aoFinal : data.aoNoisy);
     WGPUBindGroup temporalGroup = nullptr;
     if (data.run_temporal != 0) {
+        // binding 3 (raw_depth) reuses the full-res scene depth snapshot (data.depth), which the
+        // preprocess pass also consumes as its input.
         temporalGroup = makeBindGroup(g_temporalLayout,
             {textureEntry(0, denoisedView), textureEntry(1, data.historyIn),
-                textureEntry(2, data.preprocessedDepthMips[0]), textureEntry(3, data.historyOut),
-                uniformEntry(4)});
+                textureEntry(2, data.preprocessedDepthMips[0]), textureEntry(3, data.depth),
+                textureEntry(4, data.historyOut), uniformEntry(5)});
     }
     if (preprocessGroup == nullptr || mip4Group == nullptr || vbaoGroup == nullptr || !denoiseOk ||
         (data.run_temporal != 0 && temporalGroup == nullptr))
@@ -610,10 +646,12 @@ void on_compute(
         }
     }
     if (temporalGroup != nullptr) {
+        // The temporal pass runs at full render resolution (it reconstructs the half-res estimate
+        // into the full-res history).
         wgpuComputePassEncoderSetPipeline(pass, g_temporalPipeline);
         wgpuComputePassEncoderSetBindGroup(pass, 0, temporalGroup, 0, nullptr);
         wgpuComputePassEncoderDispatchWorkgroups(
-            pass, div_ceil(data.width, 8), div_ceil(data.height, 8), 1);
+            pass, div_ceil(data.fullWidth, 8), div_ceil(data.fullHeight, 8), 1);
     }
     wgpuComputePassEncoderEnd(pass);
     wgpuComputePassEncoderRelease(pass);
@@ -709,7 +747,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const uint32_t divisor = halfRes ? 2 : 1;
     const uint32_t width = resolved.width / divisor;
     const uint32_t height = resolved.height / divisor;
-    if (width < 32 || height < 32 || !ensure_targets(width, height)) {
+    if (width < 32 || height < 32 ||
+        !ensure_targets(width, height, resolved.width, resolved.height)) {
         return;
     }
 
@@ -743,30 +782,62 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     };
     // Depth-proportional radius: the setting is a permille of the view distance (100 = 10%).
     uniforms.effect_radius =
-        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarRadius, 100), 25, 800)) /
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarRadius, 200), 25, 800)) /
         1000.0f;
-    uniforms.intensity = percent(g_cvarIntensity, 150, 0, 300);
+    // Far radius (same scale, 0 = off) ramps in across [rampStart, rampEnd] world units of view
+    // depth. World units, not far-plane fractions: TP's far plane is per-stage and far beyond
+    // the visible field, so fractions of it are scene-dependent and absurdly compressed.
+    uniforms.radius_far =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarRadiusFar, 800), 0, 800)) /
+        1000.0f;
+    uniforms.radius_ramp_start = static_cast<float>(
+        std::clamp<int64_t>(get_int_option(g_cvarRadiusRampStart, 0), 0, 200000));
+    uniforms.radius_ramp_end = static_cast<float>(
+        std::clamp<int64_t>(get_int_option(g_cvarRadiusRampEnd, 10000), 500, 200000));
+    uniforms.intensity = percent(g_cvarIntensity, 150, 0, 500);
     uniforms.contrast = percent(g_cvarContrast, 150, 50, 300);
     uniforms.thickness = percent(g_cvarThickness, 150, 25, 400);
-    uniforms.black_point = percent(g_cvarBlackPoint, 0, 0, 30);
+    uniforms.black_point = percent(g_cvarBlackPoint, 3, 0, 30);
     uniforms.radius_max = percent(g_cvarRadiusMax, 40, 10, 100);
     uniforms.thick_fade = percent(g_cvarThickFade, 150, 50, 400);
+    // Radius-proportional occluder thickness floor: restores mid/far occlusion that the
+    // log-scaled base thickness starves (the value is per-mille of the view radius).
+    uniforms.thick_dist_scale =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarThickDist, 60), 0, 100)) /
+        1000.0f;
+    uniforms.inv_debug_depth =
+        1.0f / static_cast<float>(
+                   std::clamp<int64_t>(get_int_option(g_cvarDebugDepthRange, 3300), 500, 100000));
     // Self-occlusion bias in permille toward the camera (4 = the 0.996 factor).
     uniforms.depth_bias =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarDepthBias, 4), 0, 20)) /
         1000.0f;
     quality_counts(
         get_int_option(g_cvarQuality, 2), uniforms.slice_count, uniforms.steps_per_side);
+    uniforms.denoise_strength = percent(g_cvarDenoiseStrength, 60, 0, 100);
     const int64_t temporalFrames = std::clamp<int64_t>(get_int_option(g_cvarTemporalFrames, 5), 2, 12);
     uniforms.temporal_alpha = 1.0f / static_cast<float>(temporalFrames);
     uniforms.temporal_clamp_k = percent(g_cvarTemporalClamp, 200, 100, 300);
     uniforms.velocity_scale = percent(g_cvarMotionResponse, 10, 0, 100);
     uniforms.content_thresh = percent(g_cvarContentThresh, 100, 25, 300);
-    uniforms.disocc_tol = percent(g_cvarDisoccTol, 4, 1, 20);
+    uniforms.disocc_tol = percent(g_cvarDisoccTol, 0, 0, 20);
     const bool distanceFade = get_bool_option(g_cvarDistanceFade, false);
-    uniforms.fade_start = percent(g_cvarFadeStart, 40, 5, 95);
-    uniforms.fade_end = percent(g_cvarFadeEnd, 90, 10, 100);
+    uniforms.fade_start = static_cast<float>(
+        std::clamp<int64_t>(get_int_option(g_cvarFadeStart, 15000), 0, 200000));
+    uniforms.fade_end = static_cast<float>(
+        std::clamp<int64_t>(get_int_option(g_cvarFadeEnd, 40000), 500, 200000));
     uniforms.inv_far = camera.far_plane > 1.0f ? 1.0f / camera.far_plane : 1.0f / 200000.0f;
+    // Calibration aid for the world-unit distance settings above: log the stage's far plane
+    // whenever it changes materially (once per change, not per frame).
+    if (camera.far_plane > 1.0f &&
+        std::fabs(camera.far_plane - g_loggedFarPlane) > g_loggedFarPlane * 0.01f)
+    {
+        g_loggedFarPlane = camera.far_plane;
+        char msg[96];
+        std::snprintf(
+            msg, sizeof(msg), "camera far plane: %.0f world units", camera.far_plane);
+        svc_log->info(mod_ctx, msg);
+    }
     const uint32_t debugMode =
         static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 4));
     uniforms.debug_view = debugMode;
@@ -801,6 +872,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     computePayload.uniform_size = uniformRange.size;
     computePayload.width = width;
     computePayload.height = height;
+    computePayload.fullWidth = resolved.width;
+    computePayload.fullHeight = resolved.height;
     computePayload.run_temporal = temporal ? 1u : 0u;
     computePayload.denoise_passes = denoisePasses;
     if (svc_gfx->push_compute(mod_ctx, g_computeType, &computePayload, sizeof(computePayload)) !=
@@ -816,7 +889,14 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const CompositePayload drawPayload{
         temporal ? g_targets.historyViews[writeIdx] : denoisedView, g_targets.preprocessedDepthAll,
         resolved.depth, uniformRange.offset, uniformRange.size, debugMode};
-    svc_gfx->push_draw(mod_ctx, g_drawType, &drawPayload, sizeof(drawPayload));
+    if (debugMode != 0) {
+        // Debug views draw at FRAME_BEFORE_HUD so deferred fog, translucency, and bloom
+        // don't paint over them (all payload views stay valid for the rest of the frame).
+        g_pendingDebugDraw = drawPayload;
+        g_debugDrawPending = true;
+    } else {
+        svc_gfx->push_draw(mod_ctx, g_drawType, &drawPayload, sizeof(drawPayload));
+    }
 
     // Advance the temporal state for the next frame.
     if (temporal) {
@@ -825,6 +905,16 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     }
     std::memcpy(g_prevProjFromWorld, camera.proj_from_world, sizeof(g_prevProjFromWorld));
     g_prevCameraValid = true;
+}
+
+// Game thread, after the full 3D scene: push the staged debug-view draw, unobscured by
+// everything the scene layered on after the opaque pass.
+void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
+    if (!g_debugDrawPending) {
+        return;
+    }
+    g_debugDrawPending = false;
+    svc_gfx->push_draw(mod_ctx, g_drawType, &g_pendingDebugDraw, sizeof(g_pendingDebugDraw));
 }
 
 void add_control(UiElementHandle pane, const UiControlDesc& desc) {
@@ -876,7 +966,7 @@ ModResult build_controls_tab(
     svc_ui->pane_add_section(mod_ctx, left, "Effect");
     add_toggle(left, "Enabled", g_cvarEnabled, "Enables the ambient occlusion pass.");
     add_number(left, "Intensity", g_cvarIntensity,
-        "How strongly occlusion darkens the scene.", 0, 300, 5, "%");
+        "How strongly occlusion darkens the scene.", 0, 500, 5, "%");
     add_number(left, "Contrast", g_cvarContrast,
         "Contrast of the occlusion falloff. Lower softens the transition; higher sharpens it.",
         50, 300, 10, "%");
@@ -896,12 +986,27 @@ ModResult build_controls_tab(
     add_number(left, "Custom Steps", g_cvarCustomSteps,
         "Custom quality only: marched samples per slice side.", 1, 8, 1, nullptr);
     add_number(left, "Radius", g_cvarRadius,
-        "How far the occlusion reaches, as a fraction of view distance (100 = 10%). "
+        "How far the occlusion reaches up close, as a fraction of view distance (100 = 10%). "
         "Raise to broaden coverage; lower for tighter contact shadows.",
         25, 800, 25, nullptr);
+    add_number(left, "Far Radius", g_cvarRadiusFar,
+        "Radius at long view distances (same scale as Radius). The radius ramps from Radius up "
+        "to this across the band below, so close-up content keeps tight contact detail while "
+        "distant landmarks gain broad occlusion depth. 0 disables (constant Radius).",
+        0, 800, 25, nullptr);
+    add_number(left, "Far Radius Start", g_cvarRadiusRampStart,
+        "View distance in world units where the radius starts ramping toward Far Radius (the "
+        "shadow mod's Coverage uses the same scale). The log prints the stage's camera far "
+        "plane for reference.",
+        0, 200000, 500, nullptr);
+    add_number(left, "Far Radius End", g_cvarRadiusRampEnd,
+        "View distance in world units where the ramp reaches Far Radius.",
+        500, 200000, 500, nullptr);
     add_number(left, "Max Screen Radius", g_cvarRadiusMax,
-        "Caps the search radius as a share of screen height, limiting how large the effect gets "
-        "on very close surfaces. Lowering it also bounds worst-case cost.",
+        "Hard cap on the screen-space search radius, as a share of screen height. The search "
+        "radius is constant in screen space, so at normal Radius values it sits well under this "
+        "cap and the setting has no visible effect - it only engages to bound sampling cost when "
+        "Radius is pushed very high.",
         10, 100, 5, "%");
     add_number(left, "Thickness", g_cvarThickness,
         "How thick occluders are treated. Higher darkens the deepest part of contacts and "
@@ -912,6 +1017,12 @@ ModResult build_controls_tab(
         "influence fades out. Lower stops halos around silhouettes sooner; higher lets deep "
         "crevices darken further.",
         50, 400, 25, "%");
+    add_number(left, "Distance Thickness", g_cvarThickDist,
+        "Extra occluder thickness that scales with distance (per-mille of the search radius). "
+        "The base thickness grows only logarithmically, which starves mid/far occlusion; raise "
+        "this to keep distant geometry darkening at full strength. 0 restores the old "
+        "behavior.",
+        0, 100, 5, nullptr);
     add_number(left, "Depth Bias", g_cvarDepthBias,
         "Small bias toward the camera that suppresses a surface shadowing itself (speckle/acne "
         "on flat surfaces). Raise if flat surfaces show noise; too high loses fine contact "
@@ -941,8 +1052,9 @@ ModResult build_controls_tab(
     add_number(left, "Disocclusion Tolerance", g_cvarDisoccTol,
         "Depth mismatch (as % of depth) before reprojected history is treated as a different "
         "surface and discarded. Lower rejects more aggressively at silhouettes; higher keeps "
-        "more history.",
-        1, 20, 1, "%");
+        "more history. 0 rejects the most (a small fixed depth floor still admits history on "
+        "matching surfaces), which minimizes distant ghosting.",
+        0, 20, 1, "%");
 
     svc_ui->pane_add_section(mod_ctx, left, "Filtering");
     add_number(left, "Denoise Passes", g_cvarDenoisePasses,
@@ -950,18 +1062,26 @@ ModResult build_controls_tab(
         "(noisy; useful with temporal accumulation on, or for judging the raw kernel). More "
         "passes are smoother but softer.",
         0, 3, 1, nullptr);
+    add_number(left, "Denoise Strength", g_cvarDenoiseStrength,
+        "How strongly each denoise pass blurs (0 = raw estimate, 100 = full blur). Lower "
+        "preserves fine detail - with temporal accumulation carrying the noise reduction, "
+        "moderate values keep the sharper look without visible noise.",
+        0, 100, 5, "%");
     add_toggle(left, "Half Resolution", g_cvarHalfRes,
-        "Computes AO at half resolution and upscales (depth-aware, so silhouettes stay crisp); "
-        "faster, slightly softer.");
+        "Computes occlusion at half resolution (about a quarter of the cost). With Temporal "
+        "Accumulation on, a jittered temporal upsampler reconstructs full-resolution detail across "
+        "frames, so the result stays close to full-res; with it off, a depth-aware bilinear upscale "
+        "is used instead (silhouettes stay crisp, but softer).");
 
     svc_ui->pane_add_section(mod_ctx, left, "Distance Fade");
     add_toggle(left, "Distance Fade", g_cvarDistanceFade,
         "Fades the AO out with distance so far terrain (already washed toward fog) is not "
         "darkened. Off applies AO at full strength to the horizon.");
     add_number(left, "Fade Start", g_cvarFadeStart,
-        "Distance (as % of the far plane) where the fade begins.", 5, 95, 5, "%");
+        "View distance in world units where the fade begins.", 0, 200000, 500, nullptr);
     add_number(left, "Fade End", g_cvarFadeEnd,
-        "Distance (as % of the far plane) where the AO is fully faded out.", 10, 100, 5, "%");
+        "View distance in world units where the AO is fully faded out.", 500, 200000, 500,
+        nullptr);
 
     svc_ui->pane_add_section(mod_ctx, left, "Debug");
     static const char* kDebugOptions[] = {"Off", "AO", "Normals", "Depth", "Staircase"};
@@ -971,8 +1091,14 @@ ModResult build_controls_tab(
         "consumes.<br/>Depth: the preprocessed depth as a distance "
         "gradient.<br/>Staircase: detects quantized depth - smooth depth is "
         "near-black with thin triangle edges, quantized depth lights up across "
-        "surfaces.",
+        "surfaces.<br/>Debug views draw over the finished frame (after fog and bloom), so "
+        "other effects never obscure them.",
         kDebugOptions, 5);
+    add_number(left, "Debug Depth Range", g_cvarDebugDepthRange,
+        "Distance scale of the Depth debug view's gradient, in world units: the view fades "
+        "toward black across roughly 3x this distance. Raise to inspect large scenes; the "
+        "visualization has no effect on the AO itself.",
+        500, 100000, 500, nullptr);
     return MOD_OK;
 }
 
@@ -1082,22 +1208,28 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"quality", 2, &g_cvarQuality},
         {"customSlices", 7, &g_cvarCustomSlices},
         {"customSteps", 3, &g_cvarCustomSteps},
-        {"radius", 100, &g_cvarRadius},
+        {"radius", 200, &g_cvarRadius},
+        {"radiusFar", 800, &g_cvarRadiusFar},
+        {"radiusRampStart", 0, &g_cvarRadiusRampStart},
+        {"radiusRampEnd", 10000, &g_cvarRadiusRampEnd},
         {"radiusMax", 40, &g_cvarRadiusMax},
         {"intensity", 150, &g_cvarIntensity},
         {"contrast", 150, &g_cvarContrast},
-        {"blackPoint", 0, &g_cvarBlackPoint},
+        {"blackPoint", 3, &g_cvarBlackPoint},
         {"thickness", 150, &g_cvarThickness},
         {"thickFade", 150, &g_cvarThickFade},
+        {"thickDist", 60, &g_cvarThickDist},
         {"depthBias", 4, &g_cvarDepthBias},
+        {"debugDepthRange", 3300, &g_cvarDebugDepthRange},
         {"temporalFrames", 5, &g_cvarTemporalFrames},
         {"temporalClamp", 200, &g_cvarTemporalClamp},
         {"motionResponse", 10, &g_cvarMotionResponse},
         {"contentThresh", 100, &g_cvarContentThresh},
-        {"disoccTol", 4, &g_cvarDisoccTol},
+        {"disoccTol", 0, &g_cvarDisoccTol},
         {"denoisePasses", 1, &g_cvarDenoisePasses},
-        {"fadeStart", 40, &g_cvarFadeStart},
-        {"fadeEnd", 90, &g_cvarFadeEnd},
+        {"denoiseStrength", 60, &g_cvarDenoiseStrength},
+        {"fadeStart", 15000, &g_cvarFadeStart},
+        {"fadeEnd", 40000, &g_cvarFadeEnd},
         {"debugMode", 0, &g_cvarDebugView},
     };
     for (const auto& opt : intOptions) {
@@ -1148,6 +1280,12 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     stageDesc.callback = on_scene_after_opaque;
     if (svc_gfx->register_stage_hook(
             mod_ctx, GFX_STAGE_SCENE_AFTER_OPAQUE, &stageDesc, &g_afterOpaqueHook) != MOD_OK)
+    {
+        return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+    }
+    stageDesc.callback = on_frame_before_hud;
+    if (svc_gfx->register_stage_hook(
+            mod_ctx, GFX_STAGE_FRAME_BEFORE_HUD, &stageDesc, &g_beforeHudHook) != MOD_OK)
     {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
@@ -1222,19 +1360,23 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         g_hilbertLut = nullptr;
     }
     g_cvarEnabled = g_cvarQuality = g_cvarCustomSlices = g_cvarCustomSteps = 0;
-    g_cvarRadius = g_cvarRadiusMax = g_cvarIntensity = g_cvarContrast = 0;
-    g_cvarBlackPoint = g_cvarThickness = g_cvarThickFade = g_cvarDepthBias = 0;
+    g_cvarRadius = g_cvarRadiusFar = g_cvarRadiusRampStart = g_cvarRadiusRampEnd = 0;
+    g_cvarRadiusMax = g_cvarIntensity = g_cvarContrast = 0;
+    g_cvarBlackPoint = g_cvarThickness = g_cvarThickFade = g_cvarThickDist = g_cvarDepthBias = 0;
+    g_cvarDebugDepthRange = 0;
     g_cvarTemporal = g_cvarTemporalFrames = g_cvarTemporalClamp = g_cvarMotionResponse = 0;
-    g_cvarContentThresh = g_cvarDisoccTol = g_cvarDenoisePasses = 0;
+    g_cvarContentThresh = g_cvarDisoccTol = g_cvarDenoisePasses = g_cvarDenoiseStrength = 0;
     g_cvarDistanceFade = g_cvarFadeStart = g_cvarFadeEnd = 0;
     g_cvarHalfRes = g_cvarDebugView = 0;
     g_computeType = g_drawType = 0;
-    g_afterOpaqueHook = 0;
+    g_afterOpaqueHook = g_beforeHudHook = 0;
+    g_debugDrawPending = false;
     g_controlsWindow = 0;
     g_frameIndex = 0;
     g_historyWriteIndex = 0;
     g_historyValid = false;
     g_prevCameraValid = false;
+    g_loggedFarPlane = 1.0f;
     return MOD_OK;
 }
 }

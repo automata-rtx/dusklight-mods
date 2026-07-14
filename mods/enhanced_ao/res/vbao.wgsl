@@ -38,12 +38,20 @@ struct Uniforms {
     content_thresh: f32, // content-mismatch response threshold scale (1 = default)
     disocc_tol: f32,     // disocclusion depth tolerance, fraction of depth
     black_point: f32,    // occlusion floor removed in the composite
-    fade_start: f32,     // distance fade start, fraction of far plane
-    fade_end: f32,       // distance fade end, fraction of far plane
+    fade_start: f32,     // distance fade start, world units of view depth
+    fade_end: f32,       // distance fade end, world units of view depth
     debug_view: u32,
     frame_index: u32,
     flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
+    thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
+    inv_debug_depth: f32,   // debug depth view gradient scale (1 / world units)
+    radius_far: f32,        // far effect radius (fraction of view depth); 0 disables the ramp
+    radius_ramp_start: f32, // radius ramp band start, world units of view depth
+    radius_ramp_end: f32,   // radius ramp band end, world units of view depth
+    denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
     _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 @group(0) @binding(0) var preprocessed_depth: texture_2d<f32>;
@@ -109,10 +117,33 @@ fn reconstruct_view_space_position(depth: f32, uv: vec2<f32>) -> vec3<f32> {
     return t.xyz / t.w;
 }
 
+// 4-phase sub-pixel jitter within each 2x2 full-res block, matching preprocess_depth.wgsl.
+fn taau_jitter() -> vec2<i32> {
+    if uniforms.depth_scale.x < 1.5 || (uniforms.flags & 1u) == 0u {
+        return vec2<i32>(0i, 0i);
+    }
+    switch uniforms.frame_index & 3u {
+        case 0u: { return vec2<i32>(0i, 0i); }
+        case 1u: { return vec2<i32>(1i, 1i); }
+        case 2u: { return vec2<i32>(1i, 0i); }
+        default: { return vec2<i32>(0i, 1i); }
+    }
+}
+
+// UV of a chain texel. In half-res temporal upsampling each texel stands in for a jittered
+// full-res pixel; anchor its uv there so the (jittered) prefiltered depth and the reconstructed
+// position agree. Otherwise this is the plain chain-space texel center (unchanged behavior).
+fn chain_uv(coord: vec2<i32>) -> vec2<f32> {
+    if uniforms.depth_scale.x >= 1.5 && (uniforms.flags & 1u) != 0u {
+        let full_size = uniforms.size * uniforms.depth_scale;
+        return (vec2<f32>(coord) * uniforms.depth_scale + vec2<f32>(taau_jitter()) + 0.5) / full_size;
+    }
+    return (vec2<f32>(coord) + 0.5) * uniforms.inv_size;
+}
+
 fn view_position_at(pixel_coordinates: vec2<i32>) -> vec3<f32> {
     let depth = load_depth(pixel_coordinates, 0i);
-    let uv = (vec2<f32>(pixel_coordinates) + 0.5) * uniforms.inv_size;
-    return reconstruct_view_space_position(depth, uv);
+    return reconstruct_view_space_position(depth, chain_uv(pixel_coordinates));
 }
 
 // Accurate view-space normal reconstruction from depth (atyuwen's 5-tap method); unchanged
@@ -204,7 +235,7 @@ fn load_sample_position(uv: vec2<f32>, sample_mip_level: f32) -> vec4<f32> {
 @workgroup_size(8, 8, 1)
 fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let pixel_coordinates = vec2<i32>(global_id.xy);
-    let uv = (vec2<f32>(pixel_coordinates) + 0.5) * uniforms.inv_size;
+    let uv = chain_uv(pixel_coordinates);
 
     let raw_depth = calculate_neighboring_depth_differences(pixel_coordinates);
     if raw_depth <= 0.0 {
@@ -224,13 +255,28 @@ fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
         normal = -normal;
     }
 
-    // Depth-proportional radius: constant screen-space search radius; thickness grows
-    // logarithmically with the view-space radius.
+    // Depth-proportional radius: constant screen-space search radius. Base thickness grows
+    // logarithmically with the view-space radius (keeps close-up foliage from overdarkening),
+    // which starves distant occlusion - the log term becomes a vanishing fraction of the
+    // radius - so thick_dist_scale adds a radius-PROPORTIONAL floor that keeps mid/far
+    // occluders carving meaningful sector spans.
     let abs_z = max(-pixel_position.z, 1.0e-4);
-    let view_radius = abs_z * uniforms.effect_radius;
+    // Distance-scaled radius: ramp the (depth-proportional) radius from effect_radius up to
+    // radius_far across [ramp_start, ramp_end] WORLD UNITS of view depth - tight contact detail
+    // up close, broad occlusion that gives distant landmarks depth at range. World units (not a
+    // far-plane fraction): the far plane is per-stage and far beyond the visible field, so
+    // fractions of it are both scene-dependent and absurdly compressed. radius_far 0 disables.
+    var eff_radius = uniforms.effect_radius;
+    if uniforms.radius_far > 0.0 {
+        eff_radius = mix(uniforms.effect_radius, uniforms.radius_far,
+            smoothstep(uniforms.radius_ramp_start,
+                max(uniforms.radius_ramp_end, uniforms.radius_ramp_start + 1.0), abs_z));
+    }
+    let view_radius = abs_z * eff_radius;
     let proj_scale_y = 0.5 * uniforms.size.y * uniforms.projection[1][1];
-    let radius_pix = clamp(uniforms.effect_radius * proj_scale_y, 4.0, uniforms.radius_max * uniforms.size.y);
-    let t_base = log(1.0 + view_radius) * 0.3333 * uniforms.thickness;
+    let radius_pix = clamp(eff_radius * proj_scale_y, 4.0, uniforms.radius_max * uniforms.size.y);
+    let t_base = log(1.0 + view_radius) * 0.3333 * uniforms.thickness +
+        view_radius * uniforms.thick_dist_scale;
     let depth_range = view_radius * uniforms.thick_fade;
 
     let noise = load_noise(pixel_coordinates);
