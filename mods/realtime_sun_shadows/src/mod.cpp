@@ -20,6 +20,7 @@
 #include "global.h"
 
 #include "bend_sss_cpu.h"
+#include "depth_to_normal_service.h"
 
 #include "JSystem/J3DGraphAnimator/J3DModel.h"
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
@@ -68,6 +69,10 @@ IMPORT_SERVICE(CameraService, svc_camera);
 IMPORT_SERVICE(HookService, svc_hook);
 IMPORT_SERVICE(GameService, svc_game);
 IMPORT_SERVICE(LogService, svc_log);
+// Realtime Sun Shadows relies on Depth to Normal for its receiver normals (a hard dependency:
+// the loader disables this mod if the provider is absent). Shadows reconstructs no normals of
+// its own anymore - it only smooths the provider's world-space normal for the bias receivers.
+IMPORT_SERVICE(DepthToNormalService, svc_n2d);
 
 namespace {
 
@@ -126,10 +131,10 @@ WGPUBindGroupLayout g_compositeDebugLayout = nullptr;
 WGPUComputePipeline g_sssPipeline = nullptr;  // Bend screen-space shadow trace
 WGPUBindGroupLayout g_sssLayout = nullptr;
 WGPUSampler g_shadowSampler = nullptr;  // non-filtering clamp sampler for the PCF textureGather
-WGPUComputePipeline g_normalGenPipeline = nullptr;  // smoothed-normal buffer (normal_smooth.wgsl)
+// The bilateral blur over the Depth to Normal provider's world-space normal (normal_smooth.wgsl).
+// Reconstruction (depth -> raw normal) lives in the provider now; shadows only smooths.
 WGPUComputePipeline g_normalBlurHPipeline = nullptr;
 WGPUComputePipeline g_normalBlurVPipeline = nullptr;
-WGPUBindGroupLayout g_normalGenLayout = nullptr;
 WGPUBindGroupLayout g_normalBlurHLayout = nullptr;
 WGPUBindGroupLayout g_normalBlurVLayout = nullptr;
 
@@ -266,12 +271,6 @@ struct ShadowUniforms {
 static_assert(sizeof(ShadowUniforms) == 496);
 static_assert(sizeof(ShadowUniforms) % 16 == 0);
 
-// Mirror of the WGSL GenUniforms struct (keep in sync with res/normal_smooth.wgsl).
-struct NormalGenUniforms {
-    float world_from_proj[16];
-};
-static_assert(sizeof(NormalGenUniforms) % 16 == 0);
-
 // Mirror of the WGSL BlurUniforms struct (keep in sync with res/normal_smooth.wgsl).
 struct NormalBlurUniforms {
     float sigma;
@@ -314,11 +313,9 @@ static_assert(sizeof(DrawPayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
 static_assert(std::is_trivially_copyable_v<DrawPayload>);
 
 struct NormalComputePayload {
-    WGPUTextureView sceneDepth;  // frame-pooled
-    WGPUTextureView normalA;     // mod-owned ping-pong (gen writes A, blur H A->B, blur V B->A)
+    WGPUTextureView d2nNormal;   // Depth to Normal provider output (external, frame-valid)
+    WGPUTextureView normalA;     // mod-owned ping-pong (blur H D2N->B, blur V B->A)
     WGPUTextureView normalB;
-    uint32_t genUniformOffset;
-    uint32_t genUniformSize;
     uint32_t blurUniformOffset;
     uint32_t blurUniformSize;
     uint32_t width;
@@ -632,9 +629,7 @@ bool build_sss_pipeline() {
 }
 
 bool build_normal_pipelines() {
-    return build_compute_pipeline("smoothed normals gen", g_normalShaderSource, "normal_gen",
-               g_normalGenPipeline, g_normalGenLayout) &&
-           build_compute_pipeline("smoothed normals blur h", g_normalShaderSource,
+    return build_compute_pipeline("smoothed normals blur h", g_normalShaderSource,
                "normal_blur_h", g_normalBlurHPipeline, g_normalBlurHLayout) &&
            build_compute_pipeline("smoothed normals blur v", g_normalShaderSource,
                "normal_blur_v", g_normalBlurVPipeline, g_normalBlurVLayout);
@@ -747,9 +742,9 @@ constexpr uint32_t div_ceil(uint32_t numerator, uint32_t denominator) {
     return (numerator + denominator - 1) / denominator;
 }
 
-// Render worker thread: build the smoothed-normal buffer - gen reconstructs per-pixel normals
-// into A, then one separable depth-aware Gaussian (H: A->B, V: B->A) whose radius came from
-// the host, so A holds the final smoothed normals.
+// Render worker thread: smooth the provider's world-space normal - one separable depth-aware
+// Gaussian (H: D2N->B, V: B->A) whose radius came from the host, so A holds the final smoothed
+// normals. Reconstruction is the Depth to Normal provider's job now; this only blurs.
 void on_normal_compute(
     ModContext*, const GfxComputeContext* ctx, const void* payload, size_t payloadSize, void*) {
     if (payloadSize != sizeof(NormalComputePayload)) {
@@ -757,8 +752,8 @@ void on_normal_compute(
     }
     NormalComputePayload data;
     std::memcpy(&data, payload, sizeof(data));
-    if (data.sceneDepth == nullptr || data.normalA == nullptr || data.normalB == nullptr ||
-        g_normalGenPipeline == nullptr)
+    if (data.d2nNormal == nullptr || data.normalA == nullptr || data.normalB == nullptr ||
+        g_normalBlurHPipeline == nullptr)
     {
         return;
     }
@@ -782,21 +777,17 @@ void on_normal_compute(
         return wgpuDeviceCreateBindGroup(ctx->device, &bindGroupDesc);
     };
 
-    WGPUBindGroup genGroup = makeGroup(g_normalGenLayout, data.sceneDepth, data.normalA,
-        data.genUniformOffset, data.genUniformSize);
-    WGPUBindGroup blurH = makeGroup(g_normalBlurHLayout, data.normalA, data.normalB,
+    // H reads the provider's normal into B, V smooths B back into A; the composite reads A.
+    WGPUBindGroup blurH = makeGroup(g_normalBlurHLayout, data.d2nNormal, data.normalB,
         data.blurUniformOffset, data.blurUniformSize);
     WGPUBindGroup blurV = makeGroup(g_normalBlurVLayout, data.normalB, data.normalA,
         data.blurUniformOffset, data.blurUniformSize);
-    if (genGroup != nullptr && blurH != nullptr && blurV != nullptr) {
+    if (blurH != nullptr && blurV != nullptr) {
         WGPUComputePassDescriptor passDesc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
         passDesc.label = {"smoothed normals", WGPU_STRLEN};
         WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(ctx->encoder, &passDesc);
         const uint32_t groupsX = div_ceil(data.width, 8);
         const uint32_t groupsY = div_ceil(data.height, 8);
-        wgpuComputePassEncoderSetPipeline(pass, g_normalGenPipeline);
-        wgpuComputePassEncoderSetBindGroup(pass, 0, genGroup, 0, nullptr);
-        wgpuComputePassEncoderDispatchWorkgroups(pass, groupsX, groupsY, 1);
         wgpuComputePassEncoderSetPipeline(pass, g_normalBlurHPipeline);
         wgpuComputePassEncoderSetBindGroup(pass, 0, blurH, 0, nullptr);
         wgpuComputePassEncoderDispatchWorkgroups(pass, groupsX, groupsY, 1);
@@ -806,7 +797,7 @@ void on_normal_compute(
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
     }
-    for (WGPUBindGroup group : {genGroup, blurH, blurV}) {
+    for (WGPUBindGroup group : {blurH, blurV}) {
         if (group != nullptr) {
             wgpuBindGroupRelease(group);
         }
@@ -1604,17 +1595,17 @@ bool push_sss_dispatches(
 // screen (and looks the same) at any internal resolution. Returns false when the buffer
 // isn't available (composite falls back to the inline per-pixel cross).
 bool push_normal_dispatches(const GfxResolvedTargets& resolved, int64_t smoothing) {
-    if (g_normalGenPipeline == nullptr || resolved.height == 0 ||
+    if (g_normalBlurHPipeline == nullptr || resolved.height == 0 ||
         !ensure_normal_targets(resolved.width, resolved.height))
     {
         return false;
     }
 
-    NormalGenUniforms genUniforms{};
-    std::memcpy(genUniforms.world_from_proj, g_sceneCamera.info.world_from_proj,
-        sizeof(genUniforms.world_from_proj));
-    GfxRange genRange{0, 0};
-    if (svc_gfx->push_uniform(mod_ctx, &genUniforms, sizeof(genUniforms), &genRange) != MOD_OK) {
+    // The raw world-space normal comes from the Depth to Normal provider (this frame). It has no
+    // normal to smooth if there is no populated scene (a 2D screen), which the composite already
+    // gates on - so a failure here just drops the smoothed-normal buffer for the frame.
+    DepthToNormalFrame frame = DEPTH_TO_NORMAL_FRAME_INIT;
+    if (svc_n2d->get_frame(mod_ctx, &frame) != MOD_OK || frame.normal == nullptr) {
         return false;
     }
 
@@ -1631,11 +1622,9 @@ bool push_normal_dispatches(const GfxResolvedTargets& resolved, int64_t smoothin
     }
 
     NormalComputePayload payload{};
-    payload.sceneDepth = resolved.depth;
+    payload.d2nNormal = frame.normal;
     payload.normalA = g_normalTargets.views[0];
     payload.normalB = g_normalTargets.views[1];
-    payload.genUniformOffset = genRange.offset;
-    payload.genUniformSize = genRange.size;
     payload.blurUniformOffset = blurRange.offset;
     payload.blurUniformSize = blurRange.size;
     payload.width = resolved.width;
@@ -2436,10 +2425,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
             layout = nullptr;
         }
     };
-    releaseComputePipeline(g_normalGenPipeline);
     releaseComputePipeline(g_normalBlurHPipeline);
     releaseComputePipeline(g_normalBlurVPipeline);
-    releaseLayout(g_normalGenLayout);
     releaseLayout(g_normalBlurHLayout);
     releaseLayout(g_normalBlurVLayout);
     if (g_compositePipeline != nullptr) {

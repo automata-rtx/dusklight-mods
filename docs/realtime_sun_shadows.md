@@ -3,6 +3,12 @@
 Mod id `dev.automata.realtime_sun_shadows`. Game-linked: includes game headers, hooks game
 functions, and (on Windows) links the platform release's `dusklight.lib`.
 
+**Depends on the Depth to Normal mod** (`dev.automata.depth_to_normal`) as of 1.7.0. Shadows no
+longer reconstructs its own receiver normals — it imports the shared world-space normal from that
+provider and only applies its own bilateral smoothing (the one normal treatment unique to the
+shadow bias). This is a hard dependency (a required service import): the loader disables Realtime
+Sun Shadows if Depth to Normal is not installed and enabled. Install both together.
+
 ## Architecture (based on the upstream `shadow_mod` demo)
 
 1. **Light cameras** (`build_light_camera` / `build_light_camera_core`): sun/moon world

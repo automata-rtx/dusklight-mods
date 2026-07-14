@@ -1,7 +1,7 @@
 {
   "id": "dev.automata.realtime_sun_shadows",
   "name": "Realtime Sun Shadows",
-  "version": "1.6.6",
+  "version": "1.7.0",
   "author": "automata-rtx",
   "description": "Scene-wide dynamic sun and moon shadows: the opaque world is re-rendered from the light into cascaded shadow maps (up to 3 nested boxes, near sharp to far wide, cross-faded at the boundaries) plus an optional high-resolution Link-only cascade, composited deferred over the scene with Bend Studio's Days Gone screen-space shadows layering in per-pixel detail. Adds slope-scaled bias and normal-offset receivers (acne control without peter-panning), automatic indoor disable, and a full live tuning surface. Built on the dynamic shadows demo mod."
 }
