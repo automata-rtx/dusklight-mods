@@ -38,8 +38,15 @@ functions, and (on Windows) links the platform release's `dusklight.lib`.
    whose box contains the receiver, apply that cascade's slope-scaled bias
    (`bias_eff = bias + slope_bias * tan_t`, tan clamped at 4; biases normalized per cascade
    against its own light range) and normal-offset receiver
-   (`world + n * normal_offset * texel_world[cascade]`), PCF over hardware-bilinear
-   comparison taps (kernel = base + Far Softening × cascade index). Inside the outer
+   (`world + n * normal_offset * texel_world[cascade]`), PCF over bilinearly-weighted
+   comparison taps (kernel = base + Far Softening × cascade index). Each PCF tap fetches its
+   2×2 depth neighborhood with a single `textureGather` (a mod-owned non-filtering clamp
+   sampler, created via raw wgpu since the maps are R32Float and the gfx service exposes no
+   sampler API) instead of four `textureLoad`s — a quarter of the texture fetches for the
+   same bilinear-of-comparisons result (GPU-verified bit-identical). A true hardware
+   comparison sampler would also move the compare into fixed-function, but that needs a
+   `texture_depth_2d`-bindable depth view the gfx service does not currently hand back
+   (`resolve_pass` depth is R32Float). Inside the outer
    `blend_frac` band of a cascade's box the result cross-fades to the next cascade so the
    resolution step never shows as a line. The Link cascade is evaluated separately and
    combined with `max()` — its map contains only the player, so it can only add occlusion,

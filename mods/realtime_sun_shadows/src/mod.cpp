@@ -125,6 +125,7 @@ WGPUBindGroupLayout g_compositeLayout = nullptr;
 WGPUBindGroupLayout g_compositeDebugLayout = nullptr;
 WGPUComputePipeline g_sssPipeline = nullptr;  // Bend screen-space shadow trace
 WGPUBindGroupLayout g_sssLayout = nullptr;
+WGPUSampler g_shadowSampler = nullptr;  // non-filtering clamp sampler for the PCF textureGather
 WGPUComputePipeline g_normalGenPipeline = nullptr;  // smoothed-normal buffer (normal_smooth.wgsl)
 WGPUComputePipeline g_normalBlurHPipeline = nullptr;
 WGPUComputePipeline g_normalBlurVPipeline = nullptr;
@@ -881,7 +882,8 @@ void on_draw(
         data.debug_mode != 0 ? g_compositeDebugPipeline : g_compositePipeline;
     WGPUBindGroupLayout layout = data.debug_mode != 0 ? g_compositeDebugLayout : g_compositeLayout;
     if (data.sceneDepth == nullptr || data.lightColor == nullptr ||
-        data.screenShadow == nullptr || data.smoothNormal == nullptr || pipeline == nullptr)
+        data.screenShadow == nullptr || data.smoothNormal == nullptr || pipeline == nullptr ||
+        g_shadowSampler == nullptr)
     {
         return;
     }
@@ -891,10 +893,10 @@ void on_draw(
         }
     }
 
-    WGPUBindGroupEntry entries[9] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+    WGPUBindGroupEntry entries[10] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
         WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
         WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
-        WGPU_BIND_GROUP_ENTRY_INIT};
+        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
     entries[0].binding = 0;
     entries[0].textureView = data.sceneDepth;
     entries[1].binding = 1;
@@ -915,9 +917,11 @@ void on_draw(
     entries[7].textureView = data.shadowMap[2];
     entries[8].binding = 8;
     entries[8].textureView = data.shadowMap[3];
+    entries[9].binding = 9;
+    entries[9].sampler = g_shadowSampler;
     WGPUBindGroupDescriptor bindGroupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bindGroupDesc.layout = layout;
-    bindGroupDesc.entryCount = 9;
+    bindGroupDesc.entryCount = 10;
     bindGroupDesc.entries = entries;
     WGPUBindGroup bindGroup = wgpuDeviceCreateBindGroup(ctx->device, &bindGroupDesc);
     if (bindGroup == nullptr) {
@@ -2291,6 +2295,22 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return dusk::mods::set_error(
             error, MOD_ERROR, "failed to create normal smoothing pipelines");
     }
+    // Non-filtering, clamp-to-edge sampler for the PCF textureGather (res/shadow.wgsl). The
+    // shadow maps are R32Float (unfilterable), so the sampler must be non-filtering; clamp
+    // reproduces the old per-texel border clamp. Mod-owned (the device outlives all mods).
+    WGPUSamplerDescriptor samplerDesc = WGPU_SAMPLER_DESCRIPTOR_INIT;
+    samplerDesc.label = {"shadow pcf gather", WGPU_STRLEN};
+    samplerDesc.addressModeU = WGPUAddressMode_ClampToEdge;
+    samplerDesc.addressModeV = WGPUAddressMode_ClampToEdge;
+    samplerDesc.addressModeW = WGPUAddressMode_ClampToEdge;
+    samplerDesc.magFilter = WGPUFilterMode_Nearest;
+    samplerDesc.minFilter = WGPUFilterMode_Nearest;
+    samplerDesc.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+    samplerDesc.maxAnisotropy = 1;
+    g_shadowSampler = wgpuDeviceCreateSampler(g_deviceInfo.device, &samplerDesc);
+    if (g_shadowSampler == nullptr) {
+        return dusk::mods::set_error(error, MOD_ERROR, "failed to create shadow PCF sampler");
+    }
 
     GfxDrawTypeDesc drawDesc = GFX_DRAW_TYPE_DESC_INIT;
     drawDesc.label = "sun shadow composite";
@@ -2399,6 +2419,10 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     if (g_sssLayout != nullptr) {
         wgpuBindGroupLayoutRelease(g_sssLayout);
         g_sssLayout = nullptr;
+    }
+    if (g_shadowSampler != nullptr) {
+        wgpuSamplerRelease(g_shadowSampler);
+        g_shadowSampler = nullptr;
     }
     const auto releaseComputePipeline = [](WGPUComputePipeline& pipeline) {
         if (pipeline != nullptr) {
