@@ -25,6 +25,11 @@ Reconstruction uses the **atyuwen 5-tap side-selected method** (what VBAO alread
 `vbao.wgsl:151`) — strictly more stable across depth discontinuities than the 1-px cross shadows
 uses today, so both consumers improve or stay equal.
 
+**Attribution:** that 5-tap reconstruction comes from **Encounter's `ao_mod` demo** (which ports
+it from Bevy Engine's SSAO / atyuwen's normal-reconstruction post). This mod must carry the same
+credit and the Bevy/XeGTAO license files (`res/licenses/`) that VBAO already ships, since its core
+shader is adapted from that demo.
+
 ### Why world-space, and why that's lossless for VBAO
 
 VBAO works in view space, shadows in world space. The provider picks **world space** as

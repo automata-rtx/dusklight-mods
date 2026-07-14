@@ -1,6 +1,6 @@
 // Enhanced Ambient Occlusion.
 //
-// A quality-focused evolution of the ao_mod demo: the same gfx-service compute chain (depth MIP
+// A quality-focused evolution of Encounter's ao_mod demo: the same gfx-service compute chain (depth MIP
 // prefilter -> occlusion -> edge-aware spatial denoise -> composite), with
 //  - VBAO: a 32-sector visibility-bitmask occlusion estimator (Therrien et al. 2022) in place of the
 //    classic horizon tracker: separated occluders, gaps and thin geometry (grass) are handled

@@ -1,7 +1,7 @@
 // Enhanced Ambient Occlusion - fullscreen composite.
 //
 // Multiplies the accumulated (or denoised, when temporal accumulation is off) AO visibility over
-// the scene. Based on the ao_mod demo composite with two additions:
+// the scene. Based on Encounter's ao_mod demo composite with two additions:
 //  - DEPTH-AWARE upscale: the 4 bilinear taps are weighted by depth agreement with this pixel,
 //    so AO does not bleed across silhouettes when the AO chain runs at half resolution (a plain
 //    bilinear sample smears an object's AO onto the background behind its outline).

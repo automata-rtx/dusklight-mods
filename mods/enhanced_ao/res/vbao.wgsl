@@ -1,8 +1,9 @@
 // Enhanced Ambient Occlusion - VBAO (visibility-bitmask ambient occlusion) pass.
 //
 // The pass framework (MIP-prefiltered depth reads, hilbert/R2 noise, edge output for the
-// spatial denoiser, accurate 5-tap normal reconstruction) follows the ao_mod demo, which is
-// ported from Bevy Engine's SSAO (MIT OR Apache-2.0) / Intel XeGTAO (MIT); see res/licenses/.
+// spatial denoiser, accurate 5-tap normal reconstruction) follows Encounter's ao_mod demo,
+// which is ported from Bevy Engine's SSAO (MIT OR Apache-2.0) / Intel XeGTAO (MIT); see
+// res/licenses/. The depth->normal reconstruction below is adapted unchanged from that demo.
 //
 // The occlusion estimator itself replaces the classic horizon-tracking GTAO inner loop with a
 // 32-sector VISIBILITY BITMASK per slice (Therrien et al. 2022, adapted from indirect lighting
@@ -147,7 +148,7 @@ fn view_position_at(pixel_coordinates: vec2<i32>) -> vec3<f32> {
 }
 
 // Accurate view-space normal reconstruction from depth (atyuwen's 5-tap method); unchanged
-// from the demo. Stable across depth discontinuities where naive derivatives smear.
+// from Encounter's ao_mod demo. Stable across depth discontinuities where naive derivatives smear.
 fn reconstruct_normal(pixel_coordinates: vec2<i32>, pixel_position: vec3<f32>, depth_center: f32) -> vec3<f32> {
     let depth_left1 = load_depth(pixel_coordinates + vec2<i32>(-1i, 0i), 0i);
     let depth_left2 = load_depth(pixel_coordinates + vec2<i32>(-2i, 0i), 0i);
