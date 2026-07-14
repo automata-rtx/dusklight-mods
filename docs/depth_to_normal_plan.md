@@ -49,7 +49,27 @@ failed-approach #3) and the most broadly useful default. VBAO consumes it direct
 mode**. In **half-res mode**, VBAO keeps its own in-chain, jitter-coupled reconstruction — that
 path is bound to its temporal accumulation and can't read a full-res buffer cleanly, and adding a
 half-res/jittered variant here would be VBAO-specific (out of scope for a single-purpose input).
-So VBAO's benefit is: full-res AO sources normals from the service; half-res AO is unchanged.
+
+VBAO also converts on consume: it **rotates** the world-space normal into view space (one mat3,
+exact, negligible). The resolution is what governs the perf tradeoff.
+
+**When adopting the service pays for VBAO** (normal-reconstruction cost ∝ pixel count; half-res =
+¼ unit, full-res = 1 unit):
+
+| Situation | Reconstruct in VBAO | Adopt Depth to Normal | Verdict |
+|---|---|---|---|
+| VBAO alone, half-res | ¼ | 1 (full-res feeding a half-res consumer) | keep VBAO's own (~4× cheaper) |
+| VBAO alone, full-res | 1 | 1 | tie; adopt for shared/cleaner code |
+| VBAO half-res + shadows | 1 (shadows) + ¼ (VBAO) = 1¼ | 1 (shared) | adopt, ~20% saving |
+| VBAO full-res + shadows | 1 + 1 = 2 | 1 (shared) | adopt, ~50% saving |
+
+The win is **not computing the normal twice when shadows is on** (shadows needs full-res anyway,
+so VBAO sourcing from it is then free). The only loss case is VBAO **alone in half-res**, where its
+own quarter-res reconstruction beats a full-res shared one. Optional import + fallback gives us
+exactly this: VBAO consumes the service when present and worth it (full-res, or shadows loaded),
+else falls back to its own half-res reconstruction. A minor quality angle: half-res VBAO sampling
+the full-res normal aims the AO hemisphere with true fine geometry (cleaner AO at edges) for the
+cost of the full-res normal pass — worth it only when that pass already exists (shadows on).
 
 ## UI and credit (in-game)
 
