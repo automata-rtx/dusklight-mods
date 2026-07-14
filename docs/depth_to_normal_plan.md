@@ -51,6 +51,28 @@ path is bound to its temporal accumulation and can't read a full-res buffer clea
 half-res/jittered variant here would be VBAO-specific (out of scope for a single-purpose input).
 So VBAO's benefit is: full-res AO sources normals from the service; half-res AO is unchanged.
 
+## UI and credit (in-game)
+
+Depth to Normal has **no user settings** — it is a pure provider. Its mods-panel exists only to
+show a read-only **summary that explicitly credits Encounter's demo**, since the mod is
+effectively a port of that demo's depth-to-normal function into a standalone provider. Two
+surfaces carry the credit:
+
+- **`mod.json` `description`** (shown in the mod manager list), e.g.:
+  > "Depth to Normal — reconstructs a per-pixel world-space surface normal from the scene depth
+  > buffer and publishes it as a service other mods can consume (ambient occlusion, shadows,
+  > reflections, outlines). The depth→normal reconstruction (atyuwen's 5-tap method) is adapted
+  > from Encounter's ao_mod demo; see res/licenses."
+- **The mods panel** (`build_panel`), using `pane_add_section` + `pane_add_text` (ui.h:219-221)
+  for a static blurb, e.g.:
+  > Section: "About"
+  > Text: "Reconstructs a world-space surface normal from the depth buffer once per frame and
+  > provides it to other mods — it has no settings of its own. The reconstruction is a port of
+  > the depth-to-normal function from **Encounter's ao_mod demo** (itself based on atyuwen's
+  > 5-tap method and Bevy Engine SSAO / Intel XeGTAO); see res/licenses."
+
+Ship the same `res/licenses/` files VBAO carries (BEVY-MIT, BEVY-APACHE-2.0, XEGTAO-MIT).
+
 ## Service contract (`depth_to_normal_service.h`)
 
 ```c
@@ -108,9 +130,30 @@ actually asks for it that frame.
 
 ## Consumer migration (separate, in-game-verified step)
 
-- **Shadows**: `IMPORT_OPTIONAL_SERVICE`; delete `normal_gen` + its pipeline; feed the service's
-  normal into its existing bilateral blur (`normal_blur_h/v`) unchanged; keep the current inline
-  reconstruction behind the null check so it still runs standalone.
+- **Shadows** (the clean consumer): `IMPORT_OPTIONAL_SERVICE`; delete `normal_gen` + its pipeline;
+  feed the service's normal into its existing bilateral blur (`normal_blur_h/v`) unchanged; keep
+  the current inline reconstruction behind the null check so it still runs standalone.
+  - **Why shadows is the drop-in case:** the service output already matches shadows on every axis
+    that mattered for VBAO — **world space** (no rotation needed; VBAO must rotate), **full
+    resolution**, **`w` = raw depth** in the same reversed-Z convention the blur's bilateral
+    weight and the composite's `world_normal_at` already expect, and **camera-facing**
+    orientation. So it binds where `normal_gen`'s output used to.
+  - **The method change is largely masked by the blur.** Shadows switches its *raw* normal from a
+    1-px side-selected cross to the atyuwen 5-tap — but shadows immediately runs a bilateral
+    Gaussian over it. On smooth interiors both methods agree (locally planar), and the blur
+    erases the rest; the one place they differ, depth discontinuities, is exactly where the 5-tap
+    is *more* stable, so the post-blur normal is neutral-to-slightly-better, never worse. The blur
+    already rejects across silhouettes, so the 5-tap's wider ±2 reach doesn't leak across edges.
+  - **Fallback consistency note:** with an optional import, shadows keeps `normal_gen` (1-px cross)
+    as the standalone fallback, so the raw method differs by whether the service is present. Both
+    paths are blurred and visually equivalent, but if we want them identical we can upgrade the
+    fallback `normal_gen` to the same 5-tap (a few lines). Alternatively a *required* import lets
+    shadows delete `normal_gen` entirely (max code reduction) at the cost of not loading without
+    Depth to Normal installed.
+  - **Verify in-game after migration:** shadows' bias/normal-offset defaults were tuned against
+    the 1-px-cross smoothed normal. The change should be within noise (blur-dominated), but
+    confirm the acne/peter-panning balance at the defaults looks unchanged before shipping — this
+    is the one thing that can't be checked offline.
 - **VBAO (full-res)**: `IMPORT_OPTIONAL_SERVICE`; sample the service normal, rotate to view, skip
   its own `reconstruct_normal`; half-res path unchanged; fallback behind the null check.
 - **Deferred Fog**: no change (uses only raw depth today).
