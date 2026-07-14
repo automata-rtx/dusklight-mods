@@ -1,0 +1,7 @@
+{
+  "id": "dev.automata.depth_to_normal",
+  "name": "Depth to Normal",
+  "version": "1.0.0",
+  "author": "automata-rtx",
+  "description": "Depth to Normal — reconstructs a per-pixel world-space surface normal from the scene depth buffer and publishes it as a service other mods can consume (ambient occlusion, shadows, reflections, outlines). It has no settings of its own. The depth→normal reconstruction (atyuwen's 5-tap method) is adapted from Encounter's ao_mod demo (Bevy Engine SSAO / Intel XeGTAO); see res/licenses."
+}
