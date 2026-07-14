@@ -73,12 +73,15 @@ special-fog materials), and the two modes handle that differently (`mixedMode`):
     config; pixels not covered by the shape override (rare non-J3D direct drawers) decode
     as invalid and fall back to config 0 (the frame's reference) — exactly what the
     single-config quad applied to them before.
-  - Grass/flower packets draw their own geometry (not `J3DShape::drawFast`), so the replay
-    can't force them to a flat ID color — their pixels write real texture colors that decode
-    as invalid and take config 0. Since their (now suppressed + captured) fog is the room's
-    environment fog, config 0 is normally the correct one; only near a room-fog boundary
-    could a grass tuft take a slightly wrong config, and grass sits in light near-camera fog
-    where the difference is imperceptible.
+  - Grass/flower/waterfall packets draw their own geometry (not `J3DShape::drawFast`), so the
+    replay can't force them to a flat ID color — they rasterize real lit colors into the ID
+    buffer. The override writes the ID as `(id, 0, 0)` (red only), so the shader rejects any
+    pixel with non-zero green/blue — i.e. all such packets, in any lighting — back to config 0
+    (the reference). Their fog is the room's environment fog, which the GFSetFog hook now
+    captures as config 0, so this is the correct config for them. (Before the green/blue guard,
+    a blade's shaded red channel could land in another config's decode window and flicker
+    between configs as the lighting changed — the day/night grass artifact.) Residual: a
+    genuinely pure-red bypassed surface could still alias, but none occurs in practice.
   - MSAA silhouettes may resolve to an invalid ID on 1-px fringes → reference config.
 - **Vanilla**: the original behavior — only draws matching the frame's reference config
   are suppressed; any deviant reverts the scene to forward fog from the next frame until

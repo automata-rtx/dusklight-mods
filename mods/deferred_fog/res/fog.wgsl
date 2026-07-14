@@ -121,10 +121,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
 }
 
 // Decode the sparse config ID at this pixel; 0 = invalid/uncovered -> config 0 (reference).
+//
+// The replay's flat-ID override outputs (id, 0, 0): the index in red, green and blue forced to
+// zero. Geometry that bypassed the override - self-drawing packets (field/tall grass, flowers,
+// waterfalls) and any direct GX drawers - rasterizes real LIT colors instead, which vary with
+// the time of day and almost always carry non-zero green/blue. Requiring green and blue to be
+// ~0 rejects all of that so it falls back to config 0 (the reference config, which is the
+// correct room fog for grass anyway) instead of a per-pixel config that flickers with the
+// lighting. (Pure-red bypassed geometry could still alias, but none occurs in practice.)
 fn config_index_at(uv: vec2f) -> u32 {
     let size = vec2<i32>(textureDimensions(config_ids));
     let texel = clamp(vec2<i32>(uv * vec2f(size)), vec2<i32>(0i), size - 1i);
-    let v = i32(round(textureLoad(config_ids, texel, 0i).r * 255.0));
+    let c = textureLoad(config_ids, texel, 0i);
+    if c.g > 0.03 || c.b > 0.03 {
+        return 0u;
+    }
+    let v = i32(round(c.r * 255.0));
     let slot = (v + 12i) / 24i;
     if slot >= 1i && u32(slot) <= mixed.count && abs(v - slot * 24i) <= 4i {
         return u32(slot) - 1u;
