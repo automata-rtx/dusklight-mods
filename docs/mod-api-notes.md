@@ -54,8 +54,10 @@ These notes are the deltas that actually bit us.
 ## Hooks
 
 - Typed hooks (`hook_add_pre<&Class::method>`) resolve through the linked symbol — they work
-  without the symbol manifest. By-NAME hooks (`NamedHook`, `resolve`) need `dusklight.symdb`
-  next to the game exe (shipped in platform-v1+). Prefer typed hooks.
+  without the symbol manifest. By-NAME hooks (`NamedHook`, `resolve`) need the game's symbol
+  manifest, which is embedded inside `dusklight.exe` on the `platform-v2-test` base (upstream
+  #2216; earlier bases shipped it as a standalone `dusklight.symdb` next to the exe). Prefer
+  typed hooks.
 - On Windows/MSVC, only functions and `DUSK_GAME_DATA`-annotated data are reachable through
   the import library; un-annotated data references fail at link time.
 
@@ -71,14 +73,15 @@ These notes are the deltas that actually bit us.
 - The SDK (`extern/dusklight/sdk`) provides `add_mod()`, game headers
   (`dusklight_game_headers` INTERFACE target), and Dawn headers via a prebuilt package.
   Nothing from the game compiles in this repo.
-- Windows: `DUSK_GAME_IMPLIB` is REQUIRED for any mod (even service-only ones — the SDK
-  refuses to configure without it). It must come from the exact game build being targeted.
-- `.dusk` = zip of {platform-arch lib, mod.json, res/}. CI's artifact contains both mods'
-  packages; the loader also picks up a `mods/` dir next to the app for dev builds.
+- Windows: `DUSK_GAME_EXE` (the `windows-amd64.lib` import library) is REQUIRED for any mod
+  (even service-only ones — the SDK refuses to configure without it). It must come from the
+  exact game build being targeted.
+- `.dusk` = zip of {platform-arch lib, mod.json, res/}. CI's artifact contains every mod's
+  package; the loader also picks up a `mods/` dir next to the app for dev builds.
 
 ## Validation workflow
 
 - `tools/wgsl_validate.cpp` (Dawn Null backend) catches WGSL errors offline; CI runs it on
   every shader. Build with `-DMODS_BUILD_TOOLS=ON`.
-- The Linux CI job compiles both mods with GCC — a full type-check of mod.cpp against the
+- The Linux CI job compiles every mod with GCC — a full type-check of mod.cpp against the
   game headers without needing Windows.

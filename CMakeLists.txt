@@ -5,8 +5,9 @@ project(dusklight_mods CXX)
 # (headers + a prebuilt Dawn package - no game or aurora compilation) from the pinned
 # submodule, then builds each mod as a .dusk package into ${CMAKE_BINARY_DIR}/mods.
 #
-# Windows additionally needs the import library from the matching game release:
-#   -DDUSK_GAME_IMPLIB=<path to dusklight.lib>   (platform-v1 release asset)
+# Windows additionally needs the import library from the matching game release, and clang-cl:
+#   -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+#   -DDUSK_GAME_EXE=<path to windows-amd64.lib>   (platform-v2-test release asset)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 

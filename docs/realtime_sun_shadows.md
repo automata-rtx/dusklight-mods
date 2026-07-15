@@ -1,7 +1,7 @@
 # Realtime Sun Shadows
 
 Mod id `dev.automata.realtime_sun_shadows`. Game-linked: includes game headers, hooks game
-functions, and (on Windows) links the platform release's `dusklight.lib`.
+functions, and (on Windows) links the platform release's `windows-amd64.lib` import library.
 
 **Depends on the Depth to Normal mod** (`dev.automata.depth_to_normal`) as of 1.7.0. Shadows no
 longer reconstructs its own receiver normals — it imports the shared world-space normal from that
@@ -324,4 +324,5 @@ Normal Offset — the screen-space term re-grounds contacts regardless.
   it; inherent to Bend's wavefront projection — verified by a coverage simulation). For a
   directional sun that pixel is sky, which early-outs anyway.
 - ABI-coupled: after any re-platform this mod must be rebuilt against the new
-  `dusklight.lib`; the `GameService` major version rejects a mismatched load cleanly.
+  `windows-amd64.lib` import library; the `GameService` major version rejects a mismatched load
+  cleanly.
