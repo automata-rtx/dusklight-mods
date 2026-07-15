@@ -89,36 +89,28 @@ jobs:
       - name: Install dependencies
         run: choco install ninja
 
-      - name: Configure (RelWithDebInfo, matching the game + first failing user build)
-        run: >
-          cmake -S tools/hook_repro -B build-repro -G Ninja
-          -DCMAKE_BUILD_TYPE=RelWithDebInfo
-
-      - name: Build
-        run: cmake --build build-repro
-
-      - name: Run reproduction (RelWithDebInfo)
-        working-directory: build-repro
+      - name: Build & run all toolchain/config variants, then summarize
         continue-on-error: true
-        run: ./host.exe
-
-      - name: Reconfigure + run as Release (matching second failing user build)
-        working-directory: ${{ github.workspace }}
-        continue-on-error: true
+        shell: pwsh
         run: |
-          cmake -S tools/hook_repro -B build-repro-rel -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-repro-rel
-          cd build-repro-rel
-          ./host.exe
-
-      - name: Reconfigure + run with clang-cl (does it place records correctly?)
-        working-directory: ${{ github.workspace }}
-        continue-on-error: true
-        run: |
-          cmake -S tools/hook_repro -B build-repro-clang -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
-          cmake --build build-repro-clang
-          cd build-repro-clang
-          ./host.exe
+          function Run-Variant($name, $extraArgs) {
+            Write-Host "==================== $name ===================="
+            $dir = "build-$name"
+            cmake -S tools/hook_repro -B $dir -G Ninja @extraArgs 2>&1 | Out-Null
+            cmake --build $dir 2>&1 | Out-Null
+            if (Test-Path "$dir/host.exe") {
+              Push-Location $dir
+              & ./host.exe
+              Pop-Location
+            } else {
+              Write-Host "BUILD FAILED for $name (no host.exe)"
+            }
+            Write-Host ""
+          }
+          Run-Variant "cl-relwithdebinfo" @("-DCMAKE_BUILD_TYPE=RelWithDebInfo")
+          Run-Variant "cl-release"        @("-DCMAKE_BUILD_TYPE=Release")
+          Run-Variant "clangcl-relwithdebinfo" @("-DCMAKE_BUILD_TYPE=RelWithDebInfo","-DCMAKE_C_COMPILER=clang-cl","-DCMAKE_CXX_COMPILER=clang-cl")
+          Run-Variant "clangcl-release"   @("-DCMAKE_BUILD_TYPE=Release","-DCMAKE_C_COMPILER=clang-cl","-DCMAKE_CXX_COMPILER=clang-cl")
 
   build-windows:
     name: Build mods (Windows x86_64)
