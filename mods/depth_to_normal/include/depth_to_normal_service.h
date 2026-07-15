@@ -58,6 +58,7 @@ template <>
 struct dusk::mods::ServiceTraits<DepthToNormalService> {
     static constexpr const char* id = DEPTH_TO_NORMAL_SERVICE_ID;
     static constexpr uint16_t major_version = DEPTH_TO_NORMAL_SERVICE_MAJOR;
+    static constexpr uint16_t minor_version = DEPTH_TO_NORMAL_SERVICE_MINOR;
 };
 #endif
 

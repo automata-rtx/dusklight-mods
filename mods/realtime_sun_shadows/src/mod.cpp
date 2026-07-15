@@ -45,7 +45,6 @@
 #include "mods/service.hpp"
 #include "mods/svc/camera.h"
 #include "mods/svc/config.h"
-#include "mods/svc/game.h"
 #include "mods/svc/gfx.h"
 #include "mods/svc/hook.h"
 #include "mods/svc/log.h"
@@ -67,8 +66,9 @@ IMPORT_SERVICE(UiService, svc_ui);
 IMPORT_SERVICE(GfxService, svc_gfx);
 IMPORT_SERVICE(CameraService, svc_camera);
 IMPORT_SERVICE(HookService, svc_hook);
-IMPORT_SERVICE(GameService, svc_game);
 IMPORT_SERVICE(LogService, svc_log);
+// GameService is imported automatically by the SDK under `FEATURES game` (it enforces the game
+// ABI epoch); a manual IMPORT_SERVICE(GameService, ...) here would be a duplicate.
 // Realtime Sun Shadows relies on Depth to Normal for its receiver normals (a hard dependency:
 // the loader disables this mod if the provider is absent). Shadows reconstructs no normals of
 // its own anymore - it only smooths the provider's world-space normal for the bias receivers.
@@ -233,10 +233,21 @@ constexpr float kMaxLightLookahead = 10000.0f;
 constexpr float kSunMoonDistance = 80000.0f;
 constexpr float kSunMoonZDistance = -48000.0f;
 
-using ClipperSphereClip = int (J3DUClipper::*)(f32 const (*)[4], Vec, f32) const;
-using ClipperBoxClip = int (J3DUClipper::*)(f32 const (*)[4], Vec*, Vec*) const;
-constexpr ClipperSphereClip kClipperSphereClip = static_cast<ClipperSphereClip>(&J3DUClipper::clip);
-constexpr ClipperBoxClip kClipperBoxClip = static_cast<ClipperBoxClip>(&J3DUClipper::clip);
+// Hook targets are declared at namespace scope with DEFINE_HOOK (each emits a modmeta hook
+// record the host resolves at load); the generated aliases are passed to hook_add_pre in
+// mod_initialize. J3DUClipper::clip is overloaded, so the exact overload is selected by cast.
+DEFINE_HOOK(&dDlst_shadowControl_c::imageDraw, GameShadowImageDraw);
+DEFINE_HOOK(&dDlst_shadowControl_c::draw, GameShadowDraw);
+DEFINE_HOOK(&drawCloudShadow, CloudShadowDraw);
+DEFINE_HOOK(
+    static_cast<int (J3DUClipper::*)(f32 const (*)[4], Vec, f32) const>(&J3DUClipper::clip),
+    ClipperSphereClip);
+DEFINE_HOOK(
+    static_cast<int (J3DUClipper::*)(f32 const (*)[4], Vec*, Vec*) const>(&J3DUClipper::clip),
+    ClipperBoxClip);
+DEFINE_HOOK(GXCopyTex, CopyTex);
+DEFINE_HOOK(GXSetCullMode, CullMode);
+DEFINE_HOOK(&J3DShape::drawFast, ShapeDrawFast);
 
 // Mirror of the WGSL Uniforms struct (keep in sync with res/shadow.wgsl). Per-cascade values
 // are vec4-shaped (index 3 = the Link cascade); biases are normalized by each cascade's own
@@ -2348,29 +2359,29 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // Skip the game's own shadow rendering while the dynamic pass is active: the
     // shadowControl pair covers the actor real/blob shadows, drawCloudShadow the weather
     // cloud shadows.
-    if (dusk::mods::hook_add_pre<&dDlst_shadowControl_c::imageDraw>(svc_hook, on_game_shadow_pre) !=
+    if (dusk::mods::hook_add_pre<GameShadowImageDraw>(svc_hook, on_game_shadow_pre) !=
             MOD_OK ||
-        dusk::mods::hook_add_pre<&dDlst_shadowControl_c::draw>(svc_hook, on_game_shadow_pre) !=
+        dusk::mods::hook_add_pre<GameShadowDraw>(svc_hook, on_game_shadow_pre) !=
             MOD_OK ||
-        dusk::mods::hook_add_pre<&drawCloudShadow>(svc_hook, on_game_shadow_pre) != MOD_OK)
+        dusk::mods::hook_add_pre<CloudShadowDraw>(svc_hook, on_game_shadow_pre) != MOD_OK)
     {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to hook game shadow rendering");
     }
-    if (dusk::mods::hook_add_pre<kClipperSphereClip>(svc_hook, on_frustum_clip_pre) != MOD_OK ||
-        dusk::mods::hook_add_pre<kClipperBoxClip>(svc_hook, on_frustum_clip_pre) != MOD_OK)
+    if (dusk::mods::hook_add_pre<ClipperSphereClip>(svc_hook, on_frustum_clip_pre) != MOD_OK ||
+        dusk::mods::hook_add_pre<ClipperBoxClip>(svc_hook, on_frustum_clip_pre) != MOD_OK)
     {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to hook frustum clipping");
     }
-    if (dusk::mods::hook_add_pre<GXCopyTex>(svc_hook, on_copy_tex_pre) != MOD_OK) {
+    if (dusk::mods::hook_add_pre<CopyTex>(svc_hook, on_copy_tex_pre) != MOD_OK) {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to hook GXCopyTex");
     }
     // Two-sided casters (see on_shape_draw_pre / on_cull_mode_pre). The J3DShape::drawFast hook
     // is virtual, so it resolves through the symbol manifest; if that's missing, degrade to
     // leaky shadows instead of failing the whole mod.
-    if (dusk::mods::hook_add_pre<GXSetCullMode>(svc_hook, on_cull_mode_pre) != MOD_OK) {
+    if (dusk::mods::hook_add_pre<CullMode>(svc_hook, on_cull_mode_pre) != MOD_OK) {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to hook GXSetCullMode");
     }
-    if (dusk::mods::hook_add_pre<&J3DShape::drawFast>(svc_hook, on_shape_draw_pre) != MOD_OK) {
+    if (dusk::mods::hook_add_pre<ShapeDrawFast>(svc_hook, on_shape_draw_pre) != MOD_OK) {
         svc_log->warn(mod_ctx,
             "failed to hook J3DShape::drawFast (missing dusklight.symdb?); Two-Sided Casters "
             "will not affect J3D geometry");

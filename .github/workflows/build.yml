@@ -1,13 +1,15 @@
 name: Build mods
 
-# Mods-only CI: compiles the two mod libraries against the Dusklight mod SDK (headers +
-# prebuilt Dawn package) - the game and aurora are NEVER compiled here. Typical runtime
-# is a few minutes.
+# Mods-only CI: compiles the mod libraries against the Dusklight mod SDK - the game and aurora
+# are NEVER compiled here.
 #
-# ABI contract: extern/dusklight is pinned to the platform-v1 release commit of
-# automata-rtx/dusklight-ao, and the Windows job links against that release's
-# dusklight.lib. When the base game is re-platformed, bump the submodule AND the
-# RELEASE_TAG below together.
+# Platform: extern/dusklight is pinned to a MAINLINE Dusklight commit (the #2215 "Game ABI /
+# headers refactoring" mod SDK: static modmeta metadata, MOD_ABI_VERSION 1, headers under
+# sdk/include/mods, add_mod FEATURES). The Linux job fully compile-checks every mod (game/webgpu
+# symbols are left undefined and resolved at load). The Windows job, which links the real import
+# library into shippable .dusk packages, only runs when a matching mainline platform release is
+# configured (see below) - the old platform-v1 dusklight.lib is a different ABI and must NOT be
+# used against this SDK.
 
 on:
   push:
@@ -15,10 +17,6 @@ on:
       - '**.md'
   pull_request:
   workflow_dispatch:
-
-env:
-  PLATFORM_REPO: automata-rtx/dusklight-ao
-  RELEASE_TAG: platform-v1
 
 jobs:
   validate:
@@ -35,10 +33,7 @@ jobs:
           sudo apt-get -y install ninja-build
 
       - name: Configure
-        run: >
-          cmake -B build -G Ninja
-          -DMODS_BUILD_TOOLS=ON
-          -DDUSK_VERSION_OVERRIDE=${{env.RELEASE_TAG}}
+        run: cmake -B build -G Ninja -DMODS_BUILD_TOOLS=ON
 
       - name: Build mods + validator
         run: cmake --build build
@@ -58,6 +53,15 @@ jobs:
   build-windows:
     name: Build mods (Windows x86_64)
     runs-on: windows-latest
+    # Requires a mainline Dusklight platform release providing the Windows import library, matching
+    # the game build the mods are installed into. Set the repo variable PLATFORM_RELEASE_TAG (and
+    # optionally PLATFORM_REPO) to that release's tag to enable; leave it unset to skip (the Linux
+    # job still validates the port). Build the .dusk packages locally against your own Dusklight
+    # tree with -DDUSK_GAME_EXE=<path to sdk/windows-x86_64.lib> when no release is published.
+    if: vars.PLATFORM_RELEASE_TAG != ''
+    env:
+      PLATFORM_REPO: ${{ vars.PLATFORM_REPO || 'automata-rtx/dusklight-ao' }}
+      RELEASE_TAG: ${{ vars.PLATFORM_RELEASE_TAG }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -77,14 +81,13 @@ jobs:
         run: >
           gh release download ${{env.RELEASE_TAG}}
           --repo ${{env.PLATFORM_REPO}}
-          --pattern dusklight.lib
+          --pattern "*.lib"
           --dir sdk-assets
 
       - name: Configure
         run: >
           cmake -B build -G Ninja
-          -DDUSK_GAME_IMPLIB=${{github.workspace}}/sdk-assets/dusklight.lib
-          -DDUSK_VERSION_OVERRIDE=${{env.RELEASE_TAG}}
+          -DDUSK_GAME_EXE=${{github.workspace}}/sdk-assets/dusklight.lib
 
       - name: Build
         run: cmake --build build
