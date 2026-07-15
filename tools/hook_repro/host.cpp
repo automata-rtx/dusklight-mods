@@ -4,7 +4,7 @@
 // This host stands in for the game: it exports a few functions, loads a *real* MSVC-built mod
 // DLL (mod.cpp, built exactly like our shipping mods), then replays the loader's hook-resolution
 // and declared-target logic. The resolve_import_thunk / resolve_target functions below are copied
-// VERBATIM from extern/dusklight/src/dusk/mods/svc/hook.cpp so the harness exercises the identical
+// VERBATIM from dusklight/src/dusk/mods/svc/hook.cpp so the harness exercises the identical
 // address math the game uses. If a standalone-built mod's DEFINE_HOOK records do not resolve
 // self-consistently, this prints "REPRODUCED"; otherwise it prints "OK".
 #include <windows.h>

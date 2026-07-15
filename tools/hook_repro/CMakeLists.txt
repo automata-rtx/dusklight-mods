@@ -3,10 +3,11 @@ project(hook_repro CXX)
 
 # Self-contained reproduction of the mod hook-resolution path. No game binary or import library is
 # needed: the host stands in for the game, exports the hooked functions, and generates its own
-# import library for the mod to link against (ENABLE_EXPORTS). Point DUSK_DIR at the pinned
-# Dusklight source tree for the SDK headers.
-set(DUSK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../extern/dusklight" CACHE PATH
-        "Path to the pinned Dusklight source tree")
+# import library for the mod to link against (ENABLE_EXPORTS). Point DUSK_DIR at a Dusklight
+# checkout that provides sdk/include (only the SDK headers are needed). CI passes a sparse checkout;
+# locally, the top-level build fetches one into ../../dusklight (see cmake/FetchDusklight.cmake).
+set(DUSK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../dusklight" CACHE PATH
+        "Path to a Dusklight checkout providing sdk/include")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

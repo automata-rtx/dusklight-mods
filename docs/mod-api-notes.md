@@ -1,7 +1,8 @@
 # Mod API notes — pitfalls learned while building these mods
 
-Upstream reference: `extern/dusklight/docs/modding.md` and `extern/dusklight/include/mods/`.
-These notes are the deltas that actually bit us.
+Upstream reference: the fetched `dusklight/docs/modding.md` and `dusklight/sdk/include/mods/`
+(fetched by `cmake/FetchDusklight.cmake`; also on GitHub at
+`TwilitRealm/dusklight/blob/main/docs/modding.md`). These notes are the deltas that actually bit us.
 
 ## Uniform buffers
 
@@ -44,7 +45,7 @@ These notes are the deltas that actually bit us.
 
 - Matrices are column-major float[16], matrix × column-vector convention — the TRANSPOSE of
   the game's row-major `Mtx`. CPU-side multiplies must use the column-major helper
-  (`mat4_mul_col` in enhanced_ao), not game matrix code.
+  (`mat4_mul_col` in vbao), not game matrix code.
 - WebGPU clip conventions: `uv = (ndc.x*0.5+0.5, 0.5 - ndc.y*0.5)`. The single most
   expensive bug of the aurora era was a missed Y flip here (shadows sampled mirrored, which
   a sun-direction negation silently "fixed" — see realtime_sun_shadows.md issue 2).
@@ -70,14 +71,18 @@ These notes are the deltas that actually bit us.
 
 ## Build system
 
-- The SDK (`extern/dusklight/sdk`) provides `add_mod()`, game headers
-  (`dusklight_game_headers` INTERFACE target), and Dawn headers via a prebuilt package.
-  Nothing from the game compiles in this repo.
-- Windows: `DUSK_GAME_EXE` (the `windows-amd64.lib` import library) is REQUIRED for any mod
-  (even service-only ones — the SDK refuses to configure without it). It must come from the
-  exact game build being targeted.
-- `.dusk` = zip of {platform-arch lib, mod.json, res/}. CI's artifact contains every mod's
-  package; the loader also picks up a `mods/` dir next to the app for dev builds.
+- The SDK (in the fetched `dusklight/sdk`) provides `add_mod()`, game headers
+  (`dusklight_game_headers` INTERFACE target), and Dawn headers via a prebuilt package. The tree is
+  fetched by `cmake/FetchDusklight.cmake` (pinned by `DUSKLIGHT_VERSION`) — nothing from the game
+  compiles in this repo.
+- `DUSK_GAME_EXE` (a per-arch link target) is REQUIRED on **Windows/macOS/Android** for any mod
+  using `FEATURES game|webgpu` (all of ours) — it's the import library (`windows-amd64.lib`) on
+  Windows or the `sdk/stub-*` link stub on macOS/Android, and must come from the exact game build
+  being targeted (CI pulls it from the `platform-v2-test` release). **Linux needs nothing** — game
+  symbols are left undefined and resolved at load (`-Wl,--allow-shlib-undefined`).
+- `.dusk` = zip of {`lib/<platform>/mod.{dll,so}`, mod.json, res/}. CI builds one per platform and
+  `tools/merge_mod.py` merges them into a single cross-platform bundle (the `mods-combined`
+  artifact); the loader also picks up a `mods/` dir next to the app for dev builds.
 
 ## Validation workflow
 

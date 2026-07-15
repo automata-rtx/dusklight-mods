@@ -1,4 +1,4 @@
-// Enhanced Ambient Occlusion - fullscreen composite.
+// VBAO (Visibility Bitmask Ambient Occlusion) - fullscreen composite.
 //
 // Multiplies the accumulated (or denoised, when temporal accumulation is off) AO visibility over
 // the scene. Based on Encounter's ao_mod demo composite with two additions:

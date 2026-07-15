@@ -1,6 +1,6 @@
-# VBAO — Enhanced Ambient Occlusion
+# VBAO — Visibility Bitmask Ambient Occlusion
 
-Mod id `dev.automata.enhanced_ao`. Service-only (no game code): stages + snapshots from the
+Mod id `dev.automata.vbao` (directory `mods/vbao/`). Service-only (no game code): stages + snapshots from the
 gfx service, matrices from the camera service.
 
 **Optionally uses the Depth to Normal mod** (`dev.automata.depth_to_normal`) as of 1.5.0. When

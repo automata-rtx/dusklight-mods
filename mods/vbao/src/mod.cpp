@@ -1,4 +1,4 @@
-// Enhanced Ambient Occlusion.
+// VBAO — Visibility Bitmask Ambient Occlusion.
 //
 // A quality-focused evolution of Encounter's ao_mod demo: the same gfx-service compute chain (depth MIP
 // prefilter -> occlusion -> edge-aware spatial denoise -> composite), with
@@ -1316,7 +1316,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     panelDesc.build = build_panel;
     svc_ui->register_mods_panel(mod_ctx, &panelDesc);
 
-    svc_log->info(mod_ctx, "enhanced_ao ready");
+    svc_log->info(mod_ctx, "vbao ready");
     return MOD_OK;
 }
 

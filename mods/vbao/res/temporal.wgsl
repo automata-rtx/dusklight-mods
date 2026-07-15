@@ -1,4 +1,4 @@
-// Enhanced Ambient Occlusion - temporal accumulation pass.
+// VBAO (Visibility Bitmask Ambient Occlusion) - temporal accumulation pass.
 //
 // Reprojects the previous frame's accumulated AO into the current frame using the camera motion
 // (reproject = prev proj_from_world * cur world_from_view) and blends it with the current

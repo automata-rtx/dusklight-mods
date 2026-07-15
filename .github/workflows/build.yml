@@ -1,44 +1,206 @@
-name: Build mods
+name: Build
 
-# Mods-only CI: compiles the mod libraries against the Dusklight mod SDK - the game and aurora
-# are NEVER compiled here.
+# Multiplatform mod CI, adopted from the official Dusklight mod template
+# (https://github.com/TwilitRealm/mod-template): each platform builds every mod against the pinned
+# Dusklight SDK (fetched by DUSKLIGHT_VERSION in CMakeLists.txt), then `combine` merges each mod's
+# per-platform libraries into one cross-platform .dusk via tools/merge_mod.py.
 #
-# Platform: extern/dusklight is pinned to a MAINLINE Dusklight commit (the #2215 "Game ABI /
-# headers refactoring" mod SDK: static modmeta metadata, MOD_ABI_VERSION 1, headers under
-# sdk/include/mods, add_mod FEATURES). The Linux job fully compile-checks every mod (game/webgpu
-# symbols are left undefined and resolved at load). The Windows job, which links the real import
-# library into shippable .dusk packages, only runs when a matching mainline platform release is
-# configured (see below) - the old platform-v1 dusklight.lib is a different ABI and must NOT be
-# used against this SDK.
+# Two deviations from the stock template, forced by our pinned platform (automata-rtx/dusklight-ao
+# @ platform-v2-test) predating the newer upstream SDK the template targets:
+#   1. Link targets: the stock template's newer SDK auto-downloads the per-arch import lib / link
+#      stub. Ours does not, so on Windows/macOS/Android we fetch DUSK_GAME_EXE from the
+#      platform-v2-test release (the sdk/ stub inside each game zip, or windows-amd64.lib). Linux
+#      links with --allow-shlib-undefined and needs nothing. Windows-arm64 is skipped (no link lib
+#      published yet).
+#   2. clang-cl on Windows: plain MSVC (cl) strips the SDK's modmeta/DEFINE_HOOK records so hooks
+#      never register. Guarded by the hook-repro job.
 
 on:
   push:
-    paths-ignore:
-      - '**.md'
+    branches: ["*"]
+    tags: ["*"]
+    paths-ignore: ["**.md"]
   pull_request:
   workflow_dispatch:
 
+env:
+  # Platform release providing the per-arch link targets (override with repo vars if needed).
+  PLATFORM_REPO: ${{ vars.PLATFORM_REPO || 'automata-rtx/dusklight-ao' }}
+  RELEASE_TAG: ${{ vars.PLATFORM_RELEASE_TAG || 'platform-v2-test' }}
+  SYMGEN_VERSION: v1.2.4
+
 jobs:
-  validate:
-    name: Compile check + WGSL validation (Linux)
+  build:
+    name: Build ${{matrix.platform}}
+    runs-on: ${{matrix.runner}}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-latest
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - platform: macos-arm64
+            runner: macos-latest
+            link_pattern: "*-macos-appleclang-arm64.zip"
+            link_stub: sdk/stub-macos-arm64
+          - platform: macos-x86_64
+            runner: macos-latest
+            cmake_args: -DCMAKE_OSX_ARCHITECTURES=x86_64
+            link_pattern: "*-macos-appleclang-x86_64.zip"
+            link_stub: sdk/stub-macos-x86_64
+          - platform: windows-amd64
+            runner: windows-latest
+            msvc_arch: amd64
+            link_pattern: windows-amd64.lib
+          - platform: android-aarch64
+            runner: ubuntu-latest
+            android_ndk: "29.0.14206865"
+            link_pattern: "*-android-arm64.zip"
+            link_stub: sdk/stub-android-aarch64.so
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pinned Dusklight version
+        id: dusklight
+        shell: bash
+        run: echo "version=$(sed -n 's/.*set(DUSKLIGHT_VERSION \"\([^\"]*\)\").*/\1/p' CMakeLists.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Dusklight sources
+        uses: actions/cache@v4
+        with:
+          path: dusklight
+          key: dusklight-${{matrix.platform}}-${{steps.dusklight.outputs.version}}
+
+      - name: Enable Visual Studio environment
+        if: matrix.msvc_arch
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{matrix.msvc_arch}}
+
+      - name: Install ninja (Windows)
+        if: matrix.msvc_arch
+        run: choco install ninja
+
+      - name: Install Android NDK
+        if: matrix.android_ndk
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ndk;${{matrix.android_ndk}}
+
+      - name: Provide game link target (DUSK_GAME_EXE)
+        if: matrix.link_pattern
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PLATFORM_REPO_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p link
+          gh release download "$RELEASE_TAG" --repo "$PLATFORM_REPO" \
+            --pattern "${{matrix.link_pattern}}" --dir link
+          asset="$(ls link | head -1)"
+          if [ -n "${{matrix.link_stub}}" ]; then
+            unzip -o "link/$asset" "${{matrix.link_stub}}" -d link/x
+            target="$PWD/link/x/${{matrix.link_stub}}"
+            chmod +x "$target" || true
+          else
+            target="$PWD/link/$asset"
+          fi
+          echo "Using DUSK_GAME_EXE=$target"
+          echo "DUSK_GAME_EXE=$target" >> "$GITHUB_ENV"
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          args=(${{matrix.cmake_args}})
+          if [ -n "${DUSK_GAME_EXE:-}" ]; then
+            args+=("-DDUSK_GAME_EXE=$DUSK_GAME_EXE")
+          fi
+          if [ -n "${{matrix.msvc_arch}}" ]; then
+            # clang-cl is REQUIRED on Windows (see header + hook-repro job).
+            args+=(-G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl)
+          fi
+          if [ -n "${{matrix.android_ndk}}" ]; then
+            args+=(-DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/${{matrix.android_ndk}}/build/cmake/android.toolchain.cmake"
+                   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28)
+          fi
+          cmake -B build "${args[@]}"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Upload platform bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: mods-${{matrix.platform}}
+          path: build/mods/*.dusk
+          if-no-files-found: error
+
+  combine:
+    name: Combine cross-platform bundles
+    needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
+
+      - name: Download platform bundles
+        uses: actions/download-artifact@v4
         with:
-          submodules: recursive
+          pattern: mods-*
+          path: dist
+
+      - name: Install symgen
+        run: |
+          curl -fsSL -o symgen \
+            "https://github.com/encounter/symgen/releases/download/${SYMGEN_VERSION}/symgen-linux-x86_64"
+          chmod +x symgen
+
+      - name: Merge each mod across platforms
+        run: |
+          set -euo pipefail
+          mkdir -p combined
+          platforms=linux-x86_64,linux-aarch64,macos-arm64,macos-x86_64,windows-amd64,android-aarch64
+          for dusk in dist/mods-linux-x86_64/*.dusk; do
+            name="$(basename "$dusk")"
+            echo "=== merging $name ==="
+            python3 tools/merge_mod.py -o "combined/$name" --symgen ./symgen \
+              --expect-platforms "$platforms" \
+              dist/*/"$name"
+          done
+          ls -l combined
+
+      - name: Upload combined bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: mods-combined
+          path: combined/*.dusk
+          if-no-files-found: error
+
+      - name: Attach to release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{github.token}}
+        run: gh release create "$GITHUB_REF_NAME" combined/*.dusk --verify-tag --generate-notes
+
+  validate:
+    name: Shader validation + bundle layout (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get -y install ninja-build unzip
 
-      - name: Configure
-        run: cmake -B build -G Ninja -DMODS_BUILD_TOOLS=ON
+      - name: Configure + build (with WGSL validator)
+        run: |
+          cmake -B build -G Ninja -DMODS_BUILD_TOOLS=ON
+          cmake --build build
 
-      - name: Build mods + validator
-        run: cmake --build build
-
-      - name: Verify mod bundle layout (new /lib/<platform>/ layout, not old root-level)
+      - name: Verify mod bundle layout (lib/<platform>/mod.*, not root-level)
         run: |
           shopt -s nullglob
           pkgs=(build/mods/*.dusk)
@@ -47,10 +209,8 @@ jobs:
           for d in "${pkgs[@]}"; do
             echo "=== $(basename "$d") ==="
             unzip -Z1 "$d"
-            # The mainline loader rejects any native library at the zip root (old layout);
-            # the new add_mod stages it at lib/<platform>/mod.<ext>.
             if unzip -Z1 "$d" | grep -qE '^[^/]+\.(so|dll|dylib)$'; then
-              echo "FAIL: native library at bundle root -> old layout (loader rejects this)"; status=1
+              echo "FAIL: native library at bundle root (old layout, loader rejects)"; status=1
             fi
             if ! unzip -Z1 "$d" | grep -qE '^lib/[^/]+/mod\.(so|dll|dylib)$'; then
               echo "FAIL: no lib/<platform>/mod.* entry (expected new layout)"; status=1
@@ -71,119 +231,57 @@ jobs:
           exit $status
 
   hook-repro:
-    name: Hook resolution reproduction (Windows)
-    # Self-contained: a stub "game" host replays the loader's hook-resolution + declared-target
-    # logic against a real MSVC-built mod, to reproduce the "undeclared target" failure without a
-    # real game binary. Always runs; needs no game import library.
+    name: Hook resolution guard (clang-cl vs cl)
     runs-on: windows-latest
+    # Self-contained: a stub "game" host replays the loader's hook-resolution + declared-target logic
+    # against a real MSVC/clang-cl-built mod, reproducing the "undeclared target" failure without a
+    # game binary. Guards the clang-cl requirement: clang-cl MUST pass; plain cl is expected to fail
+    # (it strips the DEFINE_HOOK records under /OPT:REF). Needs only the SDK headers (sdk/include).
     steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
+      - uses: actions/checkout@v4
 
       - name: Enable Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: amd64
 
-      - name: Install dependencies
+      - name: Install ninja
         run: choco install ninja
 
-      - name: Build & run all toolchain/config variants, then assert clang-cl is correct
+      - name: Fetch SDK headers (sparse checkout)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="$(sed -n 's/.*set(DUSKLIGHT_VERSION \"\([^\"]*\)\").*/\1/p' CMakeLists.txt)"
+          git init dusklight-sdk-src
+          cd dusklight-sdk-src
+          git remote add origin "https://github.com/${PLATFORM_REPO}.git"
+          git sparse-checkout init --cone
+          git sparse-checkout set sdk/include
+          git fetch --depth 1 origin "$ver"
+          git checkout FETCH_HEAD
+
+      - name: Build variants, assert clang-cl resolves hooks
         shell: pwsh
         run: |
-          # Records the finding and guards against regression: DEFINE_HOOK records must land in the
-          # modmeta section and resolve/declare cleanly. clang-cl MUST pass; plain cl is shown for
-          # contrast (it strips the records under /OPT:REF), which is why our mods build clang-cl.
+          $dusk = "$env:GITHUB_WORKSPACE/dusklight-sdk-src"
           function Run-Variant($name, $mustPass, $extraArgs) {
             Write-Host "==================== $name ===================="
             $dir = "build-$name"
-            cmake -S tools/hook_repro -B $dir -G Ninja @extraArgs 2>&1 | Out-Null
+            cmake -S tools/hook_repro -B $dir -G Ninja "-DDUSK_DIR=$dusk" @extraArgs 2>&1 | Out-Null
             cmake --build $dir 2>&1 | Out-Null
             $code = 99
             if (Test-Path "$dir/host.exe") {
-              Push-Location $dir
-              & ./host.exe
-              $code = $LASTEXITCODE
-              Pop-Location
+              Push-Location $dir; & ./host.exe; $code = $LASTEXITCODE; Pop-Location
             } else {
               Write-Host "BUILD FAILED for $name (no host.exe)"
             }
             Write-Host ""
             if ($mustPass -and $code -ne 0) {
-              Write-Host "::error::$name must resolve all hook targets (exit $code)"
-              exit 1
+              Write-Host "::error::$name must resolve all hook targets (exit $code)"; exit 1
             }
           }
-          Run-Variant "cl-relwithdebinfo" $false @("-DCMAKE_BUILD_TYPE=RelWithDebInfo")
-          Run-Variant "cl-release"        $false @("-DCMAKE_BUILD_TYPE=Release")
-          Run-Variant "clangcl-relwithdebinfo" $true @("-DCMAKE_BUILD_TYPE=RelWithDebInfo","-DCMAKE_C_COMPILER=clang-cl","-DCMAKE_CXX_COMPILER=clang-cl")
-          Run-Variant "clangcl-release"   $true @("-DCMAKE_BUILD_TYPE=Release","-DCMAKE_C_COMPILER=clang-cl","-DCMAKE_CXX_COMPILER=clang-cl")
-
-  build-windows:
-    name: Build mods (Windows x86_64)
-    runs-on: windows-latest
-    # Links the mods against the mainline Dusklight platform's Windows import library, matching the
-    # game build the mods are installed into. Defaults to the platform-v2-test release of
-    # automata-rtx/dusklight-ao (upstream main 0f2a00cd base: Windows hook fix adfb830b + enlarged
-    # aurora streaming buffers — the game build the user runs), which provides windows-amd64.lib.
-    # Override the repo variables PLATFORM_RELEASE_TAG / PLATFORM_REPO to point elsewhere. To build
-    # the .dusk packages locally without a release, configure with
-    # -DDUSK_GAME_EXE=<path to sdk/windows-x86_64.lib> from your own Dusklight tree. If the platform
-    # repo is private, add a PAT that can read it as the PLATFORM_REPO_TOKEN secret; otherwise the
-    # default GITHUB_TOKEN is used (public repos).
-    env:
-      PLATFORM_REPO: ${{ vars.PLATFORM_REPO || 'automata-rtx/dusklight-ao' }}
-      RELEASE_TAG: ${{ vars.PLATFORM_RELEASE_TAG || 'platform-v2-test' }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Enable Visual Studio environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: amd64
-
-      - name: Install dependencies
-        run: choco install ninja
-
-      - name: Download game import library (platform release)
-        env:
-          GH_TOKEN: ${{ secrets.PLATFORM_REPO_TOKEN || github.token }}
-        # The mainline linking rework renamed the import library dusklight.lib -> windows-amd64.lib
-        # (published by platform-v2-test). Download whatever windows-*.lib the release provides.
-        run: >
-          gh release download ${{env.RELEASE_TAG}}
-          --repo ${{env.PLATFORM_REPO}}
-          --pattern "windows-*.lib"
-          --dir sdk-assets
-
-      - name: Locate import library
-        id: implib
-        shell: pwsh
-        run: |
-          $lib = Get-ChildItem sdk-assets -Filter "windows-*.lib" | Select-Object -First 1
-          if (-not $lib) { Write-Host "::error::no windows-*.lib found in the platform release"; exit 1 }
-          Write-Host "Using import library: $($lib.FullName)"
-          "path=$($lib.FullName)" >> $env:GITHUB_OUTPUT
-
-      - name: Configure
-        # clang-cl is REQUIRED on Windows: plain MSVC (cl) mishandles the mod SDK's modmeta
-        # section (__declspec(allocate("modmeta$d")) on the DEFINE_HOOK template statics), stripping
-        # the hook records under /OPT:REF and emitting a malformed layout otherwise, so hook targets
-        # never register. The SDK only grants the record-retention attribute under clang. Verified
-        # by the hook-repro job.
-        run: >
-          cmake -B build -G Ninja
-          -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
-          "-DDUSK_GAME_EXE=${{ steps.implib.outputs.path }}"
-
-      - name: Build
-        run: cmake --build build
-
-      - name: Upload mod packages
-        uses: actions/upload-artifact@v7
-        with:
-          name: dusklight-mods-win64
-          path: build/mods/*.dusk
+          Run-Variant "cl-relwithdebinfo"      $false @("-DCMAKE_BUILD_TYPE=RelWithDebInfo")
+          Run-Variant "cl-release"             $false @("-DCMAKE_BUILD_TYPE=Release")
+          Run-Variant "clangcl-relwithdebinfo" $true  @("-DCMAKE_BUILD_TYPE=RelWithDebInfo","-DCMAKE_C_COMPILER=clang-cl","-DCMAKE_CXX_COMPILER=clang-cl")
+          Run-Variant "clangcl-release"        $true  @("-DCMAKE_BUILD_TYPE=Release","-DCMAKE_C_COMPILER=clang-cl","-DCMAKE_CXX_COMPILER=clang-cl")

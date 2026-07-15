@@ -1,28 +1,48 @@
-cmake_minimum_required(VERSION 3.25)
+cmake_minimum_required(VERSION 3.26)
 project(dusklight_mods CXX)
 
-# Superproject for our Dusklight graphics mods. Configures the Dusklight mod SDK
-# (headers + a prebuilt Dawn package - no game or aurora compilation) from the pinned
-# submodule, then builds each mod as a .dusk package into ${CMAKE_BINARY_DIR}/mods.
+# Superproject for our Dusklight graphics mods, built on the official Dusklight mod template
+# (https://github.com/TwilitRealm/mod-template). Instead of vendoring the game/SDK as a submodule,
+# the pinned Dusklight source is fetched by DUSKLIGHT_VERSION into ./dusklight (see
+# cmake/FetchDusklight.cmake), and each mod is packaged as a .dusk into ${CMAKE_BINARY_DIR}/mods.
+# Only the mod sources compile here — the game and its renderer are never built.
 #
-# Windows additionally needs the import library from the matching game release, and clang-cl:
-#   -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
-#   -DDUSK_GAME_EXE=<path to windows-amd64.lib>   (platform-v2-test release asset)
+# The Dusklight version to build against: a release tag or commit SHA. To move the mods to a newer
+# base game, change this one line and reconfigure.
+if (NOT DUSKLIGHT_VERSION)
+    set(DUSKLIGHT_VERSION "c18dc4223f45c7ef3a1b656987f58f2352f6c7ac")
+endif ()
 
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# We build against OUR platform fork (automata-rtx/dusklight-ao) rather than upstream Dusklight:
+# it carries the enlarged aurora streaming buffers the shadow mod needs, and the pinned commit
+# above matches the game build the user runs (published as the platform-v2-test release). Pass
+# -DDUSKLIGHT_REPOSITORY=... or -DDUSKLIGHT_DIR=<checkout> to override.
+if (NOT DEFINED DUSKLIGHT_REPOSITORY)
+    set(DUSKLIGHT_REPOSITORY "https://github.com/automata-rtx/dusklight-ao.git"
+            CACHE STRING "Dusklight git repository to fetch from")
+endif ()
 
-set(DUSK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/dusklight" CACHE PATH
-        "Path to the pinned Dusklight source tree")
-add_subdirectory("${DUSK_DIR}/sdk" dusk-sdk EXCLUDE_FROM_ALL)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/FetchDusklight.cmake")
 
-add_subdirectory(mods/deferred_fog)
+add_subdirectory("${DUSKLIGHT_DIR}/sdk" dusklight-sdk EXCLUDE_FROM_ALL)
+
+# Provider mod first, then its consumers (they add its include/ for the shared service header).
 add_subdirectory(mods/depth_to_normal)
-add_subdirectory(mods/enhanced_ao)
+add_subdirectory(mods/vbao)
 add_subdirectory(mods/realtime_sun_shadows)
+add_subdirectory(mods/deferred_fog)
+
+# On Windows/macOS/Android a game-linked mod (FEATURES game|webgpu) needs DUSK_GAME_EXE — the
+# per-arch import library (Windows) or link stub (macOS bundle_loader / Android). Our pinned
+# platform predates the SDK's auto-download of these, so CI provides them from the platform-v2-test
+# release (see .github/workflows/build.yml); Linux links with --allow-shlib-undefined and needs
+# nothing. Windows MUST use clang-cl: plain cl strips the SDK's modmeta/DEFINE_HOOK records and
+# hooks never register (guarded by tools/hook_repro). Locally, pass
+# -DDUSK_GAME_EXE=<sdk/windows-<arch>.lib | sdk/stub-...> when building a non-Linux target.
 
 # Offline WGSL validator (Dawn Null backend). Used by CI and local shader iteration:
 #   cmake -B build -DMODS_BUILD_TOOLS=ON && cmake --build build --target wgsl_validate
-#   build/wgsl_validate mods/enhanced_ao/res/vbao.wgsl
+#   build/wgsl_validate mods/vbao/res/vbao.wgsl
 option(MODS_BUILD_TOOLS "Build repo tools (WGSL validator)" OFF)
 if (MODS_BUILD_TOOLS)
     add_executable(wgsl_validate tools/wgsl_validate.cpp)

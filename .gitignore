@@ -1,3 +1,6 @@
 build/
+build-*/
 *.dusk
-# build outputs
+# Dusklight source tree fetched by cmake/FetchDusklight.cmake (never committed)
+/dusklight/
+dusklight/

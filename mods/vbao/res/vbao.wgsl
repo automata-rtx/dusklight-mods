@@ -1,4 +1,4 @@
-// Enhanced Ambient Occlusion - VBAO (visibility-bitmask ambient occlusion) pass.
+// VBAO (visibility-bitmask ambient occlusion) pass.
 //
 // The pass framework (MIP-prefiltered depth reads, hilbert/R2 noise, edge output for the
 // spatial denoiser, accurate 5-tap normal reconstruction) follows Encounter's ao_mod demo,
