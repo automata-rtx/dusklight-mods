@@ -18,5 +18,13 @@ DEFINE_HOOK(hooked_free_fn, FreeHook);
 DEFINE_HOOK(hooked_free_fn2, FreeHook2);
 DEFINE_HOOK(hooked_free_fn3, FreeHook3);
 
-MOD_EXPORT ModResult mod_initialize(ModError*) { return MOD_OK; }
+MOD_EXPORT ModResult mod_initialize(ModError*) {
+    // Real mods reference each hook via hook_add_pre<Alias> (which touches Alias::resolved_target()
+    // -> the record). Mirror that so the modmeta records are retained under /OPT:REF, matching how
+    // deferred_fog / realtime_sun_shadows actually keep their records alive.
+    volatile const void* keep[] = {
+        FreeHook::resolved_target(), FreeHook2::resolved_target(), FreeHook3::resolved_target()};
+    (void)keep;
+    return MOD_OK;
+}
 MOD_EXPORT ModResult mod_shutdown(ModError*) { return MOD_OK; }
