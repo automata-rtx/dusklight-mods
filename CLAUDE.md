@@ -48,6 +48,26 @@ The user typically does not build locally. Iteration loop:
 3. User downloads them into `%APPDATA%\TwilitRealm\Dusklight\mods`, then uses the in-game
    mod manager's **Reload** button — no game restart needed.
 
+## Building a new mod (session setup + which pattern)
+
+- **Which repos to attach to the session:** for building or tuning ANY mod (including a
+  brand-new one), you need **only `automata-rtx/dusklight-mods`**. The game SDK you compile
+  against is the `extern/dusklight` submodule (recursive checkout — run
+  `git submodule update --init --recursive` if it's empty), and the Windows import library
+  (`windows-amd64.lib`) is downloaded from the `platform-v2-test` release by CI. Do **NOT**
+  attach `dusklight-ao` or `aurora-ao` — those are needed only when **re-platforming** (see
+  that section below), never for authoring a mod on the current platform.
+- **Default to service-only.** A new screen-space effect (e.g. SSDO, 1-bounce SSGI, SSR,
+  outlines) should follow the VBAO / `depth_to_normal` pattern: consume depth + the world-space
+  normal from the **Depth to Normal service** (`include/depth_to_normal_service.h`) + the scene
+  color, all via mod-API services — **no game headers, no hooks**. That keeps it off the ABI
+  treadmill: it survives game updates and needs no platform rebuild. `docs/depth_to_normal_consumers.md`
+  is the menu of exactly these effects plus the consumer integration boilerplate — read it first.
+- Make a mod **game-linked** only if it genuinely needs a game buffer the gfx service does not
+  expose (e.g. pre-tonemap HDR lighting or per-object albedo that SSGI might want). That couples
+  it to the pinned build like the shadow/fog mods. Prefer service-only whenever the service
+  surface (depth + normal + scene color) is enough.
+
 ## Hard constraints
 
 - **Windows mods MUST be built with clang-cl, not plain MSVC (`cl`).** The mod SDK places its
