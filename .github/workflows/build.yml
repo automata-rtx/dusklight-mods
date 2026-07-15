@@ -128,10 +128,13 @@ jobs:
     # optionally PLATFORM_REPO) to that release's tag to enable; leave it unset to skip (the Linux
     # job still validates the port). Build the .dusk packages locally against your own Dusklight
     # tree with -DDUSK_GAME_EXE=<path to sdk/windows-x86_64.lib> when no release is published.
-    if: vars.PLATFORM_RELEASE_TAG != ''
+    # Defaults to the platform-v2-test release (commit 30def245 base — matches the current
+    # submodule pin and the game build the user runs). Override PLATFORM_RELEASE_TAG / PLATFORM_REPO
+    # repo variables to point elsewhere. If the platform repo is private, add a PAT that can read it
+    # as the PLATFORM_REPO_TOKEN secret; otherwise the default GITHUB_TOKEN is used (public repos).
     env:
       PLATFORM_REPO: ${{ vars.PLATFORM_REPO || 'automata-rtx/dusklight-ao' }}
-      RELEASE_TAG: ${{ vars.PLATFORM_RELEASE_TAG }}
+      RELEASE_TAG: ${{ vars.PLATFORM_RELEASE_TAG || 'platform-v2-test' }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -147,14 +150,23 @@ jobs:
 
       - name: Download game import library (platform release)
         env:
-          GH_TOKEN: ${{ github.token }}
-        # The mainline platform renamed the import library dusklight.lib ->
-        # sdk/windows-<arch>.lib; the platform-v2-test release publishes windows-x86_64.lib.
+          GH_TOKEN: ${{ secrets.PLATFORM_REPO_TOKEN || github.token }}
+        # The mainline linking rework renamed the import library dusklight.lib -> windows-amd64.lib
+        # (published by platform-v2-test). Download whatever windows-*.lib the release provides.
         run: >
           gh release download ${{env.RELEASE_TAG}}
           --repo ${{env.PLATFORM_REPO}}
           --pattern "windows-*.lib"
           --dir sdk-assets
+
+      - name: Locate import library
+        id: implib
+        shell: pwsh
+        run: |
+          $lib = Get-ChildItem sdk-assets -Filter "windows-*.lib" | Select-Object -First 1
+          if (-not $lib) { Write-Host "::error::no windows-*.lib found in the platform release"; exit 1 }
+          Write-Host "Using import library: $($lib.FullName)"
+          "path=$($lib.FullName)" >> $env:GITHUB_OUTPUT
 
       - name: Configure
         # clang-cl is REQUIRED on Windows: plain MSVC (cl) mishandles the mod SDK's modmeta
@@ -165,7 +177,7 @@ jobs:
         run: >
           cmake -B build -G Ninja
           -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
-          -DDUSK_GAME_EXE=${{github.workspace}}/sdk-assets/windows-x86_64.lib
+          "-DDUSK_GAME_EXE=${{ steps.implib.outputs.path }}"
 
       - name: Build
         run: cmake --build build
