@@ -78,16 +78,18 @@ jobs:
       - name: Download game import library (platform release)
         env:
           GH_TOKEN: ${{ github.token }}
+        # The mainline platform renamed the import library dusklight.lib ->
+        # sdk/windows-<arch>.lib; the platform-v2-test release publishes windows-x86_64.lib.
         run: >
           gh release download ${{env.RELEASE_TAG}}
           --repo ${{env.PLATFORM_REPO}}
-          --pattern "*.lib"
+          --pattern "windows-*.lib"
           --dir sdk-assets
 
       - name: Configure
         run: >
           cmake -B build -G Ninja
-          -DDUSK_GAME_EXE=${{github.workspace}}/sdk-assets/dusklight.lib
+          -DDUSK_GAME_EXE=${{github.workspace}}/sdk-assets/windows-x86_64.lib
 
       - name: Build
         run: cmake --build build
