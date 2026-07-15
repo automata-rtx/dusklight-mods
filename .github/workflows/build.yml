@@ -89,28 +89,36 @@ jobs:
       - name: Install dependencies
         run: choco install ninja
 
-      - name: Build & run all toolchain/config variants, then summarize
-        continue-on-error: true
+      - name: Build & run all toolchain/config variants, then assert clang-cl is correct
         shell: pwsh
         run: |
-          function Run-Variant($name, $extraArgs) {
+          # Records the finding and guards against regression: DEFINE_HOOK records must land in the
+          # modmeta section and resolve/declare cleanly. clang-cl MUST pass; plain cl is shown for
+          # contrast (it strips the records under /OPT:REF), which is why our mods build clang-cl.
+          function Run-Variant($name, $mustPass, $extraArgs) {
             Write-Host "==================== $name ===================="
             $dir = "build-$name"
             cmake -S tools/hook_repro -B $dir -G Ninja @extraArgs 2>&1 | Out-Null
             cmake --build $dir 2>&1 | Out-Null
+            $code = 99
             if (Test-Path "$dir/host.exe") {
               Push-Location $dir
               & ./host.exe
+              $code = $LASTEXITCODE
               Pop-Location
             } else {
               Write-Host "BUILD FAILED for $name (no host.exe)"
             }
             Write-Host ""
+            if ($mustPass -and $code -ne 0) {
+              Write-Host "::error::$name must resolve all hook targets (exit $code)"
+              exit 1
+            }
           }
-          Run-Variant "cl-relwithdebinfo" @("-DCMAKE_BUILD_TYPE=RelWithDebInfo")
-          Run-Variant "cl-release"        @("-DCMAKE_BUILD_TYPE=Release")
-          Run-Variant "clangcl-relwithdebinfo" @("-DCMAKE_BUILD_TYPE=RelWithDebInfo","-DCMAKE_C_COMPILER=clang-cl","-DCMAKE_CXX_COMPILER=clang-cl")
-          Run-Variant "clangcl-release"   @("-DCMAKE_BUILD_TYPE=Release","-DCMAKE_C_COMPILER=clang-cl","-DCMAKE_CXX_COMPILER=clang-cl")
+          Run-Variant "cl-relwithdebinfo" $false @("-DCMAKE_BUILD_TYPE=RelWithDebInfo")
+          Run-Variant "cl-release"        $false @("-DCMAKE_BUILD_TYPE=Release")
+          Run-Variant "clangcl-relwithdebinfo" $true @("-DCMAKE_BUILD_TYPE=RelWithDebInfo","-DCMAKE_C_COMPILER=clang-cl","-DCMAKE_CXX_COMPILER=clang-cl")
+          Run-Variant "clangcl-release"   $true @("-DCMAKE_BUILD_TYPE=Release","-DCMAKE_C_COMPILER=clang-cl","-DCMAKE_CXX_COMPILER=clang-cl")
 
   build-windows:
     name: Build mods (Windows x86_64)
@@ -149,8 +157,14 @@ jobs:
           --dir sdk-assets
 
       - name: Configure
+        # clang-cl is REQUIRED on Windows: plain MSVC (cl) mishandles the mod SDK's modmeta
+        # section (__declspec(allocate("modmeta$d")) on the DEFINE_HOOK template statics), stripping
+        # the hook records under /OPT:REF and emitting a malformed layout otherwise, so hook targets
+        # never register. The SDK only grants the record-retention attribute under clang. Verified
+        # by the hook-repro job.
         run: >
           cmake -B build -G Ninja
+          -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
           -DDUSK_GAME_EXE=${{github.workspace}}/sdk-assets/windows-x86_64.lib
 
       - name: Build

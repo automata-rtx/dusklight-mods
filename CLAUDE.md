@@ -45,6 +45,16 @@ The user typically does not build locally. Iteration loop:
 
 ## Hard constraints
 
+- **Windows mods MUST be built with clang-cl, not plain MSVC (`cl`).** The mod SDK places its
+  `modmeta` records via `__declspec(allocate("modmeta$d"))`, and the `DEFINE_HOOK` records are
+  template statics. `cl` mishandles this: it strips the hook records under `/OPT:REF` (Release)
+  and emits a malformed, over-padded section otherwise, so the game reports
+  *"tried to hook undeclared target … hook targets must be declared with DEFINE_HOOK"* and the
+  game-linked mods fail to load. The SDK only grants the retention (`used`) attribute under
+  `__clang__`. Configure with `-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl`
+  (or the `windows-clang` CMake preset). CI's Windows job and the `hook-repro` regression guard
+  (`tools/hook_repro/`) both enforce this. Service-only mods (VBAO, Depth-to-Normal) have no
+  hooks and are unaffected.
 - **Uniform structs are mirrored C ↔ WGSL.** Any change must keep the byte layouts identical
   on both sides and the total size a multiple of 16 (there are `static_assert`s — keep them
   true, don't delete them). Scalars are packed to avoid vec3 16-byte alignment traps.
