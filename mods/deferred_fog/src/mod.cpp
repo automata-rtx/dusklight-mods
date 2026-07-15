@@ -69,6 +69,13 @@ IMPORT_SERVICE(LogService, svc_log);
 
 namespace {
 
+// Hook targets declared at namespace scope (each emits a modmeta hook record the host resolves at
+// load); the generated aliases are passed to hook_add_pre in mod_initialize. GXSetFog / GFSetFog
+// share a signature but are distinct functions, so each gets its own alias.
+DEFINE_HOOK(GXSetFog, SetFog);
+DEFINE_HOOK(GFSetFog, SetGfFog);
+DEFINE_HOOK(&J3DShape::drawFast, ShapeDrawFast);
+
 ConfigVarHandle g_cvarEnabled = 0;
 ConfigVarHandle g_cvarMixedMode = 0;
 ConfigVarHandle g_cvarDebugView = 0;
@@ -944,7 +951,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
 
-    if (dusk::mods::hook_add_pre<GXSetFog>(svc_hook, on_set_fog_pre) != MOD_OK) {
+    if (dusk::mods::hook_add_pre<SetFog>(svc_hook, on_set_fog_pre) != MOD_OK) {
         return dusk::mods::set_error(error, MOD_ERROR, "failed to hook GXSetFog");
     }
     // Environment/packet fog (grass, flowers, the dKy tevstr path) is programmed through
@@ -953,14 +960,14 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // identical signature to GXSetFog, so the same callback captures and suppresses it; without
     // this hook that geometry keeps its forward fog and the deferred quad double-fogs it. Only
     // one call site in the game (the grass/flower fog helper), so normal terrain is untouched.
-    if (dusk::mods::hook_add_pre<GFSetFog>(svc_hook, on_set_fog_pre) != MOD_OK) {
+    if (dusk::mods::hook_add_pre<SetGfFog>(svc_hook, on_set_fog_pre) != MOD_OK) {
         svc_log->warn(mod_ctx,
             "failed to hook GFSetFog; grass/flower fog will not be deferred (double-fogged)");
     }
     // Virtual: resolves through the symbol manifest. Without it, J3D fog can't be deferred,
     // so the mod stays loaded but inert (with vanilla fog) rather than failing.
     g_shapeHookOk =
-        dusk::mods::hook_add_pre<&J3DShape::drawFast>(svc_hook, on_shape_draw_pre) == MOD_OK;
+        dusk::mods::hook_add_pre<ShapeDrawFast>(svc_hook, on_shape_draw_pre) == MOD_OK;
     if (!g_shapeHookOk) {
         svc_log->warn(mod_ctx,
             "failed to hook J3DShape::drawFast (missing dusklight.symdb?); deferred fog is "

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(deferred_fog CXX)
+project(depth_to_normal CXX)
 
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(DUSK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.." CACHE PATH "Path to dusk source root")
@@ -12,9 +12,13 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     endif ()
 endif ()
 
-add_mod(deferred_fog
-    FEATURES game webgpu
+add_mod(depth_to_normal
+    FEATURES webgpu
     SOURCES  src/mod.cpp
     MOD_JSON mod.json
     RES_DIR  res
 )
+
+# The shared service header (depth_to_normal_service.h) lives in include/ so consumer mods can
+# add the same directory to their include path and import the service.
+target_include_directories(depth_to_normal PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

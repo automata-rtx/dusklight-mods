@@ -1,6 +1,6 @@
 // Enhanced Ambient Occlusion.
 //
-// A quality-focused evolution of the ao_mod demo: the same gfx-service compute chain (depth MIP
+// A quality-focused evolution of Encounter's ao_mod demo: the same gfx-service compute chain (depth MIP
 // prefilter -> occlusion -> edge-aware spatial denoise -> composite), with
 //  - VBAO: a 32-sector visibility-bitmask occlusion estimator (Therrien et al. 2022) in place of the
 //    classic horizon tracker: separated occluders, gaps and thin geometry (grass) are handled
@@ -16,6 +16,7 @@
 // XeGTAO (MIT); see res/licenses/ and the headers of each shader.
 
 #include "mods/service.hpp"
+#include "depth_to_normal_service.h"
 #include "mods/svc/camera.h"
 #include "mods/svc/config.h"
 #include "mods/svc/gfx.h"
@@ -41,6 +42,10 @@ IMPORT_SERVICE(ResourceService, svc_resource);
 IMPORT_SERVICE(UiService, svc_ui);
 IMPORT_SERVICE(GfxService, svc_gfx);
 IMPORT_SERVICE(CameraService, svc_camera);
+// Optional: when the Depth to Normal provider is present, VBAO sources its receiver normal from
+// it (full-res, shared with other mods) instead of reconstructing its own. Optional so VBAO still
+// loads and runs standalone, falling back to its own reconstruction.
+IMPORT_OPTIONAL_SERVICE(DepthToNormalService, svc_n2d);
 
 namespace {
 
@@ -150,6 +155,7 @@ struct AoUniforms {
     float projection[16];
     float inverse_projection[16];
     float reproject[16];
+    float view_from_world[16];  // rotates the Depth to Normal provider's world normal into view
     float size[2];
     float inv_size[2];
     float depth_scale[2];
@@ -195,12 +201,13 @@ struct ComputePayload {
     WGPUTextureView aoFinal;
     WGPUTextureView historyIn;
     WGPUTextureView historyOut;
+    WGPUTextureView d2nNormal;  // Depth to Normal provider output (or a stand-in when absent)
     uint32_t uniform_offset;
     uint32_t uniform_size;
-    uint32_t width;         // AO chain (half) resolution
-    uint32_t height;
-    uint32_t fullWidth;     // full render resolution (temporal history / raw snapshot)
-    uint32_t fullHeight;
+    // Resolutions are packed (hi 16 = width, lo 16 = height) to keep the payload within the
+    // 128-byte inline cap after adding d2nNormal. Render resolutions are well under 65535.
+    uint32_t chainSize;      // AO chain (half) resolution, packed
+    uint32_t fullSize;       // full render resolution, packed
     uint32_t run_temporal;
     uint32_t denoise_passes; // 0-3; ping-pongs aoNoisy <-> aoFinal
 };
@@ -543,6 +550,10 @@ void on_compute(
     if (data.depth == nullptr || g_preprocessPipeline == nullptr) {
         return;
     }
+    const uint32_t width = data.chainSize >> 16;
+    const uint32_t height = data.chainSize & 0xFFFFu;
+    const uint32_t fullWidth = data.fullSize >> 16;
+    const uint32_t fullHeight = data.fullSize & 0xFFFFu;
 
     const auto makeBindGroup = [&](WGPUBindGroupLayout layout,
                                    std::initializer_list<WGPUBindGroupEntry> entries) {
@@ -583,7 +594,8 @@ void on_compute(
     WGPUBindGroup vbaoGroup = makeBindGroup(
         g_vbaoLayout, {textureEntry(0, data.preprocessedDepthAll),
                           textureEntry(1, g_hilbertLutView), textureEntry(2, data.aoNoisy),
-                          textureEntry(3, data.depthDifferences), uniformEntry(4)});
+                          textureEntry(3, data.depthDifferences), uniformEntry(4),
+                          textureEntry(5, data.d2nNormal)});
     // Denoise ping-pongs aoNoisy <-> aoFinal; the last-written buffer feeds temporal/composite
     // (the game thread computes the same parity for the composite payload).
     const uint32_t denoisePasses = std::min(data.denoise_passes, 3u);
@@ -628,21 +640,21 @@ void on_compute(
     wgpuComputePassEncoderSetPipeline(pass, g_preprocessPipeline);
     wgpuComputePassEncoderSetBindGroup(pass, 0, preprocessGroup, 0, nullptr);
     wgpuComputePassEncoderDispatchWorkgroups(
-        pass, div_ceil(data.width, 16), div_ceil(data.height, 16), 1);
+        pass, div_ceil(width, 16), div_ceil(height, 16), 1);
     wgpuComputePassEncoderSetPipeline(pass, g_mip4Pipeline);
     wgpuComputePassEncoderSetBindGroup(pass, 0, mip4Group, 0, nullptr);
-    wgpuComputePassEncoderDispatchWorkgroups(pass, div_ceil(std::max(data.width >> 4, 1u), 8),
-        div_ceil(std::max(data.height >> 4, 1u), 8), 1);
+    wgpuComputePassEncoderDispatchWorkgroups(pass, div_ceil(std::max(width >> 4, 1u), 8),
+        div_ceil(std::max(height >> 4, 1u), 8), 1);
     wgpuComputePassEncoderSetPipeline(pass, g_vbaoPipeline);
     wgpuComputePassEncoderSetBindGroup(pass, 0, vbaoGroup, 0, nullptr);
     wgpuComputePassEncoderDispatchWorkgroups(
-        pass, div_ceil(data.width, 8), div_ceil(data.height, 8), 1);
+        pass, div_ceil(width, 8), div_ceil(height, 8), 1);
     if (denoisePasses > 0) {
         wgpuComputePassEncoderSetPipeline(pass, g_denoisePipeline);
         for (uint32_t i = 0; i < denoisePasses; ++i) {
             wgpuComputePassEncoderSetBindGroup(pass, 0, denoiseGroups[i], 0, nullptr);
             wgpuComputePassEncoderDispatchWorkgroups(
-                pass, div_ceil(data.width, 8), div_ceil(data.height, 8), 1);
+                pass, div_ceil(width, 8), div_ceil(height, 8), 1);
         }
     }
     if (temporalGroup != nullptr) {
@@ -651,7 +663,7 @@ void on_compute(
         wgpuComputePassEncoderSetPipeline(pass, g_temporalPipeline);
         wgpuComputePassEncoderSetBindGroup(pass, 0, temporalGroup, 0, nullptr);
         wgpuComputePassEncoderDispatchWorkgroups(
-            pass, div_ceil(data.fullWidth, 8), div_ceil(data.fullHeight, 8), 1);
+            pass, div_ceil(fullWidth, 8), div_ceil(fullHeight, 8), 1);
     }
     wgpuComputePassEncoderEnd(pass);
     wgpuComputePassEncoderRelease(pass);
@@ -768,6 +780,9 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     } else {
         std::memcpy(uniforms.reproject, camera.proj_from_view, sizeof(uniforms.reproject));
     }
+    // For rotating the Depth to Normal provider's world-space normal into view space.
+    std::memcpy(
+        uniforms.view_from_world, camera.view_from_world, sizeof(uniforms.view_from_world));
     uniforms.size[0] = static_cast<float>(width);
     uniforms.size[1] = static_cast<float>(height);
     uniforms.inv_size[0] = 1.0f / uniforms.size[0];
@@ -844,8 +859,14 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     // The noise advances per frame only while accumulating; pinned otherwise (the spatial
     // denoiser alone then sees a stable pattern, matching the single-frame fallback).
     uniforms.frame_index = temporal ? g_frameIndex : 0u;
-    uniforms.flags =
-        (temporal ? 1u : 0u) | (g_historyValid ? 2u : 0u) | (distanceFade ? 4u : 0u);
+    // Prefer the Depth to Normal provider's full-res world normal when available (queues its
+    // reconstruction into the command stream ahead of our AO pass). Falls back to VBAO's own
+    // reconstruction (flags bit 3 clear) when the provider is absent or has no scene this frame.
+    DepthToNormalFrame n2dFrame = DEPTH_TO_NORMAL_FRAME_INIT;
+    const bool haveExternalNormal = svc_n2d != nullptr &&
+        svc_n2d->get_frame(mod_ctx, &n2dFrame) == MOD_OK && n2dFrame.normal != nullptr;
+    uniforms.flags = (temporal ? 1u : 0u) | (g_historyValid ? 2u : 0u) |
+        (distanceFade ? 4u : 0u) | (haveExternalNormal ? 8u : 0u);
 
     GfxRange uniformRange{0, 0};
     if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &uniformRange) != MOD_OK) {
@@ -870,12 +891,13 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDenoisePasses, 1), 0, 3));
     computePayload.uniform_offset = uniformRange.offset;
     computePayload.uniform_size = uniformRange.size;
-    computePayload.width = width;
-    computePayload.height = height;
-    computePayload.fullWidth = resolved.width;
-    computePayload.fullHeight = resolved.height;
+    computePayload.chainSize = (width << 16) | height;
+    computePayload.fullSize = (resolved.width << 16) | resolved.height;
     computePayload.run_temporal = temporal ? 1u : 0u;
     computePayload.denoise_passes = denoisePasses;
+    // The AO pass samples binding 5 only when flags bit 3 is set; stand in with the depth
+    // snapshot (a texture_2d<f32>) otherwise so the bind group is always complete.
+    computePayload.d2nNormal = haveExternalNormal ? n2dFrame.normal : computePayload.depth;
     if (svc_gfx->push_compute(mod_ctx, g_computeType, &computePayload, sizeof(computePayload)) !=
         MOD_OK)
     {

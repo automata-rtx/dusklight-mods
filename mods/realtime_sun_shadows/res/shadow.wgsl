@@ -63,6 +63,12 @@ struct Uniforms {
 @group(0) @binding(6) var shadow_map1: texture_2d<f32>;
 @group(0) @binding(7) var shadow_map2: texture_2d<f32>;
 @group(0) @binding(8) var shadow_map3: texture_2d<f32>;   // Link cascade
+// Non-filtering, clamp-to-edge sampler used only by textureGather in the PCF inner loop: one
+// gather fetches the 2x2 depth neighborhood the manual bilinear used to read as four separate
+// textureLoads. The maps are R32Float (unfilterable), so this must be a non-filtering sampler;
+// clamp-to-edge reproduces the old per-texel clamp at map borders. The mod creates it via raw
+// wgpu (it owns the device) - no gfx-service sampler API is needed.
+@group(0) @binding(9) var shadow_sampler: sampler;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -89,24 +95,37 @@ fn load_map(map: u32, texel: vec2<i32>) -> f32 {
     }
 }
 
-// Returns 1.0 when the pixel at light-space depth `receiver` is shadowed by the map texel.
-fn shadow_test(map: u32, texel: vec2<i32>, receiver: f32, bias: f32) -> f32 {
-    // Reversed depth: a larger stored value is closer to the light, i.e. an occluder.
-    return select(0.0, 1.0, load_map(map, texel) > receiver + bias);
+// One textureGather fetches the 2x2 depth neighborhood around uv. WGSL can't index textures
+// dynamically, so cascade selection is a switch like load_map. WebGPU gather order is
+// (x0,y1), (x1,y1), (x1,y0), (x0,y0).
+fn gather_map(map: u32, uv: vec2f) -> vec4f {
+    switch map {
+        case 0u: { return textureGather(0, shadow_map0, shadow_sampler, uv); }
+        case 1u: { return textureGather(0, shadow_map1, shadow_sampler, uv); }
+        case 2u: { return textureGather(0, shadow_map2, shadow_sampler, uv); }
+        default: { return textureGather(0, shadow_map3, shadow_sampler, uv); }
+    }
 }
 
 // Bilinearly weighted comparison (what a hardware comparison sampler would do): filter the
 // four *comparison results*, never the depths themselves. This is what turns per-texel
-// staircases into smooth penumbra edges.
+// staircases into smooth penumbra edges. A single textureGather reads the same 2x2 the manual
+// bilinear used to fetch as four textureLoads (bit-identical texels, a quarter the fetches);
+// the comparison and bilinear weighting are unchanged. The gather picks the texels at
+// floor(uv*size - 0.5)..+1, matching the base/fraction computed here.
 fn shadow_compare_bilinear(map: u32, light_uv: vec2f, receiver: f32, bias: f32) -> f32 {
     let coordinates = light_uv * uniforms.map_size[map] - 0.5;
     let base = floor(coordinates);
     let fraction = coordinates - base;
-    let texel = vec2<i32>(base);
-    let s00 = shadow_test(map, texel, receiver, bias);
-    let s10 = shadow_test(map, texel + vec2<i32>(1i, 0i), receiver, bias);
-    let s01 = shadow_test(map, texel + vec2<i32>(0i, 1i), receiver, bias);
-    let s11 = shadow_test(map, texel + vec2<i32>(1i, 1i), receiver, bias);
+    let depths = gather_map(map, light_uv);
+    // Reversed depth: a larger stored value is closer to the light, i.e. an occluder.
+    let threshold = receiver + bias;
+    let occ = select(vec4f(0.0), vec4f(1.0), depths > vec4f(threshold));
+    // Remap gather order (x0y1, x1y1, x1y0, x0y0) -> (s00, s10, s01, s11).
+    let s00 = occ.w;
+    let s10 = occ.z;
+    let s01 = occ.x;
+    let s11 = occ.y;
     let top = mix(s00, s10, fraction.x);
     let bottom = mix(s01, s11, fraction.x);
     return mix(top, bottom, fraction.y);

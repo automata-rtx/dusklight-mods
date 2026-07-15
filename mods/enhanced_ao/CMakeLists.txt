@@ -13,7 +13,12 @@ if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 endif ()
 
 add_mod(enhanced_ao
+    FEATURES webgpu
     SOURCES  src/mod.cpp
     MOD_JSON mod.json
     RES_DIR  res
 )
+
+# Optional integration with the Depth to Normal provider mod (shared service header).
+target_include_directories(enhanced_ao PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../depth_to_normal/include)

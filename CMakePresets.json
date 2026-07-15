@@ -1,0 +1,29 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "windows-clang",
+      "displayName": "Windows (clang-cl) - REQUIRED for working hooks",
+      "description": "Builds the game-linked mods with clang-cl. Plain MSVC (cl) mishandles the mod SDK's modmeta section and the game refuses the hooks ('undeclared target'). Pass -DDUSK_GAME_EXE=<path to sdk/windows-x86_64.lib (a.k.a. build/.../dusklight_imports.lib)>.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "linux",
+      "displayName": "Linux compile-check (no game library)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": { "MODS_BUILD_TOOLS": "ON" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "windows-clang", "configurePreset": "windows-clang" },
+    { "name": "linux", "configurePreset": "linux" }
+  ]
+}

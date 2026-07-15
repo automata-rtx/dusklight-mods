@@ -15,6 +15,7 @@ set(DUSK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/extern/dusklight" CACHE PATH
 add_subdirectory("${DUSK_DIR}/sdk" dusk-sdk EXCLUDE_FROM_ALL)
 
 add_subdirectory(mods/deferred_fog)
+add_subdirectory(mods/depth_to_normal)
 add_subdirectory(mods/enhanced_ao)
 add_subdirectory(mods/realtime_sun_shadows)
 

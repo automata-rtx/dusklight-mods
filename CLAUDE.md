@@ -45,6 +45,16 @@ The user typically does not build locally. Iteration loop:
 
 ## Hard constraints
 
+- **Windows mods MUST be built with clang-cl, not plain MSVC (`cl`).** The mod SDK places its
+  `modmeta` records via `__declspec(allocate("modmeta$d"))`, and the `DEFINE_HOOK` records are
+  template statics. `cl` mishandles this: it strips the hook records under `/OPT:REF` (Release)
+  and emits a malformed, over-padded section otherwise, so the game reports
+  *"tried to hook undeclared target … hook targets must be declared with DEFINE_HOOK"* and the
+  game-linked mods fail to load. The SDK only grants the retention (`used`) attribute under
+  `__clang__`. Configure with `-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl`
+  (or the `windows-clang` CMake preset). CI's Windows job and the `hook-repro` regression guard
+  (`tools/hook_repro/`) both enforce this. Service-only mods (VBAO, Depth-to-Normal) have no
+  hooks and are unaffected.
 - **Uniform structs are mirrored C ↔ WGSL.** Any change must keep the byte layouts identical
   on both sides and the total size a multiple of 16 (there are `static_assert`s — keep them
   true, don't delete them). Scalars are packed to avoid vec3 16-byte alignment traps.
@@ -56,10 +66,13 @@ The user typically does not build locally. Iteration loop:
 - **Reversed-Z everywhere** (1 = near). Sky pixels have raw depth 0.
 - **VBAO stays service-only.** If a feature seems to need game code, it belongs in the shadow
   mod or needs an upstream service extension — don't add game includes to enhanced_ao.
-- **The ABI pin**: `extern/dusklight` (submodule) and `RELEASE_TAG` in
-  `.github/workflows/build.yml` point at the `platform-v1` release of
-  `automata-rtx/dusklight-ao` — the exact game build the user has installed. Never bump one
-  without the other, and never bump either as a side effect of a mod change.
+- **The ABI pin**: `extern/dusklight` (submodule) is pinned to a **mainline Dusklight** commit
+  carrying the #2215 mod SDK (static `modmeta` metadata, `MOD_ABI_VERSION 1`, headers under
+  `sdk/include/mods`, `add_mod FEATURES`). The mods must be built against the SDK matching the
+  game build the user runs. The Linux CI job compile-checks against this SDK with no game lib;
+  the Windows `.dusk` job needs the game's import library and is gated on the `PLATFORM_RELEASE_TAG`
+  repo variable (unset = skipped; build locally with `-DDUSK_GAME_EXE=<sdk/windows-<arch>.lib>`).
+  Never bump the submodule as a side effect of a mod change.
 
 ## Re-platforming (moving to a newer base game)
 
