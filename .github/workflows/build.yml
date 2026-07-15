@@ -30,13 +30,33 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get -y install ninja-build
+          sudo apt-get -y install ninja-build unzip
 
       - name: Configure
         run: cmake -B build -G Ninja -DMODS_BUILD_TOOLS=ON
 
       - name: Build mods + validator
         run: cmake --build build
+
+      - name: Verify mod bundle layout (new /lib/<platform>/ layout, not old root-level)
+        run: |
+          shopt -s nullglob
+          pkgs=(build/mods/*.dusk)
+          if [ ${#pkgs[@]} -eq 0 ]; then echo "no .dusk packages produced"; exit 1; fi
+          status=0
+          for d in "${pkgs[@]}"; do
+            echo "=== $(basename "$d") ==="
+            unzip -Z1 "$d"
+            # The mainline loader rejects any native library at the zip root (old layout);
+            # the new add_mod stages it at lib/<platform>/mod.<ext>.
+            if unzip -Z1 "$d" | grep -qE '^[^/]+\.(so|dll|dylib)$'; then
+              echo "FAIL: native library at bundle root -> old layout (loader rejects this)"; status=1
+            fi
+            if ! unzip -Z1 "$d" | grep -qE '^lib/[^/]+/mod\.(so|dll|dylib)$'; then
+              echo "FAIL: no lib/<platform>/mod.* entry (expected new layout)"; status=1
+            fi
+          done
+          exit $status
 
       - name: Validate WGSL shaders
         run: |
