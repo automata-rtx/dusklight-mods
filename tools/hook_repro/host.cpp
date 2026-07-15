@@ -8,6 +8,7 @@
 // address math the game uses. If a standalone-built mod's DEFINE_HOOK records do not resolve
 // self-consistently, this prints "REPRODUCED"; otherwise it prints "OK".
 #include <windows.h>
+#include <psapi.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -135,8 +136,45 @@ int main() {
         }
     }
 
+    // Diagnostic: scan the whole loaded image for HOOK_FN record signatures. If records exist
+    // OUTSIDE [records_begin, records_end), MSVC placed the DEFINE_HOOK template statics outside the
+    // modmeta section (ignoring __declspec(allocate)) and the loader can never see them.
+    MODULEINFO mi{};
+    if (GetModuleInformation(GetCurrentProcess(), dll, &mi, sizeof(mi))) {
+        const auto* imgBase = static_cast<const uint8_t*>(mi.lpBaseOfDll);
+        const auto* imgEnd = imgBase + mi.SizeOfImage;
+        int outside = 0;
+        const uint8_t* p = imgBase;
+        MEMORY_BASIC_INFORMATION mbi{};
+        while (p < imgEnd && VirtualQuery(p, &mbi, sizeof(mbi)) != 0) {
+            const auto* rstart = static_cast<const uint8_t*>(mbi.BaseAddress);
+            const auto* rend = rstart + mbi.RegionSize;
+            const bool readable = mbi.State == MEM_COMMIT &&
+                (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                   PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0 &&
+                (mbi.Protect & PAGE_GUARD) == 0;
+            if (readable) {
+                const uint8_t* scanEnd = rend < imgEnd ? rend : imgEnd;
+                for (const uint8_t* q = rstart; q + sizeof(ModMetaHookFn) <= scanEnd; q += 8) {
+                    const auto* rec = reinterpret_cast<const ModMetaRecord*>(q);
+                    if (rec->kind == MOD_META_HOOK_FN && rec->size == sizeof(ModMetaHookFn)) {
+                        const auto* h = reinterpret_cast<const ModMetaHookFn*>(q);
+                        const bool inSection = q >= begin && q < end;
+                        if (!inSection && h->target != nullptr) {
+                            ++outside;
+                            std::printf("  MISPLACED HOOK_FN record @%p target=%p (outside modmeta)\n",
+                                static_cast<const void*>(q), h->target);
+                        }
+                    }
+                }
+            }
+            p = rend;
+        }
+        std::printf("HOOK_FN records located OUTSIDE the modmeta section: %d\n", outside);
+    }
+
     if (hookFns.empty()) {
-        std::printf("RESULT: INCONCLUSIVE (no HOOK_FN records parsed)\n");
+        std::printf("RESULT: INCONCLUSIVE (no HOOK_FN records in modmeta section)\n");
         return 2;
     }
     if (undeclared != 0) {

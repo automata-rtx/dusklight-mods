@@ -16,6 +16,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_executable(host host.cpp)
 set_target_properties(host PROPERTIES ENABLE_EXPORTS ON)
 target_include_directories(host PRIVATE "${DUSK_DIR}/sdk/include")
+target_link_libraries(host PRIVATE psapi)
 
 # The test mod, built like a real mod: modmeta section, MultiThreadedDLL runtime, game feature,
 # linked against the host's import library.

@@ -111,6 +111,15 @@ jobs:
           cd build-repro-rel
           ./host.exe
 
+      - name: Reconfigure + run with clang-cl (does it place records correctly?)
+        working-directory: ${{ github.workspace }}
+        continue-on-error: true
+        run: |
+          cmake -S tools/hook_repro -B build-repro-clang -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+          cmake --build build-repro-clang
+          cd build-repro-clang
+          ./host.exe
+
   build-windows:
     name: Build mods (Windows x86_64)
     runs-on: windows-latest
