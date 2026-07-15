@@ -70,6 +70,47 @@ jobs:
           done
           exit $status
 
+  hook-repro:
+    name: Hook resolution reproduction (Windows)
+    # Self-contained: a stub "game" host replays the loader's hook-resolution + declared-target
+    # logic against a real MSVC-built mod, to reproduce the "undeclared target" failure without a
+    # real game binary. Always runs; needs no game import library.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Enable Visual Studio environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Install dependencies
+        run: choco install ninja
+
+      - name: Configure (RelWithDebInfo, matching the game + first failing user build)
+        run: >
+          cmake -S tools/hook_repro -B build-repro -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build-repro
+
+      - name: Run reproduction (RelWithDebInfo)
+        working-directory: build-repro
+        continue-on-error: true
+        run: ./host.exe
+
+      - name: Reconfigure + run as Release (matching second failing user build)
+        working-directory: ${{ github.workspace }}
+        continue-on-error: true
+        run: |
+          cmake -S tools/hook_repro -B build-repro-rel -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-repro-rel
+          cd build-repro-rel
+          ./host.exe
+
   build-windows:
     name: Build mods (Windows x86_64)
     runs-on: windows-latest
