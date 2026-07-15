@@ -123,15 +123,15 @@ jobs:
   build-windows:
     name: Build mods (Windows x86_64)
     runs-on: windows-latest
-    # Requires a mainline Dusklight platform release providing the Windows import library, matching
-    # the game build the mods are installed into. Set the repo variable PLATFORM_RELEASE_TAG (and
-    # optionally PLATFORM_REPO) to that release's tag to enable; leave it unset to skip (the Linux
-    # job still validates the port). Build the .dusk packages locally against your own Dusklight
-    # tree with -DDUSK_GAME_EXE=<path to sdk/windows-x86_64.lib> when no release is published.
-    # Defaults to the platform-v2-test release (commit 30def245 base — matches the current
-    # submodule pin and the game build the user runs). Override PLATFORM_RELEASE_TAG / PLATFORM_REPO
-    # repo variables to point elsewhere. If the platform repo is private, add a PAT that can read it
-    # as the PLATFORM_REPO_TOKEN secret; otherwise the default GITHUB_TOKEN is used (public repos).
+    # Links the mods against the mainline Dusklight platform's Windows import library, matching the
+    # game build the mods are installed into. Defaults to the platform-v2-test release of
+    # automata-rtx/dusklight-ao (upstream main 0f2a00cd base: Windows hook fix adfb830b + enlarged
+    # aurora streaming buffers — the game build the user runs), which provides windows-amd64.lib.
+    # Override the repo variables PLATFORM_RELEASE_TAG / PLATFORM_REPO to point elsewhere. To build
+    # the .dusk packages locally without a release, configure with
+    # -DDUSK_GAME_EXE=<path to sdk/windows-x86_64.lib> from your own Dusklight tree. If the platform
+    # repo is private, add a PAT that can read it as the PLATFORM_REPO_TOKEN secret; otherwise the
+    # default GITHUB_TOKEN is used (public repos).
     env:
       PLATFORM_REPO: ${{ vars.PLATFORM_REPO || 'automata-rtx/dusklight-ao' }}
       RELEASE_TAG: ${{ vars.PLATFORM_RELEASE_TAG || 'platform-v2-test' }}

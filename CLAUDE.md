@@ -18,6 +18,11 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   instead of the fog itself. Standalone: other mods need no changes to benefit. Scenes with
   mixed fog configurations (twilight/wolf-senses special fog) auto-revert to vanilla fog.
   **Game-linked**.
+- **`mods/depth_to_normal/`** — "Depth to Normal": reconstructs a per-pixel world-space surface
+  normal (+ raw depth) from the scene depth buffer once per frame (atyuwen's 5-tap method) and
+  publishes it as a mod-exported service other mods consume via `include/depth_to_normal_service.h`.
+  Has no settings of its own. **Service-only**. Docs: `docs/depth_to_normal_plan.md`,
+  `docs/depth_to_normal_consumers.md`.
 
 Each mod is `src/mod.cpp` (host code: pipelines, config vars, UI panel) plus `res/*.wgsl`
 (shaders). Deep documentation: `docs/vbao.md`, `docs/realtime_sun_shadows.md`,
@@ -66,28 +71,50 @@ The user typically does not build locally. Iteration loop:
 - **Reversed-Z everywhere** (1 = near). Sky pixels have raw depth 0.
 - **VBAO stays service-only.** If a feature seems to need game code, it belongs in the shadow
   mod or needs an upstream service extension — don't add game includes to enhanced_ao.
-- **The ABI pin**: `extern/dusklight` (submodule) is pinned to a **mainline Dusklight** commit
-  carrying the #2215 mod SDK (static `modmeta` metadata, `MOD_ABI_VERSION 1`, headers under
-  `sdk/include/mods`, `add_mod FEATURES`). The mods must be built against the SDK matching the
-  game build the user runs. The Linux CI job compile-checks against this SDK with no game lib;
-  the Windows `.dusk` job needs the game's import library and is gated on the `PLATFORM_RELEASE_TAG`
-  repo variable (unset = skipped; build locally with `-DDUSK_GAME_EXE=<sdk/windows-<arch>.lib>`).
-  Never bump the submodule as a side effect of a mod change.
+- **The ABI pin**: `extern/dusklight` (submodule) is pinned to the current mod platform —
+  `automata-rtx/dusklight-ao` branch `claude/dusklight-platform-rebuild-rqhsaw`, which is upstream
+  mainline Dusklight `0f2a00cd` (the #2215 mod SDK — static `modmeta` metadata, `MOD_ABI_VERSION 1`,
+  headers under `sdk/include/mods`, `add_mod FEATURES` — plus the Windows hook fix `adfb830b` and
+  embedded symdb #2216) with its `extern/aurora` repointed to our enlarged-buffer aurora fork. That
+  platform is published as the **`platform-v2-test`** release. The mods must be built against the SDK
+  matching the game build the user runs. The Linux CI job compile-checks against this SDK with no
+  game lib; the Windows `.dusk` job links the platform's `windows-amd64.lib` (downloaded from
+  `platform-v2-test`; `PLATFORM_RELEASE_TAG`/`PLATFORM_REPO` repo vars override the tag/repo, or
+  build locally with `-DDUSK_GAME_EXE=<sdk/windows-<arch>.lib>`). Never bump the submodule as a
+  side effect of a mod change.
 
 ## Re-platforming (moving to a newer base game)
 
-Only when explicitly asked: build/tag a new `platform-vN` release in
-`automata-rtx/dusklight-ao` (branch `mod-platform`; its release workflow packages the game,
-`dusklight.lib`, and `dusklight.symdb`), then in this repo bump the `extern/dusklight`
-submodule and `RELEASE_TAG` together, rebuild, and have the user install the new game build
-and fresh `.dusk` files as a pair. The shadow mod is the ABI-sensitive one; VBAO usually
-just works.
+Only when explicitly asked. The platform is built from **two** repos, both on branch
+`claude/dusklight-platform-rebuild-rqhsaw`:
 
-## Related repos (context only — not needed for mod work)
+1. **`automata-rtx/aurora-ao`** carries our only aurora change: the enlarged per-frame streaming
+   buffers in `lib/gfx/common.hpp` (Index 4 MB, Vertex 16 MB, Storage 16 MB; Uniform/TextureUpload
+   24 MB). It is otherwise pristine upstream `encounter/aurora`, reset to the exact commit mainline
+   Dusklight pins (so the ABI matches). To re-platform, reset it to the new mainline-pinned aurora
+   commit and re-apply the buffer edit.
+2. **`automata-rtx/dusklight-ao`** is pristine upstream Dusklight with only two deltas: a
+   release-publishing job grafted into `.github/workflows/build.yml` (gated to this branch), and
+   its `extern/aurora` submodule repointed at the aurora-ao fork above. Pushing it (re)publishes the
+   **`platform-v2-test`** release idempotently, attaching the game zips and `windows-amd64.lib` (the
+   symbol manifest is embedded in `dusklight.exe` as of upstream #2216 — no standalone `.symdb`).
 
-- `automata-rtx/dusklight-ao` — our Dusklight fork. Branch `mod-platform` = the pinned game
-  platform (upstream + mod-API PR #2193, no bundled mods). Branch `claude/standalone-final`
-  + the `standalone-final` release = the pre-mod-API aurora-fork build; that build is the
-  ONLY way the graphics features run on iOS (code mods cannot run there — dlopen restriction),
-  so never delete it.
-- `automata-rtx/aurora-ao` — frozen aurora fork used only by that standalone build.
+Then in this repo bump the `extern/dusklight` submodule to the new platform commit (leaving
+`RELEASE_TAG`/`PLATFORM_RELEASE_TAG` at `platform-v2-test` unless you cut a new tag), rebuild, and
+have the user install the new game build (the `win32-msvc-x86_64` zip) and fresh `.dusk` files as a
+pair. The shadow mod is the ABI-sensitive one; VBAO usually just works. Keep both base repos
+pristine apart from the two deltas above so the import library matches upstream exactly.
+
+## Related repos (context only — not needed for day-to-day mod work)
+
+- `automata-rtx/dusklight-ao` — our Dusklight fork.
+  - Branch `claude/dusklight-platform-rebuild-rqhsaw` = **the current mod platform** (upstream
+    `0f2a00cd` + the release job + the aurora-ao submodule repoint), published as `platform-v2-test`.
+    This is what `extern/dusklight` pins.
+  - Branch `claude/standalone-final` + the `standalone-final` release = the pre-mod-API aurora-fork
+    build; that build is the ONLY way the graphics features run on iOS (code mods cannot run there —
+    dlopen restriction), so never delete it. (`mod-platform` / `platform-v1` are the superseded
+    first-generation platform — historical only.)
+- `automata-rtx/aurora-ao` — our aurora fork. Branch `claude/dusklight-platform-rebuild-rqhsaw` =
+  the platform's aurora (mainline-pinned + enlarged buffers, above). Other branches remain the
+  frozen fork the `standalone-final` build uses.
