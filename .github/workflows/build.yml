@@ -17,8 +17,10 @@ name: Build
 
 on:
   push:
-    branches: ["*"]
-    tags: ["*"]
+    # "**" (not "*") so branch names containing "/" match — GitHub filter globs treat "*" as
+    # not matching "/", which would silently skip our claude/... development branch.
+    branches: ["**"]
+    tags: ["**"]
     paths-ignore: ["**.md"]
   pull_request:
   workflow_dispatch:
