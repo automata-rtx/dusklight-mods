@@ -1,3 +1,8 @@
-build/
-*.dusk
-# build outputs
+/build*/
+/cmake-build-*/
+# Dusklight source tree fetched by cmake/FetchDusklight.cmake (never committed)
+/dusklight/
+dusklight/
+.idea/
+.vscode/
+.DS_Store

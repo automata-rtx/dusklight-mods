@@ -69,6 +69,13 @@ IMPORT_SERVICE(LogService, svc_log);
 
 namespace {
 
+// Hook targets declared at namespace scope (each emits a modmeta hook record the host resolves at
+// load); the generated aliases are passed to hook_add_pre in mod_initialize. GXSetFog / GFSetFog
+// share a signature but are distinct functions, so each gets its own alias.
+DEFINE_HOOK(GXSetFog, SetFog);
+DEFINE_HOOK(GFSetFog, SetGfFog);
+DEFINE_HOOK(&J3DShape::drawFast, ShapeDrawFast);
+
 ConfigVarHandle g_cvarEnabled = 0;
 ConfigVarHandle g_cvarMixedMode = 0;
 ConfigVarHandle g_cvarDebugView = 0;
@@ -303,7 +310,7 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
         // after the replay clears any leaked state. Alpha-tested cutouts replay solid (the
         // constant alpha always passes) - a leaf hole gets its tree's config, which is
         // visually negligible since fog varies smoothly.
-        const J3DShape* shape = dusk::mods::arg<const J3DShape*>(args, 0);
+        const J3DShape* shape = mods::arg<const J3DShape*>(args, 0);
         J3DMaterial* material = shape != nullptr ? shape->getMaterial() : nullptr;
         J3DPEBlock* peBlock = material != nullptr ? material->getPEBlock() : nullptr;
         J3DFog* fog = peBlock != nullptr ? peBlock->getFog() : nullptr;
@@ -339,7 +346,7 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     if (!g_scopeActive) {
         return HOOK_CONTINUE;
     }
-    const J3DShape* shape = dusk::mods::arg<const J3DShape*>(args, 0);
+    const J3DShape* shape = mods::arg<const J3DShape*>(args, 0);
     J3DMaterial* material = shape != nullptr ? shape->getMaterial() : nullptr;
     J3DPEBlock* peBlock = material != nullptr ? material->getPEBlock() : nullptr;
     J3DFog* fog = peBlock != nullptr ? peBlock->getFog() : nullptr;
@@ -365,25 +372,25 @@ HookAction on_set_fog_pre(ModContext*, void* args, void*, void*) {
     if (g_fogReplayActive) {
         // Direct (non-J3D) drawers during the ID replay: kill their fog; their color output is
         // not a valid ID (decodes as invalid -> reference config at the quad).
-        dusk::mods::arg_ref<GXFogType>(args, 0) = GX_FOG_NONE;
+        mods::arg_ref<GXFogType>(args, 0) = GX_FOG_NONE;
         return HOOK_CONTINUE;
     }
     if (!g_scopeActive) {
         return HOOK_CONTINUE;
     }
-    const auto type = dusk::mods::arg<GXFogType>(args, 0);
+    const auto type = mods::arg<GXFogType>(args, 0);
     if (type == GX_FOG_NONE) {
         return HOOK_CONTINUE;
     }
     FogConfig config;
     config.type = static_cast<uint8_t>(type);
-    config.startZ = dusk::mods::arg<float>(args, 1);
-    config.endZ = dusk::mods::arg<float>(args, 2);
-    config.nearZ = dusk::mods::arg<float>(args, 3);
-    config.farZ = dusk::mods::arg<float>(args, 4);
-    config.color = dusk::mods::arg<GXColor>(args, 5);
+    config.startZ = mods::arg<float>(args, 1);
+    config.endZ = mods::arg<float>(args, 2);
+    config.nearZ = mods::arg<float>(args, 3);
+    config.farZ = mods::arg<float>(args, 4);
+    config.color = mods::arg<GXColor>(args, 5);
     if (vote_config(config)) {
-        dusk::mods::arg_ref<GXFogType>(args, 0) = GX_FOG_NONE;
+        mods::arg_ref<GXFogType>(args, 0) = GX_FOG_NONE;
     }
     return HOOK_CONTINUE;
 }
@@ -882,7 +889,7 @@ extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError* error) {
     ModResult result = svc_resource->load(mod_ctx, "fog.wgsl", &g_shaderSource);
     if (result != MOD_OK || g_shaderSource.data == nullptr) {
-        return dusk::mods::set_error(error, result, "failed to load fog.wgsl");
+        return mods::set_error(error, result, "failed to load fog.wgsl");
     }
 
     ConfigVarDesc cvarDesc = CONFIG_VAR_DESC_INIT;
@@ -890,62 +897,62 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     cvarDesc.type = CONFIG_VAR_BOOL;
     cvarDesc.default_bool = true;
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarEnabled) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register fog option");
+        return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
     cvarDesc = CONFIG_VAR_DESC_INIT;
     cvarDesc.name = "mixedMode";
     cvarDesc.type = CONFIG_VAR_INT;
     cvarDesc.default_int = 1;
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarMixedMode) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register fog option");
+        return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
     cvarDesc = CONFIG_VAR_DESC_INIT;
     cvarDesc.name = "debugView";
     cvarDesc.type = CONFIG_VAR_INT;
     cvarDesc.default_int = 0;
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarDebugView) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register fog option");
+        return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
 
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to query device info");
+        return mods::set_error(error, MOD_ERROR, "failed to query device info");
     }
     if (!build_fog_pipeline(true, "fs_main", g_fogPipeline, g_fogLayout) ||
         !build_fog_pipeline(false, "fs_main", g_fogDebugPipeline, g_fogDebugLayout) ||
         !build_fog_pipeline(true, "fs_mixed", g_mixedPipeline, g_mixedLayout) ||
         !build_fog_pipeline(false, "fs_mixed", g_mixedDebugPipeline, g_mixedDebugLayout))
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to create fog pipeline");
+        return mods::set_error(error, MOD_ERROR, "failed to create fog pipeline");
     }
 
     GfxDrawTypeDesc drawDesc = GFX_DRAW_TYPE_DESC_INIT;
     drawDesc.label = "deferred fog";
     drawDesc.draw = on_draw;
     if (svc_gfx->register_draw_type(mod_ctx, &drawDesc, &g_drawType) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register draw type");
+        return mods::set_error(error, MOD_ERROR, "failed to register draw type");
     }
     GfxStageHookDesc stageDesc = GFX_STAGE_HOOK_DESC_INIT;
     stageDesc.callback = on_scene_begin;
     if (svc_gfx->register_stage_hook(
             mod_ctx, GFX_STAGE_SCENE_BEGIN, &stageDesc, &g_sceneBeginHook) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+        return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
     stageDesc.callback = on_scene_after_opaque;
     if (svc_gfx->register_stage_hook(
             mod_ctx, GFX_STAGE_SCENE_AFTER_OPAQUE, &stageDesc, &g_sceneAfterOpaqueHook) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+        return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
     stageDesc.callback = on_frame_before_hud;
     if (svc_gfx->register_stage_hook(
             mod_ctx, GFX_STAGE_FRAME_BEFORE_HUD, &stageDesc, &g_frameBeforeHudHook) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+        return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
 
-    if (dusk::mods::hook_add_pre<GXSetFog>(svc_hook, on_set_fog_pre) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to hook GXSetFog");
+    if (mods::hook_add_pre<SetFog>(svc_hook, on_set_fog_pre) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to hook GXSetFog");
     }
     // Environment/packet fog (grass, flowers, the dKy tevstr path) is programmed through
     // GFSetFog - a direct BP-register write, not GXSetFog - and the geometry that uses it draws
@@ -953,14 +960,14 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // identical signature to GXSetFog, so the same callback captures and suppresses it; without
     // this hook that geometry keeps its forward fog and the deferred quad double-fogs it. Only
     // one call site in the game (the grass/flower fog helper), so normal terrain is untouched.
-    if (dusk::mods::hook_add_pre<GFSetFog>(svc_hook, on_set_fog_pre) != MOD_OK) {
+    if (mods::hook_add_pre<SetGfFog>(svc_hook, on_set_fog_pre) != MOD_OK) {
         svc_log->warn(mod_ctx,
             "failed to hook GFSetFog; grass/flower fog will not be deferred (double-fogged)");
     }
     // Virtual: resolves through the symbol manifest. Without it, J3D fog can't be deferred,
     // so the mod stays loaded but inert (with vanilla fog) rather than failing.
     g_shapeHookOk =
-        dusk::mods::hook_add_pre<&J3DShape::drawFast>(svc_hook, on_shape_draw_pre) == MOD_OK;
+        mods::hook_add_pre<ShapeDrawFast>(svc_hook, on_shape_draw_pre) == MOD_OK;
     if (!g_shapeHookOk) {
         svc_log->warn(mod_ctx,
             "failed to hook J3DShape::drawFast (missing dusklight.symdb?); deferred fog is "

@@ -1,4 +1,0 @@
-[submodule "extern/dusklight"]
-	path = extern/dusklight
-	url = https://github.com/automata-rtx/dusklight-ao.git
-	branch = mod-platform

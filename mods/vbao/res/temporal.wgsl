@@ -1,4 +1,4 @@
-// Enhanced Ambient Occlusion - temporal accumulation pass.
+// VBAO (Visibility Bitmask Ambient Occlusion) - temporal accumulation pass.
 //
 // Reprojects the previous frame's accumulated AO into the current frame using the camera motion
 // (reproject = prev proj_from_world * cur world_from_view) and blends it with the current
@@ -24,6 +24,7 @@ struct Uniforms {
     projection: mat4x4f,
     inverse_projection: mat4x4f,
     reproject: mat4x4f,
+    view_from_world: mat4x4f,  // layout-only: unused here, present so the shared uniform matches vbao.wgsl + the host
     size: vec2f,        // AO chain size in pixels (may be half the render size)
     inv_size: vec2f,
     depth_scale: vec2f, // input depth snapshot pixels per chain pixel (1 or 2)

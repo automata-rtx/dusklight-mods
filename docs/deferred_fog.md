@@ -125,8 +125,8 @@ the Open Controls window.
 
 - Translucents (water, particles) blend over the *fogged* opaque scene and then receive
   their own forward fog — matching vanilla layering.
-- If the `J3DShape::drawFast` hook cannot install (missing `dusklight.symdb`), the mod
-  loads but stays inert (vanilla fog) and logs a warning.
+- If the `J3DShape::drawFast` by-name hook cannot resolve (e.g. the game's embedded symbol
+  manifest is unavailable), the mod loads but stays inert (vanilla fog) and logs a warning.
 - Degenerate fog ranges (start == end) produce a zero fog term with a 0/0 singularity in
   vanilla; the deferred pass skips the quad entirely for those.
-- ABI-coupled: rebuild against the new `dusklight.lib` after any re-platform.
+- ABI-coupled: rebuild against the new `windows-amd64.lib` import library after any re-platform.

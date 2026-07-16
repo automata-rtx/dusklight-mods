@@ -1,7 +1,8 @@
 # Mod API notes — pitfalls learned while building these mods
 
-Upstream reference: `extern/dusklight/docs/modding.md` and `extern/dusklight/include/mods/`.
-These notes are the deltas that actually bit us.
+Upstream reference: the fetched `dusklight/docs/modding.md` and `dusklight/sdk/include/mods/`
+(fetched by `cmake/FetchDusklight.cmake`; also on GitHub at
+`TwilitRealm/dusklight/blob/main/docs/modding.md`). These notes are the deltas that actually bit us.
 
 ## Uniform buffers
 
@@ -44,7 +45,7 @@ These notes are the deltas that actually bit us.
 
 - Matrices are column-major float[16], matrix × column-vector convention — the TRANSPOSE of
   the game's row-major `Mtx`. CPU-side multiplies must use the column-major helper
-  (`mat4_mul_col` in enhanced_ao), not game matrix code.
+  (`mat4_mul_col` in vbao), not game matrix code.
 - WebGPU clip conventions: `uv = (ndc.x*0.5+0.5, 0.5 - ndc.y*0.5)`. The single most
   expensive bug of the aurora era was a missed Y flip here (shadows sampled mirrored, which
   a sun-direction negation silently "fixed" — see realtime_sun_shadows.md issue 2).
@@ -54,8 +55,10 @@ These notes are the deltas that actually bit us.
 ## Hooks
 
 - Typed hooks (`hook_add_pre<&Class::method>`) resolve through the linked symbol — they work
-  without the symbol manifest. By-NAME hooks (`NamedHook`, `resolve`) need `dusklight.symdb`
-  next to the game exe (shipped in platform-v1+). Prefer typed hooks.
+  without the symbol manifest. By-NAME hooks (`NamedHook`, `resolve`) need the game's symbol
+  manifest, which is embedded inside `dusklight.exe` on the `platform-v2-test` base (upstream
+  #2216; earlier bases shipped it as a standalone `dusklight.symdb` next to the exe). Prefer
+  typed hooks.
 - On Windows/MSVC, only functions and `DUSK_GAME_DATA`-annotated data are reachable through
   the import library; un-annotated data references fail at link time.
 
@@ -68,17 +71,23 @@ These notes are the deltas that actually bit us.
 
 ## Build system
 
-- The SDK (`extern/dusklight/sdk`) provides `add_mod()`, game headers
-  (`dusklight_game_headers` INTERFACE target), and Dawn headers via a prebuilt package.
-  Nothing from the game compiles in this repo.
-- Windows: `DUSK_GAME_IMPLIB` is REQUIRED for any mod (even service-only ones — the SDK
-  refuses to configure without it). It must come from the exact game build being targeted.
-- `.dusk` = zip of {platform-arch lib, mod.json, res/}. CI's artifact contains both mods'
-  packages; the loader also picks up a `mods/` dir next to the app for dev builds.
+- The SDK (in the fetched `dusklight/sdk`) provides `add_mod()`, game headers
+  (`dusklight_game_headers` INTERFACE target), and Dawn headers via a prebuilt package. The tree is
+  fetched by `cmake/FetchDusklight.cmake` (pinned by `DUSKLIGHT_VERSION`) — nothing from the game
+  compiles in this repo.
+- On **Windows/macOS/Android**, a mod using `FEATURES game|webgpu` (all of ours) links against a
+  per-arch stub the SDK **auto-downloads** from `DUSKLIGHT_SDK_STUB_URL` (import library on Windows,
+  `bundle_loader`/`.so` stub on macOS/Android) — no manual `DUSK_GAME_EXE` needed (set it to override
+  the download). **Linux needs nothing** — game symbols resolve at load (`-Wl,--allow-shlib-undefined`).
+- Windows builds with plain MSVC (`cl`); no clang-cl override. The base game's `modmeta` parser
+  tolerates linker padding, so `DEFINE_HOOK` records register under `cl`.
+- `.dusk` = zip of {`lib/<platform>/mod.{dll,so}`, mod.json, res/}. CI builds one per platform and
+  `tools/merge_mod.py` merges them into a single cross-platform bundle (the `mods-combined`
+  artifact); the loader also picks up a `mods/` dir next to the app for dev builds.
 
 ## Validation workflow
 
-- `tools/wgsl_validate.cpp` (Dawn Null backend) catches WGSL errors offline; CI runs it on
-  every shader. Build with `-DMODS_BUILD_TOOLS=ON`.
-- The Linux CI job compiles both mods with GCC — a full type-check of mod.cpp against the
-  game headers without needing Windows.
+- CI (the template's build + combine) compiles every mod on all seven platforms; the Linux legs are
+  a fast full type-check of mod.cpp against the game headers. Shaders are validated by the game at
+  pipeline-creation time — there is no separate offline WGSL validator (it was dropped in the move to
+  the pure template; `git log` for `tools/wgsl_validate.cpp` if you want to reinstate it).

@@ -20,6 +20,7 @@
 #include "global.h"
 
 #include "bend_sss_cpu.h"
+#include "depth_to_normal_service.h"
 
 #include "JSystem/J3DGraphAnimator/J3DModel.h"
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
@@ -44,7 +45,6 @@
 #include "mods/service.hpp"
 #include "mods/svc/camera.h"
 #include "mods/svc/config.h"
-#include "mods/svc/game.h"
 #include "mods/svc/gfx.h"
 #include "mods/svc/hook.h"
 #include "mods/svc/log.h"
@@ -66,8 +66,13 @@ IMPORT_SERVICE(UiService, svc_ui);
 IMPORT_SERVICE(GfxService, svc_gfx);
 IMPORT_SERVICE(CameraService, svc_camera);
 IMPORT_SERVICE(HookService, svc_hook);
-IMPORT_SERVICE(GameService, svc_game);
 IMPORT_SERVICE(LogService, svc_log);
+// GameService is imported automatically by the SDK under `FEATURES game` (it enforces the game
+// ABI epoch); a manual IMPORT_SERVICE(GameService, ...) here would be a duplicate.
+// Realtime Sun Shadows relies on Depth to Normal for its receiver normals (a hard dependency:
+// the loader disables this mod if the provider is absent). Shadows reconstructs no normals of
+// its own anymore - it only smooths the provider's world-space normal for the bias receivers.
+IMPORT_SERVICE(DepthToNormalService, svc_n2d);
 
 namespace {
 
@@ -125,10 +130,11 @@ WGPUBindGroupLayout g_compositeLayout = nullptr;
 WGPUBindGroupLayout g_compositeDebugLayout = nullptr;
 WGPUComputePipeline g_sssPipeline = nullptr;  // Bend screen-space shadow trace
 WGPUBindGroupLayout g_sssLayout = nullptr;
-WGPUComputePipeline g_normalGenPipeline = nullptr;  // smoothed-normal buffer (normal_smooth.wgsl)
+WGPUSampler g_shadowSampler = nullptr;  // non-filtering clamp sampler for the PCF textureGather
+// The bilateral blur over the Depth to Normal provider's world-space normal (normal_smooth.wgsl).
+// Reconstruction (depth -> raw normal) lives in the provider now; shadows only smooths.
 WGPUComputePipeline g_normalBlurHPipeline = nullptr;
 WGPUComputePipeline g_normalBlurVPipeline = nullptr;
-WGPUBindGroupLayout g_normalGenLayout = nullptr;
 WGPUBindGroupLayout g_normalBlurHLayout = nullptr;
 WGPUBindGroupLayout g_normalBlurVLayout = nullptr;
 
@@ -192,6 +198,17 @@ struct MapPassOutput {
 };
 
 MapPassOutput g_mapPass;
+
+// Per-frame cache of the game-shadow-skip gate and the frustum-bypass decision. Both are
+// constant across a frame, but J3DUClipper::clip fires hundreds-to-thousands of times per
+// frame during the game's culling and its pre-hook needs the same answer every call.
+// Recomputing it there (three config reads + dKy_Indoor_check + compute_light's envlight/time
+// lookup and trig, per call) was pure waste. Refreshed once in on_scene_begin, before the
+// clip/shadow-control hooks fire (they run after SCENE_BEGIN, ahead of SCENE_AFTER_TERRAIN).
+// Default false so a clip before the first SCENE_BEGIN bypasses nothing.
+bool g_frameShadowsWanted = false;
+bool g_frameFrustumBypass = false;
+
 bool g_replayingSceneLists = false;
 bool g_replayTwoSided = false;   // twoSidedCasters, latched for the current replay
 bool g_replayLinkOnly = false;   // Link cascade replay: only models anchored near the player draw
@@ -216,10 +233,21 @@ constexpr float kMaxLightLookahead = 10000.0f;
 constexpr float kSunMoonDistance = 80000.0f;
 constexpr float kSunMoonZDistance = -48000.0f;
 
-using ClipperSphereClip = int (J3DUClipper::*)(f32 const (*)[4], Vec, f32) const;
-using ClipperBoxClip = int (J3DUClipper::*)(f32 const (*)[4], Vec*, Vec*) const;
-constexpr ClipperSphereClip kClipperSphereClip = static_cast<ClipperSphereClip>(&J3DUClipper::clip);
-constexpr ClipperBoxClip kClipperBoxClip = static_cast<ClipperBoxClip>(&J3DUClipper::clip);
+// Hook targets are declared at namespace scope with DEFINE_HOOK (each emits a modmeta hook
+// record the host resolves at load); the generated aliases are passed to hook_add_pre in
+// mod_initialize. J3DUClipper::clip is overloaded, so the exact overload is selected by cast.
+DEFINE_HOOK(&dDlst_shadowControl_c::imageDraw, GameShadowImageDraw);
+DEFINE_HOOK(&dDlst_shadowControl_c::draw, GameShadowDraw);
+DEFINE_HOOK(&drawCloudShadow, CloudShadowDraw);
+DEFINE_HOOK(
+    static_cast<int (J3DUClipper::*)(f32 const (*)[4], Vec, f32) const>(&J3DUClipper::clip),
+    ClipperSphereClip);
+DEFINE_HOOK(
+    static_cast<int (J3DUClipper::*)(f32 const (*)[4], Vec*, Vec*) const>(&J3DUClipper::clip),
+    ClipperBoxClip);
+DEFINE_HOOK(GXCopyTex, CopyTex);
+DEFINE_HOOK(GXSetCullMode, CullMode);
+DEFINE_HOOK(&J3DShape::drawFast, ShapeDrawFast);
 
 // Mirror of the WGSL Uniforms struct (keep in sync with res/shadow.wgsl). Per-cascade values
 // are vec4-shaped (index 3 = the Link cascade); biases are normalized by each cascade's own
@@ -253,12 +281,6 @@ struct ShadowUniforms {
 };
 static_assert(sizeof(ShadowUniforms) == 496);
 static_assert(sizeof(ShadowUniforms) % 16 == 0);
-
-// Mirror of the WGSL GenUniforms struct (keep in sync with res/normal_smooth.wgsl).
-struct NormalGenUniforms {
-    float world_from_proj[16];
-};
-static_assert(sizeof(NormalGenUniforms) % 16 == 0);
 
 // Mirror of the WGSL BlurUniforms struct (keep in sync with res/normal_smooth.wgsl).
 struct NormalBlurUniforms {
@@ -302,11 +324,9 @@ static_assert(sizeof(DrawPayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
 static_assert(std::is_trivially_copyable_v<DrawPayload>);
 
 struct NormalComputePayload {
-    WGPUTextureView sceneDepth;  // frame-pooled
-    WGPUTextureView normalA;     // mod-owned ping-pong (gen writes A, blur H A->B, blur V B->A)
+    WGPUTextureView d2nNormal;   // Depth to Normal provider output (external, frame-valid)
+    WGPUTextureView normalA;     // mod-owned ping-pong (blur H D2N->B, blur V B->A)
     WGPUTextureView normalB;
-    uint32_t genUniformOffset;
-    uint32_t genUniformSize;
     uint32_t blurUniformOffset;
     uint32_t blurUniformSize;
     uint32_t width;
@@ -620,9 +640,7 @@ bool build_sss_pipeline() {
 }
 
 bool build_normal_pipelines() {
-    return build_compute_pipeline("smoothed normals gen", g_normalShaderSource, "normal_gen",
-               g_normalGenPipeline, g_normalGenLayout) &&
-           build_compute_pipeline("smoothed normals blur h", g_normalShaderSource,
+    return build_compute_pipeline("smoothed normals blur h", g_normalShaderSource,
                "normal_blur_h", g_normalBlurHPipeline, g_normalBlurHLayout) &&
            build_compute_pipeline("smoothed normals blur v", g_normalShaderSource,
                "normal_blur_v", g_normalBlurVPipeline, g_normalBlurVLayout);
@@ -735,9 +753,9 @@ constexpr uint32_t div_ceil(uint32_t numerator, uint32_t denominator) {
     return (numerator + denominator - 1) / denominator;
 }
 
-// Render worker thread: build the smoothed-normal buffer - gen reconstructs per-pixel normals
-// into A, then one separable depth-aware Gaussian (H: A->B, V: B->A) whose radius came from
-// the host, so A holds the final smoothed normals.
+// Render worker thread: smooth the provider's world-space normal - one separable depth-aware
+// Gaussian (H: D2N->B, V: B->A) whose radius came from the host, so A holds the final smoothed
+// normals. Reconstruction is the Depth to Normal provider's job now; this only blurs.
 void on_normal_compute(
     ModContext*, const GfxComputeContext* ctx, const void* payload, size_t payloadSize, void*) {
     if (payloadSize != sizeof(NormalComputePayload)) {
@@ -745,8 +763,8 @@ void on_normal_compute(
     }
     NormalComputePayload data;
     std::memcpy(&data, payload, sizeof(data));
-    if (data.sceneDepth == nullptr || data.normalA == nullptr || data.normalB == nullptr ||
-        g_normalGenPipeline == nullptr)
+    if (data.d2nNormal == nullptr || data.normalA == nullptr || data.normalB == nullptr ||
+        g_normalBlurHPipeline == nullptr)
     {
         return;
     }
@@ -770,21 +788,17 @@ void on_normal_compute(
         return wgpuDeviceCreateBindGroup(ctx->device, &bindGroupDesc);
     };
 
-    WGPUBindGroup genGroup = makeGroup(g_normalGenLayout, data.sceneDepth, data.normalA,
-        data.genUniformOffset, data.genUniformSize);
-    WGPUBindGroup blurH = makeGroup(g_normalBlurHLayout, data.normalA, data.normalB,
+    // H reads the provider's normal into B, V smooths B back into A; the composite reads A.
+    WGPUBindGroup blurH = makeGroup(g_normalBlurHLayout, data.d2nNormal, data.normalB,
         data.blurUniformOffset, data.blurUniformSize);
     WGPUBindGroup blurV = makeGroup(g_normalBlurVLayout, data.normalB, data.normalA,
         data.blurUniformOffset, data.blurUniformSize);
-    if (genGroup != nullptr && blurH != nullptr && blurV != nullptr) {
+    if (blurH != nullptr && blurV != nullptr) {
         WGPUComputePassDescriptor passDesc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
         passDesc.label = {"smoothed normals", WGPU_STRLEN};
         WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(ctx->encoder, &passDesc);
         const uint32_t groupsX = div_ceil(data.width, 8);
         const uint32_t groupsY = div_ceil(data.height, 8);
-        wgpuComputePassEncoderSetPipeline(pass, g_normalGenPipeline);
-        wgpuComputePassEncoderSetBindGroup(pass, 0, genGroup, 0, nullptr);
-        wgpuComputePassEncoderDispatchWorkgroups(pass, groupsX, groupsY, 1);
         wgpuComputePassEncoderSetPipeline(pass, g_normalBlurHPipeline);
         wgpuComputePassEncoderSetBindGroup(pass, 0, blurH, 0, nullptr);
         wgpuComputePassEncoderDispatchWorkgroups(pass, groupsX, groupsY, 1);
@@ -794,7 +808,7 @@ void on_normal_compute(
         wgpuComputePassEncoderEnd(pass);
         wgpuComputePassEncoderRelease(pass);
     }
-    for (WGPUBindGroup group : {genGroup, blurH, blurV}) {
+    for (WGPUBindGroup group : {blurH, blurV}) {
         if (group != nullptr) {
             wgpuBindGroupRelease(group);
         }
@@ -870,7 +884,8 @@ void on_draw(
         data.debug_mode != 0 ? g_compositeDebugPipeline : g_compositePipeline;
     WGPUBindGroupLayout layout = data.debug_mode != 0 ? g_compositeDebugLayout : g_compositeLayout;
     if (data.sceneDepth == nullptr || data.lightColor == nullptr ||
-        data.screenShadow == nullptr || data.smoothNormal == nullptr || pipeline == nullptr)
+        data.screenShadow == nullptr || data.smoothNormal == nullptr || pipeline == nullptr ||
+        g_shadowSampler == nullptr)
     {
         return;
     }
@@ -880,10 +895,10 @@ void on_draw(
         }
     }
 
-    WGPUBindGroupEntry entries[9] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+    WGPUBindGroupEntry entries[10] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
         WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
         WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
-        WGPU_BIND_GROUP_ENTRY_INIT};
+        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
     entries[0].binding = 0;
     entries[0].textureView = data.sceneDepth;
     entries[1].binding = 1;
@@ -904,9 +919,11 @@ void on_draw(
     entries[7].textureView = data.shadowMap[2];
     entries[8].binding = 8;
     entries[8].textureView = data.shadowMap[3];
+    entries[9].binding = 9;
+    entries[9].sampler = g_shadowSampler;
     WGPUBindGroupDescriptor bindGroupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bindGroupDesc.layout = layout;
-    bindGroupDesc.entryCount = 9;
+    bindGroupDesc.entryCount = 10;
     bindGroupDesc.entries = entries;
     WGPUBindGroup bindGroup = wgpuDeviceCreateBindGroup(ctx->device, &bindGroupDesc);
     if (bindGroup == nullptr) {
@@ -1020,7 +1037,7 @@ bool indoor_blocked() {
     return get_bool_option(g_cvarIndoorDisable, true) && dKy_Indoor_check() != 0;
 }
 
-bool dynamic_shadows_wanted() {
+bool compute_dynamic_shadows_wanted() {
     // Both gates matter: with the shadow map disabled (screen-space-only mode) the game's
     // own real/blob shadows must come back, so the skip hooks go inactive.
     if (!get_bool_option(g_cvarEnabled, true) || !get_bool_option(g_cvarShadowMap, true) ||
@@ -1036,15 +1053,25 @@ bool dynamic_shadows_wanted() {
     return compute_light(dirToLight, fade);
 }
 
+// Refresh the per-frame gate cache (see g_frameShadowsWanted). Called once from on_scene_begin,
+// so the clip / shadow-control pre-hooks just read a bool instead of recomputing the gate on
+// every call. g_sceneCamera is captured earlier in the same callback, matching the previous
+// behavior exactly (the hooks already read the scene-begin capture) - only the cost moves.
+void update_frame_shadow_gate() {
+    g_frameShadowsWanted = compute_dynamic_shadows_wanted();
+    g_frameFrustumBypass =
+        g_frameShadowsWanted && get_bool_option(g_cvarNoFrustumClipping, false);
+}
+
 HookAction on_game_shadow_pre(ModContext*, void*, void*, void*) {
-    if (!dynamic_shadows_wanted()) {
+    if (!g_frameShadowsWanted) {
         return HOOK_CONTINUE;
     }
     return HOOK_SKIP_ORIGINAL;
 }
 
 HookAction on_frustum_clip_pre(ModContext*, void*, void* retval, void*) {
-    if (!get_bool_option(g_cvarNoFrustumClipping, false) || !dynamic_shadows_wanted()) {
+    if (!g_frameFrustumBypass) {
         return HOOK_CONTINUE;
     }
     if (retval != nullptr) {
@@ -1066,7 +1093,7 @@ HookAction on_copy_tex_pre(ModContext*, void*, void*, void*) {
 // Direct GX drawers pick their cull mode up from this call, so rewriting the argument covers them.
 HookAction on_cull_mode_pre(ModContext*, void* args, void*, void*) {
     if (g_replayingSceneLists && g_replayTwoSided) {
-        dusk::mods::arg_ref<GXCullMode>(args, 0) = GX_CULL_NONE;
+        mods::arg_ref<GXCullMode>(args, 0) = GX_CULL_NONE;
     }
     return HOOK_CONTINUE;
 }
@@ -1108,7 +1135,7 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     // degenerate bounds -> draw.
     if (g_replayCullActive && !g_replayLinkOnly) {
         J3DModel* model = j3dSys.getModel();
-        J3DShape* shape = const_cast<J3DShape*>(dusk::mods::arg<const J3DShape*>(args, 0));
+        J3DShape* shape = const_cast<J3DShape*>(mods::arg<const J3DShape*>(args, 0));
         if (model != nullptr && shape != nullptr) {
             const Vec* mn = shape->getMin();
             const Vec* mx = shape->getMax();
@@ -1156,7 +1183,7 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     if (!g_replayTwoSided) {
         return HOOK_CONTINUE;
     }
-    const J3DShape* shape = dusk::mods::arg<const J3DShape*>(args, 0);
+    const J3DShape* shape = mods::arg<const J3DShape*>(args, 0);
     J3DMaterial* material = shape != nullptr ? shape->getMaterial() : nullptr;
     if (material == nullptr || material->getColorBlock() == nullptr ||
         material->getIndBlock() == nullptr)
@@ -1212,6 +1239,9 @@ void on_scene_begin(ModContext*, const GfxStageContext* stageCtx, void*) {
     tick_retired_normal_targets();
     restore_actual_light_debug();
     capture_scene_camera(stageCtx);
+    // Refresh the game-shadow-skip / frustum-bypass gate for this frame before the game's
+    // clip and shadow-control calls fire (they run after this SCENE_BEGIN callback).
+    update_frame_shadow_gate();
     if (!get_bool_option(g_cvarEnabled, true) || get_debug_mode() != 9) {
         return;
     }
@@ -1314,8 +1344,15 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
         0.0f, 0.0f, static_cast<float>(mapSize), static_cast<float>(mapSize), 0.0f, 1.0f);
     GXSetScissorRender(0, 0, mapSize, mapSize);
     dKy_setLight();
-    GXSetColorUpdate(GX_TRUE);
-    GXSetAlphaUpdate(GX_TRUE);
+    // A shadow map only needs DEPTH: the resolved color is read solely by the Camera Replay
+    // debug view (fs_main light_color case). For every other frame, disabling color writes
+    // skips the per-pixel color ROP during the replay and lets the resolve below drop the
+    // full-size color copy and its target - the single biggest waste in the map render, and
+    // it scales with map size and cascade count. Alpha TEST still runs (it gates on the shader,
+    // not on color update), so alpha-cut foliage keeps punching holes in the depth map.
+    const GXBool writeColor = cameraReplayDebug ? GX_TRUE : GX_FALSE;
+    GXSetColorUpdate(writeColor);
+    GXSetAlphaUpdate(writeColor);
     GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
     g_replayTwoSided = get_bool_option(g_cvarTwoSidedCasters, true);
     g_replayLinkOnly = linkOnly;
@@ -1361,11 +1398,11 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
     restore_game_camera();
 
     GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
-    resolveDesc.color = true;
+    resolveDesc.color = cameraReplayDebug;  // depth-only except the Camera Replay debug view
     resolveDesc.depth = true;
     GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
     if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) != MOD_OK ||
-        resolved.color == nullptr || resolved.depth == nullptr)
+        resolved.depth == nullptr || (cameraReplayDebug && resolved.color == nullptr))
     {
         return false;
     }
@@ -1569,17 +1606,17 @@ bool push_sss_dispatches(
 // screen (and looks the same) at any internal resolution. Returns false when the buffer
 // isn't available (composite falls back to the inline per-pixel cross).
 bool push_normal_dispatches(const GfxResolvedTargets& resolved, int64_t smoothing) {
-    if (g_normalGenPipeline == nullptr || resolved.height == 0 ||
+    if (g_normalBlurHPipeline == nullptr || resolved.height == 0 ||
         !ensure_normal_targets(resolved.width, resolved.height))
     {
         return false;
     }
 
-    NormalGenUniforms genUniforms{};
-    std::memcpy(genUniforms.world_from_proj, g_sceneCamera.info.world_from_proj,
-        sizeof(genUniforms.world_from_proj));
-    GfxRange genRange{0, 0};
-    if (svc_gfx->push_uniform(mod_ctx, &genUniforms, sizeof(genUniforms), &genRange) != MOD_OK) {
+    // The raw world-space normal comes from the Depth to Normal provider (this frame). It has no
+    // normal to smooth if there is no populated scene (a 2D screen), which the composite already
+    // gates on - so a failure here just drops the smoothed-normal buffer for the frame.
+    DepthToNormalFrame frame = DEPTH_TO_NORMAL_FRAME_INIT;
+    if (svc_n2d->get_frame(mod_ctx, &frame) != MOD_OK || frame.normal == nullptr) {
         return false;
     }
 
@@ -1596,11 +1633,9 @@ bool push_normal_dispatches(const GfxResolvedTargets& resolved, int64_t smoothin
     }
 
     NormalComputePayload payload{};
-    payload.sceneDepth = resolved.depth;
+    payload.d2nNormal = frame.normal;
     payload.normalA = g_normalTargets.views[0];
     payload.normalB = g_normalTargets.views[1];
-    payload.genUniformOffset = genRange.offset;
-    payload.genUniformSize = genRange.size;
     payload.blurUniformOffset = blurRange.offset;
     payload.blurUniformSize = blurRange.size;
     payload.width = resolved.width;
@@ -1627,10 +1662,11 @@ void composite_map_pass(int64_t debugMode) {
     // Indoors, the shadow map is suppressed (it reads as fully shadowed under a sky-light
     // map) but the screen-space shadows stay - so indoors is just screen-space-only mode.
     const bool mapWanted = get_bool_option(g_cvarShadowMap, true) && !indoor_blocked();
+    // Readiness keys off the depth map only: color is resolved just for the Camera Replay
+    // debug view now (depth-only replay otherwise), so lightColor is null in normal frames.
     bool mapReady = mapWanted && mapPass.ready && mapPass.cascadeCount > 0;
     for (int i = 0; mapReady && i < mapPass.cascadeCount; ++i) {
-        mapReady = mapPass.cascades[i].ready && mapPass.cascades[i].shadowMap != nullptr &&
-                   mapPass.cascades[i].lightColor != nullptr;
+        mapReady = mapPass.cascades[i].ready && mapPass.cascades[i].shadowMap != nullptr;
     }
     const bool linkReady = mapReady && mapPass.linkReady &&
                            mapPass.cascades[kLinkCascade].shadowMap != nullptr;
@@ -1771,8 +1807,12 @@ void composite_map_pass(int64_t debugMode) {
             mapReady && (i < mapPass.cascadeCount || (i == kLinkCascade && linkReady));
         payload.shadowMap[i] = slotReady ? mapPass.cascades[i].shadowMap : resolved.depth;
     }
-    payload.lightColor =
-        mapReady ? mapPass.cascades[mapPass.cascadeCount - 1].lightColor : resolved.depth;
+    // Color is resolved only for the Camera Replay debug view (depth-only otherwise), so the
+    // far cascade's lightColor is usually null - stand it in with the scene depth, which the
+    // shader never samples outside the light-color debug modes.
+    const WGPUTextureView farLightColor =
+        mapReady ? mapPass.cascades[mapPass.cascadeCount - 1].lightColor : nullptr;
+    payload.lightColor = farLightColor != nullptr ? farLightColor : resolved.depth;
     payload.screenShadow = sssReady ? g_sssTarget.view : resolved.depth;
     payload.smoothNormal = normalsReady ? g_normalTargets.views[0] : resolved.depth;
     payload.uniform_offset = uniformRange.offset;
@@ -2064,7 +2104,7 @@ ModResult register_bool_option(
     cvarDesc.type = CONFIG_VAR_BOOL;
     cvarDesc.default_bool = defaultValue;
     if (svc_config->register_var(mod_ctx, &cvarDesc, &outHandle) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register shadow option");
+        return mods::set_error(error, MOD_ERROR, "failed to register shadow option");
     }
     return MOD_OK;
 }
@@ -2076,7 +2116,7 @@ ModResult register_int_option(
     cvarDesc.type = CONFIG_VAR_INT;
     cvarDesc.default_int = defaultValue;
     if (svc_config->register_var(mod_ctx, &cvarDesc, &outHandle) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register shadow option");
+        return mods::set_error(error, MOD_ERROR, "failed to register shadow option");
     }
     return MOD_OK;
 }
@@ -2088,15 +2128,15 @@ extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError* error) {
     ModResult result = svc_resource->load(mod_ctx, "shadow.wgsl", &g_shaderSource);
     if (result != MOD_OK || g_shaderSource.data == nullptr) {
-        return dusk::mods::set_error(error, result, "failed to load shadow.wgsl");
+        return mods::set_error(error, result, "failed to load shadow.wgsl");
     }
     result = svc_resource->load(mod_ctx, "bend_sss.wgsl", &g_sssShaderSource);
     if (result != MOD_OK || g_sssShaderSource.data == nullptr) {
-        return dusk::mods::set_error(error, result, "failed to load bend_sss.wgsl");
+        return mods::set_error(error, result, "failed to load bend_sss.wgsl");
     }
     result = svc_resource->load(mod_ctx, "normal_smooth.wgsl", &g_normalShaderSource);
     if (result != MOD_OK || g_normalShaderSource.data == nullptr) {
-        return dusk::mods::set_error(error, result, "failed to load normal_smooth.wgsl");
+        return mods::set_error(error, result, "failed to load normal_smooth.wgsl");
     }
 
     result = register_bool_option("effectEnabled", true, g_cvarEnabled, error);
@@ -2240,92 +2280,108 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return result;
     }
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to query device info");
+        return mods::set_error(error, MOD_ERROR, "failed to query device info");
     }
     if (!build_composite_pipeline(true, g_compositePipeline, g_compositeLayout) ||
         !build_composite_pipeline(false, g_compositeDebugPipeline, g_compositeDebugLayout))
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to create composite pipeline");
+        return mods::set_error(error, MOD_ERROR, "failed to create composite pipeline");
     }
     if (!build_sss_pipeline()) {
-        return dusk::mods::set_error(
+        return mods::set_error(
             error, MOD_ERROR, "failed to create screen-space shadow pipeline");
     }
     if (!build_normal_pipelines()) {
-        return dusk::mods::set_error(
+        return mods::set_error(
             error, MOD_ERROR, "failed to create normal smoothing pipelines");
+    }
+    // Non-filtering, clamp-to-edge sampler for the PCF textureGather (res/shadow.wgsl). The
+    // shadow maps are R32Float (unfilterable), so the sampler must be non-filtering; clamp
+    // reproduces the old per-texel border clamp. Mod-owned (the device outlives all mods).
+    WGPUSamplerDescriptor samplerDesc = WGPU_SAMPLER_DESCRIPTOR_INIT;
+    samplerDesc.label = {"shadow pcf gather", WGPU_STRLEN};
+    samplerDesc.addressModeU = WGPUAddressMode_ClampToEdge;
+    samplerDesc.addressModeV = WGPUAddressMode_ClampToEdge;
+    samplerDesc.addressModeW = WGPUAddressMode_ClampToEdge;
+    samplerDesc.magFilter = WGPUFilterMode_Nearest;
+    samplerDesc.minFilter = WGPUFilterMode_Nearest;
+    samplerDesc.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+    samplerDesc.maxAnisotropy = 1;
+    g_shadowSampler = wgpuDeviceCreateSampler(g_deviceInfo.device, &samplerDesc);
+    if (g_shadowSampler == nullptr) {
+        return mods::set_error(error, MOD_ERROR, "failed to create shadow PCF sampler");
     }
 
     GfxDrawTypeDesc drawDesc = GFX_DRAW_TYPE_DESC_INIT;
     drawDesc.label = "sun shadow composite";
     drawDesc.draw = on_draw;
     if (svc_gfx->register_draw_type(mod_ctx, &drawDesc, &g_drawType) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register draw type");
+        return mods::set_error(error, MOD_ERROR, "failed to register draw type");
     }
     GfxComputeTypeDesc computeDesc = GFX_COMPUTE_TYPE_DESC_INIT;
     computeDesc.label = "bend screen-space shadows";
     computeDesc.callback = on_sss_compute;
     if (svc_gfx->register_compute_type(mod_ctx, &computeDesc, &g_sssComputeType) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register compute type");
+        return mods::set_error(error, MOD_ERROR, "failed to register compute type");
     }
     computeDesc = GFX_COMPUTE_TYPE_DESC_INIT;
     computeDesc.label = "smoothed normals";
     computeDesc.callback = on_normal_compute;
     if (svc_gfx->register_compute_type(mod_ctx, &computeDesc, &g_normalComputeType) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register compute type");
+        return mods::set_error(error, MOD_ERROR, "failed to register compute type");
     }
     GfxStageHookDesc stageDesc = GFX_STAGE_HOOK_DESC_INIT;
     stageDesc.callback = on_scene_begin;
     if (svc_gfx->register_stage_hook(
             mod_ctx, GFX_STAGE_SCENE_BEGIN, &stageDesc, &g_sceneBeginHook) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+        return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
     stageDesc.callback = on_scene_after_terrain;
     if (svc_gfx->register_stage_hook(
             mod_ctx, GFX_STAGE_SCENE_AFTER_TERRAIN, &stageDesc, &g_sceneAfterTerrainHook) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+        return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
     stageDesc.callback = on_scene_after_opaque;
     if (svc_gfx->register_stage_hook(
             mod_ctx, GFX_STAGE_SCENE_AFTER_OPAQUE, &stageDesc, &g_sceneAfterOpaqueHook) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+        return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
     stageDesc.callback = on_frame_before_hud;
     if (svc_gfx->register_stage_hook(
             mod_ctx, GFX_STAGE_FRAME_BEFORE_HUD, &stageDesc, &g_frameBeforeHudHook) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+        return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
 
     // Skip the game's own shadow rendering while the dynamic pass is active: the
     // shadowControl pair covers the actor real/blob shadows, drawCloudShadow the weather
     // cloud shadows.
-    if (dusk::mods::hook_add_pre<&dDlst_shadowControl_c::imageDraw>(svc_hook, on_game_shadow_pre) !=
+    if (mods::hook_add_pre<GameShadowImageDraw>(svc_hook, on_game_shadow_pre) !=
             MOD_OK ||
-        dusk::mods::hook_add_pre<&dDlst_shadowControl_c::draw>(svc_hook, on_game_shadow_pre) !=
+        mods::hook_add_pre<GameShadowDraw>(svc_hook, on_game_shadow_pre) !=
             MOD_OK ||
-        dusk::mods::hook_add_pre<&drawCloudShadow>(svc_hook, on_game_shadow_pre) != MOD_OK)
+        mods::hook_add_pre<CloudShadowDraw>(svc_hook, on_game_shadow_pre) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to hook game shadow rendering");
+        return mods::set_error(error, MOD_ERROR, "failed to hook game shadow rendering");
     }
-    if (dusk::mods::hook_add_pre<kClipperSphereClip>(svc_hook, on_frustum_clip_pre) != MOD_OK ||
-        dusk::mods::hook_add_pre<kClipperBoxClip>(svc_hook, on_frustum_clip_pre) != MOD_OK)
+    if (mods::hook_add_pre<ClipperSphereClip>(svc_hook, on_frustum_clip_pre) != MOD_OK ||
+        mods::hook_add_pre<ClipperBoxClip>(svc_hook, on_frustum_clip_pre) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to hook frustum clipping");
+        return mods::set_error(error, MOD_ERROR, "failed to hook frustum clipping");
     }
-    if (dusk::mods::hook_add_pre<GXCopyTex>(svc_hook, on_copy_tex_pre) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to hook GXCopyTex");
+    if (mods::hook_add_pre<CopyTex>(svc_hook, on_copy_tex_pre) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to hook GXCopyTex");
     }
     // Two-sided casters (see on_shape_draw_pre / on_cull_mode_pre). The J3DShape::drawFast hook
     // is virtual, so it resolves through the symbol manifest; if that's missing, degrade to
     // leaky shadows instead of failing the whole mod.
-    if (dusk::mods::hook_add_pre<GXSetCullMode>(svc_hook, on_cull_mode_pre) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to hook GXSetCullMode");
+    if (mods::hook_add_pre<CullMode>(svc_hook, on_cull_mode_pre) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to hook GXSetCullMode");
     }
-    if (dusk::mods::hook_add_pre<&J3DShape::drawFast>(svc_hook, on_shape_draw_pre) != MOD_OK) {
+    if (mods::hook_add_pre<ShapeDrawFast>(svc_hook, on_shape_draw_pre) != MOD_OK) {
         svc_log->warn(mod_ctx,
             "failed to hook J3DShape::drawFast (missing dusklight.symdb?); Two-Sided Casters "
             "will not affect J3D geometry");
@@ -2364,6 +2420,10 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         wgpuBindGroupLayoutRelease(g_sssLayout);
         g_sssLayout = nullptr;
     }
+    if (g_shadowSampler != nullptr) {
+        wgpuSamplerRelease(g_shadowSampler);
+        g_shadowSampler = nullptr;
+    }
     const auto releaseComputePipeline = [](WGPUComputePipeline& pipeline) {
         if (pipeline != nullptr) {
             wgpuComputePipelineRelease(pipeline);
@@ -2376,10 +2436,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
             layout = nullptr;
         }
     };
-    releaseComputePipeline(g_normalGenPipeline);
     releaseComputePipeline(g_normalBlurHPipeline);
     releaseComputePipeline(g_normalBlurVPipeline);
-    releaseLayout(g_normalGenLayout);
     releaseLayout(g_normalBlurHLayout);
     releaseLayout(g_normalBlurVLayout);
     if (g_compositePipeline != nullptr) {
@@ -2420,6 +2478,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         g_sceneAfterTerrainHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;
     g_controlsWindow = 0;
     g_replayTwoSided = false;
+    g_frameShadowsWanted = false;
+    g_frameFrustumBypass = false;
     g_mapPass = {};
     g_sceneCamera.valid = false;
     g_sceneCamera.raw_valid = false;

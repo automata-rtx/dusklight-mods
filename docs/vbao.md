@@ -1,7 +1,17 @@
-# VBAO — Enhanced Ambient Occlusion
+# VBAO — Visibility Bitmask Ambient Occlusion
 
-Mod id `dev.automata.enhanced_ao`. Service-only (no game code): stages + snapshots from the
+Mod id `dev.automata.vbao` (directory `mods/vbao/`). Service-only (no game code): stages + snapshots from the
 gfx service, matrices from the camera service.
+
+**Optionally uses the Depth to Normal mod** (`dev.automata.depth_to_normal`) as of 1.5.0. When
+that provider is present, VBAO sources its receiver normal from it (full-res, shared with shadows
+and any other consumer) and rotates it into view space, instead of reconstructing its own — so the
+normal reconstruction runs once for the whole suite rather than per mod. This is an *optional*
+import: without the provider, VBAO falls back to its own atyuwen 5-tap reconstruction exactly as
+before. The half-res AO toggle is independent of the normal source; when the provider is present,
+half-res AO samples the full-res normal at each chain pixel's jittered position, so temporal
+accumulation reconstructs full-res normal detail even in half-res mode (a quality win at no change
+to the AO sampling cost). See `docs/depth_to_normal_plan.md` for the per-frame cost tradeoff.
 
 ## Pipeline (per frame, at `GFX_STAGE_SCENE_AFTER_OPAQUE`)
 
@@ -111,7 +121,7 @@ default candidate) or at high supersampling.
 ## History / provenance
 
 Ported from our aurora-fork implementation (frozen at `standalone-final` in
-automata-rtx/dusklight-ao + aurora-ao) onto the upstream `ao_mod` demo's framework: the demo
+automata-rtx/dusklight-ao + aurora-ao) onto Encounter's upstream `ao_mod` demo framework: the demo
 contributed the MIP depth chain, compute scheduling, and denoiser; ours contributed the
 bitmask estimator, temporal accumulation, depth-aware upscale, thickness/contrast/black
 point, and distance fade. Never reference MXAO in code or comments.

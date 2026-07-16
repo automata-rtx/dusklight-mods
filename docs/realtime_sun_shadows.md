@@ -1,7 +1,13 @@
 # Realtime Sun Shadows
 
 Mod id `dev.automata.realtime_sun_shadows`. Game-linked: includes game headers, hooks game
-functions, and (on Windows) links the platform release's `dusklight.lib`.
+functions, and (on Windows) links the platform release's `windows-amd64.lib` import library.
+
+**Depends on the Depth to Normal mod** (`dev.automata.depth_to_normal`) as of 1.7.0. Shadows no
+longer reconstructs its own receiver normals — it imports the shared world-space normal from that
+provider and only applies its own bilateral smoothing (the one normal treatment unique to the
+shadow bias). This is a hard dependency (a required service import): the loader disables Realtime
+Sun Shadows if Depth to Normal is not installed and enabled. Install both together.
 
 ## Architecture (based on the upstream `shadow_mod` demo)
 
@@ -21,7 +27,12 @@ functions, and (on Windows) links the platform release's `dusklight.lib`.
    `J3DUClipper::clip` (sphere + box overloads) so casters outside the *camera* frustum
    still render, and skip `GXCopyTex`. `resolve_pass` depth = that cascade's shadow map
    (reversed light depth: 1 = near light). Each cascade is a full save-replay-resolve
-   bracket, so cost scales with cascade count. The Link cascade replays only the lists the
+   bracket, so cost scales with cascade count. The replay is **depth-only**: color writes are
+   disabled (`GXSetColorUpdate(GX_FALSE)`) and the color target is not resolved — a shadow map
+   needs only depth, and the resolved color is read solely by the Camera Replay debug view, so
+   normal frames skip the per-pixel color ROP and a full `mapSize²` color resolve per cascade
+   (the largest single cost in the map render; it scales with map size and cascade count).
+   Alpha *test* still runs, so alpha-cut foliage keeps punching holes in the depth map. The Link cascade replays only the lists the
    player's models enter (Middle/Opa/Dark) with a position filter in the
    `J3DShape::drawFast` pre-hook: `J3DShapePacket::prepareDraw` sets `j3dSys`'s current
    model right before every drawFast, so the filter reads `j3dSys.getModel()` and skips
@@ -33,8 +44,15 @@ functions, and (on Windows) links the platform release's `dusklight.lib`.
    whose box contains the receiver, apply that cascade's slope-scaled bias
    (`bias_eff = bias + slope_bias * tan_t`, tan clamped at 4; biases normalized per cascade
    against its own light range) and normal-offset receiver
-   (`world + n * normal_offset * texel_world[cascade]`), PCF over hardware-bilinear
-   comparison taps (kernel = base + Far Softening × cascade index). Inside the outer
+   (`world + n * normal_offset * texel_world[cascade]`), PCF over bilinearly-weighted
+   comparison taps (kernel = base + Far Softening × cascade index). Each PCF tap fetches its
+   2×2 depth neighborhood with a single `textureGather` (a mod-owned non-filtering clamp
+   sampler, created via raw wgpu since the maps are R32Float and the gfx service exposes no
+   sampler API) instead of four `textureLoad`s — a quarter of the texture fetches for the
+   same bilinear-of-comparisons result (GPU-verified bit-identical). A true hardware
+   comparison sampler would also move the compare into fixed-function, but that needs a
+   `texture_depth_2d`-bindable depth view the gfx service does not currently hand back
+   (`resolve_pass` depth is R32Float). Inside the outer
    `blend_frac` band of a cascade's box the result cross-fades to the next cascade so the
    resolution step never shows as a line. The Link cascade is evaluated separately and
    combined with `max()` — its map contains only the player, so it can only add occlusion,
@@ -88,7 +106,11 @@ Space Shadows" is inert when SSS is off.
    nearby shadows, plus the optional Link cascade for player self-shadow detail.
 5. **Shadows popping by camera angle** (Temple of Time ceiling, Lake Hylia mountains) →
    the `J3DUClipper` bypass during replay (the game culls against the *camera* frustum;
-   casters behind/above the camera must still cast).
+   casters behind/above the camera must still cast). The clip pre-hook fires per clip test
+   (hundreds–thousands per frame), so the bypass gate (enabled + map on + not indoors + sun
+   above the horizon + `noFrustumClipping`) and the game-shadow-skip gate are computed **once
+   per frame** in the `SCENE_BEGIN` callback and cached; the hooks then only read a bool
+   instead of re-running the config reads, indoor check, and sun-position math every call.
 6. **Light leaking through level edges** → single-sided geometry facing the player is
    back-facing from the light, so its material's cull mode dropped it from the shadow map.
    Fix: two-sided casters during replay. Direct GX drawers are covered by a `GXSetCullMode`
@@ -302,4 +324,5 @@ Normal Offset — the screen-space term re-grounds contacts regardless.
   it; inherent to Bend's wavefront projection — verified by a coverage simulation). For a
   directional sun that pixel is sky, which early-outs anyway.
 - ABI-coupled: after any re-platform this mod must be rebuilt against the new
-  `dusklight.lib`; the `GameService` major version rejects a mismatched load cleanly.
+  `windows-amd64.lib` import library; the `GameService` major version rejects a mismatched load
+  cleanly.

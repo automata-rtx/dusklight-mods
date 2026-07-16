@@ -17,7 +17,7 @@ The user's constraints: they want a **deferred-fog-style solution** (re-apply a 
 attenuation after AO), not a crude AO mask/height-fade (which was tried on the old aurora fork
 and looked poor).
 
-## Investigation findings (definitive — from the game source under extern/dusklight)
+## Investigation findings (definitive — from the game source in the fetched dusklight/ tree)
 
 1. **There is no separate underwater fog on the terrain.** The engine programs one global stage
    fog (`g_env_light.mFogNear`/`mFogFar`/`fog_col`, `d_kankyo.h:351,372,373`) onto ALL geometry

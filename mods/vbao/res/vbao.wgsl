@@ -1,8 +1,9 @@
-// Enhanced Ambient Occlusion - VBAO (visibility-bitmask ambient occlusion) pass.
+// VBAO (visibility-bitmask ambient occlusion) pass.
 //
 // The pass framework (MIP-prefiltered depth reads, hilbert/R2 noise, edge output for the
-// spatial denoiser, accurate 5-tap normal reconstruction) follows the ao_mod demo, which is
-// ported from Bevy Engine's SSAO (MIT OR Apache-2.0) / Intel XeGTAO (MIT); see res/licenses/.
+// spatial denoiser, accurate 5-tap normal reconstruction) follows Encounter's ao_mod demo,
+// which is ported from Bevy Engine's SSAO (MIT OR Apache-2.0) / Intel XeGTAO (MIT); see
+// res/licenses/. The depth->normal reconstruction below is adapted unchanged from that demo.
 //
 // The occlusion estimator itself replaces the classic horizon-tracking GTAO inner loop with a
 // 32-sector VISIBILITY BITMASK per slice (Therrien et al. 2022, adapted from indirect lighting
@@ -19,6 +20,7 @@ struct Uniforms {
     projection: mat4x4f,
     inverse_projection: mat4x4f,
     reproject: mat4x4f,
+    view_from_world: mat4x4f,  // rotates the Depth to Normal provider's world normal into view
     size: vec2f,        // AO chain size in pixels (may be half the render size)
     inv_size: vec2f,
     depth_scale: vec2f, // input depth snapshot pixels per chain pixel (1 or 2)
@@ -59,6 +61,9 @@ struct Uniforms {
 @group(0) @binding(2) var ambient_occlusion: texture_storage_2d<r32float, write>;
 @group(0) @binding(3) var depth_differences: texture_storage_2d<r32uint, write>;
 @group(0) @binding(4) var<uniform> uniforms: Uniforms;
+// Depth to Normal provider output (world-space normal + raw depth), full render resolution.
+// Used only when flags bit 3 is set; otherwise a stand-in is bound and never sampled.
+@group(0) @binding(5) var d2n_normal: texture_2d<f32>;
 
 const PI: f32 = 3.141592653589793;
 const HALF_PI: f32 = 1.5707963267948966;
@@ -147,7 +152,7 @@ fn view_position_at(pixel_coordinates: vec2<i32>) -> vec3<f32> {
 }
 
 // Accurate view-space normal reconstruction from depth (atyuwen's 5-tap method); unchanged
-// from the demo. Stable across depth discontinuities where naive derivatives smear.
+// from Encounter's ao_mod demo. Stable across depth discontinuities where naive derivatives smear.
 fn reconstruct_normal(pixel_coordinates: vec2<i32>, pixel_position: vec3<f32>, depth_center: f32) -> vec3<f32> {
     let depth_left1 = load_depth(pixel_coordinates + vec2<i32>(-1i, 0i), 0i);
     let depth_left2 = load_depth(pixel_coordinates + vec2<i32>(-2i, 0i), 0i);
@@ -245,7 +250,21 @@ fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     var pixel_position = reconstruct_view_space_position(raw_depth, uv);
-    let pixel_normal = reconstruct_normal(pixel_coordinates, pixel_position, raw_depth);
+    // Normal source: prefer the Depth to Normal provider's FULL-RES world normal (flags bit 3),
+    // else reconstruct here at the chain resolution (full or half res per the setting). When the
+    // provider is used in half-res mode, sample it at this chain pixel's (jittered) full-res
+    // position - the 4-phase jitter walks full-res normal detail, which temporal accumulation
+    // integrates - so half-res AO still gets a full-res normal. Rotate world -> view.
+    var pixel_normal: vec3<f32>;
+    if (uniforms.flags & 8u) != 0u {
+        let n_dims = vec2<f32>(textureDimensions(d2n_normal));
+        let n_texel = clamp(vec2<i32>(uv * n_dims), vec2<i32>(0i), vec2<i32>(n_dims) - vec2<i32>(1i));
+        let world_n = textureLoad(d2n_normal, n_texel, 0i).xyz;
+        let r = uniforms.view_from_world;
+        pixel_normal = normalize(r[0].xyz * world_n.x + r[1].xyz * world_n.y + r[2].xyz * world_n.z);
+    } else {
+        pixel_normal = reconstruct_normal(pixel_coordinates, pixel_position, raw_depth);
+    }
     pixel_position *= 1.0 - uniforms.depth_bias; // bias toward the camera suppresses self-occlusion
     let view_vec = normalize(-pixel_position);
     var normal = pixel_normal;

@@ -1,7 +1,7 @@
-// Enhanced Ambient Occlusion - fullscreen composite.
+// VBAO (Visibility Bitmask Ambient Occlusion) - fullscreen composite.
 //
 // Multiplies the accumulated (or denoised, when temporal accumulation is off) AO visibility over
-// the scene. Based on the ao_mod demo composite with two additions:
+// the scene. Based on Encounter's ao_mod demo composite with two additions:
 //  - DEPTH-AWARE upscale: the 4 bilinear taps are weighted by depth agreement with this pixel,
 //    so AO does not bleed across silhouettes when the AO chain runs at half resolution (a plain
 //    bilinear sample smears an object's AO onto the background behind its outline).
@@ -17,6 +17,7 @@ struct Uniforms {
     projection: mat4x4f,
     inverse_projection: mat4x4f,
     reproject: mat4x4f,
+    view_from_world: mat4x4f,  // layout-only: unused here, present so the shared uniform matches vbao.wgsl + the host
     size: vec2f,        // AO chain size in pixels (may be half the render size)
     inv_size: vec2f,
     depth_scale: vec2f, // input depth snapshot pixels per chain pixel (1 or 2)

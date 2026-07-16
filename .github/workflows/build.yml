@@ -1,96 +1,145 @@
-name: Build mods
+name: Build
 
-# Mods-only CI: compiles the two mod libraries against the Dusklight mod SDK (headers +
-# prebuilt Dawn package) - the game and aurora are NEVER compiled here. Typical runtime
-# is a few minutes.
-#
-# ABI contract: extern/dusklight is pinned to the platform-v1 release commit of
-# automata-rtx/dusklight-ao, and the Windows job links against that release's
-# dusklight.lib. When the base game is re-platformed, bump the submodule AND the
-# RELEASE_TAG below together.
+# Multiplatform mod CI — the official Dusklight mod template's build + combine pipeline
+# (https://github.com/TwilitRealm/mod-template), adapted only for this monorepo (the combine loops
+# over all mods) and our slashed dev-branch name. Each platform builds every mod against the pinned
+# Dusklight SDK (fetched by DUSKLIGHT_VERSION in CMakeLists.txt; the SDK auto-downloads its per-arch
+# link stub from DUSKLIGHT_SDK_STUB_URL), then `combine` merges each mod's per-platform libraries
+# into one cross-platform .dusk via tools/merge_mod.py.
 
 on:
   push:
-    paths-ignore:
-      - '**.md'
+    # "**" (not the template's "*") so branch names containing "/" match — GitHub filter globs
+    # treat "*" as not matching "/", which would skip our claude/... development branch.
+    branches: ["**"]
+    tags: ["**"]
   pull_request:
-  workflow_dispatch:
 
 env:
-  PLATFORM_REPO: automata-rtx/dusklight-ao
-  RELEASE_TAG: platform-v1
+  SYMGEN_VERSION: v1.2.4
 
 jobs:
-  validate:
-    name: Compile check + WGSL validation (Linux)
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{matrix.platform}}
+    runs-on: ${{matrix.runner}}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-latest
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - platform: macos-arm64
+            runner: macos-latest
+          - platform: macos-x86_64
+            runner: macos-latest
+            cmake_args: -DCMAKE_OSX_ARCHITECTURES=x86_64
+          - platform: windows-amd64
+            runner: windows-latest
+            msvc_arch: amd64
+          - platform: windows-arm64
+            runner: windows-latest
+            msvc_arch: amd64_arm64
+          - platform: android-aarch64
+            runner: ubuntu-latest
+            android_ndk: "29.0.14206865"
+
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
+
+      - name: Read pinned Dusklight version
+        id: dusklight
+        shell: bash
+        run: echo "version=$(sed -n 's/.*set(DUSKLIGHT_VERSION \"\([^\"]*\)\").*/\1/p' CMakeLists.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Dusklight sources
+        uses: actions/cache@v4
         with:
-          submodules: recursive
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get -y install ninja-build
-
-      - name: Configure
-        run: >
-          cmake -B build -G Ninja
-          -DMODS_BUILD_TOOLS=ON
-          -DDUSK_VERSION_OVERRIDE=${{env.RELEASE_TAG}}
-
-      - name: Build mods + validator
-        run: cmake --build build
-
-      - name: Validate WGSL shaders
-        run: |
-          status=0
-          for f in mods/*/res/*.wgsl; do
-            if build/wgsl_validate "$f" > /tmp/out.txt 2>&1; then
-              echo "OK   $f"
-            else
-              echo "FAIL $f"; cat /tmp/out.txt; status=1
-            fi
-          done
-          exit $status
-
-  build-windows:
-    name: Build mods (Windows x86_64)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
+          path: dusklight
+          key: dusklight-${{matrix.platform}}-${{steps.dusklight.outputs.version}}
 
       - name: Enable Visual Studio environment
+        if: matrix.msvc_arch
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: amd64
+          arch: ${{matrix.msvc_arch}}
 
-      - name: Install dependencies
+      - name: Install ninja (Windows)
+        if: matrix.msvc_arch
         run: choco install ninja
 
-      - name: Download game import library (platform release)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release download ${{env.RELEASE_TAG}}
-          --repo ${{env.PLATFORM_REPO}}
-          --pattern dusklight.lib
-          --dir sdk-assets
+      - name: Install Android NDK
+        if: matrix.android_ndk
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ndk;${{matrix.android_ndk}}
 
-      - name: Configure
-        run: >
-          cmake -B build -G Ninja
-          -DDUSK_GAME_IMPLIB=${{github.workspace}}/sdk-assets/dusklight.lib
-          -DDUSK_VERSION_OVERRIDE=${{env.RELEASE_TAG}}
+      - name: Configure CMake
+        shell: bash
+        run: |
+          args=(${{matrix.cmake_args}})
+          if [ -n "${{matrix.msvc_arch}}" ]; then
+            args+=(-G Ninja)
+          fi
+          if [ -n "${{matrix.android_ndk}}" ]; then
+            args+=(-DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/${{matrix.android_ndk}}/build/cmake/android.toolchain.cmake"
+                   -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28)
+          fi
+          cmake -B build "${args[@]}"
 
       - name: Build
-        run: cmake --build build
+        run: cmake --build build --parallel
 
-      - name: Upload mod packages
-        uses: actions/upload-artifact@v7
+      - name: Upload platform bundles
+        uses: actions/upload-artifact@v4
         with:
-          name: dusklight-mods-win64
+          name: mods-${{matrix.platform}}
           path: build/mods/*.dusk
+          if-no-files-found: error
+
+  combine:
+    name: Combine cross-platform bundles
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download platform bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mods-*
+          path: dist
+
+      - name: Install symgen
+        run: |
+          curl -fsSL -o symgen \
+            "https://github.com/encounter/symgen/releases/download/${SYMGEN_VERSION}/symgen-linux-x86_64"
+          chmod +x symgen
+
+      - name: Merge each mod across platforms
+        run: |
+          set -euo pipefail
+          mkdir -p combined
+          platforms=linux-x86_64,linux-aarch64,macos-arm64,macos-x86_64,windows-amd64,windows-arm64,android-aarch64
+          for dusk in dist/mods-linux-x86_64/*.dusk; do
+            name="$(basename "$dusk")"
+            echo "=== merging $name ==="
+            python3 tools/merge_mod.py -o "combined/$name" --symgen ./symgen \
+              --expect-platforms "$platforms" \
+              dist/*/"$name"
+          done
+          ls -l combined
+
+      - name: Upload combined bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: mods-combined
+          path: combined/*.dusk
+          if-no-files-found: error
+
+      - name: Attach to release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{github.token}}
+        run: gh release create "$GITHUB_REF_NAME" combined/*.dusk --verify-tag --generate-notes
