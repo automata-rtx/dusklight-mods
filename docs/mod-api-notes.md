@@ -75,18 +75,19 @@ Upstream reference: the fetched `dusklight/docs/modding.md` and `dusklight/sdk/i
   (`dusklight_game_headers` INTERFACE target), and Dawn headers via a prebuilt package. The tree is
   fetched by `cmake/FetchDusklight.cmake` (pinned by `DUSKLIGHT_VERSION`) — nothing from the game
   compiles in this repo.
-- `DUSK_GAME_EXE` (a per-arch link target) is REQUIRED on **Windows/macOS/Android** for any mod
-  using `FEATURES game|webgpu` (all of ours) — it's the import library (`windows-amd64.lib`) on
-  Windows or the `sdk/stub-*` link stub on macOS/Android, and must come from the exact game build
-  being targeted (CI pulls it from the `platform-v2-test` release). **Linux needs nothing** — game
-  symbols are left undefined and resolved at load (`-Wl,--allow-shlib-undefined`).
+- On **Windows/macOS/Android**, a mod using `FEATURES game|webgpu` (all of ours) links against a
+  per-arch stub the SDK **auto-downloads** from `DUSKLIGHT_SDK_STUB_URL` (import library on Windows,
+  `bundle_loader`/`.so` stub on macOS/Android) — no manual `DUSK_GAME_EXE` needed (set it to override
+  the download). **Linux needs nothing** — game symbols resolve at load (`-Wl,--allow-shlib-undefined`).
+- Windows builds with plain MSVC (`cl`); no clang-cl override. The base game's `modmeta` parser
+  tolerates linker padding, so `DEFINE_HOOK` records register under `cl`.
 - `.dusk` = zip of {`lib/<platform>/mod.{dll,so}`, mod.json, res/}. CI builds one per platform and
   `tools/merge_mod.py` merges them into a single cross-platform bundle (the `mods-combined`
   artifact); the loader also picks up a `mods/` dir next to the app for dev builds.
 
 ## Validation workflow
 
-- `tools/wgsl_validate.cpp` (Dawn Null backend) catches WGSL errors offline; CI runs it on
-  every shader. Build with `-DMODS_BUILD_TOOLS=ON`.
-- The Linux CI job compiles every mod with GCC — a full type-check of mod.cpp against the
-  game headers without needing Windows.
+- CI (the template's build + combine) compiles every mod on all seven platforms; the Linux legs are
+  a fast full type-check of mod.cpp against the game headers. Shaders are validated by the game at
+  pipeline-creation time — there is no separate offline WGSL validator (it was dropped in the move to
+  the pure template; `git log` for `tools/wgsl_validate.cpp` if you want to reinstate it).

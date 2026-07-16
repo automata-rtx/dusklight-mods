@@ -15,8 +15,8 @@ game updates without a rebuild). Realtime Sun Shadows and Deferred Fog are **gam
 game functions, so they are coupled to the pinned game build). Realtime Sun Shadows also consumes the
 Depth to Normal service — install both together.
 
-Each `.dusk` is a **single cross-platform bundle** (Windows x64, macOS arm64/x64, Linux x64/arm64,
-Android arm64) produced by CI. (Windows-on-ARM is not built yet.)
+Each `.dusk` is a **single cross-platform bundle** (Windows x64/arm64, macOS arm64/x64,
+Linux x64/arm64, Android arm64) produced by CI.
 
 ## Installing
 
@@ -36,35 +36,25 @@ restarting.
 
 ## Building
 
-The Dusklight SDK is **fetched automatically** (pinned by `DUSKLIGHT_VERSION` in `CMakeLists.txt`) —
-no submodule, no `--recursive`. Only the mod sources compile; the game and its renderer are never
-built here.
+This repo is the official [Dusklight mod template](https://github.com/TwilitRealm/mod-template),
+laid out as a monorepo. The Dusklight SDK is **fetched automatically** (pinned by `DUSKLIGHT_VERSION`
+in `CMakeLists.txt`) and the SDK **auto-downloads** the per-arch link stub it needs — no submodule,
+no `--recursive`, no manual link libraries, no compiler override. Only the mod sources compile.
 
 ```sh
 git clone <this repo>
-# Linux — builds out of the box (game symbols resolve at load):
-cmake -B build -G Ninja -DMODS_BUILD_TOOLS=ON
-cmake --build build                        # -> build/mods/*.dusk
+cmake -B build          # fetches the SDK + link stub on first run
+cmake --build build     # -> build/mods/*.dusk
 ```
 
-On **Windows/macOS/Android**, a game-linked mod additionally needs a per-arch link target via
-`-DDUSK_GAME_EXE=<path>` — the `sdk/` stub inside the matching `platform-v2-test` game zip
-(`sdk/windows-amd64.lib`, `sdk/stub-macos-arm64`, `sdk/stub-android-aarch64.so`, …). CI fetches these
-automatically; locally, extract the one you need. **Windows also requires clang-cl**:
+That's it, on any platform — including Windows (plain MSVC) — because the base game is the template's
+own base (`76b56cd8`). The only fork-specific configuration is two cache variables in `CMakeLists.txt`
+that point the template at our platform: `DUSKLIGHT_REPOSITORY` (our `dusklight-ao` fork, for the
+enlarged aurora buffers) and `DUSKLIGHT_SDK_STUB_URL` (our public `platform-v2-test` release).
 
-```sh
-cmake -B build -G Ninja \
-  -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl \
-  -DDUSK_GAME_EXE=<path to sdk/windows-amd64.lib>
-cmake --build build
-```
-
-Plain MSVC (`cl`) mangles the mod SDK's `modmeta`/`DEFINE_HOOK` records so hooks never register —
-clang-cl is mandatory on this platform, and CI's `hook-repro` job guards against regressing it.
-`-DMODS_BUILD_TOOLS=ON` also builds `tools/wgsl_validate.cpp`, an offline WGSL shader validator.
-
-CI (`.github/workflows/build.yml`) builds every mod on all six platforms and merges each into one
-cross-platform `.dusk` via `tools/merge_mod.py` (artifact `mods-combined`).
+CI (`.github/workflows/build.yml`) is the template's build + combine pipeline: it builds every mod on
+all seven platforms and merges each into one cross-platform `.dusk` via `tools/merge_mod.py`
+(artifact `mods-combined`).
 
 ## Docs
 
