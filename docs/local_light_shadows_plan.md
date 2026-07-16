@@ -311,11 +311,24 @@ proxy. The service makes it deterministic and one-directional:
 - **Consumer (SSILVB), a ~10-line change:** `IMPORT_OPTIONAL_SERVICE(LocalShadowService, ...)`; fetch
   the view in `on_scene_after_opaque` next to the Depth-to-Normal fetch; thread one `WGPUTextureView`
   through `ComputePayload` (a spare slot — the payload has room under its 128-byte `static_assert`);
-  bind it at the free `@binding(10)` on `g_colorMip0Layout` (currently uses 0,1,2,8,9); and in
-  `preprocess_color.wgsl` multiply `radiance *= textureLoad(local_shadow, coord, 0).r` on the opaque
-  radiance (before the emissive add), gated by a new flag bit that is 0 when the service is absent —
-  so SSILVB stays fully functional standalone. This is the same optional-service shape SSILVB already
-  uses for Depth to Normal and explicitly plans for a future albedo provider (`ssilvb_plan.md` §8).
+  bind it on `g_colorMip0Layout` at the next free binding; and in `preprocess_color.wgsl` multiply
+  `radiance *= textureLoad(local_shadow, coord, 0).r` on the opaque radiance, gated by a new flag bit
+  that is 0 when the service is absent — so SSILVB stays fully functional standalone. This is the same
+  optional-service shape SSILVB already uses for Depth to Normal and explicitly plans for a future
+  albedo provider (`ssilvb_plan.md` §8).
+
+  **Wiring numbers, verified against SSILVB HEAD (`8902507`, "directionally occluded ambient (sky
+  light)"):** that commit added a sky-radiance estimate to this exact shader, consuming `@binding(10)`
+  through `@binding(13)` and **flag bit 7** — i.e. the slots my first draft named. Use the current
+  free ones instead: **`@binding(14)`** and **flag bit 8** (`0x100`); the uniform struct already
+  carries `sky_intensity` + `_pad0/_pad1/_pad2`, so a `local_shadow_strength` param can reuse `_pad0`
+  with no size change (keep the `%16` `static_assert` true). One **new subtlety** from the sky
+  feature: `prefilter_color` now captures sky pixels (`depth <= 0`) into a `sky_contrib` before the
+  emissive add, so the local-shadow multiply must be gated to **non-sky pixels** (`if depth > 0.0 {
+  radiance *= local_shadow; }`) placed *after* the `sky_contrib` capture and *before* the emissive
+  add — otherwise it would corrupt the sky-radiance average (harmless in value, since local lights
+  don't reach the sky, but avoid the coupling). Re-verify these numbers at integration time; SSILVB
+  is under active development on its branch.
 
 ### Caveats to set expectations
 

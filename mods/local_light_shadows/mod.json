@@ -1,0 +1,7 @@
+{
+  "id": "dev.automata.local_light_shadows",
+  "name": "Local Light Shadows",
+  "version": "0.1.0",
+  "author": "automata-rtx",
+  "description": "Real-geometry shadows cast by the game's local light sources (torch fires, bonfires, lanterns). The opaque world is re-rendered from the nearest active point light into a light-space depth map and composited over the scene, darkening surfaces the light cannot reach. First attempt: single nearest light, directional (ortho) approximation of the point light, modulated by distance attenuation and surface facing so the shadow only appears where the light actually falls."
+}
