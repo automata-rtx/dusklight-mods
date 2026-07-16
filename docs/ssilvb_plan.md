@@ -287,6 +287,36 @@ can add a "resolution scale" (quarter-res chain) rather than per-platform defaul
 
 ## 8. v2 candidates (explicitly not in the first build)
 
+Additions from the post-v0.9.1 roadmap review (2026-07-16), roughly in recommended order:
+
+- **Sky light injection (directional sky fill)**: today a slice's still-visible sectors
+  contribute *nothing* — sky samples are skipped, so openness only ever darkens (via less AO),
+  never lights. Injecting `skyRadiance × visibleSectorFraction` per slice turns the unoccluded
+  hemisphere into a light source: cool blue fill on surfaces facing open sky, warm orange fill
+  at dusk, nothing under overhangs. This is the paper's §3.2 in spirit with the sky as the
+  ambient source, and it is reachable service-only: estimate sky radiance per frame from the
+  color chain's sky pixels (depth == 0) via a small reduction, or start with a user tint.
+  Probably the biggest remaining visual win outdoors.
+- **Per-sample radiance luma clamp (firefly guard)**: with `emissiveBoost` at 300% a tiny,
+  very bright emissive spot (fairy core) can spike single march samples into flicker the
+  temporal clamp then fights. A luminance ceiling on `c_j` (fixed, ~2-4 in linear) is two lines
+  in the sampler and pure robustness. Do this before or with the first emissive tuning pass.
+- **Bent-normal / directional-visibility service export**: the slice walk already knows the
+  directional visibility distribution; exporting (bent normal, AO) as a service (the
+  `depth_to_normal` pattern) would let the shadow mod shape its ambient term and any future SSR
+  mod cheapen its occlusion — SSILVB becomes a provider, not just a consumer.
+- **Resolution scale (quarter-res chain)**: the Android headroom lever noted in §7, subsuming
+  the halfRes toggle into a scale factor.
+- **Two-scale gather**: a second, coarse far-field pass (quarter res, large radius) added to the
+  near-field one — large-hall light transfer without paying full price at the contact scale.
+- **Local-light synergy (no work needed here)**: if Realtime Sun Shadows grows local light
+  sources, their lit surfaces land in the opaque snapshot and SSILVB bounces them automatically
+  — worth an explicit in-game check when that lands, not code.
+
+Known accepted limitation (documented, not scheduled): translucent surfaces (water) neither
+receive bounce nor occlude it — the composite runs before the translucent phase and the depth
+buffer is opaque-only. Revisiting means a fundamentally different composite point.
+
 - **Multi-bounce** (`multiBounce` toggle + `bounceGain` ≤ 80): feed the *previous frame's*
   `history_color` GI, reprojected with the existing temporal matrix, into `c_j` at each sample
   (`c_j += giGain × prevGI(sample_uv')`). No feedback through the scene snapshot happens by
