@@ -61,6 +61,10 @@ struct Uniforms {
     chroma_lift: f32,       // receiver albedo proxy: 0 = raw scene color .. 1 = full chroma norm
     emissive_boost: f32,     // emissive-delta bounce gain (fire, fairies, glows)
     emissive_threshold: f32, // linear floor for the emissive delta extract
+    sky_intensity: f32,      // directional sky-light strength (0 disables in the sampler)
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 @group(0) @binding(0) var preprocessed_depth: texture_2d<f32>;
@@ -73,6 +77,9 @@ struct Uniforms {
 @group(0) @binding(5) var d2n_normal: texture_2d<f32>;
 // Linear scene radiance MIP chain (preprocess_color.wgsl), chain resolution.
 @group(0) @binding(6) var color_chain: texture_2d<f32>;
+// Smoothed 1x1 sky estimate (preprocess_color.wgsl reduce_sky): rgb = linear sky radiance
+// sampled from the game's own time-of-day-tinted skybox pixels, a = confidence.
+@group(0) @binding(7) var sky_ambient: texture_2d<f32>;
 
 const PI: f32 = 3.141592653589793;
 const HALF_PI: f32 = 1.5707963267948966;
@@ -226,6 +233,9 @@ fn load_sample_radiance(uv: vec2<f32>, sample_mip_level: f32) -> vec3<f32> {
 // The bounce contribution of one march sample (paper Algorithm 1 line 23): radiance times the
 // newly-un-occluded sector fraction (receiver cosine folded into the warped sectors - see the
 // header note) times the EMITTER cosine (surfaces facing away from the receiver send no light).
+// A luminance ceiling on the radiance (firefly guard) keeps a single very bright emissive spot
+// (a fairy core boosted by emissive_boost) from spiking one sample into visible flicker that
+// the temporal clamp then has to fight.
 fn sample_bounce(sample_uv: vec2<f32>, mip: f32, sample_pos: vec3<f32>, pixel_pos: vec3<f32>,
     newly: u32) -> vec3<f32> {
     let l = normalize(sample_pos - pixel_pos);
@@ -233,8 +243,17 @@ fn sample_bounce(sample_uv: vec2<f32>, mip: f32, sample_pos: vec3<f32>, pixel_po
     if emitter_cos <= 0.0 {
         return vec3<f32>(0.0);
     }
-    return load_sample_radiance(sample_uv, mip) *
-        (f32(countOneBits(newly)) / 32.0) * emitter_cos;
+    var radiance = load_sample_radiance(sample_uv, mip);
+    let luma = dot(radiance, vec3<f32>(0.299, 0.587, 0.114));
+    radiance *= min(1.0, 3.0 / max(luma, 1.0e-4));
+    return radiance * (f32(countOneBits(newly)) / 32.0) * emitter_cos;
+}
+
+// Inverse of the cosine-lobe smoothstep warp (y = 3t^2 - 2t^3): recovers the LINEAR angular
+// position of a warped sector coordinate. Exact closed form; used once per slice to convert the
+// visible-arc midpoint back into an angle for the bent (sky) direction.
+fn unwarp_sector(y: f32) -> f32 {
+    return 0.5 - sin(asin(clamp(1.0 - 2.0 * y, -1.0, 1.0)) / 3.0);
 }
 
 @compute
@@ -286,6 +305,16 @@ fn ssilvb(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let slices = max(uniforms.slice_count, 1.0);
     let steps = max(uniforms.steps_per_side, 1.0);
     let gi_enabled = (uniforms.flags & 8u) != 0u;
+
+    // Directional sky light: the smoothed sky radiance arrives through each slice's VISIBLE
+    // sectors, weighted by how sky-facing the visible arc's bent direction is (world up rotated
+    // into view space). A floor pixel under open sky gets the full tint; a wall gets partial;
+    // anything under cover gets none - the paper's "directionally occluded ambient" with the
+    // game's own time-of-day sky as the ambient source.
+    let sky = textureLoad(sky_ambient, vec2<i32>(0i, 0i), 0i);
+    let sky_on = (uniforms.flags & 128u) != 0u && sky.a > 0.001 && uniforms.sky_intensity > 0.0;
+    let sky_radiance = sky.rgb * (sky.a * uniforms.sky_intensity);
+    let up_view = normalize(uniforms.view_from_world[1].xyz); // world +Y in view space
 
     var visibility = 0.0;
     var gi = vec3<f32>(0.0);
@@ -340,9 +369,27 @@ fn ssilvb(@builtin(global_invocation_id) global_id: vec3<u32>) {
             }
         }
 
+        // Sky light through this slice's still-visible sectors. The visible set is usually one
+        // contiguous arc, so its midpoint (between the lowest and highest visible sector,
+        // unwarped back to a linear angle) is a cheap, good bent-direction estimate. The sector
+        // count carries the cosine-weighted openness (same integral the AO term uses); the bent
+        // direction gates it by sky-facingness, letting light in sideways through a window but
+        // not "up" through a ceiling.
+        let visible_count = f32(countOneBits(occ));
+        if sky_on && visible_count > 0.0 {
+            let lo = f32(firstTrailingBit(occ));
+            let hi = f32(firstLeadingBit(occ));
+            let mid = unwarp_sector(((lo + hi) * 0.5 + 0.5) / 32.0);
+            // Invert the sector mapping: hh = (angle + n)/PI + 0.5 (pre-warp).
+            let bent_angle = PI * (mid - 0.5) - n;
+            let bent_dir = cos(bent_angle) * view_vec + sin(bent_angle) * tang;
+            let sky_facing = smoothstep(-0.15, 0.5, dot(bent_dir, up_view));
+            slice_gi += sky_radiance * (visible_count / 32.0) * sky_facing;
+        }
+
         // Slice visibility = fraction of sectors still unoccluded; both terms weighted by the
         // projected normal length (the slice's share of the hemisphere).
-        visibility += (f32(countOneBits(occ)) / 32.0) * proj_n_len;
+        visibility += (visible_count / 32.0) * proj_n_len;
         gi += slice_gi * proj_n_len;
         norm_sum += proj_n_len;
     }

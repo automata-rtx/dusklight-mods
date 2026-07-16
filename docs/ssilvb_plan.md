@@ -289,18 +289,24 @@ can add a "resolution scale" (quarter-res chain) rather than per-platform defaul
 
 Additions from the post-v0.9.1 roadmap review (2026-07-16), roughly in recommended order:
 
-- **Sky light injection (directional sky fill)**: today a slice's still-visible sectors
-  contribute *nothing* — sky samples are skipped, so openness only ever darkens (via less AO),
-  never lights. Injecting `skyRadiance × visibleSectorFraction` per slice turns the unoccluded
-  hemisphere into a light source: cool blue fill on surfaces facing open sky, warm orange fill
-  at dusk, nothing under overhangs. This is the paper's §3.2 in spirit with the sky as the
-  ambient source, and it is reachable service-only: estimate sky radiance per frame from the
-  color chain's sky pixels (depth == 0) via a small reduction, or start with a user tint.
-  Probably the biggest remaining visual win outdoors.
-- **Per-sample radiance luma clamp (firefly guard)**: with `emissiveBoost` at 300% a tiny,
-  very bright emissive spot (fairy core) can spike single march samples into flicker the
-  temporal clamp then fights. A luminance ceiling on `c_j` (fixed, ~2-4 in linear) is two lines
-  in the sampler and pure robustness. Do this before or with the first emissive tuning pass.
+- **Sky light injection (directional sky fill)** — **SHIPPED in v0.9.2** as the
+  directionally-occluded ambient (paper §3.2 with the sky as the ambient source). The sky
+  radiance is measured live from the on-screen skybox pixels (raw depth 0), which the game has
+  already painted with its time-of-day palette — sunset gradients and weather included; the
+  ambient tint the user asked about is thereby captured without any game-state access. A
+  per-workgroup reduction in `prefilter_color` plus a 1×1 `reduce_sky` collapse produce a
+  temporally smoothed (rgb = radiance, a = confidence) estimate that is HELD while no sky is
+  on screen and fades over seconds indoors. In the sampler, each slice's still-visible sector
+  count (the same cosine-weighted openness integral the AO uses) is weighted by the visible
+  arc's bent direction: the arc midpoint (first/last visible sector, unwarped through the exact
+  inverse of the cosine-lobe smoothstep) becomes an angle, and `smoothstep(-0.15, 0.5,
+  dot(bent, world_up_in_view))` gates sky-facingness — light comes in sideways through windows
+  but not up through ceilings. Works with the bounce off (directional AO + sky ambient mode);
+  `skyLight` (on) + `skyIntensity` (100 = measured tint as-is, host pre-divides by
+  gi_intensity so the sliders are independent). The per-slice bent direction computed here is
+  also the stepping stone to the bent-normal service export below.
+- **Per-sample radiance luma clamp (firefly guard)** — **SHIPPED in v0.9.2**: `c_j` luminance
+  capped at 3.0 linear in `sample_bounce`.
 - **Bent-normal / directional-visibility service export**: the slice walk already knows the
   directional visibility distribution; exporting (bent normal, AO) as a service (the
   `depth_to_normal` pattern) would let the shadow mod shape its ambient term and any future SSR

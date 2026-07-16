@@ -61,6 +61,10 @@ struct Uniforms {
     chroma_lift: f32,       // receiver albedo proxy: 0 = raw scene color .. 1 = full chroma norm
     emissive_boost: f32,     // emissive-delta bounce gain (fire, fairies, glows)
     emissive_threshold: f32, // linear floor for the emissive delta extract
+    sky_intensity: f32,      // directional sky-light strength (0 disables in the sampler)
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 @group(0) @binding(0) var gi_source: texture_2d<f32>;          // (GI.rgb linear, AO)
@@ -177,8 +181,11 @@ fn albedo_proxy(uv: vec2f) -> vec3f {
 }
 
 // Shaped bounce light in gamma space (what gets added to the gamma-encoded scene target).
+// The gi channel carries bounce AND directional sky light, so it stays live if EITHER is on
+// (the host pre-divides sky_intensity by gi_intensity so the sky strength is independent of
+// the bounce slider despite sharing this multiply).
 fn shape_gi(gi_linear: vec3f, uv: vec2f, fade: f32) -> vec3f {
-    if (uniforms.flags & 8u) == 0u {
+    if (uniforms.flags & (8u | 128u)) == 0u {
         return vec3f(0.0);
     }
     let lit = max(gi_linear, vec3f(0.0)) * albedo_proxy(uv) * uniforms.gi_intensity * (1.0 - fade);

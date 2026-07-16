@@ -63,6 +63,8 @@ ConfigVarHandle g_cvarBounceWhite = 0;
 ConfigVarHandle g_cvarEmissiveBounce = 0;
 ConfigVarHandle g_cvarEmissiveBoost = 0;
 ConfigVarHandle g_cvarEmissiveThreshold = 0;
+ConfigVarHandle g_cvarSkyLight = 0;
+ConfigVarHandle g_cvarSkyIntensity = 0;
 ConfigVarHandle g_cvarAoApply = 0;
 ConfigVarHandle g_cvarAoIntensity = 0;
 ConfigVarHandle g_cvarContrast = 0;
@@ -113,6 +115,7 @@ WGPUComputePipeline g_mip4Pipeline = nullptr;
 WGPUComputePipeline g_colorMip0Pipeline = nullptr;
 WGPUComputePipeline g_colorReducePipeline = nullptr;
 WGPUComputePipeline g_emissivePipeline = nullptr;
+WGPUComputePipeline g_skyReducePipeline = nullptr;
 WGPUComputePipeline g_ssilvbPipeline = nullptr;
 WGPUComputePipeline g_denoisePipeline = nullptr;
 WGPUComputePipeline g_temporalPipeline = nullptr;
@@ -121,6 +124,7 @@ WGPUBindGroupLayout g_mip4Layout = nullptr;
 WGPUBindGroupLayout g_colorMip0Layout = nullptr;
 WGPUBindGroupLayout g_colorReduceLayout = nullptr;
 WGPUBindGroupLayout g_emissiveLayout = nullptr;
+WGPUBindGroupLayout g_skyReduceLayout = nullptr;
 WGPUBindGroupLayout g_ssilvbLayout = nullptr;
 WGPUBindGroupLayout g_denoiseLayout = nullptr;
 WGPUBindGroupLayout g_temporalLayout = nullptr;
@@ -149,6 +153,8 @@ struct TargetViews {
     WGPUTextureView historyColor[2] = {};
     WGPUTextureView historyDepth[2] = {};
     WGPUTextureView emissive = nullptr;  // prev-frame emissive delta (full res, linear)
+    WGPUTextureView skyPartial = nullptr; // per-workgroup sky sums (chain/8, rgba32float)
+    WGPUTextureView sky[2] = {};          // smoothed 1x1 sky estimate, ping-ponged per frame
 };
 
 // Chain targets, recreated when the render size (or halfRes) changes. Old sets are retired for a
@@ -171,6 +177,10 @@ struct Targets {
     // color prefilter (reprojected). One texture suffices - within a frame the read is encoded
     // before the write.
     WGPUTexture emissive = nullptr;
+    // Sky estimate: per-workgroup partial sums + the smoothed 1x1 result (ping-ponged so the
+    // reduce can read last frame's value while writing this frame's).
+    WGPUTexture skyPartial = nullptr;
+    WGPUTexture sky[2] = {};
     TargetViews* views = nullptr;
 };
 Targets g_targets;
@@ -183,6 +193,7 @@ std::vector<RetiredTargets> g_retiredTargets;
 // Temporal state (game thread only).
 uint32_t g_frameIndex = 0;
 uint32_t g_historyWriteIndex = 0;
+uint32_t g_skyWriteIndex = 0;  // flips every pushed frame (independent of the temporal toggle)
 bool g_historyValid = false;   // the read history holds a valid previous accumulation
 bool g_prevCameraValid = false;
 float g_prevProjFromWorld[16] = {};
@@ -223,7 +234,8 @@ struct SsilvbUniforms {
     uint32_t debug_view;
     uint32_t frame_index;
     uint32_t flags; // bit 0 temporal, bit 1 history valid, bit 2 distance fade,
-                    // bit 3 GI enabled, bit 4 AO apply, bit 5 white bounce proxy
+                    // bit 3 GI enabled, bit 4 AO apply, bit 5 white bounce proxy,
+                    // bit 6 emissive bounce, bit 7 sky light
     float thick_dist_scale;  // extra occluder thickness, fraction of the view-space radius
     float radius_far;        // far effect radius (fraction of view depth); 0 disables the ramp
     float radius_ramp_start; // radius ramp band start, world units of view depth
@@ -233,6 +245,10 @@ struct SsilvbUniforms {
     float chroma_lift;       // receiver albedo proxy: 0 raw scene color .. 1 full chroma norm
     float emissive_boost;    // emissive-delta bounce gain (fire, fairies, glows)
     float emissive_threshold; // linear floor for the emissive delta extract
+    float sky_intensity;     // directional sky-light strength (0 disables in the sampler)
+    float _pad0;
+    float _pad1;
+    float _pad2;
 };
 static_assert(sizeof(SsilvbUniforms) % 16 == 0);
 
@@ -247,9 +263,11 @@ struct ComputePayload {
     uint32_t chainSize;      // chain (half) resolution, packed
     uint32_t fullSize;       // full render resolution, packed
     uint32_t run_temporal;
-    uint32_t run_gi;         // skip the color-chain dispatches entirely when the bounce is off
+    uint32_t run_gi;         // bit 0: color prefilter + sky estimate (bounce OR sky light on),
+                             // bit 1: color MIP reductions (bounce on - only the march reads them)
     uint32_t denoise_passes; // 0-3; ping-pongs giNoisy <-> giFinal
     uint32_t history_write;  // temporal ping-pong write index (read = 1 - write)
+    uint32_t sky_write;      // sky-estimate ping-pong write index (flips every frame)
 };
 static_assert(sizeof(ComputePayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
 static_assert(std::is_trivially_copyable_v<ComputePayload>);
@@ -523,6 +541,9 @@ void release_targets(Targets& targets) {
         releaseView(targets.views->historyDepth[0]);
         releaseView(targets.views->historyDepth[1]);
         releaseView(targets.views->emissive);
+        releaseView(targets.views->skyPartial);
+        releaseView(targets.views->sky[0]);
+        releaseView(targets.views->sky[1]);
         delete targets.views;
         targets.views = nullptr;
     }
@@ -536,6 +557,9 @@ void release_targets(Targets& targets) {
     releaseTexture(targets.historyDepth[0]);
     releaseTexture(targets.historyDepth[1]);
     releaseTexture(targets.emissive);
+    releaseTexture(targets.skyPartial);
+    releaseTexture(targets.sky[0]);
+    releaseTexture(targets.sky[1]);
     targets.width = targets.height = 0;
 }
 
@@ -594,7 +618,13 @@ bool ensure_targets(uint32_t width, uint32_t height, uint32_t fullWidth, uint32_
               createStorageTexture("SSILVB history depth 1", WGPUTextureFormat_R32Float, 1,
                   fullWidth, fullHeight, g_targets.historyDepth[1]) &&
               createStorageTexture("SSILVB emissive delta", WGPUTextureFormat_RGBA16Float, 1,
-                  fullWidth, fullHeight, g_targets.emissive);
+                  fullWidth, fullHeight, g_targets.emissive) &&
+              createStorageTexture("SSILVB sky partial sums", WGPUTextureFormat_RGBA32Float, 1,
+                  (width + 7) / 8, (height + 7) / 8, g_targets.skyPartial) &&
+              createStorageTexture("SSILVB sky estimate 0", WGPUTextureFormat_RGBA16Float, 1,
+                  1, 1, g_targets.sky[0]) &&
+              createStorageTexture("SSILVB sky estimate 1", WGPUTextureFormat_RGBA16Float, 1,
+                  1, 1, g_targets.sky[1]);
     if (ok) {
         g_targets.views = new TargetViews{};
         for (uint32_t mip = 0; mip < 5 && ok; ++mip) {
@@ -621,11 +651,15 @@ bool ensure_targets(uint32_t width, uint32_t height, uint32_t fullWidth, uint32_
         v.historyDepth[0] = wgpuTextureCreateView(g_targets.historyDepth[0], nullptr);
         v.historyDepth[1] = wgpuTextureCreateView(g_targets.historyDepth[1], nullptr);
         v.emissive = wgpuTextureCreateView(g_targets.emissive, nullptr);
+        v.skyPartial = wgpuTextureCreateView(g_targets.skyPartial, nullptr);
+        v.sky[0] = wgpuTextureCreateView(g_targets.sky[0], nullptr);
+        v.sky[1] = wgpuTextureCreateView(g_targets.sky[1], nullptr);
         ok = v.preprocessedDepthAll != nullptr && v.colorChainAll != nullptr &&
              v.giNoisy != nullptr && v.depthDifferences != nullptr && v.giFinal != nullptr &&
              v.historyColor[0] != nullptr && v.historyColor[1] != nullptr &&
              v.historyDepth[0] != nullptr && v.historyDepth[1] != nullptr &&
-             v.emissive != nullptr;
+             v.emissive != nullptr && v.skyPartial != nullptr && v.sky[0] != nullptr &&
+             v.sky[1] != nullptr;
     }
     if (!ok) {
         release_targets(g_targets);
@@ -698,21 +732,31 @@ void on_compute(
     WGPUBindGroup mip4Group =
         makeBindGroup(g_mip4Layout, {textureEntry(6, views.preprocessedDepthMips[3]),
                                         textureEntry(7, views.preprocessedDepthMips[4])});
-    // Color chain (only dispatched when the bounce is on).
+    const uint32_t skyWrite = data.sky_write & 1u;
+    const uint32_t skyRead = 1u - skyWrite;
+    // Color chain + sky estimate (bit 0: bounce or sky light on; bit 1: MIP reductions, which
+    // only the bounce march reads).
     WGPUBindGroup colorMip0Group = nullptr;
     WGPUBindGroup colorReduceGroups[4] = {};
+    WGPUBindGroup skyReduceGroup = nullptr;
     bool colorOk = true;
-    if (data.run_gi != 0) {
-        // Bindings 8/9: depth MIP0 (written by the preprocess dispatch above) reprojects the
-        // previous frame's emissive delta into the light input.
+    if ((data.run_gi & 1u) != 0u) {
+        // Bindings 8/9: depth MIP0 (written by the preprocess dispatch above) detects sky and
+        // reprojects the previous frame's emissive delta; binding 10 collects the per-workgroup
+        // sky partial sums.
         colorMip0Group =
             makeBindGroup(g_colorMip0Layout, {textureEntry(0, data.sceneColor),
                                                  textureEntry(1, views.colorMips[0]),
                                                  uniformEntry(2),
                                                  textureEntry(8, views.preprocessedDepthMips[0]),
-                                                 textureEntry(9, views.emissive)});
-        colorOk = colorMip0Group != nullptr && data.sceneColor != nullptr;
-        for (uint32_t mip = 1; mip < 5 && colorOk; ++mip) {
+                                                 textureEntry(9, views.emissive),
+                                                 textureEntry(10, views.skyPartial)});
+        skyReduceGroup = makeBindGroup(g_skyReduceLayout,
+            {uniformEntry(2), textureEntry(11, views.skyPartial),
+                textureEntry(12, views.sky[skyRead]), textureEntry(13, views.sky[skyWrite])});
+        colorOk = colorMip0Group != nullptr && skyReduceGroup != nullptr &&
+                  data.sceneColor != nullptr;
+        for (uint32_t mip = 1; mip < 5 && colorOk && (data.run_gi & 2u) != 0u; ++mip) {
             colorReduceGroups[mip - 1] =
                 makeBindGroup(g_colorReduceLayout, {textureEntry(3, views.colorMips[mip - 1]),
                                                        textureEntry(4, views.colorMips[mip])});
@@ -723,7 +767,8 @@ void on_compute(
         g_ssilvbLayout, {textureEntry(0, views.preprocessedDepthAll),
                             textureEntry(1, g_hilbertLutView), textureEntry(2, views.giNoisy),
                             textureEntry(3, views.depthDifferences), uniformEntry(4),
-                            textureEntry(5, data.d2nNormal), textureEntry(6, views.colorChainAll)});
+                            textureEntry(5, data.d2nNormal), textureEntry(6, views.colorChainAll),
+                            textureEntry(7, views.sky[skyWrite])});
     // Denoise ping-pongs giNoisy <-> giFinal; the last-written buffer feeds temporal/composite
     // (the game thread computes the same parity for the composite payload).
     const uint32_t denoisePasses = std::min(data.denoise_passes, 3u);
@@ -757,6 +802,7 @@ void on_compute(
         release(preprocessGroup);
         release(mip4Group);
         release(colorMip0Group);
+        release(skyReduceGroup);
         for (auto* group : colorReduceGroups) {
             release(group);
         }
@@ -780,18 +826,25 @@ void on_compute(
     wgpuComputePassEncoderSetBindGroup(pass, 0, mip4Group, 0, nullptr);
     wgpuComputePassEncoderDispatchWorkgroups(pass, div_ceil(std::max(width >> 4, 1u), 8),
         div_ceil(std::max(height >> 4, 1u), 8), 1);
-    if (data.run_gi != 0) {
+    if ((data.run_gi & 1u) != 0u) {
         wgpuComputePassEncoderSetPipeline(pass, g_colorMip0Pipeline);
         wgpuComputePassEncoderSetBindGroup(pass, 0, colorMip0Group, 0, nullptr);
         wgpuComputePassEncoderDispatchWorkgroups(
             pass, div_ceil(width, 8), div_ceil(height, 8), 1);
-        wgpuComputePassEncoderSetPipeline(pass, g_colorReducePipeline);
-        for (uint32_t mip = 1; mip < 5; ++mip) {
-            const uint32_t mipWidth = std::max(width >> mip, 1u);
-            const uint32_t mipHeight = std::max(height >> mip, 1u);
-            wgpuComputePassEncoderSetBindGroup(pass, 0, colorReduceGroups[mip - 1], 0, nullptr);
-            wgpuComputePassEncoderDispatchWorkgroups(
-                pass, div_ceil(mipWidth, 8), div_ceil(mipHeight, 8), 1);
+        // Collapse the sky partial sums to the smoothed 1x1 estimate (one workgroup).
+        wgpuComputePassEncoderSetPipeline(pass, g_skyReducePipeline);
+        wgpuComputePassEncoderSetBindGroup(pass, 0, skyReduceGroup, 0, nullptr);
+        wgpuComputePassEncoderDispatchWorkgroups(pass, 1, 1, 1);
+        if ((data.run_gi & 2u) != 0u) {
+            wgpuComputePassEncoderSetPipeline(pass, g_colorReducePipeline);
+            for (uint32_t mip = 1; mip < 5; ++mip) {
+                const uint32_t mipWidth = std::max(width >> mip, 1u);
+                const uint32_t mipHeight = std::max(height >> mip, 1u);
+                wgpuComputePassEncoderSetBindGroup(
+                    pass, 0, colorReduceGroups[mip - 1], 0, nullptr);
+                wgpuComputePassEncoderDispatchWorkgroups(
+                    pass, div_ceil(mipWidth, 8), div_ceil(mipHeight, 8), 1);
+            }
         }
     }
     wgpuComputePassEncoderSetPipeline(pass, g_ssilvbPipeline);
@@ -820,6 +873,7 @@ void on_compute(
     release(preprocessGroup);
     release(mip4Group);
     release(colorMip0Group);
+    release(skyReduceGroup);
     for (auto* group : colorReduceGroups) {
         release(group);
     }
@@ -1042,6 +1096,11 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.chroma_lift = percent(g_cvarChromaLift, 50, 0, 100);
     uniforms.emissive_boost = percent(g_cvarEmissiveBoost, 300, 0, 800);
     uniforms.emissive_threshold = percent(g_cvarEmissiveThreshold, 10, 0, 50);
+    // Sky light rides the shared gi channel, which the composite multiplies by gi_intensity.
+    // Pre-divide so the sky slider is independent of the bounce slider (100 = the measured sky
+    // tint applied as-is).
+    uniforms.sky_intensity =
+        percent(g_cvarSkyIntensity, 100, 0, 400) / std::max(uniforms.gi_intensity, 0.01f);
     uniforms.contrast = percent(g_cvarContrast, 150, 50, 300);
     uniforms.thickness = percent(g_cvarThickness, 150, 25, 400);
     uniforms.black_point = percent(g_cvarBlackPoint, 3, 0, 30);
@@ -1093,9 +1152,12 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     // Emissive capture only matters while the bounce runs, and only once a previous camera
     // exists (the reprojection of the delta needs it).
     const bool emissiveBounce = giEnabled && get_bool_option(g_cvarEmissiveBounce, true);
+    // Sky light works with the bounce off (directional-AO + sky ambient mode); it needs the
+    // color prefilter (for the sky estimate) but not the MIP reductions.
+    const bool skyLight = get_bool_option(g_cvarSkyLight, true);
     uniforms.flags = (temporal ? 1u : 0u) | (g_historyValid ? 2u : 0u) |
         (distanceFade ? 4u : 0u) | (giEnabled ? 8u : 0u) | (aoApply ? 16u : 0u) |
-        (bounceWhite ? 32u : 0u) | (emissiveBounce ? 64u : 0u);
+        (bounceWhite ? 32u : 0u) | (emissiveBounce ? 64u : 0u) | (skyLight ? 128u : 0u);
 
     GfxRange uniformRange{0, 0};
     if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &uniformRange) != MOD_OK) {
@@ -1117,9 +1179,11 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     computePayload.chainSize = (width << 16) | height;
     computePayload.fullSize = (resolved.width << 16) | resolved.height;
     computePayload.run_temporal = temporal ? 1u : 0u;
-    computePayload.run_gi = giEnabled ? 1u : 0u;
+    computePayload.run_gi = ((giEnabled || skyLight) ? 1u : 0u) | (giEnabled ? 2u : 0u);
     computePayload.denoise_passes = denoisePasses;
     computePayload.history_write = writeIdx;
+    computePayload.sky_write = g_skyWriteIndex;
+    g_skyWriteIndex ^= 1u;
     if (svc_gfx->push_compute(mod_ctx, g_computeType, &computePayload, sizeof(computePayload)) !=
         MOD_OK)
     {
@@ -1270,6 +1334,14 @@ ModResult build_controls_tab(
         "Raise if fog or subtle effects start glowing; lower if faint glows (fairies at a "
         "distance) stop contributing.",
         0, 50, 1, "%");
+    add_toggle(left, "Sky Light", g_cvarSkyLight,
+        "Directional ambient from the sky: surfaces open to the sky receive its light "
+        "(measured live from the on-screen skybox, so it follows the time-of-day tint), while "
+        "covered surfaces don't. Works even with Indirect Bounce off. Fades out gradually "
+        "indoors.");
+    add_number(left, "Sky Light Intensity", g_cvarSkyIntensity,
+        "Strength of the sky's directional ambient. 100 applies the measured sky tint as-is.",
+        0, 400, 10, "%");
     add_toggle(left, "Apply AO", g_cvarAoApply,
         "Also darken by the ambient occlusion this pass measures. Turn OFF when running the "
         "VBAO mod alongside, otherwise the scene is darkened twice.");
@@ -1494,6 +1566,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"giEnabled", true, &g_cvarGiEnabled},
         {"bounceWhite", false, &g_cvarBounceWhite},
         {"emissiveBounce", true, &g_cvarEmissiveBounce},
+        {"skyLight", true, &g_cvarSkyLight},
         {"aoApply", true, &g_cvarAoApply},
         {"temporal", true, &g_cvarTemporal},
         {"distanceFade", false, &g_cvarDistanceFade},
@@ -1515,6 +1588,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"chromaLift", 50, &g_cvarChromaLift},
         {"emissiveBoost", 300, &g_cvarEmissiveBoost},
         {"emissiveThreshold", 10, &g_cvarEmissiveThreshold},
+        {"skyIntensity", 100, &g_cvarSkyIntensity},
         {"aoIntensity", 150, &g_cvarAoIntensity},
         {"contrast", 150, &g_cvarContrast},
         {"blackPoint", 3, &g_cvarBlackPoint},
@@ -1561,6 +1635,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
             g_colorReducePipeline, g_colorReduceLayout) ||
         !build_compute_pipeline("SSILVB emissive extract", g_colorSource, "extract_emissive",
             g_emissivePipeline, g_emissiveLayout) ||
+        !build_compute_pipeline("SSILVB sky reduce", g_colorSource, "reduce_sky",
+            g_skyReducePipeline, g_skyReduceLayout) ||
         !build_compute_pipeline(
             "SSILVB sampling", g_ssilvbSource, "ssilvb", g_ssilvbPipeline, g_ssilvbLayout) ||
         !build_compute_pipeline("SSILVB denoise", g_denoiseSource, "spatial_denoise",
@@ -1667,6 +1743,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     releasePipeline(g_colorMip0Pipeline);
     releasePipeline(g_colorReducePipeline);
     releasePipeline(g_emissivePipeline);
+    releasePipeline(g_skyReducePipeline);
     releasePipeline(g_ssilvbPipeline);
     releasePipeline(g_denoisePipeline);
     releasePipeline(g_temporalPipeline);
@@ -1675,6 +1752,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     releaseLayout(g_colorMip0Layout);
     releaseLayout(g_colorReduceLayout);
     releaseLayout(g_emissiveLayout);
+    releaseLayout(g_skyReduceLayout);
     releaseLayout(g_ssilvbLayout);
     releaseLayout(g_denoiseLayout);
     releaseLayout(g_temporalLayout);
@@ -1695,6 +1773,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarEnabled = g_cvarGiEnabled = g_cvarGiIntensity = g_cvarGiBlendMode = 0;
     g_cvarChromaLift = g_cvarBounceWhite = g_cvarAoApply = g_cvarAoIntensity = 0;
     g_cvarEmissiveBounce = g_cvarEmissiveBoost = g_cvarEmissiveThreshold = 0;
+    g_cvarSkyLight = g_cvarSkyIntensity = 0;
     g_cvarContrast = g_cvarBlackPoint = 0;
     g_cvarQuality = g_cvarCustomSlices = g_cvarCustomSteps = 0;
     g_cvarRadius = g_cvarRadiusFar = g_cvarRadiusRampStart = g_cvarRadiusRampEnd = 0;
@@ -1710,6 +1789,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_controlsWindow = 0;
     g_frameIndex = 0;
     g_historyWriteIndex = 0;
+    g_skyWriteIndex = 0;
     g_historyValid = false;
     g_prevCameraValid = false;
     g_loggedFarPlane = 1.0f;

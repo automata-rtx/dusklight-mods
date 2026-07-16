@@ -1,4 +1,5 @@
-// SSILVB - scene-color prefilter: gamma decode + box-filtered MIP chain.
+// SSILVB - scene-color prefilter: gamma decode + box-filtered MIP chain, emissive injection,
+// and the sky-radiance estimate.
 //
 // The GI march samples radiance at screen positions far from the receiver; reading those from
 // the full-resolution snapshot would thrash the cache exactly the way the SSILVB paper warns
@@ -21,6 +22,15 @@
 // own composite, deferred fog's re-apply) don't feed back. prefilter_color then reprojects the
 // PREVIOUS frame's delta into MIP 0 with the same temporal reprojection matrix the accumulation
 // uses, so emissive light rides the normal MIP chain and the march needs no changes at all.
+//
+// SKY RADIANCE ESTIMATE (for the directional sky light): the skybox pixels in the snapshot were
+// drawn by the game with its time-of-day palette already applied, so averaging them measures the
+// real, blended sky tint - sunset gradients and weather included - with no game-state access.
+// prefilter_color reduces each 8x8 workgroup's sky pixels (raw depth 0 = sky) to one texel of a
+// partial-sums texture; reduce_sky collapses those to a single smoothed 1x1 value:
+//   .rgb = linear sky radiance, .a = confidence (smoothed on-screen sky fraction). The value is
+// temporally smoothed and HELD when no sky is visible (confidence decays slowly), so brief
+// look-downs don't flicker the sky light and interiors fade it out rather than snapping.
 
 struct Uniforms {
     projection: mat4x4f,
@@ -52,7 +62,7 @@ struct Uniforms {
     frame_index: u32,
     flags: u32, // bit 0 temporal, bit 1 history valid, bit 2 distance fade,
                 // bit 3 GI enabled, bit 4 AO apply, bit 5 white bounce proxy,
-                // bit 6 emissive bounce
+                // bit 6 emissive bounce, bit 7 sky light
     thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
     radius_far: f32,        // far effect radius (fraction of view depth); 0 disables the ramp
     radius_ramp_start: f32, // radius ramp band start, world units of view depth
@@ -62,6 +72,10 @@ struct Uniforms {
     chroma_lift: f32,       // receiver albedo proxy: 0 = raw scene color .. 1 = full chroma norm
     emissive_boost: f32,     // emissive-delta bounce gain (fire, fairies, glows)
     emissive_threshold: f32, // linear floor for the emissive delta extract
+    sky_intensity: f32,      // directional sky-light strength (0 disables in the sampler)
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
 }
 
 @group(0) @binding(0) var scene_color: texture_2d<f32>;
@@ -74,10 +88,15 @@ struct Uniforms {
 @group(0) @binding(5) var late_color: texture_2d<f32>;
 @group(0) @binding(6) var opaque_color: texture_2d<f32>;
 @group(0) @binding(7) var emissive_out: texture_storage_2d<rgba16float, write>;
-// prefilter_color entry point only: depth MIP 0 (already written this pass) for reprojection,
-// and the PREVIOUS frame's emissive delta.
+// prefilter_color entry point only: depth MIP 0 (already written this pass) for sky detection +
+// emissive reprojection, the PREVIOUS frame's emissive delta, and the sky partial-sums output.
 @group(0) @binding(8) var depth_mip0: texture_2d<f32>;
 @group(0) @binding(9) var emissive_prev: texture_2d<f32>;
+@group(0) @binding(10) var sky_partial_out: texture_storage_2d<rgba32float, write>;
+// reduce_sky entry point only.
+@group(0) @binding(11) var sky_partial_in: texture_2d<f32>;
+@group(0) @binding(12) var sky_prev: texture_2d<f32>;
+@group(0) @binding(13) var sky_out: texture_storage_2d<rgba16float, write>;
 
 fn decode(encoded: vec3f) -> vec3f {
     return pow(max(encoded, vec3f(0.0)), vec3f(2.2));
@@ -103,43 +122,137 @@ fn taau_jitter() -> vec2<i32> {
     }
 }
 
+// Workgroup sky reduction scratch: (sum.rgb, count) per invocation.
+var<workgroup> wg_sky: array<vec4f, 64>;
+
 @compute
 @workgroup_size(8, 8, 1)
-fn prefilter_color(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn prefilter_color(@builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(local_invocation_index) local_index: u32,
+    @builtin(workgroup_id) workgroup_id: vec3<u32>) {
     let p = vec2<i32>(global_id.xy);
-    if p.x >= i32(uniforms.size.x) || p.y >= i32(uniforms.size.y) {
-        return;
-    }
-    let input_size = vec2<i32>(textureDimensions(scene_color));
-    let coordinates = clamp(vec2<i32>(vec2<f32>(p) * uniforms.depth_scale) + taau_jitter(),
-        vec2<i32>(0i), input_size - 1i);
-    var radiance = decode(textureLoad(scene_color, coordinates, 0i).rgb);
-    if (uniforms.flags & 64u) != 0u {
-        // Add the previous frame's emissive delta, reprojected from the previous frame's screen
-        // space (the delta was extracted at the end of that frame). Sky pixels and off-screen
-        // reprojections fall back to the same uv - a one-frame smear on fast pans, invisible in
-        // practice because the delta is re-extracted every frame.
-        let full_size = vec2f(input_size);
-        let uv = (vec2f(coordinates) + 0.5) / full_size;
-        var prev_uv = uv;
+    // No early return: every invocation must reach the workgroup barriers below (uniform
+    // control flow), so out-of-bounds threads contribute zero and skip only the stores.
+    let in_bounds = p.x < i32(uniforms.size.x) && p.y < i32(uniforms.size.y);
+
+    var radiance = vec3f(0.0);
+    var sky_contrib = vec4f(0.0);
+    if in_bounds {
+        let input_size = vec2<i32>(textureDimensions(scene_color));
+        let coordinates = clamp(vec2<i32>(vec2<f32>(p) * uniforms.depth_scale) + taau_jitter(),
+            vec2<i32>(0i), input_size - 1i);
+        radiance = decode(textureLoad(scene_color, coordinates, 0i).rgb);
         let depth = textureLoad(depth_mip0, p, 0i).r;
-        if depth > 0.0 {
-            let view_pos = reconstruct_view_space_position(depth, uv);
-            let clip_prev = uniforms.reproject * vec4f(view_pos, 1.0);
-            if clip_prev.w > 1.0e-4 {
-                let ndc = clip_prev.xy / clip_prev.w;
-                let cand = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-                if cand.x >= 0.0 && cand.y >= 0.0 && cand.x <= 1.0 && cand.y <= 1.0 {
-                    prev_uv = cand;
+
+        // Sky pixels (reversed-Z clear = 0): the game's skybox with the time-of-day palette
+        // already applied. Contribute to the sky-radiance estimate, BEFORE the emissive add.
+        if depth <= 0.0 {
+            sky_contrib = vec4f(radiance, 1.0);
+        }
+
+        if (uniforms.flags & 64u) != 0u {
+            // Add the previous frame's emissive delta, reprojected from the previous frame's
+            // screen space (the delta was extracted at the end of that frame). Sky pixels and
+            // off-screen reprojections fall back to the same uv - a one-frame smear on fast
+            // pans, invisible in practice because the delta is re-extracted every frame.
+            let full_size = vec2f(input_size);
+            let uv = (vec2f(coordinates) + 0.5) / full_size;
+            var prev_uv = uv;
+            if depth > 0.0 {
+                let view_pos = reconstruct_view_space_position(depth, uv);
+                let clip_prev = uniforms.reproject * vec4f(view_pos, 1.0);
+                if clip_prev.w > 1.0e-4 {
+                    let ndc = clip_prev.xy / clip_prev.w;
+                    let cand = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+                    if cand.x >= 0.0 && cand.y >= 0.0 && cand.x <= 1.0 && cand.y <= 1.0 {
+                        prev_uv = cand;
+                    }
                 }
             }
+            let e_dims = vec2f(textureDimensions(emissive_prev));
+            let e_texel = clamp(
+                vec2<i32>(prev_uv * e_dims), vec2<i32>(0i), vec2<i32>(e_dims) - vec2<i32>(1i));
+            radiance += textureLoad(emissive_prev, e_texel, 0i).rgb * uniforms.emissive_boost;
         }
-        let e_dims = vec2f(textureDimensions(emissive_prev));
-        let e_texel = clamp(
-            vec2<i32>(prev_uv * e_dims), vec2<i32>(0i), vec2<i32>(e_dims) - vec2<i32>(1i));
-        radiance += textureLoad(emissive_prev, e_texel, 0i).rgb * uniforms.emissive_boost;
     }
-    textureStore(color_mip0, p, vec4f(radiance, 1.0));
+
+    // Tree-reduce this workgroup's sky contributions to one partial-sums texel.
+    wg_sky[local_index] = sky_contrib;
+    for (var stride = 32u; stride > 0u; stride >>= 1u) {
+        workgroupBarrier();
+        if local_index < stride {
+            wg_sky[local_index] += wg_sky[local_index + stride];
+        }
+    }
+    if local_index == 0u {
+        textureStore(sky_partial_out, vec2<i32>(workgroup_id.xy), wg_sky[0]);
+    }
+
+    if in_bounds {
+        textureStore(color_mip0, p, vec4f(radiance, 1.0));
+    }
+}
+
+// One MIP reduction step (box average of the parent level); dispatched once per level 1..4.
+@compute
+@workgroup_size(8, 8, 1)
+fn reduce_color(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let p = vec2<i32>(global_id.xy);
+    let out_size = vec2<i32>(textureDimensions(color_out));
+    if p.x >= out_size.x || p.y >= out_size.y {
+        return;
+    }
+    let in_size = vec2<i32>(textureDimensions(color_in));
+    let base = p * 2i;
+    let maxc = in_size - 1i;
+    let c0 = textureLoad(color_in, clamp(base, vec2<i32>(0i), maxc), 0i).rgb;
+    let c1 = textureLoad(color_in, clamp(base + vec2<i32>(1i, 0i), vec2<i32>(0i), maxc), 0i).rgb;
+    let c2 = textureLoad(color_in, clamp(base + vec2<i32>(0i, 1i), vec2<i32>(0i), maxc), 0i).rgb;
+    let c3 = textureLoad(color_in, clamp(base + vec2<i32>(1i, 1i), vec2<i32>(0i), maxc), 0i).rgb;
+    textureStore(color_out, p, vec4f((c0 + c1 + c2 + c3) * 0.25, 1.0));
+}
+
+// Collapse the partial sums to the single smoothed sky value (one 64-thread workgroup).
+// .rgb = linear sky radiance (held at its last value while no sky is on screen),
+// .a   = confidence: the smoothed on-screen sky fraction, rising while sky is visible and
+//        decaying slowly indoors so the sky light fades out instead of snapping.
+var<workgroup> wg_total: array<vec4f, 64>;
+
+@compute
+@workgroup_size(64, 1, 1)
+fn reduce_sky(@builtin(local_invocation_index) local_index: u32) {
+    let dims = vec2<i32>(textureDimensions(sky_partial_in));
+    let texel_count = dims.x * dims.y;
+    var acc = vec4f(0.0);
+    for (var i = i32(local_index); i < texel_count; i += 64i) {
+        acc += textureLoad(sky_partial_in, vec2<i32>(i % dims.x, i / dims.x), 0i);
+    }
+    wg_total[local_index] = acc;
+    for (var stride = 32u; stride > 0u; stride >>= 1u) {
+        workgroupBarrier();
+        if local_index < stride {
+            wg_total[local_index] += wg_total[local_index + stride];
+        }
+    }
+    if local_index == 0u {
+        let sum = wg_total[0]; // (sky rgb sum, sky pixel count)
+        let prev = textureLoad(sky_prev, vec2<i32>(0i, 0i), 0i);
+        let chain_pixels = max(uniforms.size.x * uniforms.size.y, 1.0);
+        // Full measurement confidence once >=2% of the screen is sky.
+        let coverage = clamp((sum.w / chain_pixels) / 0.02, 0.0, 1.0);
+        var value = prev;
+        if sum.w > 0.5 {
+            let mean = sum.rgb / sum.w;
+            // Lock on instantly the first time sky is ever seen; then smooth over ~12 frames,
+            // slower when only a sliver of sky is visible (a sliver is a biased sample).
+            let alpha = select(0.08 * max(coverage, 0.1), 1.0, prev.a <= 0.001);
+            value = vec4f(mix(prev.rgb, mean, alpha), prev.a);
+        }
+        // Confidence chases the coverage slowly in both directions: brief look-downs barely
+        // move it; walking indoors fades the sky light out over a few seconds.
+        value.a = clamp(mix(prev.a, coverage, 0.03), 0.0, 1.0);
+        textureStore(sky_out, vec2<i32>(0i, 0i), value);
+    }
 }
 
 // Emissive delta extract: everything the translucent/effect phase ADDED over the opaque scene
@@ -160,23 +273,4 @@ fn extract_emissive(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let opaque = decode(textureLoad(opaque_color, c, 0i).rgb);
     let delta = max(late - opaque - vec3f(uniforms.emissive_threshold), vec3f(0.0));
     textureStore(emissive_out, p, vec4f(delta, 1.0));
-}
-
-// One MIP reduction step (box average of the parent level); dispatched once per level 1..4.
-@compute
-@workgroup_size(8, 8, 1)
-fn reduce_color(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let p = vec2<i32>(global_id.xy);
-    let out_size = vec2<i32>(textureDimensions(color_out));
-    if p.x >= out_size.x || p.y >= out_size.y {
-        return;
-    }
-    let in_size = vec2<i32>(textureDimensions(color_in));
-    let base = p * 2i;
-    let maxc = in_size - 1i;
-    let c0 = textureLoad(color_in, clamp(base, vec2<i32>(0i), maxc), 0i).rgb;
-    let c1 = textureLoad(color_in, clamp(base + vec2<i32>(1i, 0i), vec2<i32>(0i), maxc), 0i).rgb;
-    let c2 = textureLoad(color_in, clamp(base + vec2<i32>(0i, 1i), vec2<i32>(0i), maxc), 0i).rgb;
-    let c3 = textureLoad(color_in, clamp(base + vec2<i32>(1i, 1i), vec2<i32>(0i), maxc), 0i).rgb;
-    textureStore(color_out, p, vec4f((c0 + c1 + c2 + c3) * 0.25, 1.0));
 }
