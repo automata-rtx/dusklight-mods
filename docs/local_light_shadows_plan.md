@@ -403,3 +403,31 @@ the occlusion term is stable — the service is a thin publish of an already-com
    versioned with SSILVB, not this mod — coordinate the `LocalShadowService` header/version across
    both. The service ABI is a mod-to-mod contract (a texture view + dims), independent of the game
    ABI, so it is stable across game re-platforms.
+
+## Implementation log
+
+- **v0.1 (first attempt, shipped, superseded)** — single nearest light from
+  `g_env_light.pointlight[]`, opaque draw-list replay into a light map, deferred modulated-darken
+  composite (attenuation × facing), inline normal reconstruction (no service dependency), on-screen
+  casters only. The shadow map used an **ortho (directional) projection** aimed light→player, chosen
+  to reuse the sun mod's exact reversed-Z path with zero depth-convention risk. Built green on all 7
+  platforms.
+
+  **In-game result:** the depth/PCF path was correct (Reach, Light-UV, and the map itself checked
+  out), but occlusion **did not line up** — because a parallel projection from a *nearby, overhead*
+  light (a flame on a totem) casts every shadow in one direction (light→player) instead of radially
+  from the light. Confirmed the ortho stand-in is inadequate for local lights, as the plan
+  anticipated.
+
+- **v0.2 (perspective point projection)** — replaced the ortho box with a **`C_MTXPerspective`
+  frustum whose camera sits at the light**, looking toward the player; shadows now diverge from the
+  light's position. Key realization that removed the reversed-Z risk: `copy_projection` negates only
+  the clip **z row** and leaves the **w row** (the perspective divide) untouched, so
+  `ndc.z = -z_clip/w` reproduces aurora's stored reversed depth for a perspective matrix *exactly*
+  as it does for ortho — the proven path carries over unchanged. Added: a **Light Height Offset**
+  control (the registered light position can sit below the visible flame particle — the requester's
+  observation), a **Cone Angle** (fov) and **Range** (far plane) control, a small-constant ndc bias
+  (perspective depth is non-linear), and a **Depth Compare** debug view (receiver depth vs stored
+  map depth) to diagnose any residual bias/projection mismatch by eye. Still one frustum toward the
+  player (covers the hemisphere that way); full omni (dual-paraboloid / cube) and N lights remain the
+  documented follow-ups.

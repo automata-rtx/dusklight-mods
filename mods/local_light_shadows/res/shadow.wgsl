@@ -5,11 +5,14 @@
 // as a fullscreen triangle with MULTIPLY blending right after the opaque scene, so translucency and
 // the game's bloom layer over an already-shadowed world.
 //
-// This is a first attempt: the light is treated as a DIRECTIONAL source for the shadow map (an
-// ortho box aimed from the light toward the receiver region), so the reversed-Z depth math reuses
-// the proven Realtime Sun Shadows path exactly. The per-pixel `reach` term (which fades to zero
-// past the light's radius and on surfaces facing away) is what makes the darkening read as a LOCAL
-// light rather than a sun. A true point (perspective / dual-paraboloid) projection is a follow-up.
+// The shadow map is a PERSPECTIVE projection with the camera at the light, looking toward the
+// receiver region, so shadows diverge from the light's position like a real point source. The
+// reversed-Z depth math still reuses the proven Realtime Sun Shadows path: the composite's light_vp
+// negates only the clip z row, so ndc.z = -z_clip/w reproduces aurora's stored reversed depth for a
+// perspective matrix exactly as it does for ortho. The per-pixel `reach` term (which fades to zero
+// past the light's radius and on surfaces facing away) makes the darkening read as a LOCAL light. A
+// single frustum only covers the hemisphere toward the player; full omni (dual-paraboloid / cube)
+// and multiple lights are follow-ups.
 //
 // Depth conventions (both reversed-Z): the scene snapshot has 1.0 at the camera near plane; the
 // shadow map, rendered through the game's GX pipeline with a reversed-Z light matrix, stores
@@ -205,6 +208,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     if uniforms.debug_mode == 3u {
         let valid = select(0.0, 1.0, p.valid);
         return vec4f(saturate(p.uv.x), saturate(p.uv.y), valid, 1.0);
+    }
+    // Depth Compare: red = the receiver's depth-from-light, green = the stored occluder depth at
+    // its projected spot. On a directly-lit surface the nearest occluder IS the receiver, so the
+    // two should track (yellow); a systematic split is a bias or reversed-Z/projection mismatch.
+    if uniforms.debug_mode == 4u {
+        if !p.valid {
+            return vec4f(0.0, 0.0, 0.0, 1.0);
+        }
+        let texel = clamp(vec2<i32>(p.uv * uniforms.map_size), vec2<i32>(0i),
+            vec2<i32>(i32(uniforms.map_size) - 1i));
+        let stored = textureLoad(shadow_map, texel, 0i).r;
+        return vec4f(saturate(p.receiver), saturate(stored), 1.0, 1.0);
     }
     if !p.valid {
         // Outside the light's shadow map: we cannot tell, so assume lit.

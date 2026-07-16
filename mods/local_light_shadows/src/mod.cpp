@@ -70,6 +70,8 @@ ConfigVarHandle g_cvarSlopeBias = 0;
 ConfigVarHandle g_cvarNormalOffset = 0;
 ConfigVarHandle g_cvarPcf = 0;
 ConfigVarHandle g_cvarAttenPower = 0;
+ConfigVarHandle g_cvarFov = 0;
+ConfigVarHandle g_cvarHeightOffset = 0;
 ConfigVarHandle g_cvarTwoSidedCasters = 0;
 ConfigVarHandle g_cvarDebugView = 0;
 
@@ -129,9 +131,8 @@ static_assert(std::is_trivially_copyable_v<DrawPayload>);
 
 struct LightCamera {
     Mtx view;
-    Mtx44 ortho;
+    Mtx44 proj;
     Mtx44 vp;
-    float dirToLight[3];
     float lightNear = kLightNear;
     float lightFar = 60000.0f;
 };
@@ -187,7 +188,7 @@ bool get_bool_option(ConfigVarHandle handle, bool fallback) {
 }
 
 int64_t get_debug_mode() {
-    return std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 3);
+    return std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 4);
 }
 
 bool matrix_ready(const Mtx m) {
@@ -317,28 +318,26 @@ LIGHT_INFLUENCE* select_local_light(const cXyz& ref) {
     return best;
 }
 
-// Build an ortho light box centered on the receiver region, viewed from the local light. Mirrors
-// Realtime Sun Shadows' build_light_camera_core exactly (texel-snap, ortho, reversed-Z path), but
-// the light direction is the explicit light->receiver geometry rather than the sun.
-bool build_local_light_camera(const cXyz& center, const float dirToLight[3], uint32_t mapSize,
-    float radius, float lightDistance, LightCamera& out) {
-    out.dirToLight[0] = dirToLight[0];
-    out.dirToLight[1] = dirToLight[1];
-    out.dirToLight[2] = dirToLight[2];
-    out.lightNear = kLightNear;
-    out.lightFar = lightDistance + radius + 20000.0f;
-    const cXyz lightEye{center.x + dirToLight[0] * lightDistance,
-        center.y + dirToLight[1] * lightDistance, center.z + dirToLight[2] * lightDistance};
-    const bool nearlyVertical = std::fabs(dirToLight[1]) > 0.99f;
+// Perspective light camera positioned AT the local light, looking toward the receiver region. A
+// true point projection: shadows diverge from the light's position, so a flame on a totem casts
+// its shadows radially outward rather than as one parallel direction (the v0.1 ortho stand-in put
+// them in the wrong place for anything but the player's exact spot). The reversed-Z path is still
+// the proven one: copy_projection negates only the clip z row (the w row is the perspective
+// divide), so ndc.z reproduces aurora's stored reversed depth exactly as it does for ortho.
+bool build_local_light_camera(const cXyz& eye, const cXyz& target, float fovYDeg, float nearZ,
+    float farZ, LightCamera& out) {
+    cXyz look{target.x - eye.x, target.y - eye.y, target.z - eye.z};
+    const float len = std::sqrt(look.x * look.x + look.y * look.y + look.z * look.z);
+    if (!(len > 1.0f) || !std::isfinite(len)) {
+        return false;
+    }
+    out.lightNear = nearZ;
+    out.lightFar = farZ;
+    const bool nearlyVertical = std::fabs(look.y / len) > 0.99f;
     cXyz up = nearlyVertical ? cXyz{0.0f, 0.0f, 1.0f} : cXyz{0.0f, 1.0f, 0.0f};
-
-    cMtx_lookAt(out.view, &lightEye, &center, &up, 0);
-    const float unitsPerTexel = (2.0f * radius) / static_cast<float>(mapSize);
-    out.view[0][3] = std::round(out.view[0][3] / unitsPerTexel) * unitsPerTexel;
-    out.view[1][3] = std::round(out.view[1][3] / unitsPerTexel) * unitsPerTexel;
-
-    C_MTXOrtho(out.ortho, radius, -radius, -radius, radius, out.lightNear, out.lightFar);
-    cMtx_concatProjView(out.ortho, out.view, out.vp);
+    cMtx_lookAt(out.view, &eye, &target, &up, 0);
+    C_MTXPerspective(out.proj, fovYDeg, 1.0f, nearZ, farZ);
+    cMtx_concatProjView(out.proj, out.view, out.vp);
     return true;
 }
 
@@ -353,7 +352,7 @@ bool build_light_replay_projection(
     }
     Mtx lightFromCamera;
     cMtx_concat(lightCamera.view, cameraInvView, lightFromCamera);
-    cMtx_concatProjView(lightCamera.ortho, lightFromCamera, out);
+    cMtx_concatProjView(lightCamera.proj, lightFromCamera, out);
     return true;
 }
 
@@ -530,23 +529,25 @@ void render_local_shadow_map(const Mtx replayView) {
     if (light == nullptr) {
         return;
     }
-    const cXyz lightPos = light->mPosition;
-    float dir[3] = {lightPos.x - ref.x, lightPos.y - ref.y, lightPos.z - ref.z};
-    const float len = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
-    if (!(len > 1.0f) || !std::isfinite(len)) {
+    cXyz lightPos = light->mPosition;
+    // The registered light position can sit below the visible flame particle; let the user raise it
+    // to line up. Applied to both the shadow projection and the reach attenuation so they agree.
+    lightPos.y += static_cast<float>(
+        std::clamp<int64_t>(get_int_option(g_cvarHeightOffset, 0), -2000, 2000));
+    if (!std::isfinite(lightPos.x + lightPos.y + lightPos.z)) {
         return;
     }
-    dir[0] /= len;
-    dir[1] /= len;
-    dir[2] /= len;
 
     const uint32_t mapSize = 512u << std::clamp<int64_t>(get_int_option(g_cvarMapSize, 1), 0, 3);
-    const float radius =
-        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarCoverage, 1500), 300, 8000));
-    const float lightDistance = std::clamp(len, radius, 60000.0f);
+    const float fov =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarFov, 130), 40, 170));
+    const float farZ =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarCoverage, 2500), 500, 12000));
+    constexpr float kNearZ = 5.0f;
 
+    // Camera AT the light, looking at the receiver region (the player).
     LightCamera lightCamera{};
-    if (!build_local_light_camera(ref, dir, mapSize, radius, lightDistance, lightCamera)) {
+    if (!build_local_light_camera(lightPos, ref, fov, kNearZ, farZ, lightCamera)) {
         return;
     }
     Mtx44 replayProjection;
@@ -613,7 +614,16 @@ void render_local_shadow_map(const Mtx replayView) {
     g_localShadow.mapSize = mapSize;
     g_localShadow.lightNear = lightCamera.lightNear;
     g_localShadow.lightFar = lightCamera.lightFar;
-    g_localShadow.texelWorld = (2.0f * radius) / static_cast<float>(mapSize);
+    // Approximate world size of one shadow texel at the receiver distance (the normal-offset
+    // scale). For a perspective map the texel grows with depth; the receiver region is the
+    // representative distance.
+    const float dx = ref.x - lightPos.x;
+    const float dy = ref.y - lightPos.y;
+    const float dz = ref.z - lightPos.z;
+    const float distToRef = std::sqrt(dx * dx + dy * dy + dz * dz);
+    const float halfFovRad = fov * 0.5f * 0.017453292f;
+    g_localShadow.texelWorld =
+        (2.0f * std::tan(halfFovRad) * distToRef) / static_cast<float>(mapSize);
     copy_projection(lightCamera.vp, g_localShadow.lightVp);
     g_localShadow.lightPos[0] = lightPos.x;
     g_localShadow.lightPos[1] = lightPos.y;
@@ -642,11 +652,16 @@ void composite_pass(int64_t debugMode) {
         return;
     }
 
-    const float lightRange = std::max(shadow.lightFar - shadow.lightNear, 1.0f);
-    const float biasWorld =
-        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarBias, 40), 0, 200));
-    const float slopeBiasWorld =
-        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarSlopeBias, 40), 0, 200));
+    // Perspective reversed-Z depth is non-linear (most precision near the light, which is where
+    // local-light receivers sit), so bias is a small constant in ndc.z units, tuned by eye rather
+    // than normalized against a world range as the ortho sun path does.
+    constexpr float kBiasNdcScale = 2.0e-5f;
+    const float biasNdc =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarBias, 40), 0, 400)) *
+        kBiasNdcScale;
+    const float slopeBiasNdc =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarSlopeBias, 40), 0, 400)) *
+        kBiasNdcScale;
 
     LocalShadowUniforms uniforms{};
     std::memcpy(uniforms.world_from_proj, camera.world_from_proj, sizeof(uniforms.world_from_proj));
@@ -657,8 +672,8 @@ void composite_pass(int64_t debugMode) {
     uniforms.light_pow = shadow.lightPow;
     uniforms.strength =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarStrength, 45), 0, 100)) / 100.0f;
-    uniforms.bias = biasWorld / lightRange;
-    uniforms.slope_bias = slopeBiasWorld / lightRange;
+    uniforms.bias = biasNdc;
+    uniforms.slope_bias = slopeBiasNdc;
     uniforms.normal_offset =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarNormalOffset, 100), 0, 300)) /
         100.0f;
@@ -772,22 +787,33 @@ ModResult build_controls_tab(
     add_number(left, "Strength", g_cvarStrength, 0, 100, 5, "%",
         "How dark shadowed areas become where the local light reaches.");
 
+    svc_ui->pane_add_section(mod_ctx, left, "Light");
+    add_number(left, "Light Height Offset", g_cvarHeightOffset, -2000, 2000, 10, nullptr,
+        "Raises (or lowers) the shadow-casting light relative to its registered position. The game "
+        "registers a torch/fire's light a bit below the visible flame particle; nudge this up until "
+        "shadows radiate from the flame you see.");
+    add_number(left, "Cone Angle", g_cvarFov, 40, 170, 5, "deg",
+        "Field of view of the light's shadow frustum (it points from the light toward the player). "
+        "Wider covers more of the scene around you at lower detail; a point light is omnidirectional "
+        "so this is the visible cone the first attempt renders.");
+    add_number(left, "Range", g_cvarCoverage, 500, 12000, 250, nullptr,
+        "Far distance of the shadow frustum from the light, in world units. Casters beyond it do "
+        "not appear in the map. Set around the light's reach; larger costs a little depth precision.");
+
     svc_ui->pane_add_section(mod_ctx, left, "Shadow Map");
     static const char* kMapSizes[] = {"512", "1024", "2048", "4096"};
     add_select(left, "Map Size", g_cvarMapSize, kMapSizes, 4,
         "Resolution of the local light's shadow map. Larger is sharper and slower.");
-    add_number(left, "Coverage", g_cvarCoverage, 300, 8000, 100, nullptr,
-        "World-unit extent of the shadow map around the player. Set roughly to how far from the "
-        "player you want local shadows to render; it is independent of the light's own falloff.");
     add_number(left, "Falloff", g_cvarAttenPower, 10, 400, 10, "%",
         "Shapes how fast the shadow fades with distance from the light (attenuation exponent). "
         "Higher concentrates the shadow near the light; 100% is linear.");
     static const char* kPcfOptions[] = {"Off", "3x3", "5x5", "7x7"};
     add_select(left, "Soft Shadows", g_cvarPcf, kPcfOptions, 4,
         "Shadow-map edge softening (percentage-closer filtering).");
-    add_number(left, "Bias", g_cvarBias, 0, 200, 5, nullptr,
-        "Constant depth bias. Raise to remove shadow-map acne; lower to reduce peter-panning.");
-    add_number(left, "Slope Bias", g_cvarSlopeBias, 0, 200, 5, nullptr,
+    add_number(left, "Bias", g_cvarBias, 0, 400, 5, nullptr,
+        "Constant depth bias. Raise to remove shadow-map acne (shimmering self-shadow); lower to "
+        "reduce peter-panning (shadows detaching from feet).");
+    add_number(left, "Slope Bias", g_cvarSlopeBias, 0, 400, 5, nullptr,
         "Extra bias that grows with surface slope relative to the light. Targets sloped-surface "
         "acne without detaching flat-ground shadows.");
     add_number(left, "Normal Offset", g_cvarNormalOffset, 0, 300, 10, "%",
@@ -798,10 +824,13 @@ ModResult build_controls_tab(
         "single-sided geometry (walls, roofs) that faces away from the light.");
 
     svc_ui->pane_add_section(mod_ctx, left, "Debug");
-    static const char* kDebugViews[] = {"Off", "Occlusion", "Reach", "Light UV"};
-    add_select(left, "Debug View", g_cvarDebugView, kDebugViews, 4,
+    static const char* kDebugViews[] = {"Off", "Occlusion", "Reach", "Light UV", "Depth Compare"};
+    add_select(left, "Debug View", g_cvarDebugView, kDebugViews, 5,
         "Occlusion = raw shadow term; Reach = light attenuation x facing; Light UV = the "
-        "receiver's projection into the shadow map (red/green = uv, blue = inside the map).");
+        "receiver's projection into the shadow map (red/green = uv, blue = inside the map); Depth "
+        "Compare = red is the receiver's depth-from-light, green is the stored map depth at that "
+        "spot - on directly-lit surfaces they should match (yellow), diverging means a bias/"
+        "projection issue.");
     return MOD_OK;
 }
 
@@ -891,7 +920,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     const IntVar intVars[] = {
         {"strength", 45, &g_cvarStrength},
         {"mapSize", 1, &g_cvarMapSize},
-        {"coverage", 1500, &g_cvarCoverage},
+        {"coverage", 2500, &g_cvarCoverage},
+        {"fov", 130, &g_cvarFov},
+        {"heightOffset", 0, &g_cvarHeightOffset},
         {"bias", 40, &g_cvarBias},
         {"slopeBias", 40, &g_cvarSlopeBias},
         {"normalOffset", 100, &g_cvarNormalOffset},
@@ -1007,6 +1038,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     releaseLayout(g_compositeDebugLayout);
 
     g_cvarEnabled = g_cvarStrength = g_cvarMapSize = g_cvarCoverage = 0;
+    g_cvarFov = g_cvarHeightOffset = 0;
     g_cvarBias = g_cvarSlopeBias = g_cvarNormalOffset = g_cvarPcf = 0;
     g_cvarAttenPower = g_cvarTwoSidedCasters = g_cvarDebugView = 0;
     g_drawType = 0;
