@@ -5,10 +5,19 @@ torches, bonfires, lanterns, glowing props) cast real-time geometry shadows — 
 each one places in the vanilla scene into a shadow-casting light. This doc is a viability study, not
 a shipped plan: it grades each subproblem and recommends a scope.
 
-**Verdict: viable as a game-linked mod for a bounded number of nearby lights, reusing ~80% of the
-Realtime Sun Shadows machinery — with one genuinely hard subproblem (compositing) that forces a
-pragmatic "darken where occluded" approach rather than physically correct light removal.** Two of
-the four subproblems are solved outright; two need care. Details below.
+**Verdict: viable as a standalone game-linked mod for a bounded number of nearby lights, reusing
+~80% of the Realtime Sun Shadows machinery — with one genuinely hard subproblem (compositing) that
+forces a pragmatic "darken where occluded" approach rather than physically correct light removal.**
+Two of the four subproblems are solved outright; two need care. Details below.
+
+**Two decisions locked in (from the requester):** (1) this is a **standalone** mod, not folded into
+Realtime Sun Shadows — see "Standalone mod + service export" below; the earlier hook-conflict worry
+does not survive scrutiny (the replay hooks self-gate). (2) The mod additionally **exports its
+per-pixel local-shadow term as a service** so the **SSILVB** GI mod can apply it to its light-input
+buffer — making the bounce respect local shadows (shadowed ground near a fire spills less light).
+That integration is designed against SSILVB's real code in "Integration with SSILVB" below, and it
+is a clean, sanctioned fit (the same optional-service pattern SSILVB already uses for Depth to
+Normal and plans for an albedo provider).
 
 ## The four subproblems, graded
 
@@ -220,16 +229,113 @@ perspective map's depth non-linearity) — an adaptation of the existing per-cas
 not new machinery. The Bend screen-space-shadow pass is directional (traces toward one light) and
 does not generalize cheaply to N omnidirectional lights; leave it sun-only.
 
-## Where it should live (and a hook-conflict warning)
+## Standalone mod + service export
 
-Build it **into Realtime Sun Shadows** (or a shared internal static lib both consume) — **not** as an
-independent sibling mod. The caster-replay hooks (`J3DUClipper::clip` bypass, `GXSetCullMode`
-rewrite, `J3DShape::drawFast` genMode re-issue, small-caster cull) are non-trivial and already
-installed by the sun mod; a second mod installing its **own** pre-hooks on the same J3D functions
-would double-fire them (both hooks run per clip test / per drawFast), which is a real correctness and
-performance hazard. One mod owning the replay hooks and driving both the sun cascades and the
-local-light maps from a shared "render this draw-list from this camera into this map" primitive is
-the clean structure. The mod's identity broadens from "Realtime Sun Shadows" to "Realtime Shadows."
+Build it as its **own** game-linked mod (`mods/local_light_shadows/`, proposed id
+`dev.automata.local_light_shadows`), not folded into Realtime Sun Shadows. Two reasons the requester
+prefers this — dissatisfaction with the current sun mod, and local-light shadows being a smaller,
+more self-contained problem (small radii, no cascades, most relevant *indoors* where the sun mod
+auto-disables) — and one reason the earlier "merge it in" recommendation was wrong:
+
+**The hook-conflict worry does not survive scrutiny — the replay hooks self-gate.** The sun mod's
+pre-hooks (`J3DUClipper::clip` bypass, `GXSetCullMode` rewrite, `J3DShape::drawFast` genMode
+re-issue, `GXCopyTex` skip) are every one of them guarded by a per-frame flag that is only live
+*inside that mod's own replay bracket* — `on_frustum_clip_pre` returns `HOOK_CONTINUE` unless
+`g_replayingSceneLists` is set (`mod.cpp:1084`), which the `replay_scope` RAII toggles on only around
+the replay (`mod.cpp:380`). Two independently-installed mods each hooking the same J3D functions
+therefore coexist cleanly: during the sun mod's replay its hooks act and the local mod's are inert
+no-ops (one bool check), and vice versa; during normal game rendering both are inert. The hook
+framework chains multiple pre-hooks on one target, so registration does not clash. The only real
+cost is *duplicated hook code to maintain* in two mods — which a shared internal header
+(`replay_primitive.hpp`: "render these draw-lists from this camera into this offscreen map") factors
+out without coupling the mods at runtime. Do keep both mods' replay brackets on the game thread and
+non-overlapping (each is a synchronous `create_pass → replay → resolve_pass`), which they naturally
+are as stage callbacks.
+
+**The mod exports a service.** Beyond drawing its own visible shadows, Local Light Shadows publishes
+a screen-space **local-light occlusion** buffer as a mod-exported service — the exact
+`depth_to_normal` pattern (`mods/depth_to_normal/include/depth_to_normal_service.h`):
+
+```c
+// include/local_shadow_service.h  (consumer-facing)
+struct LocalShadowFrame { WGPUTextureView occlusion; uint32_t width, height; /* r8/r16f: 1=lit, 0=shadowed */ };
+// provider: EXPORT_SERVICE(LocalShadowService, ...); get_frame(ctx, &out) returns a frame-valid view
+```
+
+The same per-pixel occlusion term drives both the mod's own composite (the visible shadow) and any
+consumer (SSILVB). Publishing it as a service — rather than relying on scene-color darkening being
+picked up implicitly — is what makes the SSILVB integration correct and order-independent (next
+section).
+
+## Integration with SSILVB (making the GI bounce respect local shadows)
+
+SSILVB (`mods/ssilvb/` on `claude/dusklight-platform-rebuild-rqhsaw`; docs `ssilvb_plan.md`) is the
+shipped visibility-bitmask GI mod. Its indirect light is gathered by marching the depth buffer and,
+at each marched sample, reading that sample's **outgoing radiance** `c_j` from a MIP chain of the
+opaque scene-color snapshot (`res/preprocess_color.wgsl`, linear-decoded at
+`preprocess_color.wgsl:116`; sampled in `res/ssilvb.wgsl:219` `load_sample_radiance`). The requester
+wants Local Light Shadows to feed its shadow into that light input so the bounce is more accurate:
+the patch of ground a torch *should* light but which is shadowed by an object should spill **less**
+warm bounce. This is a strong, clean synergy — for three concrete reasons grounded in SSILVB's code.
+
+**1. The effect the user wants is source-side, and source-side is exactly `c_j`.** The shadowed
+ground's radiance *is* the `c_j` a marched sample reads. Attenuating the light-input MIP chain at
+shadowed pixels reduces `c_j` there → the shadowed ground bounces less light. Nothing else in the
+march changes.
+
+**2. It survives `chromaLift` — the two do not collide.** SSILVB already has a knob (`chromaLift`,
+`composite.wgsl:166` `albedo_proxy`) that exists *because* shadow mods darken the color it samples
+and muddy the albedo estimate. But `chromaLift` is **receiver-side** (it normalizes the *receiver's*
+albedo proxy at composite). The local-shadow term multiplies into the **source** radiance
+(`preprocess_color`), a cleanly separate stage `chromaLift` never touches. So the shadow "sticks" in
+the bounce instead of being normalized away — unlike scene-color darkening picked up implicitly.
+
+**3. SSILVB already captures the fire's *glow* separately, so Local Shadows only handles surface
+shadowing.** Emissive particles (torch fire, fairy glow) are not in the opaque snapshot; SSILVB
+captures them via a late-frame delta reprojected into light-input MIP 0 (`emissiveBounce`,
+`preprocess_color.wgsl:127–140`). Local Shadows must therefore attenuate the **opaque** radiance
+*before* that emissive add, so the fire's own emission is **not** self-shadowed (an object's shadow
+doesn't fall on the flame). Concretely, the multiply goes between the decode at
+`preprocess_color.wgsl:116` and the emissive `radiance +=` at `:140`.
+
+### The wiring (against real SSILVB code)
+
+Use the **service export**, not implicit scene-color pickup. SSILVB resolves its color snapshot at
+the very top of its `SCENE_AFTER_OPAQUE` hook (`mod.cpp:968`), live at the call point; whether a
+Local Shadows composite has darkened the scene by then is **uncontrollable same-stage ordering** (the
+SSILVB plan flags this explicitly in §5.1), and even if it landed it would double-hit the receiver
+proxy. The service makes it deterministic and one-directional:
+
+- **Provider (Local Light Shadows):** publish the screen-space `occlusion` view via
+  `LocalShadowService::get_frame` (r8/r16f, 1 = lit, 0 = locally shadowed), full render resolution.
+- **Consumer (SSILVB), a ~10-line change:** `IMPORT_OPTIONAL_SERVICE(LocalShadowService, ...)`; fetch
+  the view in `on_scene_after_opaque` next to the Depth-to-Normal fetch; thread one `WGPUTextureView`
+  through `ComputePayload` (a spare slot — the payload has room under its 128-byte `static_assert`);
+  bind it at the free `@binding(10)` on `g_colorMip0Layout` (currently uses 0,1,2,8,9); and in
+  `preprocess_color.wgsl` multiply `radiance *= textureLoad(local_shadow, coord, 0).r` on the opaque
+  radiance (before the emissive add), gated by a new flag bit that is 0 when the service is absent —
+  so SSILVB stays fully functional standalone. This is the same optional-service shape SSILVB already
+  uses for Depth to Normal and explicitly plans for a future albedo provider (`ssilvb_plan.md` §8).
+
+### Caveats to set expectations
+
+- **The bounce shadow is soft, not crisp.** The light-input MIP chain box-averages MIP 0 into MIPs
+  1–4, and the chain runs **half-res** by default with a 4-phase jitter, so distant samples read a
+  blurred shadow. Fine for diffuse GI (and consistent with how all of SSILVB's light input behaves),
+  but do not expect sharp shadow lines *in the bounce* — the crisp shadow is the mod's own direct
+  composite; SSILVB only needs the low-frequency "this area is darker" signal.
+- **Ghosting on moving lights.** SSILVB's GI output is temporally accumulated (~8-frame tail), so a
+  moving torch's bounce shadow trails slightly — the same tradeoff as all SSILVB output, not
+  specific to this integration.
+- **No double-darkening by construction.** The service term is the *single* channel by which local
+  shadows enter SSILVB's light input; SSILVB must not *also* sample a post-Local-Shadows-composite
+  scene color for that purpose. Since SSILVB's opaque snapshot is taken before the translucent phase
+  and the service is applied once in `preprocess_color`, this holds as long as Local Shadows' own
+  visible composite is not double-counted into the light input — which the service design guarantees.
+
+This integration is optional and independent: Local Light Shadows ships and draws its own shadows
+with or without SSILVB; SSILVB runs with or without Local Light Shadows. Installed together, the
+bounce gains local-shadow awareness for a ~10-line consumer change and one exported view.
 
 ## Recommended v1 scope
 
@@ -246,10 +352,15 @@ the clean structure. The mod's identity broadens from "Realtime Sun Shadows" to 
 4. Distance-based bias adapted from the existing bias controls; PCF inherited.
 5. UI group "Local Light Shadows": enable, count, map size, radius scale, strength, bias, cull knobs
    — mirroring the sun panel's structure and inert-when-off convention.
+6. Export the per-pixel `occlusion` buffer as `LocalShadowService` (the `depth_to_normal` pattern) —
+   the same term the composite already computed, published for SSILVB. Land the ~10-line SSILVB
+   consumer change (optional import + `@binding(10)` in `preprocess_color`) as a paired follow-up.
 
 This proves the whole pipeline at ~2 extra small replays/frame and a bounded, well-understood
 composite. Scaling N and adding a cube-map quality toggle are natural follow-ups; Option B (deferred
-re-light) is a separate, larger project gated on an albedo source.
+re-light) is a separate, larger project gated on an albedo source. Build order suggestion: get the
+mod's own visible shadows right first (steps 1–5), then add the service export + SSILVB hook (6) once
+the occlusion term is stable — the service is a thin publish of an already-computed buffer.
 
 ## Risks / open questions
 
@@ -263,8 +374,8 @@ re-light) is a separate, larger project gated on an albedo source.
    not a flickered value, so shadow edges don't jitter (the *brightness* may still flicker via the
    composite, which is correct).
 4. **Indoors** — unlike the sun (auto-disabled indoors), local lights are *most* relevant indoors
-   (torch-lit dungeons). This mod should run indoors, which is the opposite gate from the sun path —
-   another reason to keep the two subsystems' enable logic separate within one mod.
+   (torch-lit dungeons). This mod should run indoors — the opposite gate from the sun path, and a
+   further reason it is cleaner as a standalone mod than merged into the indoor-disabled sun mod.
 5. **The distortion-particles interaction** (open bug: the sun shadow **map** disturbs heat-haze /
    steam particles) will very likely reproduce, since it stems from the offscreen replay leaving GX
    state dirty — the same replay this feature adds more of. Widening the GX save/restore around the
@@ -272,3 +383,10 @@ re-light) is a separate, larger project gated on an albedo source.
 6. **ABI coupling** — game-linked; `LIGHT_INFLUENCE` / `dScnKy_env_light_c` offsets must be
    re-verified after any re-platform (there is a `STATIC_ASSERT(sizeof(dScnKy_env_light_c) == 4880)`
    upstream that will catch a layout shift at compile time).
+7. **SSILVB integration is a soft, low-frequency signal, by design** — the bounce shadow is
+   MIP-averaged and half-res (§Integration), so it reads as "this area bounces less," not as crisp
+   shadow lines in the GI. That is the correct expectation to set; the crisp shadow is the mod's own
+   direct composite. The consumer change lives in SSILVB (on the platform-rebuild branch), so it is
+   versioned with SSILVB, not this mod — coordinate the `LocalShadowService` header/version across
+   both. The service ABI is a mod-to-mod contract (a texture view + dims), independent of the game
+   ABI, so it is stable across game re-platforms.
