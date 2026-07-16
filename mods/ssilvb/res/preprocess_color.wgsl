@@ -12,6 +12,15 @@
 // The decode to LINEAR light happens here, once, instead of per march sample: the scene target
 // is gamma-encoded, and accumulating bounce light in gamma space would over-brighten. The
 // composite re-encodes after accumulation (fixed approximate 2.2 transfer).
+//
+// EMISSIVE CAPTURE (fire, fairies, lantern glows): those are particle/effect draws in the
+// TRANSLUCENT phase, after the opaque snapshot this mod samples - so they are invisible to the
+// bounce unless captured separately. extract_emissive runs at FRAME_BEFORE_HUD each frame and
+// stores max(late_scene - opaque_scene - threshold, 0) in linear light: everything the
+// translucent phase ADDED (emissive particles, their bloom), thresholded so small deltas (our
+// own composite, deferred fog's re-apply) don't feed back. prefilter_color then reprojects the
+// PREVIOUS frame's delta into MIP 0 with the same temporal reprojection matrix the accumulation
+// uses, so emissive light rides the normal MIP chain and the march needs no changes at all.
 
 struct Uniforms {
     projection: mat4x4f,
@@ -42,7 +51,8 @@ struct Uniforms {
     debug_view: u32,
     frame_index: u32,
     flags: u32, // bit 0 temporal, bit 1 history valid, bit 2 distance fade,
-                // bit 3 GI enabled, bit 4 AO apply, bit 5 white bounce proxy
+                // bit 3 GI enabled, bit 4 AO apply, bit 5 white bounce proxy,
+                // bit 6 emissive bounce
     thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
     radius_far: f32,        // far effect radius (fraction of view depth); 0 disables the ramp
     radius_ramp_start: f32, // radius ramp band start, world units of view depth
@@ -50,8 +60,8 @@ struct Uniforms {
     denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
     gi_intensity: f32,      // indirect bounce strength (composite)
     chroma_lift: f32,       // receiver albedo proxy: 0 = raw scene color .. 1 = full chroma norm
-    _pad0: f32,
-    _pad1: f32,
+    emissive_boost: f32,     // emissive-delta bounce gain (fire, fairies, glows)
+    emissive_threshold: f32, // linear floor for the emissive delta extract
 }
 
 @group(0) @binding(0) var scene_color: texture_2d<f32>;
@@ -60,6 +70,24 @@ struct Uniforms {
 // reduce_color entry point only (successive MIP reductions; bound per level by the host).
 @group(0) @binding(3) var color_in: texture_2d<f32>;
 @group(0) @binding(4) var color_out: texture_storage_2d<rgba16float, write>;
+// extract_emissive entry point only (runs at FRAME_BEFORE_HUD, full render resolution).
+@group(0) @binding(5) var late_color: texture_2d<f32>;
+@group(0) @binding(6) var opaque_color: texture_2d<f32>;
+@group(0) @binding(7) var emissive_out: texture_storage_2d<rgba16float, write>;
+// prefilter_color entry point only: depth MIP 0 (already written this pass) for reprojection,
+// and the PREVIOUS frame's emissive delta.
+@group(0) @binding(8) var depth_mip0: texture_2d<f32>;
+@group(0) @binding(9) var emissive_prev: texture_2d<f32>;
+
+fn decode(encoded: vec3f) -> vec3f {
+    return pow(max(encoded, vec3f(0.0)), vec3f(2.2));
+}
+
+fn reconstruct_view_space_position(depth: f32, uv: vec2f) -> vec3f {
+    let clip_xy = vec2f(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y);
+    let t = uniforms.inverse_projection * vec4f(clip_xy, depth, 1.0);
+    return t.xyz / t.w;
+}
 
 // 4-phase sub-pixel jitter within each 2x2 full-res block, matching preprocess_depth.wgsl -
 // color MIP 0 must decimate the same full-res pixel the depth chain does each frame.
@@ -85,9 +113,53 @@ fn prefilter_color(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let input_size = vec2<i32>(textureDimensions(scene_color));
     let coordinates = clamp(vec2<i32>(vec2<f32>(p) * uniforms.depth_scale) + taau_jitter(),
         vec2<i32>(0i), input_size - 1i);
-    let encoded = textureLoad(scene_color, coordinates, 0i).rgb;
-    let linear = pow(max(encoded, vec3f(0.0)), vec3f(2.2));
-    textureStore(color_mip0, p, vec4f(linear, 1.0));
+    var radiance = decode(textureLoad(scene_color, coordinates, 0i).rgb);
+    if (uniforms.flags & 64u) != 0u {
+        // Add the previous frame's emissive delta, reprojected from the previous frame's screen
+        // space (the delta was extracted at the end of that frame). Sky pixels and off-screen
+        // reprojections fall back to the same uv - a one-frame smear on fast pans, invisible in
+        // practice because the delta is re-extracted every frame.
+        let full_size = vec2f(input_size);
+        let uv = (vec2f(coordinates) + 0.5) / full_size;
+        var prev_uv = uv;
+        let depth = textureLoad(depth_mip0, p, 0i).r;
+        if depth > 0.0 {
+            let view_pos = reconstruct_view_space_position(depth, uv);
+            let clip_prev = uniforms.reproject * vec4f(view_pos, 1.0);
+            if clip_prev.w > 1.0e-4 {
+                let ndc = clip_prev.xy / clip_prev.w;
+                let cand = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+                if cand.x >= 0.0 && cand.y >= 0.0 && cand.x <= 1.0 && cand.y <= 1.0 {
+                    prev_uv = cand;
+                }
+            }
+        }
+        let e_dims = vec2f(textureDimensions(emissive_prev));
+        let e_texel = clamp(
+            vec2<i32>(prev_uv * e_dims), vec2<i32>(0i), vec2<i32>(e_dims) - vec2<i32>(1i));
+        radiance += textureLoad(emissive_prev, e_texel, 0i).rgb * uniforms.emissive_boost;
+    }
+    textureStore(color_mip0, p, vec4f(radiance, 1.0));
+}
+
+// Emissive delta extract: everything the translucent/effect phase ADDED over the opaque scene
+// this frame (fire, fairy glow, lantern light, their bloom), in linear light, floored by the
+// threshold so low-level differences (our own composite, deferred fog's re-apply, bloom haze)
+// do not feed back into next frame's bounce. Runs at FRAME_BEFORE_HUD, full render resolution.
+@compute
+@workgroup_size(8, 8, 1)
+fn extract_emissive(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let p = vec2<i32>(global_id.xy);
+    let out_size = vec2<i32>(textureDimensions(emissive_out));
+    if p.x >= out_size.x || p.y >= out_size.y {
+        return;
+    }
+    let maxc = vec2<i32>(textureDimensions(late_color)) - 1i;
+    let c = clamp(p, vec2<i32>(0i), maxc);
+    let late = decode(textureLoad(late_color, c, 0i).rgb);
+    let opaque = decode(textureLoad(opaque_color, c, 0i).rgb);
+    let delta = max(late - opaque - vec3f(uniforms.emissive_threshold), vec3f(0.0));
+    textureStore(emissive_out, p, vec4f(delta, 1.0));
 }
 
 // One MIP reduction step (box average of the parent level); dispatched once per level 1..4.

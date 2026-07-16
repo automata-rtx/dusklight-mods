@@ -43,8 +43,8 @@ struct Uniforms {
     denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
     gi_intensity: f32,      // indirect bounce strength (composite)
     chroma_lift: f32,       // receiver albedo proxy: 0 = raw scene color .. 1 = full chroma norm
-    _pad0: f32,
-    _pad1: f32,
+    emissive_boost: f32,     // emissive-delta bounce gain (fire, fairies, glows)
+    emissive_threshold: f32, // linear floor for the emissive delta extract
 }
 
 @group(0) @binding(0) var gi_noisy: texture_2d<f32>;

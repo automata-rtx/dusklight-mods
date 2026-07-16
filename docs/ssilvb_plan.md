@@ -121,6 +121,19 @@ Notes:
   acceptable, no special-casing. Document the pairing as recommended.
 - The paper's known limitation carries over unchanged: light that leaves the screen stops
   bouncing. Temporal accumulation softens the pop; nothing else to do in screen space.
+- **Emissive effects (torch fire, fairy glow, lanterns) are NOT in the opaque snapshot** — they
+  are particle/effect draws in the translucent phase, after `SCENE_AFTER_OPAQUE`. First in-game
+  testing flagged this immediately (fire contributed zero bounce). The fix (v0.9.1): a second
+  `resolve_pass` at `FRAME_BEFORE_HUD` captures the late scene (aurora's resolve snapshots at
+  the call point — verified in `extern/aurora/lib/gfx/common.cpp`, no per-frame caching), a
+  small compute extracts `max(late − opaque − threshold, 0)` in linear light (everything the
+  translucent phase *added*: emissive particles and their bloom; the threshold keeps our own
+  composite and Deferred Fog's re-apply from feeding back), and the next frame's color
+  prefilter reprojects that delta into light-input MIP 0 with the temporal reprojection matrix.
+  Emissive light then rides the normal MIP chain — the march is unchanged. One-frame latency,
+  invisible in practice. Controls: `emissiveBounce` (on), `emissiveBoost` (300%), and
+  `emissiveThreshold` (10%). Known approximation: the emitter cosine uses the opaque surface
+  *behind* the particle (a flame is a volumetric emitter with no normal of its own).
 
 ## 4. The frame chain (per frame, `GFX_STAGE_SCENE_AFTER_OPAQUE`)
 

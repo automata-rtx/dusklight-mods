@@ -60,6 +60,9 @@ ConfigVarHandle g_cvarGiIntensity = 0;
 ConfigVarHandle g_cvarGiBlendMode = 0;
 ConfigVarHandle g_cvarChromaLift = 0;
 ConfigVarHandle g_cvarBounceWhite = 0;
+ConfigVarHandle g_cvarEmissiveBounce = 0;
+ConfigVarHandle g_cvarEmissiveBoost = 0;
+ConfigVarHandle g_cvarEmissiveThreshold = 0;
 ConfigVarHandle g_cvarAoApply = 0;
 ConfigVarHandle g_cvarAoIntensity = 0;
 ConfigVarHandle g_cvarContrast = 0;
@@ -91,6 +94,7 @@ ConfigVarHandle g_cvarHalfRes = 0;
 ConfigVarHandle g_cvarDebugView = 0;
 
 GfxComputeTypeHandle g_computeType = 0;
+GfxComputeTypeHandle g_emissiveComputeType = 0;
 GfxDrawTypeHandle g_drawType = 0;
 GfxStageHookHandle g_afterOpaqueHook = 0;
 GfxStageHookHandle g_beforeHudHook = 0;
@@ -108,6 +112,7 @@ WGPUComputePipeline g_preprocessPipeline = nullptr;
 WGPUComputePipeline g_mip4Pipeline = nullptr;
 WGPUComputePipeline g_colorMip0Pipeline = nullptr;
 WGPUComputePipeline g_colorReducePipeline = nullptr;
+WGPUComputePipeline g_emissivePipeline = nullptr;
 WGPUComputePipeline g_ssilvbPipeline = nullptr;
 WGPUComputePipeline g_denoisePipeline = nullptr;
 WGPUComputePipeline g_temporalPipeline = nullptr;
@@ -115,6 +120,7 @@ WGPUBindGroupLayout g_preprocessLayout = nullptr;
 WGPUBindGroupLayout g_mip4Layout = nullptr;
 WGPUBindGroupLayout g_colorMip0Layout = nullptr;
 WGPUBindGroupLayout g_colorReduceLayout = nullptr;
+WGPUBindGroupLayout g_emissiveLayout = nullptr;
 WGPUBindGroupLayout g_ssilvbLayout = nullptr;
 WGPUBindGroupLayout g_denoiseLayout = nullptr;
 WGPUBindGroupLayout g_temporalLayout = nullptr;
@@ -142,6 +148,7 @@ struct TargetViews {
     WGPUTextureView giFinal = nullptr;
     WGPUTextureView historyColor[2] = {};
     WGPUTextureView historyDepth[2] = {};
+    WGPUTextureView emissive = nullptr;  // prev-frame emissive delta (full res, linear)
 };
 
 // Chain targets, recreated when the render size (or halfRes) changes. Old sets are retired for a
@@ -160,6 +167,10 @@ struct Targets {
     // Temporal ping-pong: rgba16float (GI.rgb, AO) + r32float (normalized view depth).
     WGPUTexture historyColor[2] = {};
     WGPUTexture historyDepth[2] = {};
+    // Emissive delta (fire, fairy glow): written at FRAME_BEFORE_HUD, read by the NEXT frame's
+    // color prefilter (reprojected). One texture suffices - within a frame the read is encoded
+    // before the write.
+    WGPUTexture emissive = nullptr;
     TargetViews* views = nullptr;
 };
 Targets g_targets;
@@ -220,8 +231,8 @@ struct SsilvbUniforms {
     float denoise_strength;  // spatial denoise blend, 0 raw .. 1 fully blurred
     float gi_intensity;      // indirect bounce strength (composite)
     float chroma_lift;       // receiver albedo proxy: 0 raw scene color .. 1 full chroma norm
-    float _pad0;
-    float _pad1;
+    float emissive_boost;    // emissive-delta bounce gain (fire, fairies, glows)
+    float emissive_threshold; // linear floor for the emissive delta extract
 };
 static_assert(sizeof(SsilvbUniforms) % 16 == 0);
 
@@ -263,6 +274,24 @@ static_assert(std::is_trivially_copyable_v<CompositePayload>);
 // staged here between the two stages (game thread only; its views live for the frame).
 CompositePayload g_pendingDebugDraw{};
 bool g_debugDrawPending = false;
+
+// Emissive delta extract, pushed at FRAME_BEFORE_HUD: compares this frame's LATE scene (with
+// fire/fairy/glow particles and their bloom) against the opaque snapshot the bounce sampled,
+// and stores the thresholded difference for the NEXT frame's color prefilter.
+struct EmissivePayload {
+    WGPUTextureView lateColor;    // frame-pooled late scene snapshot
+    WGPUTextureView opaqueColor;  // frame-pooled opaque snapshot (still frame-valid here)
+    const TargetViews* views;
+    uint32_t uniform_offset;
+    uint32_t uniform_size;
+    uint32_t fullSize;  // packed full render resolution
+};
+static_assert(sizeof(EmissivePayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
+static_assert(std::is_trivially_copyable_v<EmissivePayload>);
+
+// Staged on the game thread between the two stage hooks, like the debug draw above.
+EmissivePayload g_pendingEmissive{};
+bool g_emissivePending = false;
 
 int64_t get_int_option(ConfigVarHandle handle, int64_t fallback) {
     int64_t value = fallback;
@@ -493,6 +522,7 @@ void release_targets(Targets& targets) {
         releaseView(targets.views->historyColor[1]);
         releaseView(targets.views->historyDepth[0]);
         releaseView(targets.views->historyDepth[1]);
+        releaseView(targets.views->emissive);
         delete targets.views;
         targets.views = nullptr;
     }
@@ -505,6 +535,7 @@ void release_targets(Targets& targets) {
     releaseTexture(targets.historyColor[1]);
     releaseTexture(targets.historyDepth[0]);
     releaseTexture(targets.historyDepth[1]);
+    releaseTexture(targets.emissive);
     targets.width = targets.height = 0;
 }
 
@@ -561,7 +592,9 @@ bool ensure_targets(uint32_t width, uint32_t height, uint32_t fullWidth, uint32_
               createStorageTexture("SSILVB history depth 0", WGPUTextureFormat_R32Float, 1,
                   fullWidth, fullHeight, g_targets.historyDepth[0]) &&
               createStorageTexture("SSILVB history depth 1", WGPUTextureFormat_R32Float, 1,
-                  fullWidth, fullHeight, g_targets.historyDepth[1]);
+                  fullWidth, fullHeight, g_targets.historyDepth[1]) &&
+              createStorageTexture("SSILVB emissive delta", WGPUTextureFormat_RGBA16Float, 1,
+                  fullWidth, fullHeight, g_targets.emissive);
     if (ok) {
         g_targets.views = new TargetViews{};
         for (uint32_t mip = 0; mip < 5 && ok; ++mip) {
@@ -587,10 +620,12 @@ bool ensure_targets(uint32_t width, uint32_t height, uint32_t fullWidth, uint32_
         v.historyColor[1] = wgpuTextureCreateView(g_targets.historyColor[1], nullptr);
         v.historyDepth[0] = wgpuTextureCreateView(g_targets.historyDepth[0], nullptr);
         v.historyDepth[1] = wgpuTextureCreateView(g_targets.historyDepth[1], nullptr);
+        v.emissive = wgpuTextureCreateView(g_targets.emissive, nullptr);
         ok = v.preprocessedDepthAll != nullptr && v.colorChainAll != nullptr &&
              v.giNoisy != nullptr && v.depthDifferences != nullptr && v.giFinal != nullptr &&
              v.historyColor[0] != nullptr && v.historyColor[1] != nullptr &&
-             v.historyDepth[0] != nullptr && v.historyDepth[1] != nullptr;
+             v.historyDepth[0] != nullptr && v.historyDepth[1] != nullptr &&
+             v.emissive != nullptr;
     }
     if (!ok) {
         release_targets(g_targets);
@@ -668,10 +703,14 @@ void on_compute(
     WGPUBindGroup colorReduceGroups[4] = {};
     bool colorOk = true;
     if (data.run_gi != 0) {
+        // Bindings 8/9: depth MIP0 (written by the preprocess dispatch above) reprojects the
+        // previous frame's emissive delta into the light input.
         colorMip0Group =
             makeBindGroup(g_colorMip0Layout, {textureEntry(0, data.sceneColor),
                                                  textureEntry(1, views.colorMips[0]),
-                                                 uniformEntry(2)});
+                                                 uniformEntry(2),
+                                                 textureEntry(8, views.preprocessedDepthMips[0]),
+                                                 textureEntry(9, views.emissive)});
         colorOk = colorMip0Group != nullptr && data.sceneColor != nullptr;
         for (uint32_t mip = 1; mip < 5 && colorOk; ++mip) {
             colorReduceGroups[mip - 1] =
@@ -790,6 +829,55 @@ void on_compute(
     }
     release(temporalGroup);
     g_chainExecuted.store(true, std::memory_order_release);
+}
+
+// Render worker thread: the emissive delta extract (one dispatch at full render resolution).
+void on_emissive_compute(
+    ModContext*, const GfxComputeContext* ctx, const void* payload, size_t payloadSize, void*) {
+    if (payloadSize != sizeof(EmissivePayload)) {
+        return;
+    }
+    EmissivePayload data;
+    std::memcpy(&data, payload, sizeof(data));
+    if (data.lateColor == nullptr || data.opaqueColor == nullptr || data.views == nullptr ||
+        g_emissivePipeline == nullptr)
+    {
+        return;
+    }
+    const uint32_t fullWidth = data.fullSize >> 16;
+    const uint32_t fullHeight = data.fullSize & 0xFFFFu;
+
+    WGPUBindGroupEntry entries[4] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    entries[0].binding = 2;
+    entries[0].buffer = ctx->uniform_buffer;
+    entries[0].offset = data.uniform_offset;
+    entries[0].size = data.uniform_size;
+    entries[1].binding = 5;
+    entries[1].textureView = data.lateColor;
+    entries[2].binding = 6;
+    entries[2].textureView = data.opaqueColor;
+    entries[3].binding = 7;
+    entries[3].textureView = data.views->emissive;
+    WGPUBindGroupDescriptor bindGroupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    bindGroupDesc.layout = g_emissiveLayout;
+    bindGroupDesc.entryCount = 4;
+    bindGroupDesc.entries = entries;
+    WGPUBindGroup bindGroup = wgpuDeviceCreateBindGroup(ctx->device, &bindGroupDesc);
+    if (bindGroup == nullptr) {
+        return;
+    }
+
+    WGPUComputePassDescriptor passDesc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+    passDesc.label = {"SSILVB emissive extract", WGPU_STRLEN};
+    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(ctx->encoder, &passDesc);
+    wgpuComputePassEncoderSetPipeline(pass, g_emissivePipeline);
+    wgpuComputePassEncoderSetBindGroup(pass, 0, bindGroup, 0, nullptr);
+    wgpuComputePassEncoderDispatchWorkgroups(
+        pass, div_ceil(fullWidth, 8), div_ceil(fullHeight, 8), 1);
+    wgpuComputePassEncoderEnd(pass);
+    wgpuComputePassEncoderRelease(pass);
+    wgpuBindGroupRelease(bindGroup);
 }
 
 // Render worker thread: composite GI + AO over the scene (or show a debug view).
@@ -952,6 +1040,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.intensity = percent(g_cvarAoIntensity, 150, 0, 500);
     uniforms.gi_intensity = percent(g_cvarGiIntensity, 200, 0, 800);
     uniforms.chroma_lift = percent(g_cvarChromaLift, 50, 0, 100);
+    uniforms.emissive_boost = percent(g_cvarEmissiveBoost, 300, 0, 800);
+    uniforms.emissive_threshold = percent(g_cvarEmissiveThreshold, 10, 0, 50);
     uniforms.contrast = percent(g_cvarContrast, 150, 50, 300);
     uniforms.thickness = percent(g_cvarThickness, 150, 25, 400);
     uniforms.black_point = percent(g_cvarBlackPoint, 3, 0, 30);
@@ -1000,9 +1090,12 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const bool giEnabled = get_bool_option(g_cvarGiEnabled, true);
     const bool aoApply = get_bool_option(g_cvarAoApply, true);
     const bool bounceWhite = get_bool_option(g_cvarBounceWhite, false);
+    // Emissive capture only matters while the bounce runs, and only once a previous camera
+    // exists (the reprojection of the delta needs it).
+    const bool emissiveBounce = giEnabled && get_bool_option(g_cvarEmissiveBounce, true);
     uniforms.flags = (temporal ? 1u : 0u) | (g_historyValid ? 2u : 0u) |
         (distanceFade ? 4u : 0u) | (giEnabled ? 8u : 0u) | (aoApply ? 16u : 0u) |
-        (bounceWhite ? 32u : 0u);
+        (bounceWhite ? 32u : 0u) | (emissiveBounce ? 64u : 0u);
 
     GfxRange uniformRange{0, 0};
     if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &uniformRange) != MOD_OK) {
@@ -1053,6 +1146,16 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         svc_gfx->push_draw(mod_ctx, g_drawType, &drawPayload, sizeof(drawPayload));
     }
 
+    // Stage the emissive delta extract for FRAME_BEFORE_HUD: by then the translucent/effect
+    // lists (fire, fairy glow) have drawn, and comparing that late frame against this opaque
+    // snapshot isolates what they added. The opaque color view stays valid for the frame.
+    if (emissiveBounce) {
+        // lateColor is filled by the FRAME_BEFORE_HUD hook once the late snapshot exists.
+        g_pendingEmissive = EmissivePayload{nullptr, resolved.color, g_targets.views,
+            uniformRange.offset, uniformRange.size, computePayload.fullSize};
+        g_emissivePending = true;
+    }
+
     // Advance the temporal state for the next frame.
     if (temporal) {
         g_historyWriteIndex = readIdx;
@@ -1062,9 +1165,24 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     g_prevCameraValid = true;
 }
 
-// Game thread, after the full 3D scene: push the staged debug-view draw, unobscured by
-// everything the scene layered on after the opaque pass.
+// Game thread, after the full 3D scene (translucency, particles, bloom all drawn).
+// Two jobs: extract this frame's emissive delta for the next frame's bounce, and push the
+// staged debug-view draw, unobscured by everything the scene layered on after the opaque pass.
 void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
+    if (g_emissivePending) {
+        g_emissivePending = false;
+        GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
+        resolveDesc.color = true;
+        resolveDesc.depth = false;
+        GfxResolvedTargets late = GFX_RESOLVED_TARGETS_INIT;
+        if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &late) == MOD_OK &&
+            late.color != nullptr)
+        {
+            g_pendingEmissive.lateColor = late.color;
+            svc_gfx->push_compute(
+                mod_ctx, g_emissiveComputeType, &g_pendingEmissive, sizeof(g_pendingEmissive));
+        }
+    }
     if (!g_debugDrawPending) {
         return;
     }
@@ -1138,6 +1256,20 @@ ModResult build_controls_tab(
     add_toggle(left, "White Bounce", g_cvarBounceWhite,
         "Ignores the receiving surface's color and adds the raw gathered light (chalky; mainly "
         "for judging the light transport itself).");
+    add_toggle(left, "Emissive Bounce", g_cvarEmissiveBounce,
+        "Lets emissive effects - torch fire, fairy glow, lanterns - cast bounce light. These "
+        "are particle draws that happen after the scene snapshot the bounce samples, so they "
+        "are captured separately at the end of each frame and fed into the next frame's light "
+        "input.");
+    add_number(left, "Emissive Boost", g_cvarEmissiveBoost,
+        "How strongly captured emissive effects contribute to the bounce, relative to ordinary "
+        "surfaces. Fire and glows are small on screen, so they usually need a boost to read.",
+        0, 800, 25, "%");
+    add_number(left, "Emissive Threshold", g_cvarEmissiveThreshold,
+        "Minimum brightness a translucent-phase addition needs before it counts as emissive. "
+        "Raise if fog or subtle effects start glowing; lower if faint glows (fairies at a "
+        "distance) stop contributing.",
+        0, 50, 1, "%");
     add_toggle(left, "Apply AO", g_cvarAoApply,
         "Also darken by the ambient occlusion this pass measures. Turn OFF when running the "
         "VBAO mod alongside, otherwise the scene is darkened twice.");
@@ -1361,6 +1493,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"effectEnabled", true, &g_cvarEnabled},
         {"giEnabled", true, &g_cvarGiEnabled},
         {"bounceWhite", false, &g_cvarBounceWhite},
+        {"emissiveBounce", true, &g_cvarEmissiveBounce},
         {"aoApply", true, &g_cvarAoApply},
         {"temporal", true, &g_cvarTemporal},
         {"distanceFade", false, &g_cvarDistanceFade},
@@ -1380,6 +1513,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"giIntensity", 200, &g_cvarGiIntensity},
         {"giBlendMode", 0, &g_cvarGiBlendMode},
         {"chromaLift", 50, &g_cvarChromaLift},
+        {"emissiveBoost", 300, &g_cvarEmissiveBoost},
+        {"emissiveThreshold", 10, &g_cvarEmissiveThreshold},
         {"aoIntensity", 150, &g_cvarAoIntensity},
         {"contrast", 150, &g_cvarContrast},
         {"blackPoint", 3, &g_cvarBlackPoint},
@@ -1424,6 +1559,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
             g_colorMip0Pipeline, g_colorMip0Layout) ||
         !build_compute_pipeline("SSILVB color reduce", g_colorSource, "reduce_color",
             g_colorReducePipeline, g_colorReduceLayout) ||
+        !build_compute_pipeline("SSILVB emissive extract", g_colorSource, "extract_emissive",
+            g_emissivePipeline, g_emissiveLayout) ||
         !build_compute_pipeline(
             "SSILVB sampling", g_ssilvbSource, "ssilvb", g_ssilvbPipeline, g_ssilvbLayout) ||
         !build_compute_pipeline("SSILVB denoise", g_denoiseSource, "spatial_denoise",
@@ -1450,6 +1587,11 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     computeDesc.label = "SSILVB chain";
     computeDesc.callback = on_compute;
     if (svc_gfx->register_compute_type(mod_ctx, &computeDesc, &g_computeType) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register compute type");
+    }
+    computeDesc.label = "SSILVB emissive extract";
+    computeDesc.callback = on_emissive_compute;
+    if (svc_gfx->register_compute_type(mod_ctx, &computeDesc, &g_emissiveComputeType) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register compute type");
     }
     GfxDrawTypeDesc drawDesc = GFX_DRAW_TYPE_DESC_INIT;
@@ -1524,6 +1666,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     releasePipeline(g_mip4Pipeline);
     releasePipeline(g_colorMip0Pipeline);
     releasePipeline(g_colorReducePipeline);
+    releasePipeline(g_emissivePipeline);
     releasePipeline(g_ssilvbPipeline);
     releasePipeline(g_denoisePipeline);
     releasePipeline(g_temporalPipeline);
@@ -1531,6 +1674,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     releaseLayout(g_mip4Layout);
     releaseLayout(g_colorMip0Layout);
     releaseLayout(g_colorReduceLayout);
+    releaseLayout(g_emissiveLayout);
     releaseLayout(g_ssilvbLayout);
     releaseLayout(g_denoiseLayout);
     releaseLayout(g_temporalLayout);
@@ -1550,6 +1694,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     }
     g_cvarEnabled = g_cvarGiEnabled = g_cvarGiIntensity = g_cvarGiBlendMode = 0;
     g_cvarChromaLift = g_cvarBounceWhite = g_cvarAoApply = g_cvarAoIntensity = 0;
+    g_cvarEmissiveBounce = g_cvarEmissiveBoost = g_cvarEmissiveThreshold = 0;
     g_cvarContrast = g_cvarBlackPoint = 0;
     g_cvarQuality = g_cvarCustomSlices = g_cvarCustomSteps = 0;
     g_cvarRadius = g_cvarRadiusFar = g_cvarRadiusRampStart = g_cvarRadiusRampEnd = 0;
@@ -1558,9 +1703,10 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarContentThresh = g_cvarDisoccTol = g_cvarDenoisePasses = g_cvarDenoiseStrength = 0;
     g_cvarDistanceFade = g_cvarFadeStart = g_cvarFadeEnd = 0;
     g_cvarHalfRes = g_cvarDebugView = 0;
-    g_computeType = g_drawType = 0;
+    g_computeType = g_emissiveComputeType = g_drawType = 0;
     g_afterOpaqueHook = g_beforeHudHook = 0;
     g_debugDrawPending = false;
+    g_emissivePending = false;
     g_controlsWindow = 0;
     g_frameIndex = 0;
     g_historyWriteIndex = 0;
