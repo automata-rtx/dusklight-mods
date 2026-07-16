@@ -428,26 +428,26 @@ extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError* error) {
     ModResult result = svc_resource->load(mod_ctx, "reconstruct.wgsl", &g_shaderSource);
     if (result != MOD_OK || g_shaderSource.data == nullptr) {
-        return dusk::mods::set_error(error, result, "failed to load reconstruct.wgsl");
+        return mods::set_error(error, result, "failed to load reconstruct.wgsl");
     }
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to query device info");
+        return mods::set_error(error, MOD_ERROR, "failed to query device info");
     }
     if (!build_pipeline()) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to create reconstruct pipeline");
+        return mods::set_error(error, MOD_ERROR, "failed to create reconstruct pipeline");
     }
     GfxComputeTypeDesc computeDesc = GFX_COMPUTE_TYPE_DESC_INIT;
     computeDesc.label = "depth-to-normal reconstruct";
     computeDesc.callback = on_compute;
     if (svc_gfx->register_compute_type(mod_ctx, &computeDesc, &g_computeType) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register compute type");
+        return mods::set_error(error, MOD_ERROR, "failed to register compute type");
     }
     GfxStageHookDesc stageDesc = GFX_STAGE_HOOK_DESC_INIT;
     stageDesc.callback = on_scene_begin;
     if (svc_gfx->register_stage_hook(
             mod_ctx, GFX_STAGE_SCENE_BEGIN, &stageDesc, &g_sceneBeginHook) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+        return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
 
     // Debug view: config toggle + fullscreen draw pipeline + FRAME_BEFORE_HUD hook.
@@ -456,27 +456,27 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     cvarDesc.type = CONFIG_VAR_BOOL;
     cvarDesc.default_bool = false;
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarDebugView) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register debugView");
+        return mods::set_error(error, MOD_ERROR, "failed to register debugView");
     }
     result = svc_resource->load(mod_ctx, "debug.wgsl", &g_debugShaderSource);
     if (result != MOD_OK || g_debugShaderSource.data == nullptr) {
-        return dusk::mods::set_error(error, result, "failed to load debug.wgsl");
+        return mods::set_error(error, result, "failed to load debug.wgsl");
     }
     if (!build_debug_pipeline()) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to create debug pipeline");
+        return mods::set_error(error, MOD_ERROR, "failed to create debug pipeline");
     }
     GfxDrawTypeDesc drawDesc = GFX_DRAW_TYPE_DESC_INIT;
     drawDesc.label = "depth-to-normal debug";
     drawDesc.draw = on_debug_draw;
     if (svc_gfx->register_draw_type(mod_ctx, &drawDesc, &g_debugDrawType) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register debug draw type");
+        return mods::set_error(error, MOD_ERROR, "failed to register debug draw type");
     }
     stageDesc = GFX_STAGE_HOOK_DESC_INIT;
     stageDesc.callback = on_frame_before_hud;
     if (svc_gfx->register_stage_hook(
             mod_ctx, GFX_STAGE_FRAME_BEFORE_HUD, &stageDesc, &g_frameBeforeHudHook) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register frame hook");
+        return mods::set_error(error, MOD_ERROR, "failed to register frame hook");
     }
 
     UiModsPanelDesc panelDesc = UI_MODS_PANEL_DESC_INIT;

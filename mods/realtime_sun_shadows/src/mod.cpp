@@ -1093,7 +1093,7 @@ HookAction on_copy_tex_pre(ModContext*, void*, void*, void*) {
 // Direct GX drawers pick their cull mode up from this call, so rewriting the argument covers them.
 HookAction on_cull_mode_pre(ModContext*, void* args, void*, void*) {
     if (g_replayingSceneLists && g_replayTwoSided) {
-        dusk::mods::arg_ref<GXCullMode>(args, 0) = GX_CULL_NONE;
+        mods::arg_ref<GXCullMode>(args, 0) = GX_CULL_NONE;
     }
     return HOOK_CONTINUE;
 }
@@ -1135,7 +1135,7 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     // degenerate bounds -> draw.
     if (g_replayCullActive && !g_replayLinkOnly) {
         J3DModel* model = j3dSys.getModel();
-        J3DShape* shape = const_cast<J3DShape*>(dusk::mods::arg<const J3DShape*>(args, 0));
+        J3DShape* shape = const_cast<J3DShape*>(mods::arg<const J3DShape*>(args, 0));
         if (model != nullptr && shape != nullptr) {
             const Vec* mn = shape->getMin();
             const Vec* mx = shape->getMax();
@@ -1183,7 +1183,7 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     if (!g_replayTwoSided) {
         return HOOK_CONTINUE;
     }
-    const J3DShape* shape = dusk::mods::arg<const J3DShape*>(args, 0);
+    const J3DShape* shape = mods::arg<const J3DShape*>(args, 0);
     J3DMaterial* material = shape != nullptr ? shape->getMaterial() : nullptr;
     if (material == nullptr || material->getColorBlock() == nullptr ||
         material->getIndBlock() == nullptr)
@@ -2104,7 +2104,7 @@ ModResult register_bool_option(
     cvarDesc.type = CONFIG_VAR_BOOL;
     cvarDesc.default_bool = defaultValue;
     if (svc_config->register_var(mod_ctx, &cvarDesc, &outHandle) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register shadow option");
+        return mods::set_error(error, MOD_ERROR, "failed to register shadow option");
     }
     return MOD_OK;
 }
@@ -2116,7 +2116,7 @@ ModResult register_int_option(
     cvarDesc.type = CONFIG_VAR_INT;
     cvarDesc.default_int = defaultValue;
     if (svc_config->register_var(mod_ctx, &cvarDesc, &outHandle) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register shadow option");
+        return mods::set_error(error, MOD_ERROR, "failed to register shadow option");
     }
     return MOD_OK;
 }
@@ -2128,15 +2128,15 @@ extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError* error) {
     ModResult result = svc_resource->load(mod_ctx, "shadow.wgsl", &g_shaderSource);
     if (result != MOD_OK || g_shaderSource.data == nullptr) {
-        return dusk::mods::set_error(error, result, "failed to load shadow.wgsl");
+        return mods::set_error(error, result, "failed to load shadow.wgsl");
     }
     result = svc_resource->load(mod_ctx, "bend_sss.wgsl", &g_sssShaderSource);
     if (result != MOD_OK || g_sssShaderSource.data == nullptr) {
-        return dusk::mods::set_error(error, result, "failed to load bend_sss.wgsl");
+        return mods::set_error(error, result, "failed to load bend_sss.wgsl");
     }
     result = svc_resource->load(mod_ctx, "normal_smooth.wgsl", &g_normalShaderSource);
     if (result != MOD_OK || g_normalShaderSource.data == nullptr) {
-        return dusk::mods::set_error(error, result, "failed to load normal_smooth.wgsl");
+        return mods::set_error(error, result, "failed to load normal_smooth.wgsl");
     }
 
     result = register_bool_option("effectEnabled", true, g_cvarEnabled, error);
@@ -2280,19 +2280,19 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return result;
     }
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to query device info");
+        return mods::set_error(error, MOD_ERROR, "failed to query device info");
     }
     if (!build_composite_pipeline(true, g_compositePipeline, g_compositeLayout) ||
         !build_composite_pipeline(false, g_compositeDebugPipeline, g_compositeDebugLayout))
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to create composite pipeline");
+        return mods::set_error(error, MOD_ERROR, "failed to create composite pipeline");
     }
     if (!build_sss_pipeline()) {
-        return dusk::mods::set_error(
+        return mods::set_error(
             error, MOD_ERROR, "failed to create screen-space shadow pipeline");
     }
     if (!build_normal_pipelines()) {
-        return dusk::mods::set_error(
+        return mods::set_error(
             error, MOD_ERROR, "failed to create normal smoothing pipelines");
     }
     // Non-filtering, clamp-to-edge sampler for the PCF textureGather (res/shadow.wgsl). The
@@ -2309,79 +2309,79 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     samplerDesc.maxAnisotropy = 1;
     g_shadowSampler = wgpuDeviceCreateSampler(g_deviceInfo.device, &samplerDesc);
     if (g_shadowSampler == nullptr) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to create shadow PCF sampler");
+        return mods::set_error(error, MOD_ERROR, "failed to create shadow PCF sampler");
     }
 
     GfxDrawTypeDesc drawDesc = GFX_DRAW_TYPE_DESC_INIT;
     drawDesc.label = "sun shadow composite";
     drawDesc.draw = on_draw;
     if (svc_gfx->register_draw_type(mod_ctx, &drawDesc, &g_drawType) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register draw type");
+        return mods::set_error(error, MOD_ERROR, "failed to register draw type");
     }
     GfxComputeTypeDesc computeDesc = GFX_COMPUTE_TYPE_DESC_INIT;
     computeDesc.label = "bend screen-space shadows";
     computeDesc.callback = on_sss_compute;
     if (svc_gfx->register_compute_type(mod_ctx, &computeDesc, &g_sssComputeType) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register compute type");
+        return mods::set_error(error, MOD_ERROR, "failed to register compute type");
     }
     computeDesc = GFX_COMPUTE_TYPE_DESC_INIT;
     computeDesc.label = "smoothed normals";
     computeDesc.callback = on_normal_compute;
     if (svc_gfx->register_compute_type(mod_ctx, &computeDesc, &g_normalComputeType) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register compute type");
+        return mods::set_error(error, MOD_ERROR, "failed to register compute type");
     }
     GfxStageHookDesc stageDesc = GFX_STAGE_HOOK_DESC_INIT;
     stageDesc.callback = on_scene_begin;
     if (svc_gfx->register_stage_hook(
             mod_ctx, GFX_STAGE_SCENE_BEGIN, &stageDesc, &g_sceneBeginHook) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+        return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
     stageDesc.callback = on_scene_after_terrain;
     if (svc_gfx->register_stage_hook(
             mod_ctx, GFX_STAGE_SCENE_AFTER_TERRAIN, &stageDesc, &g_sceneAfterTerrainHook) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+        return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
     stageDesc.callback = on_scene_after_opaque;
     if (svc_gfx->register_stage_hook(
             mod_ctx, GFX_STAGE_SCENE_AFTER_OPAQUE, &stageDesc, &g_sceneAfterOpaqueHook) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+        return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
     stageDesc.callback = on_frame_before_hud;
     if (svc_gfx->register_stage_hook(
             mod_ctx, GFX_STAGE_FRAME_BEFORE_HUD, &stageDesc, &g_frameBeforeHudHook) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+        return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
 
     // Skip the game's own shadow rendering while the dynamic pass is active: the
     // shadowControl pair covers the actor real/blob shadows, drawCloudShadow the weather
     // cloud shadows.
-    if (dusk::mods::hook_add_pre<GameShadowImageDraw>(svc_hook, on_game_shadow_pre) !=
+    if (mods::hook_add_pre<GameShadowImageDraw>(svc_hook, on_game_shadow_pre) !=
             MOD_OK ||
-        dusk::mods::hook_add_pre<GameShadowDraw>(svc_hook, on_game_shadow_pre) !=
+        mods::hook_add_pre<GameShadowDraw>(svc_hook, on_game_shadow_pre) !=
             MOD_OK ||
-        dusk::mods::hook_add_pre<CloudShadowDraw>(svc_hook, on_game_shadow_pre) != MOD_OK)
+        mods::hook_add_pre<CloudShadowDraw>(svc_hook, on_game_shadow_pre) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to hook game shadow rendering");
+        return mods::set_error(error, MOD_ERROR, "failed to hook game shadow rendering");
     }
-    if (dusk::mods::hook_add_pre<ClipperSphereClip>(svc_hook, on_frustum_clip_pre) != MOD_OK ||
-        dusk::mods::hook_add_pre<ClipperBoxClip>(svc_hook, on_frustum_clip_pre) != MOD_OK)
+    if (mods::hook_add_pre<ClipperSphereClip>(svc_hook, on_frustum_clip_pre) != MOD_OK ||
+        mods::hook_add_pre<ClipperBoxClip>(svc_hook, on_frustum_clip_pre) != MOD_OK)
     {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to hook frustum clipping");
+        return mods::set_error(error, MOD_ERROR, "failed to hook frustum clipping");
     }
-    if (dusk::mods::hook_add_pre<CopyTex>(svc_hook, on_copy_tex_pre) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to hook GXCopyTex");
+    if (mods::hook_add_pre<CopyTex>(svc_hook, on_copy_tex_pre) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to hook GXCopyTex");
     }
     // Two-sided casters (see on_shape_draw_pre / on_cull_mode_pre). The J3DShape::drawFast hook
     // is virtual, so it resolves through the symbol manifest; if that's missing, degrade to
     // leaky shadows instead of failing the whole mod.
-    if (dusk::mods::hook_add_pre<CullMode>(svc_hook, on_cull_mode_pre) != MOD_OK) {
-        return dusk::mods::set_error(error, MOD_ERROR, "failed to hook GXSetCullMode");
+    if (mods::hook_add_pre<CullMode>(svc_hook, on_cull_mode_pre) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to hook GXSetCullMode");
     }
-    if (dusk::mods::hook_add_pre<ShapeDrawFast>(svc_hook, on_shape_draw_pre) != MOD_OK) {
+    if (mods::hook_add_pre<ShapeDrawFast>(svc_hook, on_shape_draw_pre) != MOD_OK) {
         svc_log->warn(mod_ctx,
             "failed to hook J3DShape::drawFast (missing dusklight.symdb?); Two-Sided Casters "
             "will not affect J3D geometry");
