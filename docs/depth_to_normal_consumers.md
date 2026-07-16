@@ -44,11 +44,13 @@ normals or depths differ past a threshold are edges. Read the buffer, threshold,
 Almost the entire mod is the edge pass — a very TP-appropriate stylized look, and a great first
 third-party consumer because it needs nothing but the normal and depth.
 
-### Screen-space GI / directional occlusion (SSGI, SSDO)
+### Screen-space GI / directional occlusion (SSGI, SSDO) — **shipping as `mods/ssilvb`**
 The natural evolution of the existing AO: instead of just "how occluded is this pixel," gather a
 single bounce of light (SSGI) or directional occlusion (SSDO) from neighbors, weighted by their
 normals and depths. Adds colored bounce light and directional contact shading. Shares the AO's
 sampling machinery; the normal is what makes it *directional* rather than uniform darkening.
+This is now being built as the SSILVB mod (`docs/ssilvb_plan.md`), which is also the first
+**hard** (non-optional) consumer of the service — it needs the normal at every marched sample.
 
 ### Rim light / fresnel / wetness
 `dot(normal, view)` gives a rim term (character silhouette glow) or a fresnel sheen (water, wet

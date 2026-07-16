@@ -1,0 +1,7 @@
+{
+  "id": "dev.automata.ssilvb",
+  "name": "SSILVB",
+  "version": "0.9.0",
+  "author": "automata-rtx",
+  "description": "Screen Space Indirect Lighting with Visibility Bitmask (Therrien et al. 2023): one bounce of colored indirect light gathered through a 32-sector visibility bitmask, with jittered temporal accumulation, edge-aware denoise, and half-resolution support. Disable the bounce and it acts as a standalone directional AO. Requires the Depth to Normal mod."
+}

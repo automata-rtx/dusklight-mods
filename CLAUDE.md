@@ -24,6 +24,20 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   publishes it as a mod-exported service other mods consume via `include/depth_to_normal_service.h`.
   Has no settings of its own. **Service-only**. Docs: `docs/depth_to_normal_plan.md`,
   `docs/depth_to_normal_consumers.md`.
+- **`mods/ssilvb/`** — "SSILVB" (Screen Space Indirect Lighting with Visibility Bitmask,
+  Therrien et al. 2023 — the mod carries the paper's name): VBAO's bitmask sampling chain extended
+  with a one-bounce indirect-diffuse accumulate; with the bounce toggled off it doubles as a
+  standalone directional-AO mod. Consumes the scene-color snapshot as its light input and the
+  Depth to Normal service (hard dependency) for per-sample normals; composites GI additively and
+  AO multiplicatively in a single blend draw. **Service-only**. Docs: `docs/ssilvb_plan.md`
+  (§0 first — see the note below), then `docs/ssilvb.md` once written.
+
+  **Working mode (user's explicit standing instruction): the technical direction of SSILVB rests
+  with Claude.** The user is an amateur on SSAO/SSGI internals and cannot provide technical
+  direction on the algorithm, math, or rendering architecture — never block on them for such
+  decisions or offer them implementation options to pick from. They provide in-game testing,
+  screenshots, and taste-level feedback ("too strong", "flickers here"); translate that feedback
+  into fixes yourself. Full statement: `docs/ssilvb_plan.md` §0.
 
 Each mod is `src/mod.cpp` (host code: pipelines, config vars, UI panel) plus `res/*.wgsl`
 (shaders). Deep documentation: `docs/vbao.md`, `docs/realtime_sun_shadows.md`,

@@ -9,11 +9,14 @@ PC/mobile port), built on the official [Dusklight mod template](https://github.c
 | Realtime Sun Shadows | `realtime_sun_shadows.dusk` | Real-geometry sun/moon cascaded shadow maps with PCF, slope-scaled bias, contact (screen-space) shadows, and indoor auto-disable |
 | Deferred Fog | `deferred_fog.dusk` | Re-applies the game's fog as a fullscreen pass after AO/shadows composite, so they darken surfaces *under* the fog instead of the fog itself |
 | Depth to Normal | `depth_to_normal.dusk` | Reconstructs a per-pixel world-space surface normal from the depth buffer and publishes it as a service other mods consume. No settings of its own |
+| SSILVB | `ssilvb.dusk` | Screen-space indirect lighting with visibility bitmask (Therrien et al. 2023): one-bounce colored light gathered through the same 32-sector bitmask VBAO uses; with the bounce disabled it acts as a standalone directional AO. Requires Depth to Normal |
 
-VBAO and Depth to Normal are **service-only** (mod-API services only, no game code, so they survive
-game updates without a rebuild). Realtime Sun Shadows and Deferred Fog are **game-linked** (they hook
-game functions, so they are coupled to the pinned game build). Realtime Sun Shadows also consumes the
-Depth to Normal service — install both together.
+VBAO, Depth to Normal, and SSILVB are **service-only** (mod-API services only, no game code, so they
+survive game updates without a rebuild). Realtime Sun Shadows and Deferred Fog are **game-linked**
+(they hook game functions, so they are coupled to the pinned game build). Realtime Sun Shadows
+consumes the Depth to Normal service and SSILVB requires it — install Depth to Normal alongside
+either. Running SSILVB and VBAO together double-darkens unless you disable one mod's AO term
+(SSILVB has an "Apply AO" toggle for exactly this).
 
 Each `.dusk` is a **single cross-platform bundle** (Windows x64/arm64, macOS arm64/x64,
 Linux x64/arm64, Android arm64) produced by CI.
