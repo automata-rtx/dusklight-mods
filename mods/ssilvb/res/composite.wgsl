@@ -62,9 +62,9 @@ struct Uniforms {
     emissive_boost: f32,     // emissive-delta bounce gain (fire, fairies, glows)
     emissive_threshold: f32, // linear floor for the emissive delta extract
     sky_intensity: f32,      // directional sky-light strength (0 disables in the sampler)
+    sky_saturation: f32,     // sky tint saturation: 0 = white light at sky brightness, 1 = full
+    gi_saturation: f32,      // bounce chroma boost applied in the composite (1 = neutral)
     _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
 }
 
 @group(0) @binding(0) var gi_source: texture_2d<f32>;          // (GI.rgb linear, AO)
@@ -188,7 +188,13 @@ fn shape_gi(gi_linear: vec3f, uv: vec2f, fade: f32) -> vec3f {
     if (uniforms.flags & (8u | 128u)) == 0u {
         return vec3f(0.0);
     }
-    let lit = max(gi_linear, vec3f(0.0)) * albedo_proxy(uv) * uniforms.gi_intensity * (1.0 - fade);
+    // Saturation boost: the MIP pre-average and the temporal filter both wash chroma out of the
+    // gathered light, so colored spill (a red rug, orange firelight) reads grayer than its
+    // source. Pushing the chroma back up (>1) restores the color story without adding energy.
+    var gi = max(gi_linear, vec3f(0.0));
+    let gi_luma = dot(gi, vec3f(0.299, 0.587, 0.114));
+    gi = max(mix(vec3f(gi_luma), gi, clamp(uniforms.gi_saturation, 0.0, 3.0)), vec3f(0.0));
+    let lit = gi * albedo_proxy(uv) * uniforms.gi_intensity * (1.0 - fade);
     return pow(lit, vec3f(1.0 / 2.2));
 }
 

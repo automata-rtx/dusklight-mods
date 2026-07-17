@@ -307,7 +307,28 @@ Additions from the post-v0.9.1 roadmap review (2026-07-16), roughly in recommend
   also the stepping stone to the bent-normal service export below.
 - **Per-sample radiance luma clamp (firefly guard)** — **SHIPPED in v0.9.2**: `c_j` luminance
   capped at 3.0 linear in `sample_bounce`.
-- **Bent-normal / directional-visibility service export**: the slice walk already knows the
+- **v0.9.3 tuning from the first sky/emissive in-game round** (user feedback: desert got a blue
+  cast under overhangs and on far mountains; Hyrule Field lost contrast; bounce/emissive weak
+  even at maxed sliders): (1) the v0.9.2 firefly cap was FIXED at 3.0 luma, silently
+  neutralizing `emissiveBoost` past ~100% — it now scales as `max(4, 2 x boost)`; (2) sky
+  sampling is horizon-weighted (`w = 0.15 + screen_y^2`) so the warm horizon haze drives the
+  tint instead of the zenith blue; (3) new `skySaturation` (65) pulls the sky tint toward
+  neutral luminance, and sky default intensity dropped to 75; (4) new `giSaturation` (120)
+  restores chroma the MIP prefilter + temporal average wash out; (5) slider ceilings raised —
+  `giIntensity` to 1600 (default 250), `emissiveBoost` to 2000 (default 400) — the LDR source
+  legitimately needs large multipliers, and Screen blend attenuates on bright receivers
+  (suggest A/B with Add mode when judging strength).
+- **Un-bake / Relight companion mod (game-linked; user-requested investigation, verified
+  feasible)**: TP's world lighting is two baked layers, both confirmed in the Dusklight source:
+  per-vertex colors in the room models (J3D materials carry `J3DColorChanInfo`; BG geometry
+  rasterizes vertex color x channel light into the TEV), and the kankyo time-of-day palette
+  (`d_kankyo.cpp`: `bg_amb_col[0..3]` + actor ambient, applied per draw via
+  `settingTevStruct`/tevstr into TEV registers). A game-linked mod could neutralize both - a
+  load-time patch of the material channel config (force material source REG/white instead of
+  VTX, the deferred_fog per-draw-override pattern applied to channels) plus a tevstr hook for
+  the ambient registers - with a 0-100% strength lerp rather than a binary switch. That would
+  hand almost all shading to RSS + SSILVB (and as a bonus make the snapshot markedly closer to
+  true albedo, improving the §5.1 proxy). Big look change; prototype as its own mod.
   directional visibility distribution; exporting (bent normal, AO) as a service (the
   `depth_to_normal` pattern) would let the shadow mod shape its ambient term and any future SSR
   mod cheapen its occlusion — SSILVB becomes a provider, not just a consumer.

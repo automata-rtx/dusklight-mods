@@ -62,9 +62,9 @@ struct Uniforms {
     emissive_boost: f32,     // emissive-delta bounce gain (fire, fairies, glows)
     emissive_threshold: f32, // linear floor for the emissive delta extract
     sky_intensity: f32,      // directional sky-light strength (0 disables in the sampler)
+    sky_saturation: f32,     // sky tint saturation: 0 = white light at sky brightness, 1 = full
+    gi_saturation: f32,      // bounce chroma boost applied in the composite (1 = neutral)
     _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
 }
 
 @group(0) @binding(0) var preprocessed_depth: texture_2d<f32>;
@@ -245,7 +245,11 @@ fn sample_bounce(sample_uv: vec2<f32>, mip: f32, sample_pos: vec3<f32>, pixel_po
     }
     var radiance = load_sample_radiance(sample_uv, mip);
     let luma = dot(radiance, vec3<f32>(0.299, 0.587, 0.114));
-    radiance *= min(1.0, 3.0 / max(luma, 1.0e-4));
+    // The ceiling SCALES with emissive_boost: the boost exists to stand in for the HDR range
+    // the LDR target clipped away, so a fixed cap would silently neutralize the very slider
+    // that raises it (the v0.9.2 bug: boosts past ~100% did nothing).
+    let luma_cap = max(4.0, 2.0 * uniforms.emissive_boost);
+    radiance *= min(1.0, luma_cap / max(luma, 1.0e-4));
     return radiance * (f32(countOneBits(newly)) / 32.0) * emitter_cos;
 }
 
@@ -313,7 +317,12 @@ fn ssilvb(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // game's own time-of-day sky as the ambient source.
     let sky = textureLoad(sky_ambient, vec2<i32>(0i, 0i), 0i);
     let sky_on = (uniforms.flags & 128u) != 0u && sky.a > 0.001 && uniforms.sky_intensity > 0.0;
-    let sky_radiance = sky.rgb * (sky.a * uniforms.sky_intensity);
+    // Saturation control: full sky color can cast a blue pall over warm areas (a light-blue
+    // zenith over orange desert); pulling the tint toward its own luminance keeps the
+    // brightness-and-direction behavior while softening the hue shift.
+    let sky_luma = dot(sky.rgb, vec3<f32>(0.299, 0.587, 0.114));
+    let sky_tint = mix(vec3<f32>(sky_luma), sky.rgb, clamp(uniforms.sky_saturation, 0.0, 1.5));
+    let sky_radiance = sky_tint * (sky.a * uniforms.sky_intensity);
     let up_view = normalize(uniforms.view_from_world[1].xyz); // world +Y in view space
 
     var visibility = 0.0;

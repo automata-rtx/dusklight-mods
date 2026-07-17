@@ -46,9 +46,9 @@ struct Uniforms {
     emissive_boost: f32,     // emissive-delta bounce gain (fire, fairies, glows)
     emissive_threshold: f32, // linear floor for the emissive delta extract
     sky_intensity: f32,      // directional sky-light strength (0 disables in the sampler)
+    sky_saturation: f32,     // sky tint saturation: 0 = white light at sky brightness, 1 = full
+    gi_saturation: f32,      // bounce chroma boost applied in the composite (1 = neutral)
     _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
 }
 
 @group(0) @binding(0) var gi_noisy: texture_2d<f32>;

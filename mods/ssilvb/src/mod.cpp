@@ -65,6 +65,8 @@ ConfigVarHandle g_cvarEmissiveBoost = 0;
 ConfigVarHandle g_cvarEmissiveThreshold = 0;
 ConfigVarHandle g_cvarSkyLight = 0;
 ConfigVarHandle g_cvarSkyIntensity = 0;
+ConfigVarHandle g_cvarSkySaturation = 0;
+ConfigVarHandle g_cvarGiSaturation = 0;
 ConfigVarHandle g_cvarAoApply = 0;
 ConfigVarHandle g_cvarAoIntensity = 0;
 ConfigVarHandle g_cvarContrast = 0;
@@ -246,9 +248,9 @@ struct SsilvbUniforms {
     float emissive_boost;    // emissive-delta bounce gain (fire, fairies, glows)
     float emissive_threshold; // linear floor for the emissive delta extract
     float sky_intensity;     // directional sky-light strength (0 disables in the sampler)
+    float sky_saturation;    // sky tint saturation: 0 = white light at sky brightness, 1 = full
+    float gi_saturation;     // bounce chroma boost applied in the composite (1 = neutral)
     float _pad0;
-    float _pad1;
-    float _pad2;
 };
 static_assert(sizeof(SsilvbUniforms) % 16 == 0);
 
@@ -1092,15 +1094,17 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.radius_ramp_end = static_cast<float>(
         std::clamp<int64_t>(get_int_option(g_cvarRadiusRampEnd, 10000), 500, 200000));
     uniforms.intensity = percent(g_cvarAoIntensity, 150, 0, 500);
-    uniforms.gi_intensity = percent(g_cvarGiIntensity, 200, 0, 800);
+    uniforms.gi_intensity = percent(g_cvarGiIntensity, 250, 0, 1600);
     uniforms.chroma_lift = percent(g_cvarChromaLift, 50, 0, 100);
-    uniforms.emissive_boost = percent(g_cvarEmissiveBoost, 300, 0, 800);
+    uniforms.gi_saturation = percent(g_cvarGiSaturation, 120, 0, 300);
+    uniforms.emissive_boost = percent(g_cvarEmissiveBoost, 400, 0, 2000);
     uniforms.emissive_threshold = percent(g_cvarEmissiveThreshold, 10, 0, 50);
     // Sky light rides the shared gi channel, which the composite multiplies by gi_intensity.
     // Pre-divide so the sky slider is independent of the bounce slider (100 = the measured sky
     // tint applied as-is).
     uniforms.sky_intensity =
-        percent(g_cvarSkyIntensity, 100, 0, 400) / std::max(uniforms.gi_intensity, 0.01f);
+        percent(g_cvarSkyIntensity, 75, 0, 400) / std::max(uniforms.gi_intensity, 0.01f);
+    uniforms.sky_saturation = percent(g_cvarSkySaturation, 65, 0, 150);
     uniforms.contrast = percent(g_cvarContrast, 150, 50, 300);
     uniforms.thickness = percent(g_cvarThickness, 150, 25, 400);
     uniforms.black_point = percent(g_cvarBlackPoint, 3, 0, 30);
@@ -1306,7 +1310,14 @@ ModResult build_controls_tab(
         "One bounce of colored light gathered from nearby surfaces. Off turns the mod into a "
         "standalone directional ambient-occlusion effect (all light sampling is skipped).");
     add_number(left, "Bounce Intensity", g_cvarGiIntensity,
-        "How strongly the gathered bounce light brightens the scene.", 0, 800, 10, "%");
+        "How strongly the gathered bounce light brightens the scene. The source scene is "
+        "low-dynamic-range, so strong looks legitimately need high values here.",
+        0, 1600, 25, "%");
+    add_number(left, "Bounce Saturation", g_cvarGiSaturation,
+        "Chroma boost on the gathered light. Prefiltering and temporal smoothing wash color "
+        "out of the bounce; values above 100 restore vivid colored spill (firelight, foliage "
+        "green) without changing brightness.",
+        0, 300, 10, "%");
     static const char* kBlendOptions[] = {"Screen", "Add"};
     add_select(left, "Bounce Blend", g_cvarGiBlendMode,
         "How the bounce light combines with the scene. Screen never over-brightens (softer, "
@@ -1327,8 +1338,10 @@ ModResult build_controls_tab(
         "input.");
     add_number(left, "Emissive Boost", g_cvarEmissiveBoost,
         "How strongly captured emissive effects contribute to the bounce, relative to ordinary "
-        "surfaces. Fire and glows are small on screen, so they usually need a boost to read.",
-        0, 800, 25, "%");
+        "surfaces. This stands in for the brightness range the screen can't store - real fire "
+        "is hundreds of times brighter than white - so large values are expected and safe (a "
+        "per-sample brightness limiter scales along with it).",
+        0, 2000, 50, "%");
     add_number(left, "Emissive Threshold", g_cvarEmissiveThreshold,
         "Minimum brightness a translucent-phase addition needs before it counts as emissive. "
         "Raise if fog or subtle effects start glowing; lower if faint glows (fairies at a "
@@ -1341,7 +1354,12 @@ ModResult build_controls_tab(
         "indoors.");
     add_number(left, "Sky Light Intensity", g_cvarSkyIntensity,
         "Strength of the sky's directional ambient. 100 applies the measured sky tint as-is.",
-        0, 400, 10, "%");
+        0, 400, 5, "%");
+    add_number(left, "Sky Saturation", g_cvarSkySaturation,
+        "How much of the sky's COLOR the light carries. 100 uses the full measured tint (can "
+        "cast blue over warm areas); lower values keep the brightness and direction but pull "
+        "the hue toward neutral, preserving the scene's own palette and contrast.",
+        0, 150, 5, "%");
     add_toggle(left, "Apply AO", g_cvarAoApply,
         "Also darken by the ambient occlusion this pass measures. Turn OFF when running the "
         "VBAO mod alongside, otherwise the scene is darkened twice.");
@@ -1583,12 +1601,14 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         int64_t defaultValue;
         ConfigVarHandle* handle;
     } intOptions[] = {
-        {"giIntensity", 200, &g_cvarGiIntensity},
+        {"giIntensity", 250, &g_cvarGiIntensity},
         {"giBlendMode", 0, &g_cvarGiBlendMode},
         {"chromaLift", 50, &g_cvarChromaLift},
-        {"emissiveBoost", 300, &g_cvarEmissiveBoost},
+        {"giSaturation", 120, &g_cvarGiSaturation},
+        {"emissiveBoost", 400, &g_cvarEmissiveBoost},
         {"emissiveThreshold", 10, &g_cvarEmissiveThreshold},
-        {"skyIntensity", 100, &g_cvarSkyIntensity},
+        {"skyIntensity", 75, &g_cvarSkyIntensity},
+        {"skySaturation", 65, &g_cvarSkySaturation},
         {"aoIntensity", 150, &g_cvarAoIntensity},
         {"contrast", 150, &g_cvarContrast},
         {"blackPoint", 3, &g_cvarBlackPoint},
@@ -1773,7 +1793,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarEnabled = g_cvarGiEnabled = g_cvarGiIntensity = g_cvarGiBlendMode = 0;
     g_cvarChromaLift = g_cvarBounceWhite = g_cvarAoApply = g_cvarAoIntensity = 0;
     g_cvarEmissiveBounce = g_cvarEmissiveBoost = g_cvarEmissiveThreshold = 0;
-    g_cvarSkyLight = g_cvarSkyIntensity = 0;
+    g_cvarSkyLight = g_cvarSkyIntensity = g_cvarSkySaturation = g_cvarGiSaturation = 0;
     g_cvarContrast = g_cvarBlackPoint = 0;
     g_cvarQuality = g_cvarCustomSlices = g_cvarCustomSteps = 0;
     g_cvarRadius = g_cvarRadiusFar = g_cvarRadiusRampStart = g_cvarRadiusRampEnd = 0;

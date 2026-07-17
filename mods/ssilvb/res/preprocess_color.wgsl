@@ -73,9 +73,9 @@ struct Uniforms {
     emissive_boost: f32,     // emissive-delta bounce gain (fire, fairies, glows)
     emissive_threshold: f32, // linear floor for the emissive delta extract
     sky_intensity: f32,      // directional sky-light strength (0 disables in the sampler)
+    sky_saturation: f32,     // sky tint saturation: 0 = white light at sky brightness, 1 = full
+    gi_saturation: f32,      // bounce chroma boost applied in the composite (1 = neutral)
     _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
 }
 
 @group(0) @binding(0) var scene_color: texture_2d<f32>;
@@ -146,8 +146,15 @@ fn prefilter_color(@builtin(global_invocation_id) global_id: vec3<u32>,
 
         // Sky pixels (reversed-Z clear = 0): the game's skybox with the time-of-day palette
         // already applied. Contribute to the sky-radiance estimate, BEFORE the emissive add.
+        // HORIZON WEIGHTING: pixels lower on screen (nearer the horizon) count more - the
+        // horizon haze is the sky color that actually blends with an area's palette (Gerudo's
+        // warm horizon vs its pale blue zenith), so the estimate leans warm in warm areas
+        // instead of casting zenith blue everywhere. Zenith still contributes (floor weight)
+        // so looking straight up doesn't lose the estimate.
         if depth <= 0.0 {
-            sky_contrib = vec4f(radiance, 1.0);
+            let uv_y = (f32(p.y) + 0.5) * uniforms.inv_size.y;
+            let w = 0.15 + uv_y * uv_y;
+            sky_contrib = vec4f(radiance * w, w);
         }
 
         if (uniforms.flags & 64u) != 0u {
@@ -235,11 +242,13 @@ fn reduce_sky(@builtin(local_invocation_index) local_index: u32) {
         }
     }
     if local_index == 0u {
-        let sum = wg_total[0]; // (sky rgb sum, sky pixel count)
+        let sum = wg_total[0]; // (horizon-weighted rgb sum, weight sum)
         let prev = textureLoad(sky_prev, vec2<i32>(0i, 0i), 0i);
         let chain_pixels = max(uniforms.size.x * uniforms.size.y, 1.0);
-        // Full measurement confidence once >=2% of the screen is sky.
-        let coverage = clamp((sum.w / chain_pixels) / 0.02, 0.0, 1.0);
+        // Full measurement confidence once >=2% of the screen is sky. 0.483 is the mean of the
+        // horizon weight (0.15 + y^2) over the screen, converting weight-sum back to a pixel
+        // count equivalent.
+        let coverage = clamp((sum.w / (0.483 * chain_pixels)) / 0.02, 0.0, 1.0);
         var value = prev;
         if sum.w > 0.5 {
             let mean = sum.rgb / sum.w;
