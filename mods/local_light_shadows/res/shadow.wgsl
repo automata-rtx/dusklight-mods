@@ -34,9 +34,9 @@ struct Uniforms {
     pcf_taps: f32,              // PCF kernel radius (0 = single bilinear tap)
     texel_world: f32,           // world units per shadow-map texel (normal-offset scale)
     map_enabled: f32,           // 1 = a shadow map is bound this frame
-    debug_mode: u32,            // 0 = composite; 1 = occlusion, 2 = reach, 3 = light uv
+    debug_mode: u32,            // 0 = composite; 1 = occlusion, 2 = reach, 3 = light uv, 4 = depth
     atten_power: f32,           // distance-attenuation falloff exponent
-    _pad0: f32,
+    normal_smooth: f32,         // receiver-normal smoothing radius, pixels (0 = single cross)
 }
 
 @group(0) @binding(0) var scene_depth: texture_2d<f32>;
@@ -108,6 +108,39 @@ fn reconstruct_normal(uv: vec2f, world: vec3f, depth: f32, inv_screen: vec2f) ->
         normal = -normal;
     }
     return normal;
+}
+
+// Depth-aware smoothing of the reconstructed normal (a 3x3 bilateral average). GameCube-era models
+// are low-poly, so the raw per-facet normal makes the shadow's facing term band across a curved
+// surface like Link's cap; averaging neighbor normals weighted by depth similarity rounds the
+// facing over a few pixels without smearing across silhouettes. `radius_px` sets the tap spacing.
+fn reconstruct_normal_smooth(
+    uv: vec2f, world: vec3f, depth: f32, inv_screen: vec2f, radius_px: f32) -> vec3f {
+    if radius_px <= 0.0 {
+        return reconstruct_normal(uv, world, depth, inv_screen);
+    }
+    let step = inv_screen * max(radius_px, 1.0) * 0.5;
+    let tol = max(depth * 0.05, 1.0e-6);
+    var sum = vec3f(0.0);
+    var weight_sum = 0.0;
+    for (var dy = -1; dy <= 1; dy += 1) {
+        for (var dx = -1; dx <= 1; dx += 1) {
+            let offset = vec2f(f32(dx), f32(dy)) * step;
+            let d = scene_depth_at(uv + offset);
+            if d <= 0.0 {
+                continue;
+            }
+            let dz = (d - depth) / tol;
+            let weight = exp2(-dz * dz);
+            let tap_world = world_position_at(uv + offset, d);
+            sum += reconstruct_normal(uv + offset, tap_world, d, inv_screen) * weight;
+            weight_sum += weight;
+        }
+    }
+    if weight_sum < 1.0e-4 {
+        return reconstruct_normal(uv, world, depth, inv_screen);
+    }
+    return normalize(sum);
 }
 
 // Bilinearly weighted comparison (what a hardware comparison sampler would do): filter the four
@@ -186,15 +219,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     atten = pow(atten, max(uniforms.atten_power, 0.01));
 
     let inv_screen = 1.0 / vec2f(textureDimensions(scene_depth));
-    let n = reconstruct_normal(in.uv, world, depth, inv_screen);
-    let facing = max(dot(n, light_dir), 0.0);
-    let reach = atten * facing;
+    let n = reconstruct_normal_smooth(in.uv, world, depth, inv_screen, uniforms.normal_smooth);
+    let facing = dot(n, light_dir);
+    // Gate on facing (soft on/off) rather than scaling the darkening linearly by it: a surface
+    // that faces the light is shadowed at full strength, one that faces away not at all, and the
+    // smooth transition keeps low-poly facets near the light terminator from banding. Scaling
+    // darkness directly by `facing` (as the first draft did) made every shadow a faint fraction
+    // and painted the per-facet banding onto curved surfaces like Link's cap.
+    let facing_gate = smoothstep(0.0, 0.35, facing);
+    let reach = atten * facing_gate;
 
     if uniforms.debug_mode == 2u {
         return vec4f(reach, reach, reach, 1.0);
     }
     if reach <= 1.0e-4 {
-        return vec4f(1.0);
+        // Composite: nothing here for the light to shadow. Occlusion debug: not a shadow (black),
+        // so the real shadows (white) stand out instead of blending into the unreached background.
+        return select(vec4f(1.0), vec4f(0.0, 0.0, 0.0, 1.0), uniforms.debug_mode == 1u);
     }
 
     // Slope-scaled bias from the surface's angle to the light.
@@ -222,14 +263,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         return vec4f(saturate(p.receiver), saturate(stored), 1.0, 1.0);
     }
     if !p.valid {
-        // Outside the light's shadow map: we cannot tell, so assume lit.
-        return vec4f(1.0);
+        // Outside the light's shadow map: we cannot tell, so assume lit (black in occlusion debug).
+        return select(vec4f(1.0), vec4f(0.0, 0.0, 0.0, 1.0), uniforms.debug_mode == 1u);
     }
 
     let bias_eff = uniforms.bias + uniforms.slope_bias * tan_t;
     let occlusion = sample_shadow_pcf(p.uv, p.receiver, bias_eff);
 
     if uniforms.debug_mode == 1u {
+        // Only reached, in-frustum pixels get here, so white now means a genuine cast shadow.
         return vec4f(occlusion, occlusion, occlusion, 1.0);
     }
 

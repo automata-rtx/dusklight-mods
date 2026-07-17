@@ -68,6 +68,7 @@ ConfigVarHandle g_cvarCoverage = 0;
 ConfigVarHandle g_cvarBias = 0;
 ConfigVarHandle g_cvarSlopeBias = 0;
 ConfigVarHandle g_cvarNormalOffset = 0;
+ConfigVarHandle g_cvarNormalSmooth = 0;
 ConfigVarHandle g_cvarPcf = 0;
 ConfigVarHandle g_cvarAttenPower = 0;
 ConfigVarHandle g_cvarFov = 0;
@@ -114,7 +115,7 @@ struct LocalShadowUniforms {
     float map_enabled;
     uint32_t debug_mode;
     float atten_power;
-    float _pad0;
+    float normal_smooth;
 };
 static_assert(sizeof(LocalShadowUniforms) == 192);
 static_assert(sizeof(LocalShadowUniforms) % 16 == 0);
@@ -543,7 +544,10 @@ void render_local_shadow_map(const Mtx replayView) {
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarFov, 130), 40, 170));
     const float farZ =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarCoverage, 2500), 500, 12000));
-    constexpr float kNearZ = 5.0f;
+    // A larger near plane keeps receivers out of the ultra-compressed tail of the perspective
+    // reversed-Z range (better depth precision = less acne); casters within it of the flame are
+    // rare. Local lights don't sit right against geometry the way a first-person camera does.
+    constexpr float kNearZ = 25.0f;
 
     // Camera AT the light, looking at the receiver region (the player).
     LightCamera lightCamera{};
@@ -685,8 +689,10 @@ void composite_pass(int64_t debugMode) {
     uniforms.map_enabled = 1.0f;
     uniforms.debug_mode = static_cast<uint32_t>(debugMode);
     uniforms.atten_power =
-        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarAttenPower, 200), 10, 400)) /
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarAttenPower, 100), 10, 400)) /
         100.0f;
+    uniforms.normal_smooth =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarNormalSmooth, 3), 0, 16));
 
     GfxRange uniformRange{0, 0};
     if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &uniformRange) != MOD_OK) {
@@ -819,6 +825,10 @@ ModResult build_controls_tab(
     add_number(left, "Normal Offset", g_cvarNormalOffset, 0, 300, 10, "%",
         "Shifts the shadow-map lookup along the surface normal, scaled to one texel. The most "
         "effective acne fix with the least peter-panning; 100% = one texel.");
+    add_number(left, "Normal Smoothing", g_cvarNormalSmooth, 0, 16, 1, "px",
+        "Rounds the surface direction the shadow's falloff uses over a few pixels, removing the "
+        "faceted bands low-poly models (Link's cap) show. Also steadies the slope bias. Nearly "
+        "free; 0 = off.");
     add_toggle(left, "Two-Sided Casters", g_cvarTwoSidedCasters,
         "Renders casters with backface culling disabled, fixing light leaking through "
         "single-sided geometry (walls, roofs) that faces away from the light.");
@@ -918,16 +928,17 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return result;
     }
     const IntVar intVars[] = {
-        {"strength", 45, &g_cvarStrength},
+        {"strength", 70, &g_cvarStrength},
         {"mapSize", 1, &g_cvarMapSize},
         {"coverage", 2500, &g_cvarCoverage},
         {"fov", 130, &g_cvarFov},
         {"heightOffset", 0, &g_cvarHeightOffset},
-        {"bias", 40, &g_cvarBias},
+        {"bias", 20, &g_cvarBias},
         {"slopeBias", 40, &g_cvarSlopeBias},
         {"normalOffset", 100, &g_cvarNormalOffset},
+        {"normalSmooth", 3, &g_cvarNormalSmooth},
         {"pcf", 1, &g_cvarPcf},
-        {"attenPower", 200, &g_cvarAttenPower},
+        {"attenPower", 100, &g_cvarAttenPower},
         {"debugView", 0, &g_cvarDebugView},
     };
     for (const IntVar& v : intVars) {
@@ -1039,7 +1050,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
 
     g_cvarEnabled = g_cvarStrength = g_cvarMapSize = g_cvarCoverage = 0;
     g_cvarFov = g_cvarHeightOffset = 0;
-    g_cvarBias = g_cvarSlopeBias = g_cvarNormalOffset = g_cvarPcf = 0;
+    g_cvarBias = g_cvarSlopeBias = g_cvarNormalOffset = g_cvarNormalSmooth = g_cvarPcf = 0;
     g_cvarAttenPower = g_cvarTwoSidedCasters = g_cvarDebugView = 0;
     g_drawType = 0;
     g_sceneBeginHook = g_sceneAfterTerrainHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;
