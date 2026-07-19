@@ -2151,7 +2151,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
-    result = register_int_option("normalSmooth", 3, g_cvarNormalSmooth, error);
+    result = register_int_option("normalSmooth", 4, g_cvarNormalSmooth, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -2159,7 +2159,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
-    result = register_int_option("strength", 45, g_cvarStrength, error);
+    result = register_int_option("strength", 60, g_cvarStrength, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -2167,11 +2167,11 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
-    result = register_int_option("bias", 55, g_cvarBias, error);
+    result = register_int_option("bias", 2, g_cvarBias, error);
     if (result != MOD_OK) {
         return result;
     }
-    result = register_int_option("boxRadius", 8000, g_cvarBoxRadius, error);
+    result = register_int_option("boxRadius", 25000, g_cvarBoxRadius, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -2183,15 +2183,15 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
-    result = register_int_option("slopeBias", 30, g_cvarSlopeBias, error);
+    result = register_int_option("slopeBias", 2, g_cvarSlopeBias, error);
     if (result != MOD_OK) {
         return result;
     }
-    result = register_int_option("normalOffset", 100, g_cvarNormalOffset, error);
+    result = register_int_option("normalOffset", 50, g_cvarNormalOffset, error);
     if (result != MOD_OK) {
         return result;
     }
-    result = register_int_option("sssThickness", 50, g_cvarSssThickness, error);
+    result = register_int_option("sssThickness", 150, g_cvarSssThickness, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -2215,7 +2215,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
-    result = register_bool_option("sssFade", true, g_cvarSssFade, error);
+    result = register_bool_option("sssFade", false, g_cvarSssFade, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -2235,15 +2235,15 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
-    result = register_int_option("cascadeCount", 1, g_cvarCascadeCount, error);
+    result = register_int_option("cascadeCount", 2, g_cvarCascadeCount, error);
     if (result != MOD_OK) {
         return result;
     }
-    result = register_int_option("cascadeNearPct", 12, g_cvarCascadeNearPct, error);
+    result = register_int_option("cascadeNearPct", 5, g_cvarCascadeNearPct, error);
     if (result != MOD_OK) {
         return result;
     }
-    result = register_int_option("cascadeMidPct", 35, g_cvarCascadeMidPct, error);
+    result = register_int_option("cascadeMidPct", 40, g_cvarCascadeMidPct, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -2259,7 +2259,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
-    result = register_int_option("casterMinTexels", 2, g_cvarCasterMinTexels, error);
+    result = register_int_option("casterMinTexels", 1, g_cvarCasterMinTexels, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -2267,7 +2267,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
-    result = register_bool_option("linkCascade", true, g_cvarLinkCascade, error);
+    result = register_bool_option("linkCascade", false, g_cvarLinkCascade, error);
     if (result != MOD_OK) {
         return result;
     }

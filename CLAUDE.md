@@ -13,17 +13,63 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   optional Link-only cascade) with PCF, slope-scaled bias, normal-offset receiver, two-sided
   casters, Bend-style screen-space shadows, and indoor auto-disable. **Game-linked**: it
   includes game headers and hooks game functions, so it is coupled to the pinned game build.
-- **`mods/deferred_fog/`** — "Deferred Fog": suppresses the game's per-draw fog during the
-  opaque world lists and re-applies it (bit-exact aurora fog math) as a fullscreen pass after
-  every mod's `SCENE_AFTER_OPAQUE` composites, so AO/shadows darken surfaces under the fog
-  instead of the fog itself. Standalone: other mods need no changes to benefit. Scenes with
-  mixed fog configurations (twilight/wolf-senses special fog) auto-revert to vanilla fog.
-  **Game-linked**.
-- **`mods/depth_to_normal/`** — "Depth to Normal": reconstructs a per-pixel world-space surface
-  normal (+ raw depth) from the scene depth buffer once per frame (atyuwen's 5-tap method) and
-  publishes it as a mod-exported service other mods consume via `include/depth_to_normal_service.h`.
-  Has no settings of its own. **Service-only**. Docs: `docs/depth_to_normal_plan.md`,
-  `docs/depth_to_normal_consumers.md`.
+- **`mods/ssilvb/`** — "SSILVB" (Screen Space Indirect Lighting with Visibility Bitmask,
+  Therrien et al. 2023 — the mod carries the paper's name): VBAO's bitmask sampling chain extended
+  with a one-bounce indirect-diffuse accumulate; with the bounce toggled off it doubles as a
+  standalone directional-AO mod. Consumes the scene-color snapshot as its light input and the
+  Depth to Normal service (hard dependency, now exported by **Graphics Hub**) for per-sample
+  normals; composites GI additively and AO multiplicatively in a single blend draw. **Service-only**.
+  Docs: `docs/ssilvb_plan.md` (§0 first — see the note below), then `docs/ssilvb.md` once written.
+
+- **`mods/graphics_hub/`** — "[WIP] Graphics Hub": a **combination mod** hosting the screen-space
+  infrastructure other mods build on, so effects layer correctly over the game's original rendering.
+  It merges two former standalone mods, each in its own namespace inside `src/mod.cpp`
+  (`hub_dtn` / `hub_fog`) with its own section in the shared UI panel and independent config:
+  - **Depth to Normal** (`hub_dtn`): reconstructs a per-pixel world-space surface normal (+ raw
+    depth) from the scene depth buffer once per frame (atyuwen's 5-tap method) and **publishes it as
+    the mod-exported service** `include/depth_to_normal_service.h` (service id
+    `dev.automata.depth_to_normal`, **unchanged** so SSILVB/Realtime Sun Shadows/VBAO resolve it as
+    before — they include `../graphics_hub/include`). Passive provider: no on/off, just a debug view.
+  - **Deferred Fog** (`hub_fog`): suppresses the game's per-draw fog during the opaque world lists
+    and re-applies it (bit-exact aurora fog math) as a fullscreen pass after every mod's
+    `SCENE_AFTER_OPAQUE` composites, so AO/shadows darken surfaces under the fog instead of the fog
+    itself. Mixed fog configs auto-revert to vanilla (or exact per-pixel replay). Independently
+    toggleable.
+
+  **Game-linked** (Deferred Fog hooks game functions) + webgpu. Docs: `docs/deferred_fog.md`,
+  `docs/depth_to_normal_plan.md`, `docs/depth_to_normal_consumers.md`.
+- **`mods/effect_remover/`** — "Effect Remover": a **combination mod** that cuts down TP's built-in
+  fake-shading so it doesn't fight the realtime stack. It merges three former standalone mods, each
+  in its own namespace inside `src/mod.cpp` (`er_psr` / `er_tsr` / `er_vu`) with its own UI section
+  and independent config:
+  - **Projected Shadow Removal** (`er_psr`): pre-hooks `drawCloudShadow` (TP's "moya"
+    projected-ground-shade draw — the kankyo cloud packet) and cancels it **per `mMoyaMode`**
+    (per-area, set by `kytag` actors). Per-mode toggles; default removes only mode 5 (the slow-sway
+    canopy candidate) and keeps the wind-driven cloud shadows (modes 4/11). `mMoyaMode >= 50`
+    (heat-shimmer / senses) always preserved. Live mode logger.
+  - **Terrain Shadow Removal** (`er_tsr`): the *other* fake shadow — a drifting dapple **overlay
+    baked as a second TEV texture stage inside the terrain material** (not moya — moya count reads 0
+    there). `dKy_cloudshadow_scroll` scrolls **texmtx 1** of `MA00`/`MA01`/`MA16` by the `vrkumo`
+    packet (the sway); `dKy_bg_MAxx_proc` sets **TEV KColor 1**'s red to env fog density on
+    `MA00`/`MA01`/`MA04`/`MA16`. That red is a *wash-out* control (in-game test: 0 = **darker**, max
+    = washed out), so `er_tsr` **post-hooks `dKy_bg_MAxx_proc`** and pins KColor 1's red to **255**
+    (== max fog density, engine-faithful) — white into the shadow stage, base ground (stage 0)
+    untouched, so it **does not hole the floor**. **`MA04` is the confirmed Faron forest-floor
+    shade.** Per-code toggles + logger. Off by default (global terrain change).
+  - **Unbaked Vertex Lighting** (`er_vu`): post-hooks the J3D model loader
+    (`J3DModelLoaderDataBase::load`/`loadBinaryDisplayList`) and rewrites each model's CLR0/CLR1
+    vertex-color arrays in place — `rgb' = mix(white, rgb, vertexLight/100)` — 100 = vanilla, 0 =
+    flat; alpha untouched; all six GX color formats; applies as models load (re-enter the area).
+
+  **Game-linked**. EXPERIMENTAL. See `docs/fake_shading_systems.md` for the three systems + code
+  names.
+
+  **Working mode (user's explicit standing instruction): the technical direction of SSILVB rests
+  with Claude.** The user is an amateur on SSAO/SSGI internals and cannot provide technical
+  direction on the algorithm, math, or rendering architecture — never block on them for such
+  decisions or offer them implementation options to pick from. They provide in-game testing,
+  screenshots, and taste-level feedback ("too strong", "flickers here"); translate that feedback
+  into fixes yourself. Full statement: `docs/ssilvb_plan.md` §0.
 
 Each mod is `src/mod.cpp` (host code: pipelines, config vars, UI panel) plus `res/*.wgsl`
 (shaders). Deep documentation: `docs/vbao.md`, `docs/realtime_sun_shadows.md`,
@@ -67,11 +113,12 @@ The user typically does not build locally. Iteration loop:
   `dusklight-ao` nor `aurora-ao` needs to be attached to the session. Attach them **only when
   re-platforming** (see that section below), never for authoring a mod on the current platform.
 - **Default to service-only.** A new screen-space effect (e.g. SSDO, 1-bounce SSGI, SSR,
-  outlines) should follow the VBAO / `depth_to_normal` pattern: consume depth + the world-space
-  normal from the **Depth to Normal service** (`include/depth_to_normal_service.h`) + the scene
-  color, all via mod-API services — **no game headers, no hooks**. That keeps it off the ABI
-  treadmill: it survives game updates and needs no platform rebuild. `docs/depth_to_normal_consumers.md`
-  is the menu of exactly these effects plus the consumer integration boilerplate — read it first.
+  outlines) should follow the VBAO / SSILVB pattern: consume depth + the world-space
+  normal from the **Depth to Normal service** (`mods/graphics_hub/include/depth_to_normal_service.h`,
+  exported by Graphics Hub) + the scene color, all via mod-API services — **no game headers, no
+  hooks**. That keeps it off the ABI treadmill: it survives game updates and needs no platform
+  rebuild. `docs/depth_to_normal_consumers.md` is the menu of exactly these effects plus the
+  consumer integration boilerplate — read it first.
 - Make a mod **game-linked** only if it genuinely needs a game buffer the gfx service does not
   expose (e.g. pre-tonemap HDR lighting or per-object albedo that SSGI might want). That couples
   it to the pinned build like the shadow/fog mods. Prefer service-only whenever the service

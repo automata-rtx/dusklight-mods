@@ -22,8 +22,11 @@ if (svc_n2d != nullptr && svc_n2d->get_frame(mod_ctx, &f) == MOD_OK) {
 }
 ```
 
-Add `mods/depth_to_normal/include` to your mod's include path (CMake:
-`target_include_directories(<your_mod> PRIVATE .../mods/depth_to_normal/include)`). The view is
+Add `mods/graphics_hub/include` to your mod's include path (CMake:
+`target_include_directories(<your_mod> PRIVATE .../mods/graphics_hub/include)`). The service is
+now exported by the **Graphics Hub** mod (formerly the standalone `depth_to_normal` mod); the
+header name and the service id (`dev.automata.depth_to_normal`) are unchanged, so only the include
+path moved. The view is
 valid for the current frame only — call `get_frame` every frame, never cache the handle. World
 space is canonical; rotate into view space with the camera service's `view_from_world` if your
 effect wants view-space normals.
@@ -44,11 +47,13 @@ normals or depths differ past a threshold are edges. Read the buffer, threshold,
 Almost the entire mod is the edge pass — a very TP-appropriate stylized look, and a great first
 third-party consumer because it needs nothing but the normal and depth.
 
-### Screen-space GI / directional occlusion (SSGI, SSDO)
+### Screen-space GI / directional occlusion (SSGI, SSDO) — **shipping as `mods/ssilvb`**
 The natural evolution of the existing AO: instead of just "how occluded is this pixel," gather a
 single bounce of light (SSGI) or directional occlusion (SSDO) from neighbors, weighted by their
 normals and depths. Adds colored bounce light and directional contact shading. Shares the AO's
 sampling machinery; the normal is what makes it *directional* rather than uniform darkening.
+This is now being built as the SSILVB mod (`docs/ssilvb_plan.md`), which is also the first
+**hard** (non-optional) consumer of the service — it needs the normal at every marched sample.
 
 ### Rim light / fresnel / wetness
 `dot(normal, view)` gives a rim term (character silhouette glow) or a fresnel sheen (water, wet
