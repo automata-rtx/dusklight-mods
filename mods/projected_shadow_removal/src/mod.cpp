@@ -51,16 +51,19 @@ DEFINE_HOOK(drawCloudShadow, CloudShadow);
 
 namespace {
 
-// The moya modes a user can toggle: 1..kMaxMode. Mode 0 is "none"; mMoyaMode >= 50 is the
-// shimmer/senses branch, always preserved.
-constexpr int kMaxMode = 11;
-constexpr int kShimmerModeFloor = 50;
+// Suppressible moya modes: 0..kMaxMode. Mode 0 IS a valid drawn effect (kytag00 can set mode 0
+// with a positive count — a default wind-drift shade), so it gets a toggle too. mMoyaMode >= 50
+// is the framebuffer shimmer/senses branch and is always preserved.
+constexpr int kMaxMode = 11;  // mMoyaMode > kMaxMode (incl. >= 50 shimmer/senses) is left alone
 
 ConfigVarHandle g_cvarEnabled = 0;
 ConfigVarHandle g_cvarLogMode = 0;
-ConfigVarHandle g_cvarSuppress[kMaxMode + 1] = {};  // index by mode; [0] unused
+ConfigVarHandle g_cvarSuppress[kMaxMode + 1] = {};  // index by mode 0..11
 
-int g_lastLoggedMode = -1;
+// Logging state (mod_update, game thread): report the live moya mode+count so an area's effect
+// can be identified even when drawCloudShadow itself isn't being called (no active cloud packet).
+int g_lastLoggedMode = -1000;
+int g_lastLoggedCount = -1000;
 
 bool get_bool_option(ConfigVarHandle handle, bool fallback) {
     bool value = fallback;
@@ -72,26 +75,18 @@ bool get_bool_option(ConfigVarHandle handle, bool fallback) {
 
 // Game thread, in drawCloudShadow's own frame. Reads the live moya mode (dKy_getEnvlight() is the
 // same accessor the game uses inside drawCloudShadow) and cancels the draw only for a mode whose
-// suppression toggle is on. Optionally logs the mode on change so the user can identify areas.
+// suppression toggle is on.
 HookAction on_cloud_shadow_pre(ModContext*, void*, void*, void*) {
+    if (!get_bool_option(g_cvarEnabled, true)) {
+        return HOOK_CONTINUE;
+    }
     const dScnKy_env_light_c* envLight = dKy_getEnvlight();
     if (envLight == nullptr) {
         return HOOK_CONTINUE;
     }
     const int mode = static_cast<int>(envLight->mMoyaMode);
-
-    if (get_bool_option(g_cvarLogMode, false) && mode != g_lastLoggedMode) {
-        g_lastLoggedMode = mode;
-        char msg[64];
-        std::snprintf(msg, sizeof(msg), "projected-shade moya mode = %d", mode);
-        svc_log->info(mod_ctx, msg);
-    }
-
-    if (!get_bool_option(g_cvarEnabled, true)) {
-        return HOOK_CONTINUE;
-    }
-    if (mode < 1 || mode > kMaxMode) {
-        return HOOK_CONTINUE; // "none", or the shimmer/senses branch — leave it
+    if (mode < 0 || mode > kMaxMode) {
+        return HOOK_CONTINUE; // the shimmer/senses branch — leave it
     }
     if (get_bool_option(g_cvarSuppress[mode], false)) {
         return HOOK_SKIP_ORIGINAL;
@@ -113,9 +108,10 @@ void add_toggle(UiElementHandle pane, const char* label, ConfigVarHandle cvar, c
     add_control(pane, control);
 }
 
-// Per-mode labels + hints. Empty hint => generic drifting-shade mode.
+// Per-mode labels + hints. nullptr => generic drifting-shade mode (labelled "Mode N").
 const char* mode_label(int mode) {
     switch (mode) {
+    case 0: return "Mode 0 — default wind drift";
     case 4: return "Mode 4 — wind cloud shadows";
     case 5: return "Mode 5 — slow-sway canopy shade";
     case 11: return "Mode 11 — strong wind drift";
@@ -131,14 +127,16 @@ ModResult build_controls_tab(
     add_toggle(left, "Enabled", g_cvarEnabled,
         "Master switch for the per-mode suppression below.");
     add_toggle(left, "Log Active Mode", g_cvarLogMode,
-        "Prints the active projected-shade mode number to the log whenever it changes. Turn "
-        "this on, then walk into a spot (e.g. under forest canopy, then out into Hyrule Field) "
-        "to read off which mode each effect uses, so you can suppress exactly the ones you "
-        "want and keep the rest.");
+        "Prints the live projected-shade mode AND count to the log every time either changes "
+        "(runs continuously, not only while the effect draws). Turn it on and it reports the "
+        "current mode immediately; walk into a spot (under forest canopy, then out into Hyrule "
+        "Field) to read off each effect's mode. If an on-screen shade persists but the log "
+        "shows count 0, that shade is NOT this projected-shade system - it's a different "
+        "technique (e.g. an animated texture on the terrain).");
 
     svc_ui->pane_add_section(mod_ctx, left, "Suppress by Mode");
     static char kGenericLabels[kMaxMode + 1][16];
-    for (int mode = 1; mode <= kMaxMode; ++mode) {
+    for (int mode = 0; mode <= kMaxMode; ++mode) {
         const char* label = mode_label(mode);
         if (label == nullptr) {
             std::snprintf(kGenericLabels[mode], sizeof(kGenericLabels[mode]), "Mode %d", mode);
@@ -215,7 +213,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
-    for (int mode = 1; mode <= kMaxMode; ++mode) {
+    for (int mode = 0; mode <= kMaxMode; ++mode) {
         char name[24];
         std::snprintf(name, sizeof(name), "suppressMode%d", mode);
         // Default: only the slow-sway canopy candidate (mode 5) is removed; everything else
@@ -238,7 +236,29 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     return MOD_OK;
 }
 
+// Runs every frame on the game thread. Reports the live moya mode + count when logging is on,
+// regardless of whether the projected-shade draw is happening this frame — so an effect can be
+// identified even where drawCloudShadow isn't being called, and a count of 0 tells the user the
+// shade they see is NOT this system.
 MOD_EXPORT ModResult mod_update(ModError*) {
+    if (!get_bool_option(g_cvarLogMode, false)) {
+        g_lastLoggedMode = -1000;
+        g_lastLoggedCount = -1000;
+        return MOD_OK;
+    }
+    const dScnKy_env_light_c* envLight = dKy_getEnvlight();
+    if (envLight == nullptr) {
+        return MOD_OK;
+    }
+    const int mode = static_cast<int>(envLight->mMoyaMode);
+    const int count = envLight->mMoyaCount;
+    if (mode != g_lastLoggedMode || count != g_lastLoggedCount) {
+        g_lastLoggedMode = mode;
+        g_lastLoggedCount = count;
+        char msg[80];
+        std::snprintf(msg, sizeof(msg), "projected-shade: moya mode = %d, count = %d", mode, count);
+        svc_log->info(mod_ctx, msg);
+    }
     return MOD_OK;
 }
 
@@ -248,7 +268,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     for (auto& handle : g_cvarSuppress) {
         handle = 0;
     }
-    g_lastLoggedMode = -1;
+    g_lastLoggedMode = -1000;
+    g_lastLoggedCount = -1000;
     g_controlsWindow = 0;
     return MOD_OK;
 }
