@@ -39,6 +39,36 @@ Sun Shadows if Depth to Normal is not installed and enabled. Install both togeth
    models whose base translation is beyond 2× `linkCoverage` from the player — Link's body
    and equipment all anchor at his position, world geometry anchors far away or at the
    origin. No private `daAlink_c` fields are touched.
+
+   **Culling is two-level (1.8.0).** All the replay culls (light column, sub-texel casters,
+   the Link filter) decide first at the **mat-packet** level — a `J3DMatPacket::draw`
+   pre-hook walks the packet's shape-packet chain (each entry carries its own `mpModel`, so
+   no `j3dSys` state is touched) and skips the whole packet when every entry is culled,
+   which skips the material load + display-list streaming that a drawFast-level skip still
+   pays. A packet with any surviving entry draws, and the `J3DShape::drawFast` hook culls
+   the remaining entries individually (mat packets can hold shape packets merged from
+   several models — `J3DDrawBuffer::entryMatSort` merges same-material packets). Since the
+   near/mid cascades cull almost all world geometry, packet-level decisions make those
+   replays cheap list-walks instead of full material-decode passes — the largest CPU
+   reduction in the map render. Both hooks resolve through the symbol manifest and degrade
+   gracefully (packet-level culling off, per-shape culling still on) if `J3DMatPacket::draw`
+   can't be hooked.
+
+   **Staggered cascade updates (`cascadeStagger`, 1.8.0, default on).** The near cascade
+   re-renders every frame (it carries the player and everything close); cascades 1 and 2
+   alternate, each re-rendering every other frame — with 3 cascades that is 2 replays per
+   frame instead of 3, with 2 cascades 1.5. A skipped cascade composites from a mod-owned
+   copy of its last rendered map: on render frames a tiny compute pass
+   (`res/shadow_copy.wgsl`) copies the frame-pooled depth resolve into a persistent R32Float
+   texture (frame-pooled views must never be cached across frames), and the composite binds
+   that copy with the stored `light_vp`/`texel_world`/near/far metadata so receiver
+   projection stays consistent with the cached content. `cascade_cache_usable` force-refreshes
+   on anything that would make a one-frame-old map wrong: >0.5° sun/moon jumps (sleeping,
+   warps), camera teleports (>5% of the cascade radius in one frame), map-size/radius config
+   changes, or any gap in the map pass (menus, indoors, loads). Staleness is otherwise
+   invisible in normal play: the affected cascades hold distant, mostly static geometry, and
+   a one-frame-lagged box edge lands inside the cascade cross-fade band. Debug views disable
+   staggering so every visualization stays live.
 3. **Composite** (`SCENE_AFTER_OPAQUE`, `res/shadow.wgsl`): unproject scene depth to world,
    reconstruct a world normal from depth (side-selected crosses), pick the sharpest cascade
    whose box contains the receiver, apply that cascade's slope-scaled bias
@@ -111,6 +141,21 @@ Space Shadows" is inert when SSS is off.
    above the horizon + `noFrustumClipping`) and the game-shadow-skip gate are computed **once
    per frame** in the `SCENE_BEGIN` callback and cached; the hooks then only read a bool
    instead of re-running the config reads, indoor check, and sun-position math every call.
+
+   The bypass has a hidden cost the mod now claws back: the draw lists it inflates are the
+   same lists the game's own scene pass consumes, so with the bypass active the **main view**
+   also drew every off-screen actor each frame (CPU streaming + GPU raster for nothing
+   visible). **Main View Culling** (`mainViewCull`, 1.8.0, default on) restores the lost
+   culling at *draw* time instead of list-build time: `SCENE_BEGIN` extracts the scene
+   camera's six world-space frustum planes (from the CameraService `proj_from_world`,
+   reversed-Z aware), and during the scene window (`SCENE_BEGIN` → `FRAME_BEFORE_HUD`,
+   outside the replays — the sky lists draw before the window and the HUD after, so neither
+   is ever tested) the mat-packet hook skips packets whose every shape sphere lies fully
+   outside the frustum. Margins are deliberately generous — 1.5× radius + 300 world units,
+   and spheres over 20000 units (sky domes, oddly-anchored stage pieces) are never culled —
+   so visible geometry is not at risk; the payoff is that the main scene pass returns to
+   roughly its vanilla cost while the replays keep the complete caster set. Only active while
+   the bypass itself is active (`noFrustumClipping` + shadows wanted).
 6. **Light leaking through level edges** → single-sided geometry facing the player is
    back-facing from the light, so its material's cull mode dropped it from the shadow map.
    Fix: two-sided casters during replay. Direct GX drawers are covered by a `GXSetCullMode`
@@ -136,6 +181,8 @@ Space Shadows" is inert when SSS is off.
 | `cascadeNearPct` / `cascadeMidPct` | 12 / 35 | near / mid cascade radii as % of Coverage (log-uniform for 3 cascades) |
 | `cascadeBlend` | 20 | cross-fade band width at each cascade boundary, % of the cascade extent |
 | `cascadeCull` | on | light-column culling of replay geometry per cascade (keeps the passes inside the engine's per-frame streaming budget - leave on) |
+| `cascadeStagger` | on | staggered cascade updates: near every frame, mid/far alternate, skipped frames composite the cached copy of the last rendered map (see architecture §2) - the main CPU saver at 2-3 cascades |
+| `mainViewCull` | on | with `noFrustumClipping`, cull the game's own scene pass per mat packet against the camera frustum at draw time (the bypass otherwise makes the main view draw every off-screen object); replays still see everything |
 | `casterMinTexels` | 2 | skip casters whose world bounding radius is smaller than this many of the cascade's texels (sub-texel shadows); the main lever for the per-frame geometry budget. Raise (4-8) to stay in budget at wide coverage / 3 cascades |
 | `cascadeEdgeFade` | on | fade the widest cascade's shadow out across its outer edge (band = `cascadeBlend`) instead of a hard coverage cutoff |
 | `pcfFarStep` | 1 | extra PCF kernel steps per cascade beyond the near one (0–2) |
@@ -219,6 +266,16 @@ too far makes shadows detach from objects' feet ("peter-panning").
 - **Cascade Culling** — leave on. It skips geometry that can't cast into each cascade's
   box, which is both the perf win and what keeps multiple cascades inside the engine's
   geometry budget.
+- **Staggered Cascades** — leave on. The mid and far photos are retaken every *other*
+  frame instead of every frame (your close-up photo still updates every frame), which
+  removes a whole scene re-render from most frames — the biggest CPU saving in the mod.
+  Sudden changes (warps, sleeping, camera cuts) always force fresh photos. The only
+  theoretical visual: a distant moving object's shadow updates at half rate — turn it off
+  if you ever notice that (you likely won't).
+- **Main View Culling** — leave on. Companion to No Frustum Clipping: that option keeps
+  everything in the draw lists so off-screen objects still cast shadows, but it also made
+  the game draw all of them in your normal view every frame. This skips what you can't see
+  while drawing the normal view only — shadows are unaffected.
 - **Cascade Blend** — how wide the cross-fade between neighboring cascades is. Raise it if
   you can see a line where sharpness changes; costs extra samples only in the band.
 - **Far Softening** — far cascades have chunkier photo pixels; this widens their smoothing
@@ -297,12 +354,15 @@ Normal Offset — the screen-space term re-grounds contacts regardless.
 
   **Staying in the per-frame budget without a platform change** — the streaming cost is
   vertex/index bytes from the *replays*, so it scales with how much geometry each replay
-  streams, NOT with map resolution (Map Size is free). Levers, most effective first: (1)
-  raise `casterMinTexels` (4-8); (2) turn `noFrustumClipping` OFF — on, it forces every
-  replay to include the whole off-screen world, which is the single biggest multiplier in
-  open fields (cost: shadows from off-screen casters pop in as you turn); (3) fewer cascades
-  (2, or 1); (4) smaller `boxRadius` (a smaller far box holds less geometry) paired with
-  `cascadeEdgeFade` + Deferred Fog to hide the nearer cutoff. The definitive fix for
+  streams, NOT with map resolution (Map Size is free). `cascadeStagger` (default on) already
+  halves the worst frame: at 3 cascades only two replays share any one frame's buffers.
+  Levers on top of that, most effective first: (1) raise `casterMinTexels` (4-8); (2) turn
+  `noFrustumClipping` OFF — on, it forces every replay to include the whole off-screen
+  world, which is the single biggest multiplier in open fields (cost: shadows from
+  off-screen casters pop in as you turn; note `mainViewCull` already removes its main-view
+  cost, so turning it off only buys replay streaming); (3) fewer cascades (2, or 1); (4)
+  smaller `boxRadius` (a smaller far box holds less geometry) paired with `cascadeEdgeFade`
+  + Deferred Fog to hide the nearer cutoff. The definitive fix for
   unconstrained 3-cascade/high-radius is larger platform buffers (adaptive grow-on-overflow
   is the intended aurora change; a static bump is a re-platform per CLAUDE.md). The Link
   cascade is nearly free vertex-wise: its filter skips at drawFast BEFORE geometry streams.

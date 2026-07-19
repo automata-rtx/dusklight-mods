@@ -24,6 +24,7 @@
 
 #include "JSystem/J3DGraphAnimator/J3DModel.h"
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
+#include "JSystem/J3DGraphBase/J3DPacket.h"
 #include "JSystem/J3DGraphBase/J3DShape.h"
 #include "JSystem/J3DU/J3DUClipper.h"
 #include "JSystem/JMath/JMath.h"
@@ -111,10 +112,13 @@ ConfigVarHandle g_cvarPcfFarStep = 0;
 ConfigVarHandle g_cvarLinkCascade = 0;
 ConfigVarHandle g_cvarLinkMapSize = 0;
 ConfigVarHandle g_cvarLinkCoverage = 0;
+ConfigVarHandle g_cvarMainViewCull = 0;
+ConfigVarHandle g_cvarCascadeStagger = 0;
 
 GfxDrawTypeHandle g_drawType = 0;
 GfxComputeTypeHandle g_sssComputeType = 0;
 GfxComputeTypeHandle g_normalComputeType = 0;
+GfxComputeTypeHandle g_cascadeCopyComputeType = 0;
 GfxStageHookHandle g_sceneBeginHook = 0;
 GfxStageHookHandle g_sceneAfterTerrainHook = 0;
 GfxStageHookHandle g_sceneAfterOpaqueHook = 0;
@@ -123,6 +127,7 @@ UiWindowHandle g_controlsWindow = 0;
 ResourceBuffer g_shaderSource = RESOURCE_BUFFER_INIT;
 ResourceBuffer g_sssShaderSource = RESOURCE_BUFFER_INIT;
 ResourceBuffer g_normalShaderSource = RESOURCE_BUFFER_INIT;
+ResourceBuffer g_cascadeCopyShaderSource = RESOURCE_BUFFER_INIT;
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
 WGPURenderPipeline g_compositePipeline = nullptr;       // multiply blend
 WGPURenderPipeline g_compositeDebugPipeline = nullptr;  // no blend (debug views)
@@ -137,6 +142,10 @@ WGPUComputePipeline g_normalBlurHPipeline = nullptr;
 WGPUComputePipeline g_normalBlurVPipeline = nullptr;
 WGPUBindGroupLayout g_normalBlurHLayout = nullptr;
 WGPUBindGroupLayout g_normalBlurVLayout = nullptr;
+// Staggered cascades: copies a rendered cascade's frame-pooled depth resolve into a mod-owned
+// texture so frames that skip that cascade's replay can composite from the last rendered map.
+WGPUComputePipeline g_cascadeCopyPipeline = nullptr;
+WGPUBindGroupLayout g_cascadeCopyLayout = nullptr;
 
 // Bend SSS output target (screen-sized visibility, 1 = lit), recreated when the render size
 // changes. Old targets are retired for a few frames instead of released immediately: payloads
@@ -176,6 +185,40 @@ std::vector<RetiredNormalTargets> g_retiredNormalTargets;
 // composite because it contains no world geometry).
 constexpr int kMaxCascades = 4;
 constexpr int kLinkCascade = 3;
+
+// Staggered cascade updates: the non-near world cascades hold mostly static, distant geometry,
+// so re-rendering each of them every frame is the single largest avoidable CPU cost (every
+// replay re-walks the full opaque draw lists on the game thread). With staggering, cascade 0
+// still renders every frame (it carries the player and everything close), while cascades 1 and
+// 2 alternate - halving their replay count. A skipped cascade composites from a mod-owned copy
+// of its last rendered map, using the metadata below so the receiver projection stays
+// consistent with the cached content. Anything that would make a one-frame-old map wrong
+// (sun/moon jumps, camera teleports, config changes, frames where the map pass didn't run)
+// fails cascade_cache_usable and forces a fresh render.
+struct CascadeCacheEntry {
+    uint32_t size = 0;           // texture allocation, in texels
+    WGPUTexture texture = nullptr;
+    WGPUTextureView view = nullptr;
+    bool valid = false;          // texture + metadata hold a composable map
+    uint64_t renderedFrame = 0;  // g_frameIndex when the cached map was rendered
+    float radius = 0.0f;         // cascade box radius the map was rendered with
+    float dirToLight[3] = {};
+    float eye[3] = {};           // camera eye at render time
+    Mtx44 lightVp;               // receiver projection matching the cached map
+    float texelWorld = 1.0f;
+    float lightNear = 100.0f;
+    float lightFar = 60000.0f;
+};
+CascadeCacheEntry g_cascadeCache[3];
+struct RetiredCascadeTexture {
+    WGPUTexture texture = nullptr;
+    WGPUTextureView view = nullptr;
+    int framesLeft = 0;
+};
+std::vector<RetiredCascadeTexture> g_retiredCascadeTextures;
+
+// Frame counter for the stagger schedule and cache-age checks; incremented in on_scene_begin.
+uint64_t g_frameIndex = 0;
 
 struct CascadeSlot {
     bool ready = false;
@@ -226,6 +269,24 @@ Mtx g_replayCullLightView;      // light_from_world for the current cascade
 float g_replayCullLimit = 0.0f;  // lateral half-extent + margin, world units
 float g_replayCullMinRadius = 0.0f;  // skip casters with a smaller world bounding radius
 
+// Main-view culling: with No Frustum Clipping on, the J3DUClipper bypass keeps every
+// off-screen actor in the shared draw lists so the cascade replays can see them - but the
+// game's OWN scene pass consumes the same lists, so it also draws all of that off-screen
+// geometry every frame (CPU streaming + GPU raster for nothing visible). This restores the
+// lost culling at draw time instead of list-build time: once per frame the scene camera's
+// frustum planes are extracted, and during the main scene window (SCENE_BEGIN ->
+// FRAME_BEFORE_HUD, outside our replays) whole mat packets that lie entirely outside the
+// frustum are skipped. The replays are unaffected - they run inside the same window but are
+// bracketed by g_replayingSceneLists, which is checked first.
+bool g_mainViewCullActive = false;
+float g_mainViewPlanes[6][4];  // world-space frustum planes, unit normals pointing inward
+// Culling here must never eat visible geometry: bounds get 1.5x radius + 300 world units of
+// slack (skinned animation can poke past the static mesh bounds), and implausibly huge
+// spheres (sky domes, stage pieces anchored far from their vertices) are never culled.
+constexpr float kMainViewCullRadiusScale = 1.5f;
+constexpr float kMainViewCullMargin = 300.0f;
+constexpr float kMainViewCullMaxRadius = 20000.0f;
+
 constexpr float kLightDistance = 30000.0f;
 constexpr float kLightNear = 100.0f;
 constexpr float kLightFar = 60000.0f;
@@ -248,6 +309,7 @@ DEFINE_HOOK(
 DEFINE_HOOK(GXCopyTex, CopyTex);
 DEFINE_HOOK(GXSetCullMode, CullMode);
 DEFINE_HOOK(&J3DShape::drawFast, ShapeDrawFast);
+DEFINE_HOOK(&J3DMatPacket::draw, MatPacketDraw);
 
 // Mirror of the WGSL Uniforms struct (keep in sync with res/shadow.wgsl). Per-cascade values
 // are vec4-shaped (index 3 = the Link cascade); biases are normalized by each cascade's own
@@ -334,6 +396,17 @@ struct NormalComputePayload {
 };
 static_assert(sizeof(NormalComputePayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
 static_assert(std::is_trivially_copyable_v<NormalComputePayload>);
+
+// Copies a rendered cascade's depth resolve (frame-pooled, this frame only) into the mod-owned
+// cache texture that staggered frames composite from.
+struct CascadeCopyPayload {
+    WGPUTextureView src;  // frame-pooled cascade depth resolve
+    WGPUTextureView dst;  // mod-owned cache texture (r32float storage)
+    uint32_t width;
+    uint32_t height;
+};
+static_assert(sizeof(CascadeCopyPayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
+static_assert(std::is_trivially_copyable_v<CascadeCopyPayload>);
 
 struct SssComputePayload {
     WGPUTextureView sceneDepth;  // frame-pooled
@@ -646,6 +719,11 @@ bool build_normal_pipelines() {
                "normal_blur_v", g_normalBlurVPipeline, g_normalBlurVLayout);
 }
 
+bool build_cascade_copy_pipeline() {
+    return build_compute_pipeline("cascade depth copy", g_cascadeCopyShaderSource, "cs_main",
+        g_cascadeCopyPipeline, g_cascadeCopyLayout);
+}
+
 void release_sss_target(SssTarget& target) {
     if (target.view != nullptr) {
         wgpuTextureViewRelease(target.view);
@@ -749,8 +827,104 @@ bool ensure_normal_targets(uint32_t width, uint32_t height) {
     return true;
 }
 
+void release_cascade_cache_texture(CascadeCacheEntry& cache) {
+    if (cache.view != nullptr) {
+        wgpuTextureViewRelease(cache.view);
+        cache.view = nullptr;
+    }
+    if (cache.texture != nullptr) {
+        wgpuTextureRelease(cache.texture);
+        cache.texture = nullptr;
+    }
+    cache.size = 0;
+    cache.valid = false;
+}
+
+void tick_retired_cascade_textures() {
+    for (auto it = g_retiredCascadeTextures.begin(); it != g_retiredCascadeTextures.end();) {
+        if (--it->framesLeft <= 0) {
+            if (it->view != nullptr) {
+                wgpuTextureViewRelease(it->view);
+            }
+            if (it->texture != nullptr) {
+                wgpuTextureRelease(it->texture);
+            }
+            it = g_retiredCascadeTextures.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Same retire scheme as the SSS target: composite payloads embedding the old view can still be
+// in flight on the render worker when the map size changes.
+bool ensure_cascade_cache_texture(CascadeCacheEntry& cache, uint32_t size) {
+    if (cache.size == size && cache.view != nullptr) {
+        return true;
+    }
+    if (cache.texture != nullptr) {
+        g_retiredCascadeTextures.push_back(
+            RetiredCascadeTexture{std::exchange(cache.texture, nullptr),
+                std::exchange(cache.view, nullptr), 4});
+    }
+    cache.size = 0;
+    cache.valid = false;
+    WGPUTextureDescriptor texDesc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+    texDesc.label = {"cascade shadow cache", WGPU_STRLEN};
+    texDesc.usage = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding;
+    texDesc.size = {size, size, 1};
+    texDesc.format = WGPUTextureFormat_R32Float;
+    cache.texture = wgpuDeviceCreateTexture(g_deviceInfo.device, &texDesc);
+    if (cache.texture != nullptr) {
+        cache.view = wgpuTextureCreateView(cache.texture, nullptr);
+    }
+    if (cache.view == nullptr) {
+        release_cascade_cache_texture(cache);
+        return false;
+    }
+    cache.size = size;
+    return true;
+}
+
 constexpr uint32_t div_ceil(uint32_t numerator, uint32_t denominator) {
     return (numerator + denominator - 1) / denominator;
+}
+
+// Render worker thread: copy a cascade's frame-pooled depth resolve into the mod-owned cache
+// texture (bit-exact R32Float load/store) so later staggered frames can bind it.
+void on_cascade_copy_compute(
+    ModContext*, const GfxComputeContext* ctx, const void* payload, size_t payloadSize, void*) {
+    if (payloadSize != sizeof(CascadeCopyPayload)) {
+        return;
+    }
+    CascadeCopyPayload data;
+    std::memcpy(&data, payload, sizeof(data));
+    if (data.src == nullptr || data.dst == nullptr || g_cascadeCopyPipeline == nullptr) {
+        return;
+    }
+    WGPUBindGroupEntry entries[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    entries[0].binding = 0;
+    entries[0].textureView = data.src;
+    entries[1].binding = 1;
+    entries[1].textureView = data.dst;
+    WGPUBindGroupDescriptor bindGroupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    bindGroupDesc.layout = g_cascadeCopyLayout;
+    bindGroupDesc.entryCount = 2;
+    bindGroupDesc.entries = entries;
+    WGPUBindGroup bindGroup = wgpuDeviceCreateBindGroup(ctx->device, &bindGroupDesc);
+    if (bindGroup == nullptr) {
+        return;
+    }
+    WGPUComputePassDescriptor passDesc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+    passDesc.label = {"cascade depth copy", WGPU_STRLEN};
+    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(ctx->encoder, &passDesc);
+    wgpuComputePassEncoderSetPipeline(pass, g_cascadeCopyPipeline);
+    wgpuComputePassEncoderSetBindGroup(pass, 0, bindGroup, 0, nullptr);
+    wgpuComputePassEncoderDispatchWorkgroups(
+        pass, div_ceil(data.width, 8), div_ceil(data.height, 8), 1);
+    wgpuComputePassEncoderEnd(pass);
+    wgpuComputePassEncoderRelease(pass);
+    wgpuBindGroupRelease(bindGroup);
 }
 
 // Render worker thread: smooth the provider's world-space normal - one separable depth-aware
@@ -1098,6 +1272,161 @@ HookAction on_cull_mode_pre(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
+struct WorldSphere {
+    float x, y, z, r;
+};
+
+// Model-space shape bounds -> world-space bounding sphere through the model's base transform
+// (bounding radius scaled by the largest basis-column length, covering scaled models). False
+// on missing or degenerate inputs - callers draw conservatively then.
+bool shape_world_sphere(J3DModel* model, J3DShape* shape, WorldSphere& out) {
+    if (model == nullptr || shape == nullptr) {
+        return false;
+    }
+    const Vec* mn = shape->getMin();
+    const Vec* mx = shape->getMax();
+    const float ex = 0.5f * (mx->x - mn->x);
+    const float ey = 0.5f * (mx->y - mn->y);
+    const float ez = 0.5f * (mx->z - mn->z);
+    if (!(ex >= 0.0f && ey >= 0.0f && ez >= 0.0f) || !std::isfinite(ex + ey + ez)) {
+        return false;
+    }
+    const float cx = mn->x + ex;
+    const float cy = mn->y + ey;
+    const float cz = mn->z + ez;
+    const Mtx& base = model->getBaseTRMtx();
+    out.x = base[0][0] * cx + base[0][1] * cy + base[0][2] * cz + base[0][3];
+    out.y = base[1][0] * cx + base[1][1] * cy + base[1][2] * cz + base[1][3];
+    out.z = base[2][0] * cx + base[2][1] * cy + base[2][2] * cz + base[2][3];
+    const float s0 = base[0][0] * base[0][0] + base[1][0] * base[1][0] + base[2][0] * base[2][0];
+    const float s1 = base[0][1] * base[0][1] + base[1][1] * base[1][1] + base[2][1] * base[2][1];
+    const float s2 = base[0][2] * base[0][2] + base[1][2] * base[1][2] + base[2][2] * base[2][2];
+    const float scale = std::sqrt(std::max(s0, std::max(s1, s2)));
+    out.r = std::sqrt(ex * ex + ey * ey + ez * ez) * scale;
+    return std::isfinite(out.x + out.y + out.z + out.r);
+}
+
+// True when the sphere cannot contribute to the active world-cascade replay: a sub-texel
+// caster, or laterally outside the cascade's light column (the axis toward the light is
+// ignored - casters anywhere along it matter).
+bool replay_culls_sphere(const WorldSphere& s) {
+    if (g_replayCullMinRadius > 0.0f && s.r < g_replayCullMinRadius) {
+        return true;
+    }
+    const Mtx& view = g_replayCullLightView;
+    const float lx = view[0][0] * s.x + view[0][1] * s.y + view[0][2] * s.z + view[0][3];
+    const float ly = view[1][0] * s.x + view[1][1] * s.y + view[1][2] * s.z + view[1][3];
+    const float limit = g_replayCullLimit + s.r;
+    return std::isfinite(lx) && std::isfinite(ly) &&
+           (std::fabs(lx) > limit || std::fabs(ly) > limit);
+}
+
+// Link-cascade position filter: models anchored at the player (his body, equipment, close
+// characters) pass; world geometry anchors far away or at the origin.
+bool link_filter_keeps(J3DModel* model) {
+    const Mtx& base = model->getBaseTRMtx();
+    const float dx = base[0][3] - g_linkFilterCenter[0];
+    const float dy = base[1][3] - g_linkFilterCenter[1];
+    const float dz = base[2][3] - g_linkFilterCenter[2];
+    return dx * dx + dy * dy + dz * dz <= g_linkFilterRadiusSq;
+}
+
+// World-space frustum planes (unit normals pointing inward) from the column-major WebGPU
+// proj_from_world: |x| <= w, |y| <= w, 0 <= z <= w (reversed-Z - z >= 0 is the far plane).
+bool build_frustum_planes(const float m[16], float planes[6][4]) {
+    float rows[4][4];
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            rows[r][c] = m[c * 4 + r];
+        }
+    }
+    const auto assign = [&](int index, const float a[4], const float b[4], float sign) {
+        float plane[4];
+        for (int c = 0; c < 4; ++c) {
+            plane[c] = (a != nullptr ? a[c] : 0.0f) + sign * b[c];
+        }
+        const float length =
+            std::sqrt(plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]);
+        if (!std::isfinite(length) || length < 1.0e-8f || !std::isfinite(plane[3])) {
+            return false;
+        }
+        for (int c = 0; c < 4; ++c) {
+            planes[index][c] = plane[c] / length;
+        }
+        return true;
+    };
+    return assign(0, rows[3], rows[0], 1.0f) &&   // x >= -w
+           assign(1, rows[3], rows[0], -1.0f) &&  // x <= w
+           assign(2, rows[3], rows[1], 1.0f) &&   // y >= -w
+           assign(3, rows[3], rows[1], -1.0f) &&  // y <= w
+           assign(4, nullptr, rows[2], 1.0f) &&   // z >= 0 (far, reversed-Z)
+           assign(5, rows[3], rows[2], -1.0f);    // z <= w (near)
+}
+
+// True when the sphere lies fully outside the scene camera's frustum with generous slack.
+// Oversized spheres are never culled - see kMainViewCullMaxRadius.
+bool main_view_culls_sphere(const WorldSphere& s) {
+    if (!(s.r < kMainViewCullMaxRadius)) {
+        return false;
+    }
+    const float pad = s.r * kMainViewCullRadiusScale + kMainViewCullMargin;
+    for (const float* plane : g_mainViewPlanes) {
+        if (plane[0] * s.x + plane[1] * s.y + plane[2] * s.z + plane[3] < -pad) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Packet-level culling. J3DMatPacket::draw streams the full material state (material load +
+// display lists) before any of its shapes draw, so a cull that fires only in the
+// J3DShape::drawFast pre-hook still pays every skipped shape's material setup - and across
+// several cascade replays plus the bypass-inflated main view, that decode work dominates the
+// mod's CPU cost. Deciding once per mat packet skips all of it. A packet's shape chain can
+// hold shape packets merged from several models (J3DDrawBuffer::entryMatSort merges
+// same-material packets), so every chain entry is tested and the packet draws if ANY entry
+// survives; the drawFast hook then still culls the skippable ones individually during
+// replays. Unknowns (null model/shape, degenerate bounds) keep the packet. This reads each
+// shape packet's own model pointer - never j3dSys's current model, which is only valid inside
+// a packet draw (the 1.6.1 stale-model hazard).
+HookAction on_mat_packet_draw_pre(ModContext*, void* args, void*, void*) {
+    bool replayLinkCull = false;
+    bool replayWorldCull = false;
+    bool mainViewCull = false;
+    if (g_replayingSceneLists) {
+        replayLinkCull = g_replayLinkOnly;
+        replayWorldCull = g_replayCullActive && !g_replayLinkOnly;
+    } else {
+        mainViewCull = g_mainViewCullActive;
+    }
+    if (!replayLinkCull && !replayWorldCull && !mainViewCull) {
+        return HOOK_CONTINUE;
+    }
+    J3DMatPacket* matPacket = mods::arg<J3DMatPacket*>(args, 0);
+    if (matPacket == nullptr || matPacket->getShapePacket() == nullptr) {
+        return HOOK_CONTINUE;
+    }
+    for (J3DShapePacket* packet = matPacket->getShapePacket(); packet != nullptr;
+         packet = static_cast<J3DShapePacket*>(packet->getNextPacket()))
+    {
+        J3DModel* model = packet->getModel();
+        if (replayLinkCull) {
+            if (model == nullptr || link_filter_keeps(model)) {
+                return HOOK_CONTINUE;
+            }
+            continue;
+        }
+        WorldSphere sphere;
+        if (!shape_world_sphere(model, packet->getShape(), sphere)) {
+            return HOOK_CONTINUE;
+        }
+        if (replayWorldCull ? !replay_culls_sphere(sphere) : !main_view_culls_sphere(sphere)) {
+            return HOOK_CONTINUE;
+        }
+    }
+    return HOOK_SKIP_ORIGINAL;
+}
+
 // J3D materials don't call GXSetCullMode: their cull mode is baked into the genMode BP write of
 // the material display list (J3DGDSetGenMode), replayed through the command processor each draw.
 // Re-issue genMode through the GX shim between the material load and the shape's geometry lists
@@ -1117,14 +1446,7 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     // the origin.
     if (g_replayLinkOnly) {
         J3DModel* model = j3dSys.getModel();
-        if (model == nullptr) {
-            return HOOK_SKIP_ORIGINAL;
-        }
-        const Mtx& base = model->getBaseTRMtx();
-        const float dx = base[0][3] - g_linkFilterCenter[0];
-        const float dy = base[1][3] - g_linkFilterCenter[1];
-        const float dz = base[2][3] - g_linkFilterCenter[2];
-        if (dx * dx + dy * dy + dz * dz > g_linkFilterRadiusSq) {
+        if (model == nullptr || !link_filter_keeps(model)) {
             return HOOK_SKIP_ORIGINAL;
         }
     }
@@ -1132,52 +1454,14 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     // via the model's base transform, then laterally into the cascade's light space; a shape
     // entirely outside the column cannot cast into the cascade's box, so skipping it saves
     // its whole geometry stream. Conservative on unknowns: no model (a non-packet draw) or
-    // degenerate bounds -> draw.
+    // degenerate bounds -> draw. Whole packets of culled shapes are already skipped in
+    // on_mat_packet_draw_pre; this catches the culled shapes of mixed packets.
     if (g_replayCullActive && !g_replayLinkOnly) {
         J3DModel* model = j3dSys.getModel();
         J3DShape* shape = const_cast<J3DShape*>(mods::arg<const J3DShape*>(args, 0));
-        if (model != nullptr && shape != nullptr) {
-            const Vec* mn = shape->getMin();
-            const Vec* mx = shape->getMax();
-            const float ex = 0.5f * (mx->x - mn->x);
-            const float ey = 0.5f * (mx->y - mn->y);
-            const float ez = 0.5f * (mx->z - mn->z);
-            if (ex >= 0.0f && ey >= 0.0f && ez >= 0.0f && std::isfinite(ex + ey + ez)) {
-                const float cx = mn->x + ex;
-                const float cy = mn->y + ey;
-                const float cz = mn->z + ez;
-                const Mtx& base = model->getBaseTRMtx();
-                const float wx =
-                    base[0][0] * cx + base[0][1] * cy + base[0][2] * cz + base[0][3];
-                const float wy =
-                    base[1][0] * cx + base[1][1] * cy + base[1][2] * cz + base[1][3];
-                const float wz =
-                    base[2][0] * cx + base[2][1] * cy + base[2][2] * cz + base[2][3];
-                // Bounding radius scaled by the largest basis-column length of the base
-                // transform (covers scaled models); skinned shapes get extra slack below.
-                const float s0 = base[0][0] * base[0][0] + base[1][0] * base[1][0] +
-                                 base[2][0] * base[2][0];
-                const float s1 = base[0][1] * base[0][1] + base[1][1] * base[1][1] +
-                                 base[2][1] * base[2][1];
-                const float s2 = base[0][2] * base[0][2] + base[1][2] * base[1][2] +
-                                 base[2][2] * base[2][2];
-                const float scale = std::sqrt(std::max(s0, std::max(s1, s2)));
-                const float radius = std::sqrt(ex * ex + ey * ey + ez * ez) * scale;
-                // Sub-texel caster: its shadow is smaller than a shadow-map texel, so it
-                // cannot produce a visible shadow in this cascade - skip before it streams.
-                if (g_replayCullMinRadius > 0.0f && radius < g_replayCullMinRadius) {
-                    return HOOK_SKIP_ORIGINAL;
-                }
-                const Mtx& view = g_replayCullLightView;
-                const float lx = view[0][0] * wx + view[0][1] * wy + view[0][2] * wz + view[0][3];
-                const float ly = view[1][0] * wx + view[1][1] * wy + view[1][2] * wz + view[1][3];
-                const float limit = g_replayCullLimit + radius;
-                if (std::isfinite(lx) && std::isfinite(ly) &&
-                    (std::fabs(lx) > limit || std::fabs(ly) > limit))
-                {
-                    return HOOK_SKIP_ORIGINAL;
-                }
-            }
+        WorldSphere sphere;
+        if (shape_world_sphere(model, shape, sphere) && replay_culls_sphere(sphere)) {
+            return HOOK_SKIP_ORIGINAL;
         }
     }
     if (!g_replayTwoSided) {
@@ -1188,6 +1472,12 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     if (material == nullptr || material->getColorBlock() == nullptr ||
         material->getIndBlock() == nullptr)
     {
+        return HOOK_CONTINUE;
+    }
+    // Already-two-sided material: its own display list set cull-off, so the re-issue below
+    // would change nothing - skip the five shim calls (foliage-heavy scenes are full of
+    // cull-none materials).
+    if (material->getColorBlock()->getCullMode() == GX_CULL_NONE) {
         return HOOK_CONTINUE;
     }
     GXSetNumTexGens(static_cast<u8>(material->getTexGenNum()));
@@ -1235,13 +1525,26 @@ void restore_actual_light_debug() {
 }
 
 void on_scene_begin(ModContext*, const GfxStageContext* stageCtx, void*) {
+    ++g_frameIndex;
     tick_retired_sss_targets();
     tick_retired_normal_targets();
+    tick_retired_cascade_textures();
     restore_actual_light_debug();
     capture_scene_camera(stageCtx);
     // Refresh the game-shadow-skip / frustum-bypass gate for this frame before the game's
     // clip and shadow-control calls fire (they run after this SCENE_BEGIN callback).
     update_frame_shadow_gate();
+    // Main-view culling claws back what the clip bypass costs the game's own scene pass, so
+    // it is gated on the same frame flag; the planes come from this frame's scene camera.
+    // Everything drawn between here and FRAME_BEFORE_HUD uses that camera (the sky lists draw
+    // before SCENE_BEGIN and the HUD after FRAME_BEFORE_HUD, so neither is ever culled).
+    g_mainViewCullActive = false;
+    if (g_frameFrustumBypass && get_bool_option(g_cvarMainViewCull, true) &&
+        get_debug_mode() == 0 && g_sceneCamera.valid)
+    {
+        g_mainViewCullActive =
+            build_frustum_planes(g_sceneCamera.info.proj_from_world, g_mainViewPlanes);
+    }
     if (!get_bool_option(g_cvarEnabled, true) || get_debug_mode() != 9) {
         return;
     }
@@ -1422,6 +1725,71 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
     return true;
 }
 
+// True when a staggered cascade's cached map can stand in for a skipped replay this frame.
+bool cascade_cache_usable(const CascadeCacheEntry& cache, uint32_t mapSize, float radius,
+    const float dirToLight[3], const float eye[3]) {
+    if (!cache.valid || cache.view == nullptr || cache.size != mapSize ||
+        cache.radius != radius)
+    {
+        return false;
+    }
+    // A gap since the last render means the map pass wasn't running (menus, indoors, loads) -
+    // the cached world may be arbitrarily old, so re-render instead of compositing it.
+    if (g_frameIndex - cache.renderedFrame > 2) {
+        return false;
+    }
+    // Sun/moon jumps (sleeping, warping, time skips) move every shadow at once; a cascade
+    // holding the pre-jump world would visibly disagree with the fresh ones. Normal
+    // time-of-day drift is orders of magnitude below this threshold per frame.
+    const float dot = dirToLight[0] * cache.dirToLight[0] +
+                      dirToLight[1] * cache.dirToLight[1] +
+                      dirToLight[2] * cache.dirToLight[2];
+    if (dot < 0.99996f) {  // ~0.5 degrees
+        return false;
+    }
+    // Camera teleports (warps, cutscene cuts) displace the cascade box wholesale; ordinary
+    // movement covers a tiny fraction of any cascade's radius per frame.
+    const float dx = eye[0] - cache.eye[0];
+    const float dy = eye[1] - cache.eye[1];
+    const float dz = eye[2] - cache.eye[2];
+    const float jump = radius * 0.05f;
+    if (dx * dx + dy * dy + dz * dz > jump * jump) {
+        return false;
+    }
+    return true;
+}
+
+// Queue the copy of a just-rendered cascade's depth resolve into its cache texture and stamp
+// the metadata the composite needs on the frames that skip this cascade's replay.
+void update_cascade_cache(CascadeCacheEntry& cache, const CascadeSlot& slot, float radius,
+    const float dirToLight[3], const float eye[3]) {
+    cache.valid = false;
+    if (g_cascadeCopyPipeline == nullptr || slot.shadowMap == nullptr ||
+        !ensure_cascade_cache_texture(cache, slot.mapSize))
+    {
+        return;
+    }
+    CascadeCopyPayload payload{};
+    payload.src = slot.shadowMap;
+    payload.dst = cache.view;
+    payload.width = slot.mapSize;
+    payload.height = slot.mapSize;
+    if (svc_gfx->push_compute(mod_ctx, g_cascadeCopyComputeType, &payload, sizeof(payload)) !=
+        MOD_OK)
+    {
+        return;
+    }
+    cache.renderedFrame = g_frameIndex;
+    cache.radius = radius;
+    std::memcpy(cache.dirToLight, dirToLight, sizeof(cache.dirToLight));
+    std::memcpy(cache.eye, eye, sizeof(cache.eye));
+    std::memcpy(cache.lightVp, slot.lightVp, sizeof(cache.lightVp));
+    cache.texelWorld = slot.texelWorld;
+    cache.lightNear = slot.lightNear;
+    cache.lightFar = slot.lightFar;
+    cache.valid = true;
+}
+
 // Game thread, after the draw handlers have populated next frame's scene lists: replay opaque
 // scene geometry from the light's point of view - once per cascade (near -> far boxes around
 // the camera, radii split from the Coverage setting), plus the optional Link-only cascade (a
@@ -1476,7 +1844,46 @@ void render_shadow_map(
         radii[1] = coverage * midPct;
     }
 
+    // Current light + camera eye, for the stagger schedule and the composite direction (the
+    // same values build_light_camera derives internally; a failure here is the same no-light
+    // frame that would have failed the first cascade).
+    float dirToLight[3];
+    float fade = 0.0f;
+    if (!compute_light(dirToLight, fade)) {
+        return;
+    }
+    Mtx invView;
+    cMtx_inverse(replayViewMtx, invView);
+    if (!matrix_ready(invView)) {
+        return;
+    }
+    const float eye[3] = {invView[0][3], invView[1][3], invView[2][3]};
+    // Staggered cascades: cascade 0 renders every frame (it carries the player and everything
+    // near); cascades 1 and 2 alternate, each re-rendering every other frame and compositing
+    // from its cached copy in between - dropping a full draw-list replay from most frames.
+    // Debug views always render everything so they stay live.
+    const bool stagger =
+        get_bool_option(g_cvarCascadeStagger, true) && debugMode == 0 && count > 1;
+
     for (int i = 0; i < count; ++i) {
+        CascadeCacheEntry& cache = g_cascadeCache[i];
+        if (stagger && i > 0) {
+            const bool scheduledRender = ((g_frameIndex + static_cast<uint64_t>(i)) & 1) == 0;
+            if (!scheduledRender &&
+                cascade_cache_usable(cache, mapSize, radii[i], dirToLight, eye))
+            {
+                CascadeSlot& slot = g_mapPass.cascades[i];
+                slot.shadowMap = cache.view;
+                slot.lightColor = nullptr;
+                slot.mapSize = cache.size;
+                std::memcpy(slot.lightVp, cache.lightVp, sizeof(slot.lightVp));
+                slot.texelWorld = cache.texelWorld;
+                slot.lightNear = cache.lightNear;
+                slot.lightFar = cache.lightFar;
+                slot.ready = true;
+                continue;
+            }
+        }
         LightCamera lightCamera{};
         if (!build_light_camera(replayViewMtx, mapSize, radii[i], lightCamera) ||
             !replay_cascade(lightCamera, replayViewMtx, replayProjection, cameraReplayDebug,
@@ -1485,10 +1892,13 @@ void render_shadow_map(
             g_mapPass = {};
             return;
         }
-        std::memcpy(g_mapPass.dirToLightWorld, lightCamera.dirToLight,
-            sizeof(g_mapPass.dirToLightWorld));
-        g_mapPass.fade = lightCamera.fade;
+        if (stagger && i > 0) {
+            update_cascade_cache(
+                cache, g_mapPass.cascades[i], radii[i], lightCamera.dirToLight, eye);
+        }
     }
+    std::memcpy(g_mapPass.dirToLightWorld, dirToLight, sizeof(g_mapPass.dirToLightWorld));
+    g_mapPass.fade = fade;
     g_mapPass.cascadeCount = count;
     g_mapPass.ready = true;
 
@@ -1835,6 +2245,9 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
 // scene layers on after the opaque pass. Also the safety net that clears a map pass the
 // after-opaque composite didn't consume.
 void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
+    // End of the scene window: HUD and menu models (drawn from here on, with their own
+    // cameras) must never be tested against the scene frustum.
+    g_mainViewCullActive = false;
     const int64_t debugMode = get_debug_mode();
     restore_actual_light_debug();
     if (debugMode == 0 || debugMode == 9) {
@@ -1923,6 +2336,14 @@ ModResult build_controls_tab(
         "Skips geometry that cannot cast into a cascade's box before it is drawn. Keeps the "
         "extra cascade passes cheap and inside the engine's per-frame geometry budget - "
         "leave on. Turn off only to test whether a missing shadow was wrongly culled.");
+    add_toggle(left, "Staggered Cascades", g_cvarCascadeStagger,
+        "Re-renders the mid and far cascades on alternating frames instead of every frame, "
+        "reusing each one's last map in between - a large CPU saving, since every cascade "
+        "render re-walks the whole scene. The near cascade (you and everything close) still "
+        "updates every frame, and any sudden change - time skips, warps, camera cuts - "
+        "forces a full refresh. Distant moving objects update their shadows at half rate; "
+        "in normal play this is invisible. Turn off for strictly per-frame shadows "
+        "everywhere.");
     add_number(left, "Caster Detail", g_cvarCasterMinTexels, 0, 16, 1, nullptr,
         "Skips casters smaller than this many shadow-map texels, whose shadow would be "
         "sub-pixel anyway. This is the main control for staying within the engine's per-frame "
@@ -1975,6 +2396,13 @@ ModResult build_controls_tab(
         "Keeps camera-frustum-culled objects in the draw lists so off-screen objects still cast "
         "map shadows. Fixes shadows popping in and out with camera direction (distant mountains, "
         "ceilings) at some GPU cost.");
+    add_toggle(left, "Main View Culling", g_cvarMainViewCull,
+        "Companion to No Frustum Clipping: that option keeps every off-screen object in the "
+        "draw lists, which also makes the game's own camera view draw all of them each frame "
+        "for nothing. This skips objects that are fully outside your view while drawing the "
+        "normal scene only - shadow rendering still sees everything, so shadows from "
+        "off-screen casters are unaffected. Big CPU saving; leave on. Turn off only if "
+        "geometry ever visibly disappears at the screen edge.");
     add_toggle(left, "Two-Sided Casters", g_cvarTwoSidedCasters,
         "Renders map casters with backface culling disabled. Fixes light leaking through "
         "single-sided geometry (level-edge walls, roofs) that faces away from the sun.");
@@ -2138,6 +2566,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK || g_normalShaderSource.data == nullptr) {
         return mods::set_error(error, result, "failed to load normal_smooth.wgsl");
     }
+    result = svc_resource->load(mod_ctx, "shadow_copy.wgsl", &g_cascadeCopyShaderSource);
+    if (result != MOD_OK || g_cascadeCopyShaderSource.data == nullptr) {
+        return mods::set_error(error, result, "failed to load shadow_copy.wgsl");
+    }
 
     result = register_bool_option("effectEnabled", true, g_cvarEnabled, error);
     if (result != MOD_OK) {
@@ -2279,6 +2711,14 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
+    result = register_bool_option("mainViewCull", true, g_cvarMainViewCull, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_bool_option("cascadeStagger", true, g_cvarCascadeStagger, error);
+    if (result != MOD_OK) {
+        return result;
+    }
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to query device info");
     }
@@ -2294,6 +2734,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (!build_normal_pipelines()) {
         return mods::set_error(
             error, MOD_ERROR, "failed to create normal smoothing pipelines");
+    }
+    if (!build_cascade_copy_pipeline()) {
+        return mods::set_error(error, MOD_ERROR, "failed to create cascade copy pipeline");
     }
     // Non-filtering, clamp-to-edge sampler for the PCF textureGather (res/shadow.wgsl). The
     // shadow maps are R32Float (unfilterable), so the sampler must be non-filtering; clamp
@@ -2328,6 +2771,14 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     computeDesc.label = "smoothed normals";
     computeDesc.callback = on_normal_compute;
     if (svc_gfx->register_compute_type(mod_ctx, &computeDesc, &g_normalComputeType) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register compute type");
+    }
+    computeDesc = GFX_COMPUTE_TYPE_DESC_INIT;
+    computeDesc.label = "cascade depth copy";
+    computeDesc.callback = on_cascade_copy_compute;
+    if (svc_gfx->register_compute_type(mod_ctx, &computeDesc, &g_cascadeCopyComputeType) !=
+        MOD_OK)
+    {
         return mods::set_error(error, MOD_ERROR, "failed to register compute type");
     }
     GfxStageHookDesc stageDesc = GFX_STAGE_HOOK_DESC_INIT;
@@ -2386,6 +2837,15 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
             "failed to hook J3DShape::drawFast (missing dusklight.symdb?); Two-Sided Casters "
             "will not affect J3D geometry");
     }
+    // Packet-level culling (replay light columns, the Link filter, and Main View Culling all
+    // decide whole mat packets here before their material state streams). Virtual like
+    // drawFast, so it resolves through the symbol manifest; degrade to the per-shape culls
+    // rather than failing the mod.
+    if (mods::hook_add_pre<MatPacketDraw>(svc_hook, on_mat_packet_draw_pre) != MOD_OK) {
+        svc_log->warn(mod_ctx,
+            "failed to hook J3DMatPacket::draw (missing dusklight.symdb?); packet-level "
+            "culling disabled - per-shape culling still applies");
+    }
     UiModsPanelDesc panelDesc = UI_MODS_PANEL_DESC_INIT;
     panelDesc.build = build_panel;
     svc_ui->register_mods_panel(mod_ctx, &panelDesc);
@@ -2402,6 +2862,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     svc_resource->free(mod_ctx, &g_shaderSource);
     svc_resource->free(mod_ctx, &g_sssShaderSource);
     svc_resource->free(mod_ctx, &g_normalShaderSource);
+    svc_resource->free(mod_ctx, &g_cascadeCopyShaderSource);
     release_sss_target(g_sssTarget);
     for (auto& retired : g_retiredSssTargets) {
         release_sss_target(retired.target);
@@ -2412,6 +2873,19 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         release_normal_targets(retired.targets);
     }
     g_retiredNormalTargets.clear();
+    for (auto& cache : g_cascadeCache) {
+        release_cascade_cache_texture(cache);
+        cache = {};
+    }
+    for (auto& retired : g_retiredCascadeTextures) {
+        if (retired.view != nullptr) {
+            wgpuTextureViewRelease(retired.view);
+        }
+        if (retired.texture != nullptr) {
+            wgpuTextureRelease(retired.texture);
+        }
+    }
+    g_retiredCascadeTextures.clear();
     if (g_sssPipeline != nullptr) {
         wgpuComputePipelineRelease(g_sssPipeline);
         g_sssPipeline = nullptr;
@@ -2438,8 +2912,10 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     };
     releaseComputePipeline(g_normalBlurHPipeline);
     releaseComputePipeline(g_normalBlurVPipeline);
+    releaseComputePipeline(g_cascadeCopyPipeline);
     releaseLayout(g_normalBlurHLayout);
     releaseLayout(g_normalBlurVLayout);
+    releaseLayout(g_cascadeCopyLayout);
     if (g_compositePipeline != nullptr) {
         wgpuRenderPipelineRelease(g_compositePipeline);
         g_compositePipeline = nullptr;
@@ -2472,10 +2948,14 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_replayCullActive = false;
     g_replayCullLimit = 0.0f;
     g_cvarPcfFarStep = g_cvarLinkCascade = g_cvarLinkMapSize = g_cvarLinkCoverage = 0;
+    g_cvarMainViewCull = g_cvarCascadeStagger = 0;
+    g_mainViewCullActive = false;
+    g_frameIndex = 0;
     g_replayLinkOnly = false;
     g_linkFilterRadiusSq = 0.0f;
-    g_drawType = g_sssComputeType = g_normalComputeType = g_sceneBeginHook =
-        g_sceneAfterTerrainHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;
+    g_drawType = g_sssComputeType = g_normalComputeType = g_cascadeCopyComputeType =
+        g_sceneBeginHook = g_sceneAfterTerrainHook = g_sceneAfterOpaqueHook =
+            g_frameBeforeHudHook = 0;
     g_controlsWindow = 0;
     g_replayTwoSided = false;
     g_frameShadowsWanted = false;
