@@ -53,12 +53,15 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   terrain material itself** (not moya — moya count reads 0 there). The environment code drives it
   per frame: `dKy_cloudshadow_scroll` scrolls **texture matrix 1** of the `MA00`/`MA01`/`MA16`
   terrain materials by the drifting cloud (`vrkumo`) packet (the *sway*), and `dKy_bg_MAxx_proc`
-  sets **TEV KColor register 1**'s red channel to the env fog density on `MA00`/`MA01`/`MA04`/`MA16`
-  (the shadow *strength*). The mod **post-hooks `dKy_bg_MAxx_proc`** and, for the enabled
-  material codes, rewrites KColor 1 to zero — cancelling the overlay stage's contribution while
-  leaving the base ground texture (stage 0) untouched, so it **does not hole the floor** (the
-  earlier shape-skip approach did, and was replaced). Per-material-code toggles (MA00/MA01/MA16
-  default on when enabled, MA04 static off) + a live logger of which codes a room uses. The big
+  sets **TEV KColor register 1**'s red channel to the env fog density on `MA00`/`MA01`/`MA04`/`MA16`.
+  That red channel is a *wash-out* control, not a darkener (in-game test: forcing it to 0 made the
+  shade **darker**; maximum fog density washes it out). The mod **post-hooks `dKy_bg_MAxx_proc`**
+  and, for the enabled material codes, pins KColor 1's red to **255** (== max fog density, engine-
+  faithful) — feeding white into the shadow stage so it stops darkening the ground, while leaving
+  the base ground texture (stage 0) untouched, so it **does not hole the floor** (the earlier
+  shape-skip approach did, and was replaced). **`MA04` is the confirmed Faron forest-floor shade.**
+  Per-material-code toggles (all default on when the mod is enabled) + a live logger of which codes
+  a room uses (the Faron spot logs ~72 MA04 materials). The big
   rolling Hyrule-Field cloud shadows are the *moya* system (`projected_shadow_removal`) and are
   not touched here. **Off by default / EXPERIMENTAL** (global terrain change; the KColor→shadow
   strength mapping is inferred, so verify per area). **Game-linked**.

@@ -7,10 +7,12 @@
 //   - dKy_cloudshadow_scroll() scrolls TEXTURE MATRIX 1 of the MA00/MA01/MA16 materials by the
 //     drifting cloud ("vrkumo") packet translation  -> this is the SWAY,
 //   - dKy_bg_MAxx_proc() then sets TEV KColor register 1's RED channel to the environment fog
-//     density on the MA00/MA01/MA04/MA16 materials  -> this is the shadow STRENGTH.
-// The shadow TEV stage multiplies the scrolled shadow texture into the base ground by that KColor1
-// strength. Set the fog-density red channel to 0 and the overlay stage contributes nothing, while
-// the base ground texture (stage 0) is untouched.
+//     density on the MA00/MA01/MA04/MA16 materials  -> this controls how much the shadow shows.
+// The shadow TEV stage uses that red channel (swizzled to grey) as a WASH-OUT amount: in-game
+// testing showed forcing it to 0 makes the shade DARKER, and maximum fog density washes it out.
+// So we pin the red channel to 255 (== maximum fog density, a value the engine renders cleanly),
+// feeding white into the shadow stage so it stops darkening the ground. The base ground texture
+// (stage 0) is untouched, so this does not hole the floor.
 //
 // WHY THIS (and not the previous shape-skip): the shadow is a stage INSIDE the ground material, so
 // skipping the whole shape holed the ground. Zeroing the overlay's strength register removes only
@@ -78,9 +80,9 @@ constexpr ShadowCode kCodes[] = {
      "MA00 for the swaying floor shade."},
     {'1', '6', "Remove MA16 (scrolling shade, alt)",
      "Another scrolling ground-shadow overlay variant used by some rooms."},
-    {'0', '4', "Remove MA04 (static shade)",
-     "The same shadow-overlay family but without the scroll (a static ground darkening). Off by "
-     "default because it does not sway; enable it if a still ground shade remains."},
+    {'0', '4', "Remove MA04 (forest-floor shade)",
+     "The Faron/forest-floor ground shadow overlay (confirmed in-game as the slowly swaying floor "
+     "shade there). Same shadow-overlay family; washed out the same way."},
 };
 constexpr int kCodeCount = static_cast<int>(sizeof(kCodes) / sizeof(kCodes[0]));
 
@@ -145,11 +147,18 @@ void on_maxx_post(ModContext*, void* args, void*, void*) {
         return;
     }
 
-    J3DGXColor zero;
-    zero.r = 0;
-    zero.g = 0;
-    zero.b = 0;
-    zero.a = 0;
+    // The game writes KColor register 1's RED channel = fog density on these materials, and the
+    // shadow TEV stage treats that value as a WASH-OUT amount (in-game test: forcing it to 0 made
+    // the shade DARKER, so it lightens the shadow, it does not strengthen it). The red channel is
+    // swizzled to the stage (K1_R replicated -> grey), so red = 255 feeds white into the stage =
+    // no darkening. So we pin it to 255, which is exactly what maximum fog density produces (a
+    // value the engine renders cleanly), washing the overlay out. g and b stay 0 and a stays 0,
+    // matching the vanilla register for these codes so nothing else changes.
+    J3DGXColor wash;
+    wash.r = 255;
+    wash.g = 0;
+    wash.b = 0;
+    wash.a = 0;
 
     const u16 count = modelData->getMaterialNum();
     for (u16 i = 0; i < count; ++i) {
@@ -164,9 +173,7 @@ void on_maxx_post(ModContext*, void* args, void*, void*) {
         }
         J3DMaterial* material = modelData->getMaterialNodePointer(i);
         if (material != nullptr) {
-            // KColor register 1's red channel is the environment fog-density shadow strength for
-            // these materials; zeroing it removes the overlay's contribution.
-            material->setTevKColor(1, &zero);
+            material->setTevKColor(1, &wash);
             ++g_hitAccum;
         }
     }
@@ -276,10 +283,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     for (int i = 0; i < kCodeCount; ++i) {
         char name[24];
         std::snprintf(name, sizeof(name), "removeMA%c%c", kCodes[i].c5, kCodes[i].c6);
-        // The three scrolling (swaying) codes default on when the mod is enabled; the static MA04
-        // defaults off (it does not sway and is less likely to be an unwanted shadow).
-        const bool def = !(kCodes[i].c5 == '0' && kCodes[i].c6 == '4');
-        result = register_bool(name, def, g_cvarRemove[i], error);
+        // All shadow-overlay codes default on when the mod is enabled (MA04 is the confirmed
+        // forest-floor shade); untick any code whose overlay you want to keep in another area.
+        result = register_bool(name, true, g_cvarRemove[i], error);
         if (result != MOD_OK) {
             return result;
         }

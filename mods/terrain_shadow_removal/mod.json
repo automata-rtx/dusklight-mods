@@ -1,7 +1,7 @@
 {
   "id": "dev.automata.terrain_shadow_removal",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "name": "[WIP] Terrain Shadow Removal",
   "author": "automata-rtx",
-  "description": "Removes the animated ground-shadow overlay that Twilight Princess bakes into the terrain material itself (the slowly swaying dappled shade on forest/field floors) - a different system from the 'moya' particle shadows. It works by zeroing the overlay's TEV strength register on the cloud-shadow terrain materials (MA00/MA01/MA16 scroll, MA04 static) after the game sets it, so only the shadow stage is cancelled and the base ground is left fully intact - no holes. Per-material-code toggles plus a live logger let you keep the overlay in areas you want it. The big rolling Hyrule-Field cloud shadows are the separate moya system and are not touched here. EXPERIMENTAL and off by default."
+  "description": "Removes the animated ground-shadow overlay that Twilight Princess bakes into the terrain material itself (the slowly swaying dappled shade on forest/field floors, e.g. Faron) - a different system from the 'moya' particle shadows. It washes the overlay out by pinning its TEV wash register to maximum (the same value maximum fog density produces) on the cloud-shadow terrain materials (MA00/MA01/MA04/MA16) after the game sets it, so only the shadow stage stops darkening and the base ground is left fully intact - no holes. Per-material-code toggles plus a live logger let you keep the overlay in areas you want it. The big rolling Hyrule-Field cloud shadows are the separate moya system and are not touched here. EXPERIMENTAL and off by default."
 }
