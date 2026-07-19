@@ -48,6 +48,17 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   wind-driven cloud shadows (modes 4/11). A `logMode` toggle prints the active mode on change so
   areas can be identified in-game. `mMoyaMode >= 50` (heat-shimmer / wolf-senses distortion) is
   always preserved. **Game-linked**. EXPERIMENTAL.
+- **`mods/terrain_shadow_removal/`** — "[WIP] Terrain Shadow Removal": the *other* fake-shadow
+  system — TP scrolls a shadow/dapple texture across the terrain itself via the room model's
+  `model.btk` (loaded by `d_a_bg`), which is what the slowly-swaying Faron forest-floor shade is
+  (it's not moya — moya count reads 0 there). Pre-hooks `daBg_btkAnm_c::create` to record which
+  terrain materials the room BTK animates, then pre-hooks `J3DShape::drawFast` and cancels the
+  draw of any shape whose material is in that recorded set (guarded by `getMaterialAnm() != NULL`,
+  so the set membership *is* the scope — characters and water/waterfalls, which are separate
+  actors with object-archive BTKs, never match). **Off by default / EXPERIMENTAL**: if a room's
+  shadow is a stage *inside* the base ground material rather than its own overlay material,
+  skipping the shape takes the ground with it (floor looks wrong) — so it's opt-in and tested per
+  area. **Game-linked**.
 
   **Working mode (user's explicit standing instruction): the technical direction of SSILVB rests
   with Claude.** The user is an amateur on SSAO/SSGI internals and cannot provide technical

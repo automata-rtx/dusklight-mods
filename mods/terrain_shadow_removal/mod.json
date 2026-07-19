@@ -1,0 +1,7 @@
+{
+  "id": "dev.automata.terrain_shadow_removal",
+  "name": "[WIP] Terrain Shadow Removal",
+  "version": "0.1.0",
+  "author": "automata-rtx",
+  "description": "Removes the fake shadow that Twilight Princess scrolls across the terrain as an animated texture overlay (e.g. the slowly drifting dappled shade on forest floors), so realtime shadow/GI mods provide the shading instead. Works by skipping the draw of the room terrain's texture-animated materials - waterfalls and water are separate actors and are never affected. EXPERIMENTAL and off by default: if a room's shadow shares the base ground material, enabling this can leave the ground looking wrong there, so test per area."
+}
