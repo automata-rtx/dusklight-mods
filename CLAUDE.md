@@ -32,6 +32,13 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   AO multiplicatively in a single blend draw. **Service-only**. Docs: `docs/ssilvb_plan.md`
   (§0 first — see the note below), then `docs/ssilvb.md` once written.
 
+- **`mods/vertex_unbake/`** — "[WIP] Unbaked Vertex Lighting": post-hooks the J3D model loader
+  (`J3DModelLoaderDataBase::load`/`loadBinaryDisplayList`) and rewrites each loaded model's
+  CLR0/CLR1 vertex-color arrays in place — `rgb' = mix(white, rgb, vertexLight/100)` — fading
+  out TP's baked lighting so the realtime stack (shadows + SSILVB) carries the shading. 100 =
+  vanilla, 0 = fully flat; alpha untouched; all six GX color formats handled; changes apply as
+  models load (re-enter the area). **Game-linked**. EXPERIMENTAL.
+
   **Working mode (user's explicit standing instruction): the technical direction of SSILVB rests
   with Claude.** The user is an amateur on SSAO/SSGI internals and cannot provide technical
   direction on the algorithm, math, or rendering architecture — never block on them for such

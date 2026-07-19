@@ -318,8 +318,15 @@ Additions from the post-v0.9.1 roadmap review (2026-07-16), roughly in recommend
   `giIntensity` to 1600 (default 250), `emissiveBoost` to 2000 (default 400) — the LDR source
   legitimately needs large multipliers, and Screen blend attenuates on bright receivers
   (suggest A/B with Add mode when judging strength).
-- **Un-bake / Relight companion mod (game-linked; user-requested investigation, verified
-  feasible)**: TP's world lighting is two baked layers, both confirmed in the Dusklight source:
+- **Un-bake / Relight companion mod — vertex layer SHIPPED as `mods/vertex_unbake` v0.1.0**
+  ("[WIP] Unbaked Vertex Lighting"): instead of the channel-override sketch below (which is
+  binary), the mod post-hooks the J3D model-load funnel and rewrites each model's CLR0/CLR1
+  arrays in place with the exact blend `rgb' = mix(white, rgb, t)` — true 0–100 semantics, one
+  patch per model, zero per-frame cost (aurora streams vertex data from these buffers every
+  frame), no registry/dangling-pointer risk. Alpha untouched (it carries transparency, not
+  lighting); all six GX color formats handled per the PC loader's endian rules. Setting changes
+  apply to models loaded afterward (area re-entry). The kankyo time-of-day ambient layer
+  remains vanilla — a future second knob via a `settingTevStruct` hook. Original sketch: TP's world lighting is two baked layers, both confirmed in the Dusklight source:
   per-vertex colors in the room models (J3D materials carry `J3DColorChanInfo`; BG geometry
   rasterizes vertex color x channel light into the TEV), and the kankyo time-of-day palette
   (`d_kankyo.cpp`: `bg_amb_col[0..3]` + actor ambient, applied per draw via
