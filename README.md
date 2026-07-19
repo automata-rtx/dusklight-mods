@@ -11,7 +11,7 @@ PC/mobile port), built on the official [Dusklight mod template](https://github.c
 | Depth to Normal | `depth_to_normal.dusk` | Reconstructs a per-pixel world-space surface normal from the depth buffer and publishes it as a service other mods consume. No settings of its own |
 | SSILVB | `ssilvb.dusk` | Screen-space indirect lighting with visibility bitmask (Therrien et al. 2023): one-bounce colored light gathered through the same 32-sector bitmask VBAO uses; with the bounce disabled it acts as a standalone directional AO. Requires Depth to Normal |
 | [WIP] Unbaked Vertex Lighting | `vertex_unbake.dusk` | Fades out the lighting baked into world geometry's vertex colors (0 = fully flat, 100 = vanilla) so the realtime shadow/GI mods carry the shading. Changes apply as areas load. Experimental |
-| [WIP] Projected Shadow Removal | `projected_shadow_removal.dusk` | Removes TP's fake projected ground shadows — swaying forest-canopy dapple and rolling Hyrule Field cloud shadows (the game's "moya" texture projection) — so realtime shadows/GI carry the shading. Heat-shimmer preserved. Experimental |
+| [WIP] Projected Shadow Removal | `projected_shadow_removal.dusk` | Selectively removes TP's fake projected ground shade (the "moya" system) per effect — swaying forest-canopy dapple vs. rolling Hyrule Field cloud shadows are independent toggles. Defaults to removing only the canopy shade. Live mode logger for identification; heat-shimmer preserved. Experimental |
 
 VBAO, Depth to Normal, and SSILVB are **service-only** (mod-API services only, no game code, so they
 survive game updates without a rebuild). Realtime Sun Shadows, Deferred Fog, Unbaked Vertex

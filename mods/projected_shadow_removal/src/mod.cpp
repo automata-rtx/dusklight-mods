@@ -1,25 +1,30 @@
-// Projected Shadow Removal — suppresses Twilight Princess's fake projected ground shadows.
+// Projected Shadow Removal — selectively suppresses Twilight Princess's fake projected
+// ground-shade effects, per effect type.
 //
-// TP has no real-time shadow casting for the environment; instead the "moya" system projects a
-// scrolling texture onto the ground to fake it. The SAME function, drawCloudShadow (the kankyo
-// cloud packet's draw), renders every variant of this:
-//   - the slowly swaying dappled canopy shadows on forest floors (Faron, Ordon),
+// TP has no real-time environment shadow casting; it fakes atmospheric ground shade with the
+// "moya" system. drawCloudShadow (the kankyo cloud packet's draw) renders a field of soft
+// wind/animation-driven particles projected onto the ground. The SAME function draws every
+// variant, distinguished by dScnKy_env_light_c::mMoyaMode:
+//   - the slowly swaying dappled canopy shade on forest floors (Faron/Ordon),
 //   - the rolling cloud shadows drifting across Hyrule Field,
-//   - a few other drifting-shade moya modes,
-// each with a per-stage texture and an animated (rotating/scrolling) projection matrix — which
-// is exactly why they read as "swaying tree shadows" in one place and "rolling clouds" in
-// another. They are the game's stand-in for the shadows our Realtime Sun Shadows + SSILVB stack
-// now provides for real, so this mod removes them.
+//   - drifting mist / dust / steam variants,
+// each with a per-stage texture and per-mode motion. The mode is set per area by the map's
+// "kytag" actors, so which NUMBER is the forest canopy vs the field clouds is map data, not
+// something the code fixes — hence this mod suppresses BY MODE and ships a live mode logger so
+// the exact number for any spot can be read off in-game.
 //
-// MECHANISM: a pre-hook on drawCloudShadow that cancels the original call (the same tactic
-// Deferred Fog uses to suppress the game's fog draw). Skipping a self-contained immediate-mode
-// draw is safe — the next draw sets its own GX state — so nothing downstream is disturbed.
+// Behavioral notes from the game's cloud_shadow_move (used for the default + UI hints):
+//   - mode 5 is the only pure non-wind SLOW SWAY → the forest-canopy candidate (default: removed),
+//   - modes 4 and 11 are WIND-DRIVEN drift → the rolling-cloud candidates (default: kept),
+//   - modes 6/8/10/11 add vertical rise → drifting mist/steam (default: kept).
+// mMoyaMode >= 50 is a different effect entirely (framebuffer heat-shimmer / wolf-senses
+// distortion) and is always left alone.
 //
-// PRESERVED: drawCloudShadow's mMoyaMode >= 50 branch is a different effect entirely (it samples
-// the framebuffer to project a heat-shimmer/refraction, e.g. Death Mountain). The hook only
-// cancels the projected-shadow branch (mMoyaMode < 50), so the shimmer still works.
+// MECHANISM: a pre-hook on drawCloudShadow that cancels the call only when the current mode's
+// suppression toggle is on (the Deferred Fog suppression tactic). Skipping a self-contained
+// immediate-mode draw is safe — the next draw sets its own GX state.
 //
-// Game-linked: hooks a game function, so it is coupled to the pinned game build.
+// Game-linked: hooks a game function, coupled to the pinned game build.
 
 #include "global.h"
 
@@ -33,22 +38,29 @@
 #include "mods/svc/log.h"
 #include "mods/svc/ui.h"
 
+#include <cstdio>
+
 DEFINE_MOD();
 IMPORT_SERVICE(LogService, svc_log);
 IMPORT_SERVICE(ConfigService, svc_config);
 IMPORT_SERVICE(UiService, svc_ui);
 IMPORT_SERVICE(HookService, svc_hook);
 
-// The projected-ground-shadow draw (kankyo cloud packet). Free function declared in
-// d/d_kankyo_rain.h.
+// The projected-ground-shade draw (kankyo cloud packet). Free function in d/d_kankyo_rain.h.
 DEFINE_HOOK(drawCloudShadow, CloudShadow);
 
 namespace {
 
-ConfigVarHandle g_cvarEnabled = 0;
-
-// mMoyaMode >= this is the framebuffer-based heat-shimmer branch, not a ground shadow; leave it.
+// The moya modes a user can toggle: 1..kMaxMode. Mode 0 is "none"; mMoyaMode >= 50 is the
+// shimmer/senses branch, always preserved.
+constexpr int kMaxMode = 11;
 constexpr int kShimmerModeFloor = 50;
+
+ConfigVarHandle g_cvarEnabled = 0;
+ConfigVarHandle g_cvarLogMode = 0;
+ConfigVarHandle g_cvarSuppress[kMaxMode + 1] = {};  // index by mode; [0] unused
+
+int g_lastLoggedMode = -1;
 
 bool get_bool_option(ConfigVarHandle handle, bool fallback) {
     bool value = fallback;
@@ -58,36 +70,135 @@ bool get_bool_option(ConfigVarHandle handle, bool fallback) {
     return value;
 }
 
-// Game thread, in drawCloudShadow's own frame: cancel the projected-shadow draw. Reads the live
-// moya mode (dKy_getEnvlight() is the same accessor the game uses inside drawCloudShadow) so the
-// heat-shimmer branch is never touched.
+// Game thread, in drawCloudShadow's own frame. Reads the live moya mode (dKy_getEnvlight() is the
+// same accessor the game uses inside drawCloudShadow) and cancels the draw only for a mode whose
+// suppression toggle is on. Optionally logs the mode on change so the user can identify areas.
 HookAction on_cloud_shadow_pre(ModContext*, void*, void*, void*) {
+    const dScnKy_env_light_c* envLight = dKy_getEnvlight();
+    if (envLight == nullptr) {
+        return HOOK_CONTINUE;
+    }
+    const int mode = static_cast<int>(envLight->mMoyaMode);
+
+    if (get_bool_option(g_cvarLogMode, false) && mode != g_lastLoggedMode) {
+        g_lastLoggedMode = mode;
+        char msg[64];
+        std::snprintf(msg, sizeof(msg), "projected-shade moya mode = %d", mode);
+        svc_log->info(mod_ctx, msg);
+    }
+
     if (!get_bool_option(g_cvarEnabled, true)) {
         return HOOK_CONTINUE;
     }
-    const dScnKy_env_light_c* envLight = dKy_getEnvlight();
-    if (envLight != nullptr && envLight->mMoyaMode >= kShimmerModeFloor) {
-        return HOOK_CONTINUE; // heat shimmer / refraction — keep it
+    if (mode < 1 || mode > kMaxMode) {
+        return HOOK_CONTINUE; // "none", or the shimmer/senses branch — leave it
     }
-    return HOOK_SKIP_ORIGINAL; // projected cloud / canopy shadow — remove it
+    if (get_bool_option(g_cvarSuppress[mode], false)) {
+        return HOOK_SKIP_ORIGINAL;
+    }
+    return HOOK_CONTINUE;
 }
 
 void add_control(UiElementHandle pane, const UiControlDesc& desc) {
     svc_ui->pane_add_control(mod_ctx, pane, &desc, nullptr);
 }
 
+void add_toggle(UiElementHandle pane, const char* label, ConfigVarHandle cvar, const char* help) {
+    UiControlDesc control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_TOGGLE;
+    control.label = label;
+    control.help_rml = help;
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = cvar;
+    add_control(pane, control);
+}
+
+// Per-mode labels + hints. Empty hint => generic drifting-shade mode.
+const char* mode_label(int mode) {
+    switch (mode) {
+    case 4: return "Mode 4 — wind cloud shadows";
+    case 5: return "Mode 5 — slow-sway canopy shade";
+    case 11: return "Mode 11 — strong wind drift";
+    default: return nullptr; // filled generically below
+    }
+}
+
+ModResult build_controls_tab(
+    ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*, ModError*) {
+    (void)right;
+
+    svc_ui->pane_add_section(mod_ctx, left, "General");
+    add_toggle(left, "Enabled", g_cvarEnabled,
+        "Master switch for the per-mode suppression below.");
+    add_toggle(left, "Log Active Mode", g_cvarLogMode,
+        "Prints the active projected-shade mode number to the log whenever it changes. Turn "
+        "this on, then walk into a spot (e.g. under forest canopy, then out into Hyrule Field) "
+        "to read off which mode each effect uses, so you can suppress exactly the ones you "
+        "want and keep the rest.");
+
+    svc_ui->pane_add_section(mod_ctx, left, "Suppress by Mode");
+    static char kGenericLabels[kMaxMode + 1][16];
+    for (int mode = 1; mode <= kMaxMode; ++mode) {
+        const char* label = mode_label(mode);
+        if (label == nullptr) {
+            std::snprintf(kGenericLabels[mode], sizeof(kGenericLabels[mode]), "Mode %d", mode);
+            label = kGenericLabels[mode];
+        }
+        add_toggle(left, label, g_cvarSuppress[mode],
+            "Removes this projected-shade effect. Use Log Active Mode to find which number an "
+            "on-screen effect uses. Mode 5 (default on) is the slow-swaying canopy shade; the "
+            "wind-driven cloud shadows are usually a different mode, left on so Hyrule Field "
+            "keeps its drifting shadows.");
+    }
+    return MOD_OK;
+}
+
+UiWindowHandle g_controlsWindow = 0;
+
+void on_controls_window_closed(ModContext*, UiWindowHandle, void*) {
+    g_controlsWindow = 0;
+}
+
+void on_open_controls(ModContext*, void*) {
+    if (g_controlsWindow != 0) {
+        return;
+    }
+    UiTabDesc tabs[1] = {UI_TAB_DESC_INIT};
+    tabs[0].title = "Controls";
+    tabs[0].build = build_controls_tab;
+    UiWindowDesc desc = UI_WINDOW_DESC_INIT;
+    desc.tabs = tabs;
+    desc.tab_count = 1;
+    desc.on_closed = on_controls_window_closed;
+    if (svc_ui->window_push(mod_ctx, &desc, &g_controlsWindow) != MOD_OK) {
+        svc_log->error(mod_ctx, "failed to open Projected Shadow Removal controls window");
+    }
+}
+
 ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     UiControlDesc control = UI_CONTROL_DESC_INIT;
     control.kind = UI_CONTROL_TOGGLE;
-    control.label = "Remove Projected Shadows";
-    control.help_rml =
-        "Removes the game's fake projected ground shadows: the swaying dappled shade under "
-        "forest canopies and the rolling cloud shadows over Hyrule Field. Leave on so the "
-        "realtime shadow/GI mods carry the shading instead. Heat-shimmer effects (Death "
-        "Mountain) are unaffected.";
+    control.label = "Enabled";
     control.binding = UI_BINDING_CONFIG_VAR;
     control.config_var = g_cvarEnabled;
     add_control(panel, control);
+
+    control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_BUTTON;
+    control.label = "Open Controls";
+    control.on_pressed = on_open_controls;
+    add_control(panel, control);
+    return MOD_OK;
+}
+
+ModResult register_bool(const char* name, bool def, ConfigVarHandle& out, ModError* error) {
+    ConfigVarDesc cvarDesc = CONFIG_VAR_DESC_INIT;
+    cvarDesc.name = name;
+    cvarDesc.type = CONFIG_VAR_BOOL;
+    cvarDesc.default_bool = def;
+    if (svc_config->register_var(mod_ctx, &cvarDesc, &out) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register option");
+    }
     return MOD_OK;
 }
 
@@ -96,16 +207,27 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
 extern "C" {
 
 MOD_EXPORT ModResult mod_initialize(ModError* error) {
-    ConfigVarDesc cvarDesc = CONFIG_VAR_DESC_INIT;
-    cvarDesc.name = "effectEnabled";
-    cvarDesc.type = CONFIG_VAR_BOOL;
-    cvarDesc.default_bool = true;
-    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarEnabled) != MOD_OK) {
-        return mods::set_error(error, MOD_ERROR, "failed to register effectEnabled option");
+    ModResult result = register_bool("effectEnabled", true, g_cvarEnabled, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_bool("logMode", false, g_cvarLogMode, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    for (int mode = 1; mode <= kMaxMode; ++mode) {
+        char name[24];
+        std::snprintf(name, sizeof(name), "suppressMode%d", mode);
+        // Default: only the slow-sway canopy candidate (mode 5) is removed; everything else
+        // (including the wind cloud shadows) is kept until the user opts in.
+        result = register_bool(name, mode == 5, g_cvarSuppress[mode], error);
+        if (result != MOD_OK) {
+            return result;
+        }
     }
 
     if (mods::hook_add_pre<CloudShadow>(svc_hook, on_cloud_shadow_pre) != MOD_OK) {
-        return mods::set_error(error, MOD_ERROR, "failed to hook the projected-shadow draw");
+        return mods::set_error(error, MOD_ERROR, "failed to hook the projected-shade draw");
     }
 
     UiModsPanelDesc panelDesc = UI_MODS_PANEL_DESC_INIT;
@@ -122,6 +244,12 @@ MOD_EXPORT ModResult mod_update(ModError*) {
 
 MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarEnabled = 0;
+    g_cvarLogMode = 0;
+    for (auto& handle : g_cvarSuppress) {
+        handle = 0;
+    }
+    g_lastLoggedMode = -1;
+    g_controlsWindow = 0;
     return MOD_OK;
 }
 }

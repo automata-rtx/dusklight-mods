@@ -39,12 +39,15 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   vanilla, 0 = fully flat; alpha untouched; all six GX color formats handled; changes apply as
   models load (re-enter the area). **Game-linked**. EXPERIMENTAL.
 - **`mods/projected_shadow_removal/`** — "[WIP] Projected Shadow Removal": pre-hooks
-  `drawCloudShadow` (TP's "moya" projected-ground-shadow draw — the kankyo cloud packet) and
-  cancels it, removing the swaying dappled canopy shadows on forest floors and the rolling cloud
-  shadows over Hyrule Field (one texture-projection system, per-stage texture + animated matrix,
-  so it reads as both). Gated to `mMoyaMode < 50` so the framebuffer heat-shimmer branch (Death
-  Mountain) survives. Single `effectEnabled` toggle. Removes the game's fake shadows so the
-  realtime stack carries them. **Game-linked**. EXPERIMENTAL.
+  `drawCloudShadow` (TP's "moya" projected-ground-shade draw — the kankyo cloud packet, a
+  wind/animation-driven particle field projected onto the ground) and cancels it **per
+  `mMoyaMode`**. The mode is set per area by the map's `kytag` actors, so the forest-canopy
+  shade, the Hyrule Field rolling cloud shadows, and drifting mist/dust are different mode
+  numbers that can be suppressed independently (per-mode toggles). Default removes only mode 5
+  (the sole pure non-wind *slow sway* — the canopy candidate) and keeps the rest, incl. the
+  wind-driven cloud shadows (modes 4/11). A `logMode` toggle prints the active mode on change so
+  areas can be identified in-game. `mMoyaMode >= 50` (heat-shimmer / wolf-senses distortion) is
+  always preserved. **Game-linked**. EXPERIMENTAL.
 
   **Working mode (user's explicit standing instruction): the technical direction of SSILVB rests
   with Claude.** The user is an amateur on SSAO/SSGI internals and cannot provide technical
