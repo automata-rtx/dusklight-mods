@@ -1,7 +1,0 @@
-{
-  "id": "dev.automata.vertex_unbake",
-  "name": "[WIP] Unbaked Vertex Lighting",
-  "version": "0.1.0",
-  "author": "automata-rtx",
-  "description": "Fades out the lighting baked into world geometry's vertex colors, so realtime effects (Realtime Sun Shadows, SSILVB) carry the shading instead. Vertex Lighting 100 keeps the vanilla baked look; 0 removes it entirely (flat, texture-only base). Applies to models as they load, so changes take effect when an area (re)loads. EXPERIMENTAL"
-}

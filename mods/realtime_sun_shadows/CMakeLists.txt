@@ -7,6 +7,7 @@ add_mod(realtime_sun_shadows
     RES_DIR  res
 )
 
-# Hard dependency on the Depth to Normal provider mod for receiver normals (shared service header).
+# Depends on the depth-to-normal service for receiver normals (shared header), now exported by
+# Graphics Hub.
 target_include_directories(realtime_sun_shadows PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../depth_to_normal/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../graphics_hub/include)

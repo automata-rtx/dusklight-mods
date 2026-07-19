@@ -7,6 +7,7 @@ add_mod(vbao
     RES_DIR  res
 )
 
-# Optional integration with the Depth to Normal provider mod (shared service header).
+# Optional integration with the depth-to-normal service (shared header), now exported by
+# Graphics Hub.
 target_include_directories(vbao PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../depth_to_normal/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../graphics_hub/include)

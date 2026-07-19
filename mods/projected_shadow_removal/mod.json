@@ -1,7 +1,0 @@
-{
-  "id": "dev.automata.projected_shadow_removal",
-  "name": "[WIP] Projected Shadow Removal",
-  "version": "0.2.1",
-  "author": "automata-rtx",
-  "description": "Selectively removes Twilight Princess's fake projected ground shade (the game's 'moya' system) per effect type: the slowly swaying dappled shadows under forest canopies, the rolling cloud shadows over Hyrule Field, and drifting mist/dust variants are separate modes you can toggle independently. Defaults to removing only the slow-sway canopy shade and keeping the wind-driven cloud shadows. Includes a live mode logger so you can identify exactly which effect uses which mode in any spot. Heat-shimmer / wolf-senses distortion is always preserved. EXPERIMENTAL"
-}

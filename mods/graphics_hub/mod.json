@@ -1,0 +1,7 @@
+{
+  "id": "dev.automata.graphics_hub",
+  "name": "[WIP] Graphics Hub",
+  "version": "1.0.0",
+  "author": "automata-rtx",
+  "description": "Hosts the screen-space infrastructure that other graphics mods build on, applying it so added effects layer correctly with the game's original rendering instead of over-applying on top of it. Bundles two independently-toggleable features: Depth to Normal (reconstructs a per-pixel world-space surface normal from the depth buffer and publishes it as a service that ambient occlusion, GI and shadow mods consume - keep this mod enabled for SSILVB and Realtime Sun Shadows), and Deferred Fog (re-applies the game's fog after screen-space effects composite, so they darken the world under the fog instead of the fog itself). Each feature has its own section in the settings. EXPERIMENTAL"
+}

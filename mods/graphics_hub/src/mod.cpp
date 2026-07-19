@@ -1,33 +1,23 @@
-// Deferred Fog.
+// Graphics Hub — a combined host for the screen-space infrastructure that other graphics mods
+// build on. It bundles two independently-toggleable sub-features that share the goal of making
+// added effects layer CORRECTLY over the game's original rendering rather than over-applying on
+// top of it:
 //
-// Standalone helper mod for screen-space visual enhancements: the game applies fog per
-// fragment while drawing (each J3D material bakes fog BP state into its display list; a few
-// direct drawers call GXSetFog), which means any mod compositing over the opaque scene - AO,
-// deferred shadows - darkens the *fogged* color, visibly dimming the fog/aerial perspective
-// instead of the surfaces under it. This mod suppresses fog while the opaque world lists
-// draw, captures the live fog parameters, and re-applies fog as a fullscreen pass pushed
-// right before the first J3D translucent geometry draws (with a FRAME_BEFORE_HUD fallback) -
-// after every mod's SCENE_AFTER_OPAQUE composites regardless of mod load order, and before
-// water, particles, and bloom, which keep their native forward fog. Other mods need no
-// changes and no awareness of this mod to benefit.
+//   * Depth to Normal — reconstructs a per-pixel world-space surface normal (+ raw depth) from the
+//     scene depth buffer once per frame and PUBLISHES it as a mod service (id
+//     "dev.automata.depth_to_normal") that AO / GI / shadow mods consume. It is passive
+//     infrastructure: it only does work when a consumer asks, so it has no on/off, just a debug
+//     view. (SSILVB and Realtime Sun Shadows require this service — keep Graphics Hub enabled.)
 //
-// The re-apply trigger deliberately avoids hooking the painter's own list functions: those
-// are inlinable into their callsites, where a detour never fires. J3DShape::drawFast (already
-// hooked for suppression) is the anchor instead - the first shape drawn after the opaque
-// stage IS the first translucent geometry.
+//   * Deferred Fog — moves the game's fog to AFTER the opaque scene so screen-space effects darken
+//     the world UNDER the fog instead of the fog itself. Independently toggleable.
 //
-// The re-applied fog is an exact reproduction, not an approximation: aurora's per-fragment
-// fog input is the raw depth value (the same value in the depth snapshot), and mod.cpp
-// mirrors the exact J3DGDSetFog BP encode -> aurora command-processor decode round trip for
-// the (a, b, c) coefficients, quantization included. See res/fog.wgsl.
+// This file merges the two former standalone mods (depth_to_normal + deferred_fog) verbatim, each
+// inside its own namespace (hub_dtn / hub_fog) so they keep separate state; the service imports and
+// the mod entry points are shared. To change a default or drop a control, edit the sub-namespace's
+// init()/build_section() — see docs/self_editing_guide.md.
 //
-// Special fog handling: materials are suppressed only when their fog matches the frame's
-// reference configuration (the first fogged draw, normally stage geometry). Frames that mix
-// configurations - twilight black fog (authored type 7, converted by d_kankyo to linear
-// black), wolf-senses white fog (type 6), room-blend transitions - disable suppression from
-// the next frame on, reverting to exact vanilla forward fog until the scene is uniform
-// again. Mixed content is never flattened onto one config for more than the one transition
-// frame.
+// Game-linked (Deferred Fog hooks game functions) + webgpu.
 
 #include "global.h"
 
@@ -43,8 +33,12 @@
 #include "dolphin/gx/GXLighting.h"
 #include "dolphin/gx/GXPixel.h"
 #include "dolphin/gx/GXTev.h"
+
+#include "depth_to_normal_service.h"
+
 #include "mods/hook.hpp"
 #include "mods/service.hpp"
+#include "mods/svc/camera.h"
 #include "mods/svc/config.h"
 #include "mods/svc/gfx.h"
 #include "mods/svc/hook.h"
@@ -57,28 +51,487 @@
 #include <cstdio>
 #include <cstring>
 #include <type_traits>
+#include <utility>
+#include <vector>
 #include <webgpu/webgpu.h>
 
 DEFINE_MOD();
+// Union of both sub-features' service needs, imported once and shared.
+IMPORT_SERVICE(GfxService, svc_gfx);
+IMPORT_SERVICE(CameraService, svc_camera);
 IMPORT_SERVICE(ConfigService, svc_config);
 IMPORT_SERVICE(ResourceService, svc_resource);
 IMPORT_SERVICE(UiService, svc_ui);
-IMPORT_SERVICE(GfxService, svc_gfx);
 IMPORT_SERVICE(HookService, svc_hook);
 IMPORT_SERVICE(LogService, svc_log);
 
-namespace {
+// ===========================================================================================
+// SUB-FEATURE: Depth to Normal   (world-space normal provider service)
+// ===========================================================================================
+namespace hub_dtn {
 
-// Hook targets declared at namespace scope (each emits a modmeta hook record the host resolves at
-// load); the generated aliases are passed to hook_add_pre in mod_initialize. GXSetFog / GFSetFog
-// share a signature but are distinct functions, so each gets its own alias.
+ResourceBuffer g_shaderSource = RESOURCE_BUFFER_INIT;
+GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
+WGPUComputePipeline g_pipeline = nullptr;
+WGPUBindGroupLayout g_layout = nullptr;
+GfxComputeTypeHandle g_computeType = 0;
+GfxStageHookHandle g_sceneBeginHook = 0;
+
+ResourceBuffer g_debugShaderSource = RESOURCE_BUFFER_INIT;
+WGPURenderPipeline g_debugPipeline = nullptr;
+WGPUBindGroupLayout g_debugLayout = nullptr;
+GfxDrawTypeHandle g_debugDrawType = 0;
+GfxStageHookHandle g_frameBeforeHudHook = 0;
+ConfigVarHandle g_cvarNormalsDebug = 0;  // DEFAULT below in init()
+
+struct NormalTarget {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    WGPUTexture texture = nullptr;
+    WGPUTextureView view = nullptr;
+};
+NormalTarget g_target;
+struct RetiredTarget {
+    NormalTarget target;
+    int framesLeft = 0;
+};
+std::vector<RetiredTarget> g_retired;
+
+bool g_cameraValid = false;
+float g_viewFromProj[16] = {};
+float g_worldFromView[16] = {};
+bool g_frameComputed = false;
+WGPUTextureView g_frameView = nullptr;
+uint32_t g_frameWidth = 0;
+uint32_t g_frameHeight = 0;
+
+// Mirror of the WGSL Uniforms struct (keep in sync with res/reconstruct.wgsl).
+struct ReconstructUniforms {
+    float view_from_proj[16];
+    float world_from_view[16];
+    float inv_size[2];
+    float _pad0[2];
+};
+static_assert(sizeof(ReconstructUniforms) == 144);
+static_assert(sizeof(ReconstructUniforms) % 16 == 0);
+
+struct ComputePayload {
+    WGPUTextureView sceneDepth;
+    WGPUTextureView normalOut;
+    uint32_t uniformOffset;
+    uint32_t uniformSize;
+    uint32_t width;
+    uint32_t height;
+};
+static_assert(sizeof(ComputePayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
+static_assert(std::is_trivially_copyable_v<ComputePayload>);
+
+struct DebugDrawPayload {
+    WGPUTextureView normal;
+};
+static_assert(sizeof(DebugDrawPayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
+static_assert(std::is_trivially_copyable_v<DebugDrawPayload>);
+
+constexpr uint32_t div_ceil(uint32_t n, uint32_t d) { return (n + d - 1) / d; }
+
+void release_target(NormalTarget& t) {
+    if (t.view != nullptr) {
+        wgpuTextureViewRelease(t.view);
+        t.view = nullptr;
+    }
+    if (t.texture != nullptr) {
+        wgpuTextureRelease(t.texture);
+        t.texture = nullptr;
+    }
+    t.width = t.height = 0;
+}
+
+void tick_retired() {
+    for (auto it = g_retired.begin(); it != g_retired.end();) {
+        if (--it->framesLeft <= 0) {
+            release_target(it->target);
+            it = g_retired.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+bool ensure_target(uint32_t width, uint32_t height) {
+    if (g_target.width == width && g_target.height == height && g_target.view != nullptr) {
+        return true;
+    }
+    if (g_target.width != 0) {
+        g_retired.push_back(RetiredTarget{std::exchange(g_target, NormalTarget{}), 4});
+    }
+    WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+    desc.label = {"depth-to-normal world normal", WGPU_STRLEN};
+    desc.usage = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding;
+    desc.size = {width, height, 1};
+    desc.format = WGPUTextureFormat_RGBA32Float;
+    g_target.texture = wgpuDeviceCreateTexture(g_deviceInfo.device, &desc);
+    if (g_target.texture != nullptr) {
+        g_target.view = wgpuTextureCreateView(g_target.texture, nullptr);
+    }
+    if (g_target.view == nullptr) {
+        release_target(g_target);
+        return false;
+    }
+    g_target.width = width;
+    g_target.height = height;
+    return true;
+}
+
+bool build_pipeline() {
+    WGPUShaderSourceWGSL wgsl = WGPU_SHADER_SOURCE_WGSL_INIT;
+    wgsl.code = {static_cast<const char*>(g_shaderSource.data), g_shaderSource.size};
+    WGPUShaderModuleDescriptor moduleDesc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+    moduleDesc.nextInChain = &wgsl.chain;
+    moduleDesc.label = {"depth-to-normal reconstruct", WGPU_STRLEN};
+    WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_deviceInfo.device, &moduleDesc);
+    if (module == nullptr) {
+        return false;
+    }
+    WGPUComputePipelineDescriptor desc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+    desc.label = {"depth-to-normal reconstruct", WGPU_STRLEN};
+    desc.compute.module = module;
+    desc.compute.entryPoint = {"reconstruct", WGPU_STRLEN};
+    g_pipeline = wgpuDeviceCreateComputePipeline(g_deviceInfo.device, &desc);
+    wgpuShaderModuleRelease(module);
+    if (g_pipeline == nullptr) {
+        return false;
+    }
+    g_layout = wgpuComputePipelineGetBindGroupLayout(g_pipeline, 0);
+    return g_layout != nullptr;
+}
+
+bool build_debug_pipeline() {
+    WGPUShaderSourceWGSL wgsl = WGPU_SHADER_SOURCE_WGSL_INIT;
+    wgsl.code = {static_cast<const char*>(g_debugShaderSource.data), g_debugShaderSource.size};
+    WGPUShaderModuleDescriptor moduleDesc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+    moduleDesc.nextInChain = &wgsl.chain;
+    moduleDesc.label = {"depth-to-normal debug", WGPU_STRLEN};
+    WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_deviceInfo.device, &moduleDesc);
+    if (module == nullptr) {
+        return false;
+    }
+    WGPUColorTargetState colorTarget = WGPU_COLOR_TARGET_STATE_INIT;
+    colorTarget.format = g_deviceInfo.color_format;
+    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+    fragment.module = module;
+    fragment.entryPoint = {"fs_main", WGPU_STRLEN};
+    fragment.targetCount = 1;
+    fragment.targets = &colorTarget;
+    WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
+    depthStencil.format = g_deviceInfo.depth_format;
+    depthStencil.depthWriteEnabled = WGPUOptionalBool_False;
+    depthStencil.depthCompare = WGPUCompareFunction_Always;
+    WGPURenderPipelineDescriptor pipelineDesc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    pipelineDesc.label = {"depth-to-normal debug", WGPU_STRLEN};
+    pipelineDesc.vertex.module = module;
+    pipelineDesc.vertex.entryPoint = {"vs_main", WGPU_STRLEN};
+    pipelineDesc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+    pipelineDesc.depthStencil = &depthStencil;
+    pipelineDesc.multisample.count = g_deviceInfo.sample_count;
+    pipelineDesc.fragment = &fragment;
+    g_debugPipeline = wgpuDeviceCreateRenderPipeline(g_deviceInfo.device, &pipelineDesc);
+    wgpuShaderModuleRelease(module);
+    if (g_debugPipeline == nullptr) {
+        return false;
+    }
+    g_debugLayout = wgpuRenderPipelineGetBindGroupLayout(g_debugPipeline, 0);
+    return g_debugLayout != nullptr;
+}
+
+void on_debug_draw(
+    ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
+    if (payloadSize != sizeof(DebugDrawPayload)) {
+        return;
+    }
+    DebugDrawPayload data;
+    std::memcpy(&data, payload, sizeof(data));
+    if (data.normal == nullptr || g_debugPipeline == nullptr) {
+        return;
+    }
+    WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
+    entry.binding = 0;
+    entry.textureView = data.normal;
+    WGPUBindGroupDescriptor bgDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    bgDesc.layout = g_debugLayout;
+    bgDesc.entryCount = 1;
+    bgDesc.entries = &entry;
+    WGPUBindGroup group = wgpuDeviceCreateBindGroup(ctx->device, &bgDesc);
+    if (group == nullptr) {
+        return;
+    }
+    wgpuRenderPassEncoderSetPipeline(ctx->pass, g_debugPipeline);
+    wgpuRenderPassEncoderSetBindGroup(ctx->pass, 0, group, 0, nullptr);
+    wgpuRenderPassEncoderDraw(ctx->pass, 3, 1, 0, 0);
+    wgpuBindGroupRelease(group);
+}
+
+void on_compute(
+    ModContext*, const GfxComputeContext* ctx, const void* payload, size_t payloadSize, void*) {
+    if (payloadSize != sizeof(ComputePayload)) {
+        return;
+    }
+    ComputePayload data;
+    std::memcpy(&data, payload, sizeof(data));
+    if (data.sceneDepth == nullptr || data.normalOut == nullptr || g_pipeline == nullptr) {
+        return;
+    }
+    WGPUBindGroupEntry entries[3] = {
+        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    entries[0].binding = 0;
+    entries[0].textureView = data.sceneDepth;
+    entries[1].binding = 1;
+    entries[1].textureView = data.normalOut;
+    entries[2].binding = 2;
+    entries[2].buffer = ctx->uniform_buffer;
+    entries[2].offset = data.uniformOffset;
+    entries[2].size = data.uniformSize;
+    WGPUBindGroupDescriptor bgDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    bgDesc.layout = g_layout;
+    bgDesc.entryCount = 3;
+    bgDesc.entries = entries;
+    WGPUBindGroup group = wgpuDeviceCreateBindGroup(ctx->device, &bgDesc);
+    if (group == nullptr) {
+        return;
+    }
+    WGPUComputePassDescriptor passDesc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+    passDesc.label = {"depth-to-normal", WGPU_STRLEN};
+    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(ctx->encoder, &passDesc);
+    wgpuComputePassEncoderSetPipeline(pass, g_pipeline);
+    wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, nullptr);
+    wgpuComputePassEncoderDispatchWorkgroups(pass, div_ceil(data.width, 8), div_ceil(data.height, 8), 1);
+    wgpuComputePassEncoderEnd(pass);
+    wgpuComputePassEncoderRelease(pass);
+    wgpuBindGroupRelease(group);
+}
+
+void on_scene_begin(ModContext*, const GfxStageContext* stageCtx, void*) {
+    tick_retired();
+    g_frameComputed = false;
+    g_frameView = nullptr;
+    g_cameraValid = false;
+    if (stageCtx == nullptr || stageCtx->struct_size < sizeof(GfxStageContext) ||
+        stageCtx->game_view == nullptr)
+    {
+        return;
+    }
+    CameraInfo info = CAMERA_INFO_INIT;
+    if (svc_camera->get_camera(mod_ctx, stageCtx->game_view, &info) != MOD_OK) {
+        return;
+    }
+    std::memcpy(g_viewFromProj, info.view_from_proj, sizeof(g_viewFromProj));
+    std::memcpy(g_worldFromView, info.world_from_view, sizeof(g_worldFromView));
+    g_cameraValid = true;
+}
+
+// The exported service entry point (see g_dtnService below).
+ModResult get_frame(ModContext*, DepthToNormalFrame* out) {
+    if (out == nullptr || out->struct_size < sizeof(DepthToNormalFrame)) {
+        return MOD_INVALID_ARGUMENT;
+    }
+    out->normal = nullptr;
+    out->width = 0;
+    out->height = 0;
+    if (!g_cameraValid || g_pipeline == nullptr) {
+        return MOD_UNAVAILABLE;
+    }
+    if (!g_frameComputed) {
+        GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
+        resolveDesc.color = false;
+        resolveDesc.depth = true;
+        GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
+        if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) != MOD_OK ||
+            resolved.depth == nullptr || resolved.width == 0 || resolved.height == 0)
+        {
+            return MOD_UNAVAILABLE;
+        }
+        if (!ensure_target(resolved.width, resolved.height)) {
+            return MOD_UNAVAILABLE;
+        }
+        ReconstructUniforms uniforms{};
+        std::memcpy(uniforms.view_from_proj, g_viewFromProj, sizeof(uniforms.view_from_proj));
+        std::memcpy(uniforms.world_from_view, g_worldFromView, sizeof(uniforms.world_from_view));
+        uniforms.inv_size[0] = 1.0f / static_cast<float>(resolved.width);
+        uniforms.inv_size[1] = 1.0f / static_cast<float>(resolved.height);
+        GfxRange range{0, 0};
+        if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &range) != MOD_OK) {
+            return MOD_UNAVAILABLE;
+        }
+        ComputePayload payload{};
+        payload.sceneDepth = resolved.depth;
+        payload.normalOut = g_target.view;
+        payload.uniformOffset = range.offset;
+        payload.uniformSize = range.size;
+        payload.width = resolved.width;
+        payload.height = resolved.height;
+        if (svc_gfx->push_compute(mod_ctx, g_computeType, &payload, sizeof(payload)) != MOD_OK) {
+            return MOD_UNAVAILABLE;
+        }
+        g_frameView = g_target.view;
+        g_frameWidth = resolved.width;
+        g_frameHeight = resolved.height;
+        g_frameComputed = true;
+    }
+    out->normal = g_frameView;
+    out->width = g_frameWidth;
+    out->height = g_frameHeight;
+    return MOD_OK;
+}
+
+void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
+    bool debugOn = false;
+    if (g_cvarNormalsDebug == 0 ||
+        svc_config->get_bool(mod_ctx, g_cvarNormalsDebug, &debugOn) != MOD_OK || !debugOn)
+    {
+        return;
+    }
+    DepthToNormalFrame frame = DEPTH_TO_NORMAL_FRAME_INIT;
+    if (get_frame(mod_ctx, &frame) != MOD_OK || frame.normal == nullptr) {
+        return;
+    }
+    DebugDrawPayload payload{};
+    payload.normal = frame.normal;
+    svc_gfx->push_draw(mod_ctx, g_debugDrawType, &payload, sizeof(payload));
+}
+
+// Adds this sub-feature's section to the shared mods panel.
+void build_section(UiElementHandle panel) {
+    svc_ui->pane_add_section(mod_ctx, panel, "Depth to Normal");
+    svc_ui->pane_add_text(mod_ctx, panel,
+        "Reconstructs a world-space surface normal from the depth buffer each frame and provides "
+        "it to other mods (AO, GI, shadows). Passive: no on/off, just the debug view below.",
+        nullptr);
+    UiControlDesc debugToggle = UI_CONTROL_DESC_INIT;
+    debugToggle.kind = UI_CONTROL_TOGGLE;
+    debugToggle.label = "Show Normals";
+    debugToggle.help_rml =
+        "Draws the reconstructed world-space normal buffer over the whole screen at the very end "
+        "of the frame (after every other effect), as a diagnostic. World normal XYZ maps to RGB; "
+        "sky / invalid pixels are black.";
+    debugToggle.binding = UI_BINDING_CONFIG_VAR;
+    debugToggle.config_var = g_cvarNormalsDebug;
+    svc_ui->pane_add_control(mod_ctx, panel, &debugToggle, nullptr);
+}
+
+ModResult init(ModError* error) {
+    ModResult result = svc_resource->load(mod_ctx, "reconstruct.wgsl", &g_shaderSource);
+    if (result != MOD_OK || g_shaderSource.data == nullptr) {
+        return mods::set_error(error, result, "failed to load reconstruct.wgsl");
+    }
+    if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to query device info");
+    }
+    if (!build_pipeline()) {
+        return mods::set_error(error, MOD_ERROR, "failed to create reconstruct pipeline");
+    }
+    GfxComputeTypeDesc computeDesc = GFX_COMPUTE_TYPE_DESC_INIT;
+    computeDesc.label = "depth-to-normal reconstruct";
+    computeDesc.callback = on_compute;
+    if (svc_gfx->register_compute_type(mod_ctx, &computeDesc, &g_computeType) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register compute type");
+    }
+    GfxStageHookDesc stageDesc = GFX_STAGE_HOOK_DESC_INIT;
+    stageDesc.callback = on_scene_begin;
+    if (svc_gfx->register_stage_hook(
+            mod_ctx, GFX_STAGE_SCENE_BEGIN, &stageDesc, &g_sceneBeginHook) != MOD_OK)
+    {
+        return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
+    }
+
+    // DEFAULT: normals debug view off.
+    ConfigVarDesc cvarDesc = CONFIG_VAR_DESC_INIT;
+    cvarDesc.name = "normalsDebug";
+    cvarDesc.type = CONFIG_VAR_BOOL;
+    cvarDesc.default_bool = false;
+    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarNormalsDebug) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register normalsDebug");
+    }
+    result = svc_resource->load(mod_ctx, "debug.wgsl", &g_debugShaderSource);
+    if (result != MOD_OK || g_debugShaderSource.data == nullptr) {
+        return mods::set_error(error, result, "failed to load debug.wgsl");
+    }
+    if (!build_debug_pipeline()) {
+        return mods::set_error(error, MOD_ERROR, "failed to create debug pipeline");
+    }
+    GfxDrawTypeDesc drawDesc = GFX_DRAW_TYPE_DESC_INIT;
+    drawDesc.label = "depth-to-normal debug";
+    drawDesc.draw = on_debug_draw;
+    if (svc_gfx->register_draw_type(mod_ctx, &drawDesc, &g_debugDrawType) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register debug draw type");
+    }
+    stageDesc = GFX_STAGE_HOOK_DESC_INIT;
+    stageDesc.callback = on_frame_before_hud;
+    if (svc_gfx->register_stage_hook(
+            mod_ctx, GFX_STAGE_FRAME_BEFORE_HUD, &stageDesc, &g_frameBeforeHudHook) != MOD_OK)
+    {
+        return mods::set_error(error, MOD_ERROR, "failed to register frame hook");
+    }
+    return MOD_OK;
+}
+
+void shutdown() {
+    svc_resource->free(mod_ctx, &g_shaderSource);
+    svc_resource->free(mod_ctx, &g_debugShaderSource);
+    release_target(g_target);
+    for (auto& retired : g_retired) {
+        release_target(retired.target);
+    }
+    g_retired.clear();
+    if (g_pipeline != nullptr) {
+        wgpuComputePipelineRelease(g_pipeline);
+        g_pipeline = nullptr;
+    }
+    if (g_layout != nullptr) {
+        wgpuBindGroupLayoutRelease(g_layout);
+        g_layout = nullptr;
+    }
+    if (g_debugPipeline != nullptr) {
+        wgpuRenderPipelineRelease(g_debugPipeline);
+        g_debugPipeline = nullptr;
+    }
+    if (g_debugLayout != nullptr) {
+        wgpuBindGroupLayoutRelease(g_debugLayout);
+        g_debugLayout = nullptr;
+    }
+    g_computeType = 0;
+    g_sceneBeginHook = 0;
+    g_debugDrawType = 0;
+    g_frameBeforeHudHook = 0;
+    g_cvarNormalsDebug = 0;
+    g_cameraValid = false;
+    g_frameComputed = false;
+    g_frameView = nullptr;
+}
+
+}  // namespace hub_dtn
+
+// The exported world-normal service — same id ("dev.automata.depth_to_normal") the standalone
+// provider used, so SSILVB / Realtime Sun Shadows resolve it unchanged. Kept at global scope so
+// EXPORT_SERVICE's generated meta record is a simple token.
+constexpr DepthToNormalService g_dtnService{
+    .header = SERVICE_HEADER(DepthToNormalService, DEPTH_TO_NORMAL_SERVICE_MAJOR,
+        DEPTH_TO_NORMAL_SERVICE_MINOR),
+    .get_frame = hub_dtn::get_frame,
+};
+EXPORT_SERVICE(g_dtnService);
+
+// ===========================================================================================
+// SUB-FEATURE: Deferred Fog   (re-applies fog after screen-space effects)
+// ===========================================================================================
+namespace hub_fog {
+
+// Hook targets (each emits a modmeta hook record the host resolves at load).
 DEFINE_HOOK(GXSetFog, SetFog);
 DEFINE_HOOK(GFSetFog, SetGfFog);
 DEFINE_HOOK(&J3DShape::drawFast, ShapeDrawFast);
 
-ConfigVarHandle g_cvarEnabled = 0;
-ConfigVarHandle g_cvarMixedMode = 0;
-ConfigVarHandle g_cvarDebugView = 0;
+ConfigVarHandle g_cvarFogEnabled = 0;    // DEFAULT below in init()
+ConfigVarHandle g_cvarFogMixed = 0;      // DEFAULT below in init()
+ConfigVarHandle g_cvarFogDebug = 0;      // DEFAULT below in init()
 
 UiWindowHandle g_controlsWindow = 0;
 GfxDrawTypeHandle g_drawType = 0;
@@ -87,19 +540,18 @@ GfxStageHookHandle g_sceneAfterOpaqueHook = 0;
 GfxStageHookHandle g_frameBeforeHudHook = 0;
 ResourceBuffer g_shaderSource = RESOURCE_BUFFER_INIT;
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
-WGPURenderPipeline g_fogPipeline = nullptr;       // (srcAlpha, 1-srcAlpha) blend
-WGPURenderPipeline g_fogDebugPipeline = nullptr;  // no blend (fog factor view)
-WGPURenderPipeline g_mixedPipeline = nullptr;      // per-pixel config selection, blended
-WGPURenderPipeline g_mixedDebugPipeline = nullptr; // per-pixel config selection, unblended
+WGPURenderPipeline g_fogPipeline = nullptr;
+WGPURenderPipeline g_fogDebugPipeline = nullptr;
+WGPURenderPipeline g_mixedPipeline = nullptr;
+WGPURenderPipeline g_mixedDebugPipeline = nullptr;
 WGPUBindGroupLayout g_fogLayout = nullptr;
 WGPUBindGroupLayout g_fogDebugLayout = nullptr;
 WGPUBindGroupLayout g_mixedLayout = nullptr;
 WGPUBindGroupLayout g_mixedDebugLayout = nullptr;
 
-// One fog configuration as the game specifies it (J3DFogInfo fields / GXSetFog arguments).
 struct FogConfig {
     bool valid = false;
-    uint8_t type = 0;  // GXFogType; only the low 3 bits reach aurora's fog state
+    uint8_t type = 0;
     float startZ = 0.0f;
     float endZ = 0.0f;
     float nearZ = 0.0f;
@@ -107,33 +559,25 @@ struct FogConfig {
     GXColor color{0, 0, 0, 0};
 };
 
-// Per-frame suppression state (game thread only).
-bool g_scopeActive = false;      // between SCENE_BEGIN and SCENE_AFTER_OPAQUE
-bool g_quadArmed = false;        // push the fog quad at the next J3D shape draw (first xlu)
-bool g_suppressAllowed = false;  // last completed frame saw exactly one fog configuration
-bool g_shapeHookOk = false;      // J3DShape::drawFast hook installed (needs the vtable symbol)
+bool g_scopeActive = false;
+bool g_quadArmed = false;
+bool g_suppressAllowed = false;
+bool g_shapeHookOk = false;
 bool g_warnedPushFailure = false;
-FogConfig g_reference;           // first fogged configuration seen this frame
-uint32_t g_suppressedCount = 0;  // draws whose fog was deferred this frame
-uint32_t g_deviantCount = 0;     // draws whose fog did not match the reference
+FogConfig g_reference;
+uint32_t g_suppressedCount = 0;
+uint32_t g_deviantCount = 0;
 
-// Revert diagnostics: the silent fall-back to vanilla fog on mixed configurations is invisible
-// in-game (other mods' effects then darken the fog itself), so surface it - a log line per state
-// transition and a live status string for the panel.
-bool g_wasSuppressing = false;   // previous frame's suppression verdict (transition detection)
-FogConfig g_firstDeviant;        // first non-matching configuration this frame (for the log)
+bool g_wasSuppressing = false;
+FogConfig g_firstDeviant;
 char g_statusText[160] = "Waiting for first fogged frame";
 
-// Exact mixed-config mode: every fogged draw is suppressed and its configuration is captured
-// into this per-frame table (matched with the config_matches tolerances). When the frame holds
-// more than one config, the opaque lists are replayed once with each shape's output forced to a
-// flat ID color, and the fog quad selects each pixel's exact config from the resulting buffer.
 constexpr uint32_t kMaxFogConfigs = 8;
 FogConfig g_frameConfigs[kMaxFogConfigs];
 uint32_t g_frameConfigCount = 0;
-bool g_fogReplayActive = false;          // the opaque lists are replaying for the ID buffer
-WGPUTextureView g_configIdView = nullptr;  // frame-pooled ID buffer (mixed frames only)
-bool g_wasMixed = false;                 // last frame held >1 config (transition logging)
+bool g_fogReplayActive = false;
+WGPUTextureView g_configIdView = nullptr;
+bool g_wasMixed = false;
 bool g_warnedReplayFailure = false;
 
 // Mirror of the WGSL FogUniforms struct (keep in sync with res/fog.wgsl).
@@ -150,7 +594,6 @@ struct FogUniforms {
 };
 static_assert(sizeof(FogUniforms) % 16 == 0);
 
-// Mirror of the WGSL MixedFogEntry / MixedFogUniforms (keep in sync with res/fog.wgsl).
 struct MixedFogEntry {
     float color[4];
     float a;
@@ -169,8 +612,8 @@ struct MixedFogUniforms {
 static_assert(sizeof(MixedFogUniforms) % 16 == 0);
 
 struct DrawPayload {
-    WGPUTextureView sceneDepth;  // frame-pooled
-    WGPUTextureView configIds;   // frame-pooled; non-null selects the mixed pipeline
+    WGPUTextureView sceneDepth;
+    WGPUTextureView configIds;
     uint32_t uniform_offset;
     uint32_t uniform_size;
     uint32_t debug_mode;
@@ -195,12 +638,9 @@ bool get_bool_option(ConfigVarHandle handle, bool fallback) {
 }
 
 bool effect_enabled() {
-    return get_bool_option(g_cvarEnabled, true) && g_shapeHookOk;
+    return get_bool_option(g_cvarFogEnabled, true) && g_shapeHookOk;
 }
 
-// Configurations within these tolerances are treated as the same fog: palette interpolation
-// can leave actors a blend step apart from the stage without a visible difference. Anything
-// beyond them is a deviant (special fog) and turns suppression off for following frames.
 bool config_matches(const FogConfig& reference, const FogConfig& candidate) {
     if (reference.type != candidate.type) {
         return false;
@@ -222,12 +662,9 @@ bool config_matches(const FogConfig& reference, const FogConfig& candidate) {
 }
 
 bool exact_mode() {
-    return get_int_option(g_cvarMixedMode, 1) == 1;
+    return get_int_option(g_cvarFogMixed, 1) == 1;
 }
 
-// Find (or register) a configuration in the per-frame table. Returns its index; a table
-// overflow (more than kMaxFogConfigs distinct configs in one frame - not seen in practice)
-// falls back to index 0, the frame's reference config.
 uint32_t register_frame_config(const FogConfig& config) {
     for (uint32_t i = 0; i < g_frameConfigCount; ++i) {
         if (config_matches(g_frameConfigs[i], config)) {
@@ -242,7 +679,6 @@ uint32_t register_frame_config(const FogConfig& config) {
     return 0;
 }
 
-// Read-only lookup for the replay's ID override (the table is complete by replay time).
 uint32_t lookup_frame_config(const FogConfig& config) {
     for (uint32_t i = 0; i < g_frameConfigCount; ++i) {
         if (config_matches(g_frameConfigs[i], config)) {
@@ -252,16 +688,12 @@ uint32_t lookup_frame_config(const FogConfig& config) {
     return 0;
 }
 
-// Vote a fogged draw's configuration against the frame reference. Returns true when the
-// draw's fog should be suppressed (deferred).
 bool vote_config(const FogConfig& config) {
     if (!g_reference.valid) {
         g_reference = config;
         g_reference.valid = true;
     }
     if (exact_mode()) {
-        // Exact mixed mode: every fogged draw is deferred; the config table + ID replay put
-        // the right configuration back per pixel. Deviant counting stays for the status line.
         const uint32_t index = register_frame_config(config);
         if (index != 0) {
             if (g_deviantCount == 0) {
@@ -291,30 +723,13 @@ bool vote_config(const FogConfig& config) {
 
 void push_fog_quad();
 
-// Game thread, per J3D shape draw.
-//
-// While the opaque world lists draw (the suppression scope): J3D materials never call
-// GXSetFog - their fog is baked into the material display list's BP writes (which aurora's
-// command processor replays into per-draw fog state). The material display list has already
-// executed when the shape draws, so an immediate GXSetFog(GX_FOG_NONE) here overrides it
-// for this shape's geometry - and the material's true parameters are readable off its PE
-// block for capture. Same interception pattern as Realtime Sun Shadows' two-sided casters.
-//
-// After the opaque stage (quad armed): the first shape drawn is the first translucent
-// geometry - water included - so the deferred fog pushes here, under it.
 HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     if (g_fogReplayActive) {
-        // Config-ID replay: force this shape's output to a flat sparse-encoded index color
-        // (see res/fog.wgsl). The material display list has already executed, so these GX
-        // writes override its TEV/channel/fog state for this shape only; j3dSys.reinitGX()
-        // after the replay clears any leaked state. Alpha-tested cutouts replay solid (the
-        // constant alpha always passes) - a leaf hole gets its tree's config, which is
-        // visually negligible since fog varies smoothly.
         const J3DShape* shape = mods::arg<const J3DShape*>(args, 0);
         J3DMaterial* material = shape != nullptr ? shape->getMaterial() : nullptr;
         J3DPEBlock* peBlock = material != nullptr ? material->getPEBlock() : nullptr;
         J3DFog* fog = peBlock != nullptr ? peBlock->getFog() : nullptr;
-        uint32_t index = 0;  // unfogged / unknown -> reference config at the quad
+        uint32_t index = 0;
         if (fog != nullptr && fog->mType != 0) {
             FogConfig config;
             config.type = fog->mType;
@@ -366,12 +781,8 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
-// Game thread: direct (non-J3D) drawers set fog through this call; rewrite the type to
-// GX_FOG_NONE when the configuration matches the frame reference.
 HookAction on_set_fog_pre(ModContext*, void* args, void*, void*) {
     if (g_fogReplayActive) {
-        // Direct (non-J3D) drawers during the ID replay: kill their fog; their color output is
-        // not a valid ID (decodes as invalid -> reference config at the quad).
         mods::arg_ref<GXFogType>(args, 0) = GX_FOG_NONE;
         return HOOK_CONTINUE;
     }
@@ -395,7 +806,6 @@ HookAction on_set_fog_pre(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
-// Render worker thread: fullscreen fog blend over the scene.
 void on_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
     if (payloadSize != sizeof(DrawPayload)) {
@@ -419,8 +829,6 @@ void on_draw(
         WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
     entries[0].binding = 0;
     entries[0].textureView = data.sceneDepth;
-    // The single-config path binds FogUniforms at 1; the mixed path binds the config-ID
-    // texture at 2 and MixedFogUniforms at 3 (matching each entry point's bindings).
     entries[1].binding = mixed ? 3 : 1;
     entries[1].buffer = ctx->uniform_buffer;
     entries[1].offset = data.uniform_offset;
@@ -444,8 +852,6 @@ void on_draw(
     wgpuBindGroupRelease(bindGroup);
 }
 
-// Game thread: resolve the opaque scene depth and push the fog quad at the current point in
-// the command stream (the top of the translucent phase).
 void push_fog_quad() {
     GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
     resolveDesc.color = false;
@@ -462,9 +868,8 @@ void push_fog_quad() {
     }
 
     const auto debugMode =
-        static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 2));
+        static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarFogDebug, 0), 0, 2));
 
-    // Mixed frame with a valid config-ID buffer: per-pixel config selection.
     if (exact_mode() && g_frameConfigCount > 1 && g_configIdView != nullptr) {
         MixedFogUniforms uniforms{};
         for (uint32_t i = 0; i < g_frameConfigCount; ++i) {
@@ -473,7 +878,6 @@ void push_fog_quad() {
             dusk_fog::compute_fog_coefficients(
                 config.startZ, config.endZ, config.nearZ, config.farZ, entry.a, entry.b, entry.c);
             if (entry.a == 0.0f && entry.c == 0.0f) {
-                // Degenerate range: force the zero-fog linear curve (a=0,c=0 with LIN yields 0).
                 entry.fog_type = 2u;
             } else {
                 entry.fog_type = config.type & 7u;
@@ -501,16 +905,12 @@ void push_fog_quad() {
     dusk_fog::compute_fog_coefficients(g_reference.startZ, g_reference.endZ, g_reference.nearZ,
         g_reference.farZ, uniforms.a, uniforms.b, uniforms.c);
     if (uniforms.a == 0.0f && uniforms.c == 0.0f) {
-        // Degenerate range (start == end or near == far): the vanilla term is zero
-        // everywhere except a 0/0 singularity; there is no fog to re-apply.
         return;
     }
     uniforms.color[0] = static_cast<float>(g_reference.color.r) / 255.0f;
     uniforms.color[1] = static_cast<float>(g_reference.color.g) / 255.0f;
     uniforms.color[2] = static_cast<float>(g_reference.color.b) / 255.0f;
     uniforms.color[3] = 1.0f;
-    // Aurora's command processor keeps only 3 bits of the fog type (ortho variants collapse
-    // onto their perspective curve); match that.
     uniforms.fog_type = g_reference.type & 7u;
     uniforms.debug_mode = debugMode > 1u ? 1u : debugMode;
 
@@ -538,11 +938,6 @@ bool draw_lists_ready() {
            dComIfGd_getListPacket() != nullptr;
 }
 
-// Game thread: replay the opaque draw lists once into a mod-owned offscreen pass, with every
-// shape's output forced (by on_shape_draw_pre) to a flat config-index color. The resolved color
-// is the frame's per-pixel config-ID buffer. Same save-replay-resolve bracket as the shadow
-// mod's cascades, minus the light-space camera override - the game's own view/projection stay
-// in place, so the replay rasterizes the same visibility the main pass produced.
 bool replay_config_ids(uint32_t width, uint32_t height) {
     f32 savedViewport[6];
     GXGetViewportv(savedViewport);
@@ -567,8 +962,6 @@ bool replay_config_ids(uint32_t width, uint32_t height) {
     GXSetAlphaUpdate(GX_TRUE);
     GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
 
-    // Stale-model guard (see the shadow mod): shapes drawn outside a live packet would leave
-    // j3dSys's model pointer dangling across scene teardowns.
     J3DModel* savedModel = j3dSys.getModel();
     j3dSys.setModel(nullptr);
     g_fogReplayActive = true;
@@ -600,17 +993,12 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
     g_frameConfigCount = 0;
     g_configIdView = nullptr;
     g_quadArmed = false;
-    // The sky lists draw before this stage and keep their own fog untouched.
     g_scopeActive = effect_enabled();
     if (!g_scopeActive) {
         g_suppressAllowed = false;
     }
 }
 
-// Game thread, right after the last opaque list: end the suppression scope (the next J3D
-// shape drawn is translucent geometry) and arm the deferred fog push. The quad itself pushes
-// later - at the first translucent shape draw, or the FRAME_BEFORE_HUD fallback - so it
-// lands after every mod's SCENE_AFTER_OPAQUE composites regardless of stage-callback order.
 void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
     if (!g_scopeActive) {
         return;
@@ -619,9 +1007,6 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
     const bool exact = exact_mode();
     g_quadArmed = (g_suppressedCount > 0 || (exact && g_frameConfigCount > 0)) &&
                   g_reference.valid;
-    // Vanilla mode: one configuration this frame -> keep (or start) deferring next frame; mixed
-    // -> exact vanilla fog from the next frame until the scene is uniform. Exact mode: always
-    // defer; the ID replay below reconstructs per-pixel configs for mixed frames.
     g_suppressAllowed = exact ? effect_enabled() : (g_deviantCount == 0 && effect_enabled());
 
     if (exact && g_frameConfigCount > 1 && g_quadArmed) {
@@ -638,7 +1023,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
             }
         }
         if (!ok) {
-            g_configIdView = nullptr;  // quad falls back to the reference config everywhere
+            g_configIdView = nullptr;
             if (!g_warnedReplayFailure) {
                 g_warnedReplayFailure = true;
                 svc_log->warn(mod_ctx,
@@ -660,8 +1045,6 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
         }
     }
 
-    // Diagnostics: log the revert/re-engage transitions (invisible in-game otherwise) and keep
-    // the panel status line current. Log volume is bounded by transitions, not frames.
     if (!exact && g_wasSuppressing && !g_suppressAllowed && effect_enabled()) {
         char msg[240];
         std::snprintf(msg, sizeof(msg),
@@ -701,9 +1084,6 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
     }
 }
 
-// Game thread, after the full 3D scene: fallback for frames without any translucent J3D
-// geometry - late fog (over translucency/bloom, vanilla-incorrect for one frame) beats
-// suppressed fog never coming back. Also guarantees the armed flag never crosses frames.
 void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
     if (!g_quadArmed) {
         return;
@@ -716,7 +1096,6 @@ void add_control(UiElementHandle panel, const UiControlDesc& desc) {
     svc_ui->pane_add_control(mod_ctx, panel, &desc, nullptr);
 }
 
-// Live status readout (game thread; polled per frame while visible).
 void status_get(ModContext*, void*, UiControlValue* outValue) {
     outValue->string_value = g_statusText;
 }
@@ -734,7 +1113,7 @@ void add_enabled_toggle(UiElementHandle pane) {
         "of during world drawing, so those effects darken the surfaces under the fog rather "
         "than the fog itself.";
     control.binding = UI_BINDING_CONFIG_VAR;
-    control.config_var = g_cvarEnabled;
+    control.config_var = g_cvarFogEnabled;
     add_control(pane, control);
 }
 
@@ -755,8 +1134,6 @@ void add_status_line(UiElementHandle pane) {
     add_control(pane, control);
 }
 
-// The tab's left pane holds the SELECT controls: SELECT is only supported where a help pane
-// exists (window tabs), never in the flat mods panel, so these must live here to render at all.
 ModResult build_controls_tab(
     ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*, ModError*) {
     (void)right;
@@ -775,7 +1152,7 @@ ModResult build_controls_tab(
         "heavy shadow-cascade settings this can crowd the engine's fixed streaming buffers, so "
         "prefer Vanilla there until the adaptive-buffer engine update lands.";
     control.binding = UI_BINDING_CONFIG_VAR;
-    control.config_var = g_cvarMixedMode;
+    control.config_var = g_cvarFogMixed;
     control.options = kMixedOptions;
     control.option_count = 2;
     add_control(left, control);
@@ -789,7 +1166,7 @@ ModResult build_controls_tab(
         "on mixed frames in exact mode, which captured fog configuration each pixel resolved "
         "to (one gray band per config); falls back to Fog Factor on uniform frames.";
     control.binding = UI_BINDING_CONFIG_VAR;
-    control.config_var = g_cvarDebugView;
+    control.config_var = g_cvarFogDebug;
     control.options = kDebugOptions;
     control.option_count = 3;
     add_control(left, control);
@@ -805,7 +1182,7 @@ void on_open_controls(ModContext*, void*) {
         return;
     }
     UiTabDesc tabs[1] = {UI_TAB_DESC_INIT};
-    tabs[0].title = "Controls";
+    tabs[0].title = "Deferred Fog";
     tabs[0].build = build_controls_tab;
     UiWindowDesc desc = UI_WINDOW_DESC_INIT;
     desc.tabs = tabs;
@@ -816,16 +1193,17 @@ void on_open_controls(ModContext*, void*) {
     }
 }
 
-ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
+// Adds this sub-feature's section to the shared mods panel.
+void build_section(UiElementHandle panel) {
+    svc_ui->pane_add_section(mod_ctx, panel, "Deferred Fog");
     add_enabled_toggle(panel);
     add_status_line(panel);
 
     UiControlDesc control = UI_CONTROL_DESC_INIT;
     control.kind = UI_CONTROL_BUTTON;
-    control.label = "Open Controls";
+    control.label = "Open Fog Controls";
     control.on_pressed = on_open_controls;
     add_control(panel, control);
-    return MOD_OK;
 }
 
 bool build_fog_pipeline(bool blend, const char* entryPoint, WGPURenderPipeline& outPipeline,
@@ -840,8 +1218,6 @@ bool build_fog_pipeline(bool blend, const char* entryPoint, WGPURenderPipeline& 
         return false;
     }
 
-    // mix(dst, fogColor, fogZ): fog color in rgb, fog factor in alpha, standard alpha
-    // blending; the target's alpha channel stays untouched (forward fog never wrote alpha).
     WGPUBlendState blendState{
         .color = {.operation = WGPUBlendOperation_Add,
             .srcFactor = WGPUBlendFactor_SrcAlpha,
@@ -882,35 +1258,34 @@ bool build_fog_pipeline(bool blend, const char* entryPoint, WGPURenderPipeline& 
     return outLayout != nullptr;
 }
 
-}  // namespace
-
-extern "C" {
-
-MOD_EXPORT ModResult mod_initialize(ModError* error) {
+ModResult init(ModError* error) {
     ModResult result = svc_resource->load(mod_ctx, "fog.wgsl", &g_shaderSource);
     if (result != MOD_OK || g_shaderSource.data == nullptr) {
         return mods::set_error(error, result, "failed to load fog.wgsl");
     }
 
+    // DEFAULT: deferred fog enabled.
     ConfigVarDesc cvarDesc = CONFIG_VAR_DESC_INIT;
-    cvarDesc.name = "effectEnabled";
+    cvarDesc.name = "fogEnabled";
     cvarDesc.type = CONFIG_VAR_BOOL;
     cvarDesc.default_bool = true;
-    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarEnabled) != MOD_OK) {
+    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogEnabled) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
+    // DEFAULT: mixed-scene mode = Exact replay (1). 0 = Vanilla fallback.
     cvarDesc = CONFIG_VAR_DESC_INIT;
-    cvarDesc.name = "mixedMode";
+    cvarDesc.name = "fogMixedMode";
     cvarDesc.type = CONFIG_VAR_INT;
     cvarDesc.default_int = 1;
-    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarMixedMode) != MOD_OK) {
+    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogMixed) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
+    // DEFAULT: fog debug view off (0).
     cvarDesc = CONFIG_VAR_DESC_INIT;
-    cvarDesc.name = "debugView";
+    cvarDesc.name = "fogDebug";
     cvarDesc.type = CONFIG_VAR_INT;
     cvarDesc.default_int = 0;
-    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarDebugView) != MOD_OK) {
+    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogDebug) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
 
@@ -954,18 +1329,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (mods::hook_add_pre<SetFog>(svc_hook, on_set_fog_pre) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to hook GXSetFog");
     }
-    // Environment/packet fog (grass, flowers, the dKy tevstr path) is programmed through
-    // GFSetFog - a direct BP-register write, not GXSetFog - and the geometry that uses it draws
-    // outside J3DShape::drawFast, so it evades both other interception points. GFSetFog has the
-    // identical signature to GXSetFog, so the same callback captures and suppresses it; without
-    // this hook that geometry keeps its forward fog and the deferred quad double-fogs it. Only
-    // one call site in the game (the grass/flower fog helper), so normal terrain is untouched.
     if (mods::hook_add_pre<SetGfFog>(svc_hook, on_set_fog_pre) != MOD_OK) {
         svc_log->warn(mod_ctx,
             "failed to hook GFSetFog; grass/flower fog will not be deferred (double-fogged)");
     }
-    // Virtual: resolves through the symbol manifest. Without it, J3D fog can't be deferred,
-    // so the mod stays loaded but inert (with vanilla fog) rather than failing.
     g_shapeHookOk =
         mods::hook_add_pre<ShapeDrawFast>(svc_hook, on_shape_draw_pre) == MOD_OK;
     if (!g_shapeHookOk) {
@@ -973,18 +1340,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
             "failed to hook J3DShape::drawFast (missing dusklight.symdb?); deferred fog is "
             "disabled");
     }
-
-    UiModsPanelDesc panelDesc = UI_MODS_PANEL_DESC_INIT;
-    panelDesc.build = build_panel;
-    svc_ui->register_mods_panel(mod_ctx, &panelDesc);
     return MOD_OK;
 }
 
-MOD_EXPORT ModResult mod_update(ModError*) {
-    return MOD_OK;
-}
-
-MOD_EXPORT ModResult mod_shutdown(ModError*) {
+void shutdown() {
     svc_resource->free(mod_ctx, &g_shaderSource);
     const auto releasePipeline = [](WGPURenderPipeline& pipeline) {
         if (pipeline != nullptr) {
@@ -1006,7 +1365,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     releaseLayout(g_fogDebugLayout);
     releaseLayout(g_mixedLayout);
     releaseLayout(g_mixedDebugLayout);
-    g_cvarEnabled = g_cvarMixedMode = g_cvarDebugView = 0;
+    g_cvarFogEnabled = g_cvarFogMixed = g_cvarFogDebug = 0;
     g_controlsWindow = 0;
     g_drawType = g_sceneBeginHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;
     g_scopeActive = g_quadArmed = g_suppressAllowed = g_shapeHookOk = g_wasSuppressing = false;
@@ -1017,6 +1376,50 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_frameConfigCount = 0;
     g_configIdView = nullptr;
     std::snprintf(g_statusText, sizeof(g_statusText), "Waiting for first fogged frame");
+}
+
+}  // namespace hub_fog
+
+// ===========================================================================================
+// Combined mod entry points + shared UI panel
+// ===========================================================================================
+namespace {
+
+ModResult build_combined_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
+    hub_dtn::build_section(panel);
+    hub_fog::build_section(panel);
+    return MOD_OK;
+}
+
+}  // namespace
+
+extern "C" {
+
+MOD_EXPORT ModResult mod_initialize(ModError* error) {
+    ModResult result = hub_dtn::init(error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = hub_fog::init(error);
+    if (result != MOD_OK) {
+        return result;
+    }
+
+    UiModsPanelDesc panelDesc = UI_MODS_PANEL_DESC_INIT;
+    panelDesc.build = build_combined_panel;
+    svc_ui->register_mods_panel(mod_ctx, &panelDesc);
+
+    svc_log->info(mod_ctx, "graphics_hub ready (depth-to-normal + deferred fog)");
+    return MOD_OK;
+}
+
+MOD_EXPORT ModResult mod_update(ModError*) {
+    return MOD_OK;
+}
+
+MOD_EXPORT ModResult mod_shutdown(ModError*) {
+    hub_fog::shutdown();
+    hub_dtn::shutdown();
     return MOD_OK;
 }
 }

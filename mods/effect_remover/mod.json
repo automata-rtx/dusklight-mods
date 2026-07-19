@@ -1,0 +1,7 @@
+{
+  "id": "dev.automata.effect_remover",
+  "name": "Effect Remover",
+  "version": "1.0.0",
+  "author": "automata-rtx",
+  "description": "Cuts down or removes built-in Twilight Princess visual features so they don't fight new realtime graphical effects. Bundles three independently-toggleable removers, each targeting one of TP's fake-shading systems: Projected Shadow Removal (the 'moya' fake projected ground shade - swaying canopy dapple, rolling cloud shadows, drifting mist - suppressible per mode), Terrain Shadow Removal (the animated shadow overlay baked into terrain materials, per material code), and Unbaked Vertex Lighting (fades the lighting painted into geometry's vertex colors, 0 = flat, 100 = vanilla). Each has its own section in the settings and can be toggled or tuned on its own. EXPERIMENTAL"
+}
