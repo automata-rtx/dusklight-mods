@@ -34,7 +34,10 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
     and re-applies it (bit-exact aurora fog math) as a fullscreen pass after every mod's
     `SCENE_AFTER_OPAQUE` composites, so AO/shadows darken surfaces under the fog instead of the fog
     itself. Mixed fog configs auto-revert to vanilla (or exact per-pixel replay). Independently
-    toggleable.
+    toggleable. Special-cases the Hyrule Castle Ganon barrier (`d_a_obj_ganonwall2`, a translucent
+    dome drawn in the *opaque* BG list with pure-black `endZ 250000` fog) via `is_barrier_fog`: it
+    is left on vanilla forward fog, never suppressed/deferred, so its black fog isn't stamped onto
+    the castle/trees inside it.
 
   **Game-linked** (Deferred Fog hooks game functions) + webgpu. Docs: `docs/deferred_fog.md`,
   `docs/depth_to_normal_plan.md`, `docs/depth_to_normal_consumers.md`.

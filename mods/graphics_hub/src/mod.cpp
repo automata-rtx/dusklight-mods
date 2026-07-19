@@ -661,6 +661,26 @@ bool config_matches(const FogConfig& reference, const FogConfig& candidate) {
            std::fabs(candidate.farZ - reference.farZ) <= reference.farZ * 0.01f + 1.0f;
 }
 
+// The Hyrule Castle "Ganon barrier" (game actor d_a_obj_ganonwall2) is a translucent dome, but it
+// draws in the OPAQUE BG list (its Draw() calls dComIfGd_setListBG()), so it lands inside the
+// suppression scope. Every frame that actor rewrites its material fog to pure BLACK with a huge
+// range (startZ 1000, endZ 250000) so the dome fades to black at distance. If we defer that config,
+// two things break: the config-ID replay rasterizes the (really translucent) dome SOLID and stamps
+// its black fog onto the castle and trees INSIDE it (they turn dark), and the barrier's own
+// fog-then-blend compositing is lost. So we recognise this one distinctive signature and leave the
+// barrier entirely on its vanilla forward fog: its shapes are never suppressed and never registered
+// as a frame config. The frame then stays uniform (the field fog), the geometry inside the barrier
+// keeps the correct field fog, and the dome keeps its own black forward fog. (Residual: the
+// fullscreen quad still adds the field fog over the dome pixels — minor, and far better than the
+// black-stamped geometry it replaces. A perfect result is impossible here: a single fullscreen fog
+// pass cannot reproduce per-fragment fog through a translucent surface.)
+//
+// Signature match is deliberately narrow — fully black color AND a far plane past 100000 — so it
+// cannot catch normal fog or the black twilight fog (which keeps a normal range).
+bool is_barrier_fog(const FogConfig& c) {
+    return c.color.r == 0 && c.color.g == 0 && c.color.b == 0 && c.endZ > 100000.0f;
+}
+
 bool exact_mode() {
     return get_int_option(g_cvarFogMixed, 1) == 1;
 }
@@ -775,6 +795,9 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     config.nearZ = fog->mNearZ;
     config.farZ = fog->mFarZ;
     config.color = fog->mColor;
+    if (is_barrier_fog(config)) {
+        return HOOK_CONTINUE;  // leave the Ganon barrier on its own forward fog (see is_barrier_fog)
+    }
     if (vote_config(config)) {
         GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, GXColor{0, 0, 0, 0});
     }
@@ -800,6 +823,9 @@ HookAction on_set_fog_pre(ModContext*, void* args, void*, void*) {
     config.nearZ = mods::arg<float>(args, 3);
     config.farZ = mods::arg<float>(args, 4);
     config.color = mods::arg<GXColor>(args, 5);
+    if (is_barrier_fog(config)) {
+        return HOOK_CONTINUE;  // leave the Ganon barrier on its own forward fog (see is_barrier_fog)
+    }
     if (vote_config(config)) {
         mods::arg_ref<GXFogType>(args, 0) = GX_FOG_NONE;
     }
