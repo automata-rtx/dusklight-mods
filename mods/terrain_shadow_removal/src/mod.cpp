@@ -30,6 +30,7 @@
 #include "JSystem/J3DGraphAnimator/J3DModelData.h"    // J3DModelData::getMaterialNodePointer
 #include "JSystem/J3DGraphBase/J3DMaterial.h"         // J3DMaterial::getMaterialAnm
 #include "JSystem/J3DGraphBase/J3DShape.h"            // J3DShape::getMaterial
+#include "m_Do/m_Do_ext.h"                            // mDoExt_btkAnm/mDoExt_brkAnm (d_a_bg.h members)
 #include "d/actor/d_a_bg.h"                           // daBg_btkAnm_c
 #include "mods/hook.hpp"
 #include "mods/service.hpp"
