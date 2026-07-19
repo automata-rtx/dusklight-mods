@@ -7,20 +7,17 @@ PC/mobile port), built on the official [Dusklight mod template](https://github.c
 |---|---|---|
 | VBAO | `vbao.dusk` | Visibility-bitmask ambient occlusion with temporal accumulation, edge-aware denoise, and a large tuning surface |
 | Realtime Sun Shadows | `realtime_sun_shadows.dusk` | Real-geometry sun/moon cascaded shadow maps with PCF, slope-scaled bias, contact (screen-space) shadows, and indoor auto-disable |
-| Deferred Fog | `deferred_fog.dusk` | Re-applies the game's fog as a fullscreen pass after AO/shadows composite, so they darken surfaces *under* the fog instead of the fog itself |
-| Depth to Normal | `depth_to_normal.dusk` | Reconstructs a per-pixel world-space surface normal from the depth buffer and publishes it as a service other mods consume. No settings of its own |
-| SSILVB | `ssilvb.dusk` | Screen-space indirect lighting with visibility bitmask (Therrien et al. 2023): one-bounce colored light gathered through the same 32-sector bitmask VBAO uses; with the bounce disabled it acts as a standalone directional AO. Requires Depth to Normal |
-| [WIP] Unbaked Vertex Lighting | `vertex_unbake.dusk` | Fades out the lighting baked into world geometry's vertex colors (0 = fully flat, 100 = vanilla) so the realtime shadow/GI mods carry the shading. Changes apply as areas load. Experimental |
-| [WIP] Projected Shadow Removal | `projected_shadow_removal.dusk` | Selectively removes TP's fake projected ground shade (the "moya" system) per effect — swaying forest-canopy dapple vs. rolling Hyrule Field cloud shadows are independent toggles. Defaults to removing only the canopy shade. Live mode logger for identification; heat-shimmer preserved. Experimental |
-| [WIP] Terrain Shadow Removal | `terrain_shadow_removal.dusk` | Removes the *other* fake shadow — the drifting dappled shade TP bakes into the terrain material as a second texture stage (not the "moya" particles). Washes the overlay out by pinning its TEV register to max (like full fog) on the cloud-shadow terrain materials, so the shadow stops darkening but the base ground stays (no holes). Per-material-code toggles + live logger. Off by default; the big rolling Hyrule-Field cloud shadows (moya) are untouched. Experimental |
+| SSILVB | `ssilvb.dusk` | Screen-space indirect lighting with visibility bitmask (Therrien et al. 2023): one-bounce colored light gathered through the same 32-sector bitmask VBAO uses; with the bounce disabled it acts as a standalone directional AO. Requires Graphics Hub |
+| [WIP] Graphics Hub | `graphics_hub.dusk` | Hosts the screen-space infrastructure other graphics mods build on, so effects layer correctly with the game's original rendering instead of over-applying. Two independently-toggleable features: **Depth to Normal** (reconstructs a world-space surface normal buffer that AO/GI/shadow mods consume — no settings, keep enabled for SSILVB & Realtime Sun Shadows) and **Deferred Fog** (re-applies the game's fog after screen-space effects so they darken the world under the fog, not the fog itself). Experimental |
+| Effect Remover | `effect_remover.dusk` | Cuts down TP's built-in fake-shading so it doesn't fight new realtime effects. Three independently-toggleable removers: **Projected Shadow Removal** (the "moya" fake ground shade — swaying canopy dapple vs. rolling cloud shadows are per-mode toggles), **Terrain Shadow Removal** (the animated shadow overlay baked into terrain materials, per material code), and **Unbaked Vertex Lighting** (fades the lighting painted into vertex colors, 0 = flat, 100 = vanilla). Experimental |
 
-VBAO, Depth to Normal, and SSILVB are **service-only** (mod-API services only, no game code, so they
-survive game updates without a rebuild). Realtime Sun Shadows, Deferred Fog, Unbaked Vertex
-Lighting, Projected Shadow Removal, and Terrain Shadow Removal are **game-linked** (they hook game
-functions, so they are coupled to the pinned game build). Realtime Sun Shadows
-consumes the Depth to Normal service and SSILVB requires it — install Depth to Normal alongside
-either. Running SSILVB and VBAO together double-darkens unless you disable one mod's AO term
-(SSILVB has an "Apply AO" toggle for exactly this).
+VBAO and SSILVB are **service-only** (mod-API services only, no game code, so they survive game
+updates without a rebuild). Realtime Sun Shadows, Graphics Hub, and Effect Remover are
+**game-linked** (they hook game functions, so they are coupled to the pinned game build). Graphics
+Hub exports the *depth-to-normal* service that Realtime Sun Shadows consumes and SSILVB requires —
+keep **Graphics Hub installed and enabled** alongside either. Running SSILVB and VBAO together
+double-darkens unless you disable one mod's AO term (SSILVB has an "Apply AO" toggle for exactly
+this).
 
 Each `.dusk` is a **single cross-platform bundle** (Windows x64/arm64, macOS arm64/x64,
 Linux x64/arm64, Android arm64) produced by CI.
@@ -66,11 +63,15 @@ all seven platforms and merges each into one cross-platform `.dusk` via `tools/m
 ## Docs
 
 - `CLAUDE.md` — repo overview, build model, hard constraints, and the platform/ABI pin (read first)
+- `docs/self_editing_guide.md` — **how to change defaults / hardcode options and build without AI**
+- `docs/fake_shading_systems.md` — TP's fake-shading systems (moya, terrain overlay, vertex
+  lighting), their in-code names, and which Effect Remover feature handles each
 - `docs/vbao.md` — AO algorithm, every tunable, defaults rationale
 - `docs/realtime_sun_shadows.md` — shadow architecture, known issues and their fixes, tuning
-- `docs/deferred_fog.md` — deferred fog design, mixed-config handling, caveats
+- `docs/deferred_fog.md` — deferred fog design, mixed-config handling, caveats (now the Deferred
+  Fog feature of Graphics Hub)
 - `docs/depth_to_normal_plan.md`, `docs/depth_to_normal_consumers.md` — the normal-reconstruction
-  provider and how other mods tap it
+  provider (now the Depth to Normal feature of Graphics Hub) and how other mods tap its service
 - `docs/mod-api-notes.md` — mod-API pitfalls learned the hard way
 - Upstream mod API reference: <https://github.com/TwilitRealm/dusklight/blob/main/docs/modding.md>
 

@@ -22,8 +22,11 @@ if (svc_n2d != nullptr && svc_n2d->get_frame(mod_ctx, &f) == MOD_OK) {
 }
 ```
 
-Add `mods/depth_to_normal/include` to your mod's include path (CMake:
-`target_include_directories(<your_mod> PRIVATE .../mods/depth_to_normal/include)`). The view is
+Add `mods/graphics_hub/include` to your mod's include path (CMake:
+`target_include_directories(<your_mod> PRIVATE .../mods/graphics_hub/include)`). The service is
+now exported by the **Graphics Hub** mod (formerly the standalone `depth_to_normal` mod); the
+header name and the service id (`dev.automata.depth_to_normal`) are unchanged, so only the include
+path moved. The view is
 valid for the current frame only — call `get_frame` every frame, never cache the handle. World
 space is canonical; rotate into view space with the camera service's `view_from_world` if your
 effect wants view-space normals.
