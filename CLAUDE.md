@@ -38,6 +38,13 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   out TP's baked lighting so the realtime stack (shadows + SSILVB) carries the shading. 100 =
   vanilla, 0 = fully flat; alpha untouched; all six GX color formats handled; changes apply as
   models load (re-enter the area). **Game-linked**. EXPERIMENTAL.
+- **`mods/projected_shadow_removal/`** — "[WIP] Projected Shadow Removal": pre-hooks
+  `drawCloudShadow` (TP's "moya" projected-ground-shadow draw — the kankyo cloud packet) and
+  cancels it, removing the swaying dappled canopy shadows on forest floors and the rolling cloud
+  shadows over Hyrule Field (one texture-projection system, per-stage texture + animated matrix,
+  so it reads as both). Gated to `mMoyaMode < 50` so the framebuffer heat-shimmer branch (Death
+  Mountain) survives. Single `effectEnabled` toggle. Removes the game's fake shadows so the
+  realtime stack carries them. **Game-linked**. EXPERIMENTAL.
 
   **Working mode (user's explicit standing instruction): the technical direction of SSILVB rests
   with Claude.** The user is an amateur on SSAO/SSGI internals and cannot provide technical

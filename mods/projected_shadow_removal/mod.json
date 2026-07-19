@@ -1,0 +1,7 @@
+{
+  "id": "dev.automata.projected_shadow_removal",
+  "name": "[WIP] Projected Shadow Removal",
+  "version": "0.1.0",
+  "author": "automata-rtx",
+  "description": "Removes Twilight Princess's fake projected ground shadows - the slowly swaying dappled shadows under forest canopies and the rolling cloud shadows across Hyrule Field, both drawn by the game's 'moya' system as a scrolling texture cast onto the ground. Turning them off lets realtime shadow/GI mods provide the shading instead. The Death Mountain-style heat shimmer, which shares the same draw, is preserved. EXPERIMENTAL"
+}
