@@ -1,7 +1,7 @@
 {
   "id": "dev.automata.terrain_shadow_removal",
+  "version": "0.2.0",
   "name": "[WIP] Terrain Shadow Removal",
-  "version": "0.1.1",
   "author": "automata-rtx",
-  "description": "Removes the fake shadow that Twilight Princess scrolls across the terrain as an animated texture overlay (e.g. the slowly drifting dappled shade on forest floors), so realtime shadow/GI mods provide the shading instead. Works by skipping the draw of the room terrain's texture-animated materials - waterfalls and water are separate actors and are never affected. EXPERIMENTAL and off by default: if a room's shadow shares the base ground material, enabling this can leave the ground looking wrong there, so test per area."
+  "description": "Removes the animated ground-shadow overlay that Twilight Princess bakes into the terrain material itself (the slowly swaying dappled shade on forest/field floors) - a different system from the 'moya' particle shadows. It works by zeroing the overlay's TEV strength register on the cloud-shadow terrain materials (MA00/MA01/MA16 scroll, MA04 static) after the game sets it, so only the shadow stage is cancelled and the base ground is left fully intact - no holes. Per-material-code toggles plus a live logger let you keep the overlay in areas you want it. The big rolling Hyrule-Field cloud shadows are the separate moya system and are not touched here. EXPERIMENTAL and off by default."
 }

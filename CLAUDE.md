@@ -49,16 +49,19 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   areas can be identified in-game. `mMoyaMode >= 50` (heat-shimmer / wolf-senses distortion) is
   always preserved. **Game-linked**. EXPERIMENTAL.
 - **`mods/terrain_shadow_removal/`** — "[WIP] Terrain Shadow Removal": the *other* fake-shadow
-  system — TP scrolls a shadow/dapple texture across the terrain itself via the room model's
-  `model.btk` (loaded by `d_a_bg`), which is what the slowly-swaying Faron forest-floor shade is
-  (it's not moya — moya count reads 0 there). Pre-hooks `daBg_btkAnm_c::create` to record which
-  terrain materials the room BTK animates, then pre-hooks `J3DShape::drawFast` and cancels the
-  draw of any shape whose material is in that recorded set (guarded by `getMaterialAnm() != NULL`,
-  so the set membership *is* the scope — characters and water/waterfalls, which are separate
-  actors with object-archive BTKs, never match). **Off by default / EXPERIMENTAL**: if a room's
-  shadow is a stage *inside* the base ground material rather than its own overlay material,
-  skipping the shape takes the ground with it (floor looks wrong) — so it's opt-in and tested per
-  area. **Game-linked**.
+  system — TP bakes a drifting shadow/dapple **overlay as a second TEV texture stage inside the
+  terrain material itself** (not moya — moya count reads 0 there). The environment code drives it
+  per frame: `dKy_cloudshadow_scroll` scrolls **texture matrix 1** of the `MA00`/`MA01`/`MA16`
+  terrain materials by the drifting cloud (`vrkumo`) packet (the *sway*), and `dKy_bg_MAxx_proc`
+  sets **TEV KColor register 1**'s red channel to the env fog density on `MA00`/`MA01`/`MA04`/`MA16`
+  (the shadow *strength*). The mod **post-hooks `dKy_bg_MAxx_proc`** and, for the enabled
+  material codes, rewrites KColor 1 to zero — cancelling the overlay stage's contribution while
+  leaving the base ground texture (stage 0) untouched, so it **does not hole the floor** (the
+  earlier shape-skip approach did, and was replaced). Per-material-code toggles (MA00/MA01/MA16
+  default on when enabled, MA04 static off) + a live logger of which codes a room uses. The big
+  rolling Hyrule-Field cloud shadows are the *moya* system (`projected_shadow_removal`) and are
+  not touched here. **Off by default / EXPERIMENTAL** (global terrain change; the KColor→shadow
+  strength mapping is inferred, so verify per area). **Game-linked**.
 
   **Working mode (user's explicit standing instruction): the technical direction of SSILVB rests
   with Claude.** The user is an amateur on SSAO/SSGI internals and cannot provide technical
