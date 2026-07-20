@@ -208,6 +208,7 @@ Space Shadows" is inert when SSS is off.
 | `cascadeStagger` | on | staggered cascade updates: near every frame, mid/far alternate, skipped frames composite the cached copy of the last rendered map (see architecture §2) - the main CPU saver at 2-3 cascades |
 | `mainViewCull` | on | with `noFrustumClipping`, cull the game's own scene pass per mat packet against the camera frustum at draw time (the bypass otherwise makes the main view draw every off-screen object); replays still see everything |
 | `casterMinTexels` | 2 | skip casters whose world bounding radius is smaller than this many of the cascade's texels (sub-texel shadows); the main lever for the per-frame geometry budget. Raise (4-8) to stay in budget at wide coverage / 3 cascades |
+| `grassShadows` | 0 (All) | which cascades replay the dDlst packet list — the field grass/flower custom drawers (`d_grass.inc`/`d_flower.inc`, the list's only users). They are immediate-mode per-tuft draws no shadow cull can touch, redrawn in FULL by every included cascade — a large flat CPU cost per replay in grassy areas. 1 = near cascade only (crisp close grass shadows kept, distant dapple dropped), 2 = off (SSS still grounds on-screen grass) |
 | `cascadeEdgeFade` | on | fade the widest cascade's shadow out across its outer edge (band = `cascadeBlend`) instead of a hard coverage cutoff |
 | `pcfFarStep` | 1 | extra PCF kernel steps per cascade beyond the near one (0–2) |
 | `linkCascade` | on | the Link cascade: an extra map covering only the player, combined with max() |
@@ -231,7 +232,7 @@ Space Shadows" is inert when SSS is off.
 | `noFrustumClipping` | on | the anti-popping clipper bypass (issue 5) |
 | `twoSidedCasters` | on | render casters with backface culling off (issue 6) |
 | `indoorDisable` | on | disable the shadow MAP indoors (game shadows return); screen-space shadows still run (issue 3) |
-| `perfLog` | off | logs averaged game-thread timings every ~600 frames: whole-frame + scene time, then one line per cascade splitting its replay into setup / draw-list walk / finish (resolve) phases with per-run drawn/culled packet counts. The tuning feedback channel - the phase split distinguishes geometry cost (walk) from fixed pass overhead (setup+finish) |
+| `perfLog` | off | logs averaged game-thread timings every ~600 frames: whole-frame + scene time, then one line per cascade splitting its replay into setup / J3D-buffer walk / grass (packet list) / finish (resolve) phases with per-run drawn/culled packet counts. The tuning feedback channel - the phase split separates J3D geometry cost, the grass/flower packet list, and fixed pass overhead |
 | `debugView` | 0 | map/coverage/factor visualizations + SSS buffer/edge-mask views |
 
 Tuning order for acne: raise `slopeBias` first, then `normalOffset`; lower `bias` if shadows

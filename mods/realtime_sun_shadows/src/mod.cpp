@@ -116,6 +116,7 @@ ConfigVarHandle g_cvarLinkMapSize = 0;
 ConfigVarHandle g_cvarLinkCoverage = 0;
 ConfigVarHandle g_cvarMainViewCull = 0;
 ConfigVarHandle g_cvarCascadeStagger = 0;
+ConfigVarHandle g_cvarGrassShadows = 0;
 ConfigVarHandle g_cvarPerfLog = 0;
 
 GfxDrawTypeHandle g_drawType = 0;
@@ -323,10 +324,12 @@ constexpr float kMainViewCullMaxRadius = 20000.0f;
 struct PerfStats {
     double replayMs[kMaxCascades] = {};    // per world cascade; slot 3 = the Link cascade
     // Where each replay's time goes: [0] setup (camera save, create_pass, state), [1] the
-    // draw-list walk itself, [2] finish (state restore, resolve_pass). Splitting these is
-    // what distinguishes geometry cost (walk) from fixed per-replay overhead (setup+finish)
-    // and from per-frame warmup a first replay pays on behalf of later ones.
-    double replayPhaseMs[kMaxCascades][3] = {};
+    // J3D draw-buffer walk, [2] the dDlst packet list (grass/flower custom drawers - the
+    // only two users of that list, immediate-mode geometry our packet culls cannot see),
+    // [3] finish (state restore, resolve_pass). Splitting these is what distinguishes
+    // geometry cost from fixed per-replay overhead and pins the flat per-walk cost the
+    // 1.9.1 numbers exposed.
+    double replayPhaseMs[kMaxCascades][4] = {};
     uint32_t replayCount[kMaxCascades] = {};
     uint64_t slotPackets[kMaxCascades] = {};        // mat packets tested per replay slot
     uint64_t slotPacketsCulled[kMaxCascades] = {};
@@ -1593,13 +1596,27 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
-void draw_opaque_scene_lists() {
+// Packet-list (grass/flower) time within the current replay walk, for the perf phase split.
+double g_walkEffectsMs = 0.0;
+
+// The dDlst packet list holds exactly two kinds of custom drawers - the field grass and
+// flowers (d_grass.inc / d_flower.inc): per-instance immediate-mode geometry with no bounds
+// our packet culls can see, so every replay that includes it redraws every tuft in the loaded
+// rooms. The Grass Shadows option can therefore restrict it to the near cascade (grass keeps
+// its crisp close-up shadows; the distant dapple goes) or skip it entirely (the screen-space
+// term still grounds on-screen grass).
+void draw_opaque_scene_lists(bool withEffectPackets) {
     dComIfGd_drawOpaListBG();
     dComIfGd_drawOpaListDarkBG();
     dComIfGd_drawOpaListMiddle();
     dComIfGd_drawOpaList();
     dComIfGd_drawOpaListDark();
-    dComIfGd_drawOpaListPacket();
+    if (withEffectPackets) {
+        const auto start = std::chrono::steady_clock::now();
+        dComIfGd_drawOpaListPacket();
+        g_walkEffectsMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+    }
 }
 
 bool draw_lists_ready() {
@@ -1728,8 +1745,8 @@ void draw_link_scene_lists() {
 // clean between passes.
 bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
     const f32 replayProjection[7], bool cameraReplayDebug, uint32_t mapSize, float radius,
-    bool linkOnly, bool cull, const float* excludeCenterWorld, float excludeLimit,
-    CascadeSlot& out) {
+    bool linkOnly, bool cull, bool withEffectPackets, const float* excludeCenterWorld,
+    float excludeLimit, CascadeSlot& out) {
     const auto perfT0 = std::chrono::steady_clock::now();
     auto perfT1 = perfT0;
     auto perfT2 = perfT0;
@@ -1826,13 +1843,14 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
     // being dereferenced; restore afterwards.
     J3DModel* savedModel = j3dSys.getModel();
     j3dSys.setModel(nullptr);
+    g_walkEffectsMs = 0.0;
     perfT1 = std::chrono::steady_clock::now();
     {
         replay_scope replay;
         if (linkOnly) {
             draw_link_scene_lists();
         } else {
-            draw_opaque_scene_lists();
+            draw_opaque_scene_lists(withEffectPackets);
         }
     }
     perfT2 = std::chrono::steady_clock::now();
@@ -1871,8 +1889,10 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
         g_perf.replayPhaseMs[g_replayPerfSlot][0] +=
             std::chrono::duration<double, std::milli>(perfT1 - perfT0).count();
         g_perf.replayPhaseMs[g_replayPerfSlot][1] +=
-            std::chrono::duration<double, std::milli>(perfT2 - perfT1).count();
-        g_perf.replayPhaseMs[g_replayPerfSlot][2] +=
+            std::chrono::duration<double, std::milli>(perfT2 - perfT1).count() -
+            g_walkEffectsMs;
+        g_perf.replayPhaseMs[g_replayPerfSlot][2] += g_walkEffectsMs;
+        g_perf.replayPhaseMs[g_replayPerfSlot][3] +=
             std::chrono::duration<double, std::milli>(perfT3 - perfT2).count();
     }
     return true;
@@ -2052,6 +2072,11 @@ void render_shadow_map(
     const float blendFrac =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarCascadeBlend, 20), 5, 40)) /
         100.0f;
+    // Grass Shadows: which cascades replay the dDlst packet list (the grass/flower custom
+    // drawers - see draw_opaque_scene_lists). 0 = all cascades (vanilla behavior), 1 = near
+    // cascade only, 2 = none. The Camera Replay debug view always draws everything.
+    const int64_t grassMode =
+        std::clamp<int64_t>(get_int_option(g_cvarGrassShadows, 0), 0, 2);
     // Staggered cascades: cascade 0 renders every frame (it carries the player and everything
     // near); the middle cascade re-renders every other frame and the outermost every fourth
     // (every other when its radius is small enough that mid-distance movers land in it), each
@@ -2116,12 +2141,15 @@ void render_shadow_map(
         const float* exclCenter =
             exclusionEligible && freshExclLimit > 0.0f ? innerCenter : nullptr;
         const float exclLimit = exclCenter != nullptr ? freshExclLimit : 0.0f;
+        const bool effectPackets =
+            cameraReplayDebug || grassMode == 0 || (grassMode == 1 && i == 0);
         const auto renderStart = std::chrono::steady_clock::now();
         g_replayPerfSlot = i;
         LightCamera lightCamera{};
         if (!build_light_camera(replayViewMtx, mapSize, radii[i], lightCamera) ||
             !replay_cascade(lightCamera, replayViewMtx, replayProjection, cameraReplayDebug,
-                mapSize, radii[i], false, cull, exclCenter, exclLimit, g_mapPass.cascades[i]))
+                mapSize, radii[i], false, cull, effectPackets, exclCenter, exclLimit,
+                g_mapPass.cascades[i]))
         {
             g_replayPerfSlot = -1;
             g_mapPass = {};
@@ -2173,7 +2201,8 @@ void render_shadow_map(
             if (build_light_camera_core(
                     center, linkMapSize, linkRadius, linkRadius * 4.0f + 2000.0f, lightCamera) &&
                 replay_cascade(lightCamera, replayViewMtx, replayProjection, false, linkMapSize,
-                    linkRadius, true, false, nullptr, 0.0f, g_mapPass.cascades[kLinkCascade]))
+                    linkRadius, true, false, false, nullptr, 0.0f,
+                    g_mapPass.cascades[kLinkCascade]))
             {
                 g_mapPass.linkReady = true;
             }
@@ -2519,11 +2548,12 @@ void flush_perf_stats() {
             const double drawn =
                 static_cast<double>(g_perf.slotPackets[i]) / runs - culled;
             std::snprintf(line, sizeof(line),
-                "perf   %s %.2f ms/run x%u = setup %.2f + walk %.2f + finish %.2f | "
-                "pkts/run: %.0f drawn, %.0f culled",
+                "perf   %s %.2f ms/run x%u = setup %.2f + walk %.2f + grass %.2f + finish "
+                "%.2f | pkts/run: %.0f drawn, %.0f culled",
                 kSlotNames[i], g_perf.replayMs[i] / runs, runs,
                 g_perf.replayPhaseMs[i][0] / runs, g_perf.replayPhaseMs[i][1] / runs,
-                g_perf.replayPhaseMs[i][2] / runs, drawn, culled);
+                g_perf.replayPhaseMs[i][2] / runs, g_perf.replayPhaseMs[i][3] / runs, drawn,
+                culled);
             svc_log->info(mod_ctx, line);
         }
     }
@@ -2638,6 +2668,14 @@ ModResult build_controls_tab(
         "forces a full refresh. Distant moving objects update their shadows at half rate; "
         "in normal play this is invisible. Turn off for strictly per-frame shadows "
         "everywhere.");
+    static const char* kGrassShadowOptions[] = {"All Cascades", "Near Only", "Off"};
+    add_select(left, "Grass Shadows", g_cvarGrassShadows, kGrassShadowOptions, 3,
+        "Whether the field grass and flowers cast map shadows. They are drawn by a special "
+        "game path that redraws every tuft in the loaded rooms into EVERY cascade, and none "
+        "of the shadow culling can touch it - a large fixed CPU cost per cascade in grassy "
+        "areas. Near Only keeps crisp grass shadows around you and drops only the distant "
+        "dapple; Off removes their map shadows entirely (screen-space shadows still ground "
+        "on-screen grass). All Cascades is the original behavior.");
     add_number(left, "Caster Detail", g_cvarCasterMinTexels, 0, 16, 1, nullptr,
         "Skips casters smaller than this many shadow-map texels, whose shadow would be "
         "sub-pixel anyway. This is the main control for staying within the engine's per-frame "
@@ -3018,6 +3056,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
+    result = register_int_option("grassShadows", 0, g_cvarGrassShadows, error);
+    if (result != MOD_OK) {
+        return result;
+    }
     result = register_bool_option("perfLog", false, g_cvarPerfLog, error);
     if (result != MOD_OK) {
         return result;
@@ -3257,7 +3299,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_replayCullActive = false;
     g_replayCullLimit = 0.0f;
     g_cvarPcfFarStep = g_cvarLinkCascade = g_cvarLinkMapSize = g_cvarLinkCoverage = 0;
-    g_cvarMainViewCull = g_cvarCascadeStagger = g_cvarPerfLog = 0;
+    g_cvarMainViewCull = g_cvarCascadeStagger = g_cvarGrassShadows = g_cvarPerfLog = 0;
+    g_walkEffectsMs = 0.0;
     g_mainViewCullActive = false;
     g_insideMatPacketDraw = false;
     g_matPacketPostHooked = false;
