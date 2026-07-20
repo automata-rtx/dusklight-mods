@@ -55,20 +55,37 @@ Sun Shadows if Depth to Normal is not installed and enabled. Install both togeth
    can't be hooked.
 
    **Staggered cascade updates (`cascadeStagger`, 1.8.0, default on).** The near cascade
-   re-renders every frame (it carries the player and everything close); cascades 1 and 2
-   alternate, each re-rendering every other frame — with 3 cascades that is 2 replays per
-   frame instead of 3, with 2 cascades 1.5. A skipped cascade composites from a mod-owned
-   copy of its last rendered map: on render frames a tiny compute pass
+   re-renders every frame (it carries the player and everything close); the middle cascade
+   re-renders every other frame, and since 1.9.0 the outermost re-renders every **fourth**
+   frame when its radius is ≥8000 (else every other), with phases that never collide — no
+   frame runs more than two world replays, and most run fewer. A skipped cascade composites
+   from a mod-owned copy of its last rendered map: on render frames a tiny compute pass
    (`res/shadow_copy.wgsl`) copies the frame-pooled depth resolve into a persistent R32Float
    texture (frame-pooled views must never be cached across frames), and the composite binds
    that copy with the stored `light_vp`/`texel_world`/near/far metadata so receiver
    projection stays consistent with the cached content. `cascade_cache_usable` force-refreshes
-   on anything that would make a one-frame-old map wrong: >0.5° sun/moon jumps (sleeping,
-   warps), camera teleports (>5% of the cascade radius in one frame), map-size/radius config
-   changes, or any gap in the map pass (menus, indoors, loads). Staleness is otherwise
-   invisible in normal play: the affected cascades hold distant, mostly static geometry, and
-   a one-frame-lagged box edge lands inside the cascade cross-fade band. Debug views disable
-   staggering so every visualization stays live.
+   on anything that would make a stale map wrong: >0.5° sun/moon jumps (sleeping, warps),
+   box-center drift over 5% of the cascade radius — the center leads the camera by the
+   forward lookahead, so this catches snap camera turns as well as teleports — map-size /
+   radius config changes, or any gap in the map pass (menus, indoors, loads). Staleness is
+   otherwise invisible in normal play: the affected cascades hold distant, mostly static
+   geometry, and a lagged box edge lands inside the cascade cross-fade band. Debug views
+   disable staggering so every visualization stays live.
+
+   **Outermost-cascade interior exclusion (1.9.0, part of `cascadeCull`).** The composite
+   picks the FIRST cascade containing the receiver, so the outermost map is only ever
+   sampled for receivers in the inner cascade's outer blend band (`fit > 1 - blend_frac`) or
+   beyond its box — and a caster occludes only receivers at its own lateral light-space
+   position. Therefore casters whose footprint lies entirely inside the inner box's
+   guaranteed-sampled interior can be culled from the outermost replay wholesale: they can
+   only shadow receivers the inner map already covers. The exclusion square's half-extent is
+   `innerRadius × (1 − blend_frac)` minus the PCF + normal-offset sampling reach (8 outer + 4
+   inner texels), texel snapping, and a drift allowance (`min(1000, 10% of innerRadius)`)
+   for the inner box's movement over a cached outer map's lifetime; a cached outer map
+   records the exclusion it was rendered with and is invalidated if the inner box drifts
+   past that allowance or settings would shrink the hole. This removes the densest central
+   geometry (everything near the camera) from the most expensive replay. Disabled in debug
+   modes so map visualizations stay complete.
 3. **Composite** (`SCENE_AFTER_OPAQUE`, `res/shadow.wgsl`): unproject scene depth to world,
    reconstruct a world normal from depth (side-selected crosses), pick the sharpest cascade
    whose box contains the receiver, apply that cascade's slope-scaled bias
@@ -155,7 +172,14 @@ Space Shadows" is inert when SSS is off.
    and spheres over 20000 units (sky domes, oddly-anchored stage pieces) are never culled —
    so visible geometry is not at risk; the payoff is that the main scene pass returns to
    roughly its vanilla cost while the replays keep the complete caster set. Only active while
-   the bypass itself is active (`noFrustumClipping` + shadows wanted).
+   the bypass itself is active (`noFrustumClipping` + shadows wanted). Since 1.9.0 mixed mat
+   packets are also culled per shape: `entryMatSort` merges same-material shape packets from
+   several models into one packet, so one on-screen instance used to keep all its off-screen
+   siblings drawing. A `J3DMatPacket::draw` post-hook bounds the window in which `j3dSys`'s
+   current model is trustworthy (prepareDraw sets it immediately before every packet-chain
+   drawFast), and inside that window the drawFast pre-hook applies the same frustum test per
+   shape — never outside it, where a stray drawFast could see a stale model (the 1.6.1
+   hazard).
 6. **Light leaking through level edges** → single-sided geometry facing the player is
    back-facing from the light, so its material's cull mode dropped it from the shadow map.
    Fix: two-sided casters during replay. Direct GX drawers are covered by a `GXSetCullMode`
@@ -207,6 +231,7 @@ Space Shadows" is inert when SSS is off.
 | `noFrustumClipping` | on | the anti-popping clipper bypass (issue 5) |
 | `twoSidedCasters` | on | render casters with backface culling off (issue 6) |
 | `indoorDisable` | on | disable the shadow MAP indoors (game shadows return); screen-space shadows still run (issue 3) |
+| `perfLog` | off | logs averaged game-thread timings every ~600 frames: scene time, per-cascade replay cost and run counts, packet-cull ratios. The tuning feedback channel |
 | `debugView` | 0 | map/coverage/factor visualizations + SSS buffer/edge-mask views |
 
 Tuning order for acne: raise `slopeBias` first, then `normalOffset`; lower `bias` if shadows

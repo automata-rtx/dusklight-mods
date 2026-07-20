@@ -53,7 +53,9 @@
 #include "mods/svc/ui.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <type_traits>
 #include <utility>
@@ -114,6 +116,7 @@ ConfigVarHandle g_cvarLinkMapSize = 0;
 ConfigVarHandle g_cvarLinkCoverage = 0;
 ConfigVarHandle g_cvarMainViewCull = 0;
 ConfigVarHandle g_cvarCascadeStagger = 0;
+ConfigVarHandle g_cvarPerfLog = 0;
 
 GfxDrawTypeHandle g_drawType = 0;
 GfxComputeTypeHandle g_sssComputeType = 0;
@@ -203,11 +206,18 @@ struct CascadeCacheEntry {
     uint64_t renderedFrame = 0;  // g_frameIndex when the cached map was rendered
     float radius = 0.0f;         // cascade box radius the map was rendered with
     float dirToLight[3] = {};
-    float eye[3] = {};           // camera eye at render time
+    float boxCenter[3] = {};     // pre-snap ortho box center the map was rendered around
     Mtx44 lightVp;               // receiver projection matching the cached map
     float texelWorld = 1.0f;
     float lightNear = 100.0f;
     float lightFar = 60000.0f;
+    // Interior exclusion carved into this cached map (outermost cascade only): casters whole
+    // inside the square of half-extent exclLimit around exclCenter were culled at render, so
+    // the cache is only reusable while the inner cascade's presented box stays within
+    // exclSlack of exclCenter and the currently-allowed hole is no smaller. 0 = no hole.
+    float exclCenter[3] = {};
+    float exclLimit = 0.0f;
+    float exclSlack = 0.0f;
 };
 CascadeCacheEntry g_cascadeCache[3];
 struct RetiredCascadeTexture {
@@ -269,6 +279,18 @@ Mtx g_replayCullLightView;      // light_from_world for the current cascade
 float g_replayCullLimit = 0.0f;  // lateral half-extent + margin, world units
 float g_replayCullMinRadius = 0.0f;  // skip casters with a smaller world bounding radius
 
+// Interior exclusion for the OUTERMOST cascade's replay: the composite samples the outer map
+// only for receivers in the inner cascade's outer blend band or beyond (shadow.wgsl picks the
+// first cascade containing the receiver), so casters whose lateral footprint lies entirely
+// inside the inner box's guaranteed-sampled interior can be culled from the outer replay -
+// they can only ever shadow receivers the inner map already covers. The limit already
+// subtracts the blend band, PCF/normal-offset reach, texel snapping, and a drift allowance
+// for the inner box (see render_shadow_map), so the carved hole is strictly smaller than the
+// never-sampled region.
+bool g_replayExcludeActive = false;
+float g_replayExcludeCenter[2] = {};  // inner box center, lateral light-space coordinates
+float g_replayExcludeLimit = 0.0f;    // half-extent of the excluded square, world units
+
 // Main-view culling: with No Frustum Clipping on, the J3DUClipper bypass keeps every
 // off-screen actor in the shared draw lists so the cascade replays can see them - but the
 // game's OWN scene pass consumes the same lists, so it also draws all of that off-screen
@@ -280,12 +302,38 @@ float g_replayCullMinRadius = 0.0f;  // skip casters with a smaller world boundi
 // bracketed by g_replayingSceneLists, which is checked first.
 bool g_mainViewCullActive = false;
 float g_mainViewPlanes[6][4];  // world-space frustum planes, unit normals pointing inward
+// True while inside a J3DMatPacket::draw call (set by its pre-hook, cleared by its post-hook).
+// Within that window every J3DShape::drawFast arrives via J3DShapePacket::drawFast, whose
+// prepareDraw just set j3dSys's current model - so the per-shape main-view cull can safely
+// read it there (outside the window a drawFast could see a stale model; see the 1.6.1 note).
+// Enables per-shape culling of mixed packets (entryMatSort merges same-material shape packets
+// from several models: one on-screen instance keeps the packet, this culls the rest).
+bool g_insideMatPacketDraw = false;
+bool g_matPacketPostHooked = false;
 // Culling here must never eat visible geometry: bounds get 1.5x radius + 300 world units of
 // slack (skinned animation can poke past the static mesh bounds), and implausibly huge
 // spheres (sky domes, stage pieces anchored far from their vertices) are never culled.
 constexpr float kMainViewCullRadiusScale = 1.5f;
 constexpr float kMainViewCullMargin = 300.0f;
 constexpr float kMainViewCullMaxRadius = 20000.0f;
+
+// Lightweight game-thread profiling (the counters always tick - they are a handful of adds
+// per packet; the timers wrap only the replay calls). Logged via the log service every
+// kPerfLogFrames frames when the Perf Log toggle is on, so in-game reports can drive tuning.
+struct PerfStats {
+    double replayMs[kMaxCascades] = {};    // per world cascade; slot 3 = the Link cascade
+    uint32_t replayCount[kMaxCascades] = {};
+    double sceneMs = 0.0;                  // SCENE_BEGIN -> FRAME_BEFORE_HUD, game thread
+    uint32_t frames = 0;
+    uint64_t replayPackets = 0;            // mat packets tested during replays
+    uint64_t replayPacketsCulled = 0;
+    uint64_t mainPackets = 0;              // mat packets tested in the main view
+    uint64_t mainPacketsCulled = 0;
+};
+PerfStats g_perf;
+std::chrono::steady_clock::time_point g_sceneBeginTime;
+bool g_sceneBeginTimeValid = false;
+constexpr uint32_t kPerfLogFrames = 600;
 
 constexpr float kLightDistance = 30000.0f;
 constexpr float kLightNear = 100.0f;
@@ -424,6 +472,7 @@ struct LightCamera {
     Mtx44 ortho;
     Mtx44 vp;
     float dirToLight[3];
+    float center[3];  // ortho box focus point (pre texel snap), world space
     float fade = 0.0f;
     float lightNear = 100.0f;
     float lightFar = 60000.0f;
@@ -1144,6 +1193,9 @@ bool build_light_camera_core(
     if (!compute_light(out.dirToLight, out.fade)) {
         return false;
     }
+    out.center[0] = center.x;
+    out.center[1] = center.y;
+    out.center[2] = center.z;
     out.lightNear = kLightNear;
     out.lightFar = lightDistance + radius + 20000.0f;
     const cXyz lightEye{center.x + out.dirToLight[0] * lightDistance,
@@ -1316,9 +1368,22 @@ bool replay_culls_sphere(const WorldSphere& s) {
     const Mtx& view = g_replayCullLightView;
     const float lx = view[0][0] * s.x + view[0][1] * s.y + view[0][2] * s.z + view[0][3];
     const float ly = view[1][0] * s.x + view[1][1] * s.y + view[1][2] * s.z + view[1][3];
+    if (!std::isfinite(lx) || !std::isfinite(ly)) {
+        return false;
+    }
     const float limit = g_replayCullLimit + s.r;
-    return std::isfinite(lx) && std::isfinite(ly) &&
-           (std::fabs(lx) > limit || std::fabs(ly) > limit);
+    if (std::fabs(lx) > limit || std::fabs(ly) > limit) {
+        return true;
+    }
+    // Outermost-cascade interior exclusion: a caster wholly inside the inner cascade's
+    // guaranteed-sampled interior can only shadow receivers the inner map already covers.
+    if (g_replayExcludeActive &&
+        std::fabs(lx - g_replayExcludeCenter[0]) + s.r < g_replayExcludeLimit &&
+        std::fabs(ly - g_replayExcludeCenter[1]) + s.r < g_replayExcludeLimit)
+    {
+        return true;
+    }
+    return false;
 }
 
 // Link-cascade position filter: models anchored at the player (his body, equipment, close
@@ -1402,6 +1467,14 @@ HookAction on_mat_packet_draw_pre(ModContext*, void* args, void*, void*) {
     if (!replayLinkCull && !replayWorldCull && !mainViewCull) {
         return HOOK_CONTINUE;
     }
+    if (mainViewCull) {
+        // Arm the per-shape main-view cull window (see g_insideMatPacketDraw); the post-hook
+        // clears it when the packet draw returns.
+        g_insideMatPacketDraw = g_matPacketPostHooked;
+        ++g_perf.mainPackets;
+    } else {
+        ++g_perf.replayPackets;
+    }
     J3DMatPacket* matPacket = mods::arg<J3DMatPacket*>(args, 0);
     if (matPacket == nullptr || matPacket->getShapePacket() == nullptr) {
         return HOOK_CONTINUE;
@@ -1424,7 +1497,16 @@ HookAction on_mat_packet_draw_pre(ModContext*, void* args, void*, void*) {
             return HOOK_CONTINUE;
         }
     }
+    if (mainViewCull) {
+        ++g_perf.mainPacketsCulled;
+    } else {
+        ++g_perf.replayPacketsCulled;
+    }
     return HOOK_SKIP_ORIGINAL;
+}
+
+void on_mat_packet_draw_post(ModContext*, void*, void*, void*) {
+    g_insideMatPacketDraw = false;
 }
 
 // J3D materials don't call GXSetCullMode: their cull mode is baked into the genMode BP write of
@@ -1435,6 +1517,18 @@ HookAction on_mat_packet_draw_pre(ModContext*, void* args, void*, void*) {
 // casters like foliage — but with culling forced off.
 HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     if (!g_replayingSceneLists) {
+        // Main-view per-shape cull for mixed mat packets (one on-screen instance keeps the
+        // packet; this skips its off-screen siblings). Only inside a J3DMatPacket::draw,
+        // where prepareDraw has just set j3dSys's current model - never for stray drawFast
+        // calls, whose model pointer could be stale.
+        if (g_mainViewCullActive && g_insideMatPacketDraw) {
+            J3DModel* model = j3dSys.getModel();
+            J3DShape* shape = const_cast<J3DShape*>(mods::arg<const J3DShape*>(args, 0));
+            WorldSphere sphere;
+            if (shape_world_sphere(model, shape, sphere) && main_view_culls_sphere(sphere)) {
+                return HOOK_SKIP_ORIGINAL;
+            }
+        }
         return HOOK_CONTINUE;
     }
     // Link-cascade replay: draw only models anchored near the player. J3DShapePacket::
@@ -1526,6 +1620,8 @@ void restore_actual_light_debug() {
 
 void on_scene_begin(ModContext*, const GfxStageContext* stageCtx, void*) {
     ++g_frameIndex;
+    g_sceneBeginTime = std::chrono::steady_clock::now();
+    g_sceneBeginTimeValid = true;
     tick_retired_sss_targets();
     tick_retired_normal_targets();
     tick_retired_cascade_textures();
@@ -1609,7 +1705,8 @@ void draw_link_scene_lists() {
 // clean between passes.
 bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
     const f32 replayProjection[7], bool cameraReplayDebug, uint32_t mapSize, float radius,
-    bool linkOnly, bool cull, CascadeSlot& out) {
+    bool linkOnly, bool cull, const float* excludeCenterWorld, float excludeLimit,
+    CascadeSlot& out) {
     Mtx44 lightReplayProjection;
     if (!build_light_replay_projection(lightCamera, replayViewMtx, lightReplayProjection)) {
         return false;
@@ -1660,6 +1757,24 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
     g_replayTwoSided = get_bool_option(g_cvarTwoSidedCasters, true);
     g_replayLinkOnly = linkOnly;
     g_replayCullActive = cull;
+    g_replayExcludeActive = false;
+    if (cull && excludeCenterWorld != nullptr && excludeLimit > 0.0f) {
+        // Inner box center into this cascade's lateral light space (same rotation as the
+        // culling matrix below - all cascades share the light direction).
+        const Mtx& view = lightCamera.view;
+        const float ex = view[0][0] * excludeCenterWorld[0] +
+                         view[0][1] * excludeCenterWorld[1] +
+                         view[0][2] * excludeCenterWorld[2] + view[0][3];
+        const float ey = view[1][0] * excludeCenterWorld[0] +
+                         view[1][1] * excludeCenterWorld[1] +
+                         view[1][2] * excludeCenterWorld[2] + view[1][3];
+        if (std::isfinite(ex) && std::isfinite(ey)) {
+            g_replayExcludeCenter[0] = ex;
+            g_replayExcludeCenter[1] = ey;
+            g_replayExcludeLimit = excludeLimit;
+            g_replayExcludeActive = true;
+        }
+    }
     if (cull) {
         cMtx_copy(lightCamera.view, g_replayCullLightView);
         g_replayCullLimit = radius * 1.05f + 200.0f;
@@ -1696,6 +1811,7 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
     j3dSys.setModel(savedModel);
     g_replayLinkOnly = false;
     g_replayCullActive = false;
+    g_replayExcludeActive = false;
     j3dSys.reinitGX();
     J3DShape::resetVcdVatCache();
     restore_game_camera();
@@ -1726,8 +1842,14 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
 }
 
 // True when a staggered cascade's cached map can stand in for a skipped replay this frame.
+// wantCenter is the box focus point a fresh render would use NOW - comparing box centers
+// (not eyes) catches snap camera turns too, since the center leads the camera by the forward
+// lookahead. For a cached outer map with an exclusion hole, the inner cascade's presented
+// center must still sit within the drift allowance reserved at render time, and the hole must
+// be no larger than what current settings would allow.
 bool cascade_cache_usable(const CascadeCacheEntry& cache, uint32_t mapSize, float radius,
-    const float dirToLight[3], const float eye[3]) {
+    const float dirToLight[3], const float wantCenter[3], uint64_t maxAge,
+    const float* presentedInnerCenter, float freshExclLimit) {
     if (!cache.valid || cache.view == nullptr || cache.size != mapSize ||
         cache.radius != radius)
     {
@@ -1735,7 +1857,7 @@ bool cascade_cache_usable(const CascadeCacheEntry& cache, uint32_t mapSize, floa
     }
     // A gap since the last render means the map pass wasn't running (menus, indoors, loads) -
     // the cached world may be arbitrarily old, so re-render instead of compositing it.
-    if (g_frameIndex - cache.renderedFrame > 2) {
+    if (g_frameIndex - cache.renderedFrame > maxAge) {
         return false;
     }
     // Sun/moon jumps (sleeping, warping, time skips) move every shadow at once; a cascade
@@ -1747,14 +1869,26 @@ bool cascade_cache_usable(const CascadeCacheEntry& cache, uint32_t mapSize, floa
     if (dot < 0.99996f) {  // ~0.5 degrees
         return false;
     }
-    // Camera teleports (warps, cutscene cuts) displace the cascade box wholesale; ordinary
-    // movement covers a tiny fraction of any cascade's radius per frame.
-    const float dx = eye[0] - cache.eye[0];
-    const float dy = eye[1] - cache.eye[1];
-    const float dz = eye[2] - cache.eye[2];
+    const float dx = wantCenter[0] - cache.boxCenter[0];
+    const float dy = wantCenter[1] - cache.boxCenter[1];
+    const float dz = wantCenter[2] - cache.boxCenter[2];
     const float jump = radius * 0.05f;
     if (dx * dx + dy * dy + dz * dz > jump * jump) {
         return false;
+    }
+    if (cache.exclLimit > 0.0f) {
+        if (presentedInnerCenter == nullptr) {
+            return false;
+        }
+        const float ix = presentedInnerCenter[0] - cache.exclCenter[0];
+        const float iy = presentedInnerCenter[1] - cache.exclCenter[1];
+        const float iz = presentedInnerCenter[2] - cache.exclCenter[2];
+        if (ix * ix + iy * iy + iz * iz > cache.exclSlack * cache.exclSlack) {
+            return false;
+        }
+        if (cache.exclLimit > freshExclLimit + 1.0f) {
+            return false;
+        }
     }
     return true;
 }
@@ -1762,7 +1896,8 @@ bool cascade_cache_usable(const CascadeCacheEntry& cache, uint32_t mapSize, floa
 // Queue the copy of a just-rendered cascade's depth resolve into its cache texture and stamp
 // the metadata the composite needs on the frames that skip this cascade's replay.
 void update_cascade_cache(CascadeCacheEntry& cache, const CascadeSlot& slot, float radius,
-    const float dirToLight[3], const float eye[3]) {
+    const LightCamera& lightCamera, const float* exclCenter, float exclLimit,
+    float exclSlack) {
     cache.valid = false;
     if (g_cascadeCopyPipeline == nullptr || slot.shadowMap == nullptr ||
         !ensure_cascade_cache_texture(cache, slot.mapSize))
@@ -1781,12 +1916,20 @@ void update_cascade_cache(CascadeCacheEntry& cache, const CascadeSlot& slot, flo
     }
     cache.renderedFrame = g_frameIndex;
     cache.radius = radius;
-    std::memcpy(cache.dirToLight, dirToLight, sizeof(cache.dirToLight));
-    std::memcpy(cache.eye, eye, sizeof(cache.eye));
+    std::memcpy(cache.dirToLight, lightCamera.dirToLight, sizeof(cache.dirToLight));
+    std::memcpy(cache.boxCenter, lightCamera.center, sizeof(cache.boxCenter));
     std::memcpy(cache.lightVp, slot.lightVp, sizeof(cache.lightVp));
     cache.texelWorld = slot.texelWorld;
     cache.lightNear = slot.lightNear;
     cache.lightFar = slot.lightFar;
+    if (exclCenter != nullptr && exclLimit > 0.0f) {
+        std::memcpy(cache.exclCenter, exclCenter, sizeof(cache.exclCenter));
+        cache.exclLimit = exclLimit;
+        cache.exclSlack = exclSlack;
+    } else {
+        cache.exclLimit = 0.0f;
+        cache.exclSlack = 0.0f;
+    }
     cache.valid = true;
 }
 
@@ -1844,7 +1987,7 @@ void render_shadow_map(
         radii[1] = coverage * midPct;
     }
 
-    // Current light + camera eye, for the stagger schedule and the composite direction (the
+    // Current light + camera basis, for the stagger schedule and the composite direction (the
     // same values build_light_camera derives internally; a failure here is the same no-light
     // frame that would have failed the first cascade).
     float dirToLight[3];
@@ -1858,19 +2001,65 @@ void render_shadow_map(
         return;
     }
     const float eye[3] = {invView[0][3], invView[1][3], invView[2][3]};
+    float forward[3] = {-invView[0][2], -invView[1][2], -invView[2][2]};
+    const float forwardLength = std::sqrt(
+        forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2]);
+    if (forwardLength > 0.001f) {
+        forward[0] /= forwardLength;
+        forward[1] /= forwardLength;
+        forward[2] /= forwardLength;
+    } else {
+        forward[0] = forward[1] = 0.0f;
+        forward[2] = -1.0f;
+    }
+    const float blendFrac =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarCascadeBlend, 20), 5, 40)) /
+        100.0f;
     // Staggered cascades: cascade 0 renders every frame (it carries the player and everything
-    // near); cascades 1 and 2 alternate, each re-rendering every other frame and compositing
-    // from its cached copy in between - dropping a full draw-list replay from most frames.
-    // Debug views always render everything so they stay live.
+    // near); the middle cascade re-renders every other frame and the outermost every fourth
+    // (every other when its radius is small enough that mid-distance movers land in it), each
+    // compositing from its cached copy in between. Phases never collide, so no frame runs
+    // more than two world replays. Debug views always render everything so they stay live.
     const bool stagger =
         get_bool_option(g_cvarCascadeStagger, true) && debugMode == 0 && count > 1;
 
+    // The inner cascade's presented box (fresh or cached), for the outermost cascade's
+    // interior-exclusion cull. The exclusion limit leaves the blend band plus slack for PCF /
+    // normal-offset reach, texel snapping, and inner-box drift over the cached map's lifetime.
+    float innerCenter[3] = {};
+    float innerRadius = 0.0f;
+    bool innerValid = false;
+    const auto exclusion_slack = [](float radius) {
+        return std::min(1000.0f, radius * 0.10f);
+    };
+    const auto exclusion_limit = [&](float inner, float outer) {
+        const float innerTexel = (2.0f * inner) / static_cast<float>(mapSize);
+        const float outerTexel = (2.0f * outer) / static_cast<float>(mapSize);
+        return inner * (1.0f - blendFrac) - exclusion_slack(inner) - 8.0f * outerTexel -
+               4.0f * innerTexel;
+    };
+
     for (int i = 0; i < count; ++i) {
         CascadeCacheEntry& cache = g_cascadeCache[i];
+        const bool exclusionEligible = cull && !cameraReplayDebug && debugMode == 0 &&
+                                       i == count - 1 && i > 0 && innerValid;
+        const float freshExclLimit =
+            exclusionEligible ? exclusion_limit(innerRadius, radii[i]) : 0.0f;
         if (stagger && i > 0) {
-            const bool scheduledRender = ((g_frameIndex + static_cast<uint64_t>(i)) & 1) == 0;
+            uint64_t interval = 2;
+            bool scheduledRender = (g_frameIndex + (i == 2 ? 1u : 0u)) % 2 == 0;
+            if (i == count - 1 && radii[i] >= 8000.0f) {
+                interval = 4;
+                scheduledRender = g_frameIndex % 4 == 1;
+            }
+            float wantCenter[3];
+            const float lookahead = std::min(radii[i] * 0.75f, kMaxLightLookahead);
+            for (int c = 0; c < 3; ++c) {
+                wantCenter[c] = eye[c] + forward[c] * lookahead;
+            }
             if (!scheduledRender &&
-                cascade_cache_usable(cache, mapSize, radii[i], dirToLight, eye))
+                cascade_cache_usable(cache, mapSize, radii[i], dirToLight, wantCenter,
+                    interval + 1, exclusionEligible ? innerCenter : nullptr, freshExclLimit))
             {
                 CascadeSlot& slot = g_mapPass.cascades[i];
                 slot.shadowMap = cache.view;
@@ -1881,21 +2070,35 @@ void render_shadow_map(
                 slot.lightNear = cache.lightNear;
                 slot.lightFar = cache.lightFar;
                 slot.ready = true;
+                std::memcpy(innerCenter, cache.boxCenter, sizeof(innerCenter));
+                innerRadius = radii[i];
+                innerValid = true;
                 continue;
             }
         }
+        const float* exclCenter =
+            exclusionEligible && freshExclLimit > 0.0f ? innerCenter : nullptr;
+        const float exclLimit = exclCenter != nullptr ? freshExclLimit : 0.0f;
+        const auto renderStart = std::chrono::steady_clock::now();
         LightCamera lightCamera{};
         if (!build_light_camera(replayViewMtx, mapSize, radii[i], lightCamera) ||
             !replay_cascade(lightCamera, replayViewMtx, replayProjection, cameraReplayDebug,
-                mapSize, radii[i], false, cull, g_mapPass.cascades[i]))
+                mapSize, radii[i], false, cull, exclCenter, exclLimit, g_mapPass.cascades[i]))
         {
             g_mapPass = {};
             return;
         }
+        g_perf.replayMs[i] +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                renderStart).count();
+        ++g_perf.replayCount[i];
         if (stagger && i > 0) {
-            update_cascade_cache(
-                cache, g_mapPass.cascades[i], radii[i], lightCamera.dirToLight, eye);
+            update_cascade_cache(cache, g_mapPass.cascades[i], radii[i], lightCamera,
+                exclCenter, exclLimit, exclusion_slack(innerRadius));
         }
+        std::memcpy(innerCenter, lightCamera.center, sizeof(innerCenter));
+        innerRadius = radii[i];
+        innerValid = true;
     }
     std::memcpy(g_mapPass.dirToLightWorld, dirToLight, sizeof(g_mapPass.dirToLightWorld));
     g_mapPass.fade = fade;
@@ -1925,13 +2128,18 @@ void render_shadow_map(
             LightCamera lightCamera{};
             // A short light distance keeps the ortho depth range tight around the player for
             // maximum depth discrimination on self-shadowing.
+            const auto linkStart = std::chrono::steady_clock::now();
             if (build_light_camera_core(
                     center, linkMapSize, linkRadius, linkRadius * 4.0f + 2000.0f, lightCamera) &&
                 replay_cascade(lightCamera, replayViewMtx, replayProjection, false, linkMapSize,
-                    linkRadius, true, false, g_mapPass.cascades[kLinkCascade]))
+                    linkRadius, true, false, nullptr, 0.0f, g_mapPass.cascades[kLinkCascade]))
             {
                 g_mapPass.linkReady = true;
             }
+            g_perf.replayMs[kLinkCascade] +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                    linkStart).count();
+            ++g_perf.replayCount[kLinkCascade];
         }
     }
 }
@@ -2244,10 +2452,43 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
 // Game thread, after the full 3D scene: debug views draw here, unobscured by everything the
 // scene layers on after the opaque pass. Also the safety net that clears a map pass the
 // after-opaque composite didn't consume.
+// Emit the averaged game-thread numbers (Perf Log toggle) and reset the accumulators. The
+// scene time covers SCENE_BEGIN -> FRAME_BEFORE_HUD on the game thread - the whole 3D scene
+// including the game's own work, so mod changes show up as deltas against it.
+void flush_perf_stats() {
+    if (get_bool_option(g_cvarPerfLog, false) && g_perf.frames > 0) {
+        const auto avg = [](int i) {
+            return g_perf.replayCount[i] > 0 ? g_perf.replayMs[i] / g_perf.replayCount[i] : 0.0;
+        };
+        char line[384];
+        std::snprintf(line, sizeof(line),
+            "perf %u frames: scene %.2f ms/f | replay ms/run (runs/frames): near %.2f (%u) "
+            "mid %.2f (%u) far %.2f (%u) link %.2f (%u) | replay packets culled %llu/%llu | "
+            "main view culled %llu/%llu",
+            g_perf.frames, g_perf.sceneMs / g_perf.frames, avg(0), g_perf.replayCount[0],
+            avg(1), g_perf.replayCount[1], avg(2), g_perf.replayCount[2], avg(kLinkCascade),
+            g_perf.replayCount[kLinkCascade],
+            static_cast<unsigned long long>(g_perf.replayPacketsCulled),
+            static_cast<unsigned long long>(g_perf.replayPackets),
+            static_cast<unsigned long long>(g_perf.mainPacketsCulled),
+            static_cast<unsigned long long>(g_perf.mainPackets));
+        svc_log->info(mod_ctx, line);
+    }
+    g_perf = {};
+}
+
 void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
     // End of the scene window: HUD and menu models (drawn from here on, with their own
     // cameras) must never be tested against the scene frustum.
     g_mainViewCullActive = false;
+    if (g_sceneBeginTimeValid) {
+        g_sceneBeginTimeValid = false;
+        g_perf.sceneMs += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - g_sceneBeginTime).count();
+        if (++g_perf.frames >= kPerfLogFrames) {
+            flush_perf_stats();
+        }
+    }
     const int64_t debugMode = get_debug_mode();
     restore_actual_light_debug();
     if (debugMode == 0 || debugMode == 9) {
@@ -2469,6 +2710,11 @@ ModResult build_controls_tab(
         "out. Set around the fog's full-density distance.");
 
     svc_ui->pane_add_section(mod_ctx, left, "Debug");
+    add_toggle(left, "Perf Log", g_cvarPerfLog,
+        "Writes averaged game-thread timings to the log every few hundred frames: total scene "
+        "time, each cascade replay's cost and how often it ran, and how many draw packets the "
+        "culling removed. Use it to see where the mod's remaining frame time goes; negligible "
+        "overhead.");
     static const char* kDebugOptions[] = {"Off", "Shadow Map", "Shadow Factor", "Occlusion",
         "Light UV", "Compare Sign", "Depth Values", "Receiver Range", "Bounds", "Light View",
         "Camera Replay", "Screen Shadows", "SSS Edge Mask", "Receiver Normal", "Cascades"};
@@ -2719,6 +2965,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK) {
         return result;
     }
+    result = register_bool_option("perfLog", false, g_cvarPerfLog, error);
+    if (result != MOD_OK) {
+        return result;
+    }
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to query device info");
     }
@@ -2845,6 +3095,12 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         svc_log->warn(mod_ctx,
             "failed to hook J3DMatPacket::draw (missing dusklight.symdb?); packet-level "
             "culling disabled - per-shape culling still applies");
+    } else if (mods::hook_add_post<MatPacketDraw>(svc_hook, on_mat_packet_draw_post) ==
+               MOD_OK)
+    {
+        // The post-hook bounds the window where j3dSys's current model is trustworthy for
+        // the per-shape main-view cull; without it that cull simply stays off.
+        g_matPacketPostHooked = true;
     }
     UiModsPanelDesc panelDesc = UI_MODS_PANEL_DESC_INIT;
     panelDesc.build = build_panel;
@@ -2948,9 +3204,15 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_replayCullActive = false;
     g_replayCullLimit = 0.0f;
     g_cvarPcfFarStep = g_cvarLinkCascade = g_cvarLinkMapSize = g_cvarLinkCoverage = 0;
-    g_cvarMainViewCull = g_cvarCascadeStagger = 0;
+    g_cvarMainViewCull = g_cvarCascadeStagger = g_cvarPerfLog = 0;
     g_mainViewCullActive = false;
+    g_insideMatPacketDraw = false;
+    g_matPacketPostHooked = false;
+    g_replayExcludeActive = false;
+    g_replayExcludeLimit = 0.0f;
     g_frameIndex = 0;
+    g_perf = {};
+    g_sceneBeginTimeValid = false;
     g_replayLinkOnly = false;
     g_linkFilterRadiusSq = 0.0f;
     g_drawType = g_sssComputeType = g_normalComputeType = g_cascadeCopyComputeType =
