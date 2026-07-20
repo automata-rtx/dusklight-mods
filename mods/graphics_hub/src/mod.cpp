@@ -606,7 +606,7 @@ struct MixedFogUniforms {
     MixedFogEntry configs[8];
     uint32_t count;
     uint32_t debug_mode;
-    float _pad0;
+    uint32_t fallback_index;  // config for pixels the ID replay didn't cover (see push_fog_quad)
     float _pad1;
 };
 static_assert(sizeof(MixedFogUniforms) % 16 == 0);
@@ -679,6 +679,22 @@ bool config_matches(const FogConfig& reference, const FogConfig& candidate) {
 // cannot catch normal fog or the black twilight fog (which keeps a normal range).
 bool is_barrier_fog(const FogConfig& c) {
     return c.color.r == 0 && c.color.g == 0 && c.color.b == 0 && c.endZ > 100000.0f;
+}
+
+// Index of the captured config with the widest projection far plane — TP's distant-scenery fog
+// (Death Mountain, the castle). Used as the uncovered-pixel fallback in the fog quad AND as the
+// config-ID replay stamp for the barrier dome, so the far geometry inside/behind the barrier
+// resolves to that gentle long-range fog instead of the aggressive near fog (config 0).
+uint32_t widest_far_index() {
+    uint32_t idx = 0;
+    float widest = g_frameConfigCount > 0 ? g_frameConfigs[0].farZ : 0.0f;
+    for (uint32_t i = 1; i < g_frameConfigCount; ++i) {
+        if (g_frameConfigs[i].farZ > widest) {
+            widest = g_frameConfigs[i].farZ;
+            idx = i;
+        }
+    }
+    return idx;
 }
 
 bool exact_mode() {
@@ -758,7 +774,11 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
             config.nearZ = fog->mNearZ;
             config.farZ = fog->mFarZ;
             config.color = fog->mColor;
-            index = lookup_frame_config(config);
+            // The barrier dome (excluded from the config table) is a translucent surface drawn
+            // solid in the replay; stamping it as the near config 0 would darken the distant castle
+            // behind it. Resolve it to the distant (widest-far) fog instead, which is what that
+            // castle uses.
+            index = is_barrier_fog(config) ? widest_far_index() : lookup_frame_config(config);
         }
         const auto idByte = static_cast<u8>((index + 1) * 24);
         GXSetNumTevStages(1);
@@ -915,6 +935,14 @@ void push_fog_quad() {
         }
         uniforms.count = g_frameConfigCount;
         uniforms.debug_mode = debugMode;
+        // Pixels the config-ID replay did not cover fall back to this config. TP draws distant
+        // scenery (Death Mountain, the castle behind the barrier) with a WIDER projection far plane
+        // and a separate, gentle long-range fog; the single-projection replay clips that far
+        // geometry, so its pixels are uncovered. Falling those back to config 0 (the aggressive
+        // NEAR fog, which reads ~fully fogged at that distance) is what over-fogs / darkens the
+        // distant subjects. Fall back instead to the config with the widest far plane — that IS the
+        // distant-scenery fog — so uncovered far geometry gets its correct light fog.
+        uniforms.fallback_index = widest_far_index();
         GfxRange uniformRange{0, 0};
         if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &uniformRange) !=
             MOD_OK)

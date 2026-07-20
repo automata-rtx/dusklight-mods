@@ -37,7 +37,14 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
     toggleable. Special-cases the Hyrule Castle Ganon barrier (`d_a_obj_ganonwall2`, a translucent
     dome drawn in the *opaque* BG list with pure-black `endZ 250000` fog) via `is_barrier_fog`: it
     is left on vanilla forward fog, never suppressed/deferred, so its black fog isn't stamped onto
-    the castle/trees inside it.
+    the castle/trees inside it. Also handles TP's **near-fog + distant-scenery-fog split** (Hyrule
+    Field draws distant geometry — Death Mountain, the castle — with a *wider projection far plane*
+    and a separate gentle long-range fog config): the single-projection config-ID replay clips that
+    far geometry, so its pixels are uncovered; the fog quad falls those back to `widest_far_index()`
+    (the widest-far config = the distant fog) rather than config 0 (the aggressive near fog), and
+    the barrier dome stamps that same distant index in the replay — so distant subjects keep their
+    correct light fog instead of being over-fogged toward the dark near fog. Diagnostic: a
+    `fogLogConfigs` toggle dumps the frame's captured fog-config table.
 
   **Game-linked** (Deferred Fog hooks game functions) + webgpu. Docs: `docs/deferred_fog.md`,
   `docs/depth_to_normal_plan.md`, `docs/depth_to_normal_consumers.md`.
