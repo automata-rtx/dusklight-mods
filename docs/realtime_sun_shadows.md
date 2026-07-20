@@ -104,7 +104,14 @@ Sun Shadows if Depth to Normal is not installed and enabled. Install both togeth
    resolution step never shows as a line. The Link cascade is evaluated separately and
    combined with `max()` — its map contains only the player, so it can only add occlusion,
    never remove world shadows. Then combine with the screen-space shadow term (below) and
-   darken the scene. The composite runs right after the opaque scene — before translucency
+   darken the scene. **Colored shadows (`shadowTint`, 1.11.0):** the darkening multiply is
+   bent toward the current skylight color (`dScnKy_env_light_c::vrbox_sky_col`, read straight
+   off env light since this mod is game-linked, peak-normalized so it only shifts hue and
+   never brightens under the multiply blend) in proportion to occlusion, so shadows read as
+   skylit — cool by day, warm at dusk — instead of neutral gray. It follows area / time /
+   weather for free; SSILVB reconstructs the same sky value by reducing the rendered skybox
+   pixels because it is service-only, so the two stay visually coherent. `0` restores the
+   neutral multiply. The composite runs right after the opaque scene — before translucency
    and, critically, before the game's bloom filter (`m_Do_graphic.cpp` draws bloom between
    `SCENE_AFTER_OPAQUE` and `FRAME_BEFORE_HUD`; compositing at `FRAME_BEFORE_HUD` darkened
    the bloom glow itself). Debug views visualize map/coverage/factors and still draw at
@@ -200,28 +207,29 @@ Space Shadows" is inert when SSS is off.
 | `effectEnabled` | on | master toggle |
 | `shadowMapEnabled` | on | off = screen-space-only mode: no map render/composite, the game's own real/blob shadows return (the skip hooks go inactive), the Bend SSS term still applies |
 | `mapSize` | 2 | EACH world cascade's map: 0=1024 1=2048 2=4096 3=8192 |
-| `boxRadius` | 8000 | full coverage radius in world units (1000–30000) = the FAR cascade |
-| `cascadeCount` | 1 | world cascades minus one (UI select "1/2/3"): 0=single map, 1=two cascades (default), 2=three. See the streaming-budget caveat before defaulting to 3 |
-| `cascadeNearPct` / `cascadeMidPct` | 12 / 35 | near / mid cascade radii as % of Coverage (log-uniform for 3 cascades) |
+| `boxRadius` | 25000 | full coverage radius in world units (1000–30000) = the FAR cascade |
+| `cascadeCount` | 2 | world cascades minus one (UI select "1/2/3"): 0=single map, 1=two cascades, 2=three (default). See the streaming-budget caveat; the enlarged platform buffers carry 3 in normal play |
+| `cascadeNearPct` / `cascadeMidPct` | 5 / 40 | near / mid cascade radii as % of Coverage (log-uniform for 3 cascades) |
 | `cascadeBlend` | 20 | cross-fade band width at each cascade boundary, % of the cascade extent |
 | `cascadeCull` | on | light-column culling of replay geometry per cascade (keeps the passes inside the engine's per-frame streaming budget - leave on) |
 | `cascadeStagger` | on | staggered cascade updates: near every frame, mid/far alternate, skipped frames composite the cached copy of the last rendered map (see architecture §2) - the main CPU saver at 2-3 cascades |
 | `mainViewCull` | on | with `noFrustumClipping`, cull the game's own scene pass per mat packet against the camera frustum at draw time (the bypass otherwise makes the main view draw every off-screen object); replays still see everything |
-| `casterMinTexels` | 2 | skip casters whose world bounding radius is smaller than this many of the cascade's texels (sub-texel shadows); the main lever for the per-frame geometry budget. Raise (4-8) to stay in budget at wide coverage / 3 cascades |
+| `casterMinTexels` | 1 | skip casters whose world bounding radius is smaller than this many of the cascade's texels (sub-texel shadows); the main lever for the per-frame geometry budget. Raise (4-8) to stay in budget at wide coverage / 3 cascades |
 | `grassShadows` | 0 (All) | which cascades replay the dDlst packet list — the field grass/flower custom drawers (`d_grass.inc`/`d_flower.inc`, the list's only users). They are immediate-mode per-tuft draws no shadow cull can touch, redrawn in FULL by every included cascade — a large flat CPU cost per replay in grassy areas. 1 = near cascade only (crisp close grass shadows kept, distant dapple dropped), 2 = off (SSS still grounds on-screen grass) |
 | `cascadeEdgeFade` | on | fade the widest cascade's shadow out across its outer edge (band = `cascadeBlend`) instead of a hard coverage cutoff |
 | `pcfFarStep` | 1 | extra PCF kernel steps per cascade beyond the near one (0–2) |
-| `linkCascade` | on | the Link cascade: an extra map covering only the player, combined with max() |
+| `linkCascade` | off | the Link cascade: an extra map covering only the player, combined with max() |
 | `linkMapSize` | 2 | Link cascade resolution (same scale as `mapSize`), independent of it |
 | `linkCoverage` | 300 | Link cascade box radius in world units (100–2000) |
-| `strength` | 45 | shadow darkening % |
-| `bias` | 55 | constant depth bias (normalized against light range) |
-| `slopeBias` | 30 | bias added ∝ surface slope vs light |
-| `normalOffset` | 100 | receiver offset, % of one shadow texel's world size |
-| `normalSmooth` | 3 | smooths the depth-reconstructed normal that Slope Bias / Normal Offset use (`res/normal_smooth.wgsl`): FULL-resolution per-pixel crosses + one separable depth-aware Gaussian whose radius = `normalSmooth * renderHeight / 1080` px (dense, capped 32). Only affects the shadow-MAP bias — SSS fine detail is independent (see note). One value looks the same at any internal resolution. History of failed approaches, do not repeat: (1) widening a single cross straddles facets and manufactures garbage normals (shattered glass); (2) sparse taps at fixed pixel distances ghost past a resolution-dependent sweet spot; (3) a resolution-CAPPED buffer blurs fine geometry away and needs a lossy upscale. NO light-terminator flip (mirrored the normal across curved surfaces' terminator = hard bias discontinuity on faces). 0 = off (inline 1px cross) |
+| `strength` | 60 | shadow darkening % |
+| `shadowTint` | 50 | tint shadows toward the current skylight color (`vrbox_sky_col`, peak-normalized) instead of neutral gray - reads as skylit, follows area/time/weather; hue-only, never brightens. 0 = neutral. Both methods |
+| `bias` | 2 | constant depth bias (normalized against light range) |
+| `slopeBias` | 2 | bias added ∝ surface slope vs light |
+| `normalOffset` | 50 | receiver offset, % of one shadow texel's world size |
+| `normalSmooth` | 4 | smooths the depth-reconstructed normal that Slope Bias / Normal Offset use (`res/normal_smooth.wgsl`): FULL-resolution per-pixel crosses + one separable depth-aware Gaussian whose radius = `normalSmooth * renderHeight / 1080` px (dense, capped 32). Only affects the shadow-MAP bias — SSS fine detail is independent (see note). One value looks the same at any internal resolution. History of failed approaches, do not repeat: (1) widening a single cross straddles facets and manufactures garbage normals (shattered glass); (2) sparse taps at fixed pixel distances ghost past a resolution-dependent sweet spot; (3) a resolution-CAPPED buffer blurs fine geometry away and needs a lossy upscale. NO light-terminator flip (mirrored the normal across curved surfaces' terminator = hard bias discontinuity on faces). 0 = off (inline 1px cross) |
 | `pcf` | 2 | PCF kernel: 0=1×1 1=3×3 2=5×5 3=7×7 |
 | `contactShadows` | on | the Bend screen-space shadow term (runs even with the map off / indoors) |
-| `sssThickness` | 50 | assumed caster thickness, 1/100 % of remaining depth (50 = 0.5%) |
+| `sssThickness` | 150 | assumed caster thickness, 1/100 % of remaining depth (50 = 0.5%) |
 | `sssEdgeThreshold` | 200 | depth delta treated as an edge, 1/100 % (200 = 2%) |
 | `sssContrast` | 4 | contrast boost on the SSS transition (1–8) |
 | `sssLength` | 20 | NEAR screen-space shadow length in render pixels, smooth falloff (60 = the full trace). The facet-banding fix - see below |
@@ -229,7 +237,7 @@ Space Shadows" is inert when SSS is off.
 | `sssLengthRampStart` / `sssLengthRampEnd` | 3000 / 12000 | world-unit distances over which the SSS length grows from `sssLength` (near) to `sssLengthFar` (far). Keep Start past close-up geometry so Link/near structures keep the clean near length |
 | `sssBias` | 0 | receiver offset in shadow-window %, uniformly lightens ALL near-surface SSS detail. Blunt fallback; prefer `sssLength` |
 | `sssIgnoreEdges` | off | edge pixels don't cast (helps grazing-angle aliasing) |
-| `sssFade` | on | fade the screen-space shadows out with distance so distant fogged geometry isn't full-strength shadowed |
+| `sssFade` | off | fade the screen-space shadows out with distance so distant fogged geometry isn't full-strength shadowed |
 | `sssFadeStart` / `sssFadeEnd` | 8000 / 25000 | world-unit distances where the SSS fade begins / completes (set around where the scene washes into fog) |
 | `noFrustumClipping` | on | the anti-popping clipper bypass (issue 5) |
 | `twoSidedCasters` | on | render casters with backface culling off (issue 6) |

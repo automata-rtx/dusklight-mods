@@ -85,6 +85,7 @@ ConfigVarHandle g_cvarMapSize = 0;
 ConfigVarHandle g_cvarNormalSmooth = 0;
 ConfigVarHandle g_cvarNoFrustumClipping = 0;
 ConfigVarHandle g_cvarStrength = 0;
+ConfigVarHandle g_cvarShadowTint = 0;
 ConfigVarHandle g_cvarPcf = 0;
 ConfigVarHandle g_cvarBias = 0;
 ConfigVarHandle g_cvarBoxRadius = 0;
@@ -405,8 +406,10 @@ struct ShadowUniforms {
     float edge_fade;           // 1 = fade the outermost cascade's shadow out at its box edge
     float _pad1;
     float _pad2;
+    float shadow_tint[3];      // skylight color (peak-normalized), colored-shadow multiply
+    float shadow_tint_strength;  // 0 = neutral gray shadow (original), 1 = full sky tint
 };
-static_assert(sizeof(ShadowUniforms) == 496);
+static_assert(sizeof(ShadowUniforms) == 512);
 static_assert(sizeof(ShadowUniforms) % 16 == 0);
 
 // Mirror of the WGSL BlurUniforms struct (keep in sync with res/normal_smooth.wgsl).
@@ -1182,7 +1185,7 @@ void on_draw(
 
 // Picks the sun or moon (whichever is above the horizon) and returns the normalized
 // world-space direction *toward* the light plus a horizon fade factor. False = no light.
-bool compute_light(float outDirToLight[3], float& outFade) {
+bool compute_light_uncached(float outDirToLight[3], float& outFade) {
     dScnKy_env_light_c* envLight = dKy_getEnvlight();
     if (envLight == nullptr) {
         return false;
@@ -1205,6 +1208,80 @@ bool compute_light(float outDirToLight[3], float& outFade) {
     // Fade shadows out as the light approaches the horizon (elevation below ~11 degrees).
     outFade = std::clamp((outDirToLight[1] - 0.05f) / 0.15f, 0.0f, 1.0f);
     return outFade > 0.0f;
+}
+
+// The game's own skybox color for the current area / time / weather (vrbox_sky_col), which is
+// the light that actually fills a sun/moon shadow - so tinting shadows toward it reads as
+// skylit rather than painted black. Read straight from env light (this mod is game-linked);
+// SSILVB reconstructs the same value by reducing the rendered skybox pixels because it is
+// service-only. Max-normalized to [0,1] (peak channel = 1) so it only shifts hue, never
+// brightens under the composite's multiply blend; the darkening amount stays the Strength
+// knob's job. False (leave white) on a degenerate / near-black sky (deep interiors, true
+// night with no moon), which then tints nothing.
+bool compute_sky_tint_uncached(float out[3]) {
+    dScnKy_env_light_c* envLight = dKy_getEnvlight();
+    if (envLight == nullptr) {
+        return false;
+    }
+    const float r = static_cast<float>(envLight->vrbox_sky_col.r);
+    const float g = static_cast<float>(envLight->vrbox_sky_col.g);
+    const float b = static_cast<float>(envLight->vrbox_sky_col.b);
+    if (!std::isfinite(r + g + b)) {
+        return false;
+    }
+    const float peak = std::max(r, std::max(g, b));
+    if (peak < 1.0f) {
+        return false;
+    }
+    out[0] = std::clamp(r / peak, 0.0f, 1.0f);
+    out[1] = std::clamp(g / peak, 0.0f, 1.0f);
+    out[2] = std::clamp(b / peak, 0.0f, 1.0f);
+    return true;
+}
+
+// Sun/moon light + sky tint are constant across a frame, but compute_light was recomputed
+// several times (once per cascade in build_light_camera_core, plus the frame gate and the
+// composite), each doing an envlight + time lookup and trig. Memoize both on the frame index
+// (bumped in on_scene_begin, before any consumer runs) so the first call each frame does the
+// work and the rest read it back.
+struct FrameLightCache {
+    uint64_t frame = ~0ull;
+    bool valid = false;
+    float dirToLight[3] = {};
+    float fade = 0.0f;
+    bool skyValid = false;
+    float skyTint[3] = {1.0f, 1.0f, 1.0f};
+};
+FrameLightCache g_lightCache;
+
+void refresh_light_cache() {
+    g_lightCache.frame = g_frameIndex;
+    g_lightCache.valid = compute_light_uncached(g_lightCache.dirToLight, g_lightCache.fade);
+    g_lightCache.skyValid = compute_sky_tint_uncached(g_lightCache.skyTint);
+}
+
+bool compute_light(float outDirToLight[3], float& outFade) {
+    if (g_lightCache.frame != g_frameIndex) {
+        refresh_light_cache();
+    }
+    if (!g_lightCache.valid) {
+        return false;
+    }
+    std::memcpy(outDirToLight, g_lightCache.dirToLight, sizeof(g_lightCache.dirToLight));
+    outFade = g_lightCache.fade;
+    return true;
+}
+
+// Skylight tint for the current frame (uses the same per-frame cache). False leaves out white.
+bool get_sky_tint(float out[3]) {
+    if (g_lightCache.frame != g_frameIndex) {
+        refresh_light_cache();
+    }
+    if (!g_lightCache.skyValid) {
+        return false;
+    }
+    std::memcpy(out, g_lightCache.skyTint, sizeof(g_lightCache.skyTint));
+    return true;
 }
 
 // Light camera around an explicit world-space focus point (cascades share the light direction
@@ -2511,6 +2588,17 @@ void composite_map_pass(int64_t debugMode) {
     // smoothly (and hide under deferred fog) rather than popping at the coverage boundary.
     uniforms.edge_fade = get_bool_option(g_cvarCascadeEdgeFade, true) ? 1.0f : 0.0f;
     uniforms.debug_mode = static_cast<uint32_t>(debugMode);
+    // Colored shadows: tint the darkening toward the current skylight color so shadows read
+    // as skylit instead of neutral gray. 0 strength (or no sky reading) leaves the original
+    // gray multiply; the tint is peak-normalized so it only shifts hue, never brightens.
+    uniforms.shadow_tint[0] = 1.0f;
+    uniforms.shadow_tint[1] = 1.0f;
+    uniforms.shadow_tint[2] = 1.0f;
+    const float tintStrength =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarShadowTint, 0), 0, 100)) /
+        100.0f;
+    uniforms.shadow_tint_strength =
+        (tintStrength > 0.0f && get_sky_tint(uniforms.shadow_tint)) ? tintStrength : 0.0f;
 
     GfxRange uniformRange{0, 0};
     if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &uniformRange) != MOD_OK) {
@@ -2664,6 +2752,12 @@ ModResult build_controls_tab(
     add_number(left, "Strength", g_cvarStrength, 0, 100, 5, "%",
         "How dark shadowed areas become. Applies to both the shadow map and the screen-space "
         "shadows.");
+    add_number(left, "Sky Tint", g_cvarShadowTint, 0, 100, 5, "%",
+        "Tints shadows toward the current sky color instead of neutral gray, so they read as "
+        "lit by the sky (cool blue by day, warmer at dusk) rather than painted black - the "
+        "skylight is what actually fills a sun shadow. Follows the area, time of day, and "
+        "weather automatically. Only shifts hue, never brightens; 0 = the original neutral "
+        "shadow. Applies to both the shadow map and the screen-space shadows.");
 
     // Shadow Map: the light-space depth map and everything that only affects it.
     svc_ui->pane_add_section(mod_ctx, left, "Shadow Map");
@@ -2974,6 +3068,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return result;
     }
     result = register_int_option("strength", 60, g_cvarStrength, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_int_option("shadowTint", 50, g_cvarShadowTint, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -3358,6 +3456,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_replayCullLimit = 0.0f;
     g_cvarPcfFarStep = g_cvarLinkCascade = g_cvarLinkMapSize = g_cvarLinkCoverage = 0;
     g_cvarMainViewCull = g_cvarCascadeStagger = g_cvarGrassShadows = g_cvarPerfLog = 0;
+    g_cvarStrength = g_cvarShadowTint = 0;
+    g_lightCache = FrameLightCache{};
     g_walkEffectsMs = 0.0;
     g_mainViewCullActive = false;
     g_insideMatPacketDraw = false;

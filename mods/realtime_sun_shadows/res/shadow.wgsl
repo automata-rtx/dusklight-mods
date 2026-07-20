@@ -52,6 +52,10 @@ struct Uniforms {
     edge_fade: f32,           // 1 = fade the outermost cascade's shadow out at its box edge
     _pad1: f32,
     _pad2: f32,
+    shadow_tint_r: f32,       // skylight color (peak-normalized) for colored shadows
+    shadow_tint_g: f32,
+    shadow_tint_b: f32,
+    shadow_tint_strength: f32,  // 0 = neutral gray shadow, 1 = full sky tint
 }
 
 @group(0) @binding(0) var scene_depth: texture_2d<f32>;
@@ -483,6 +487,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         occlusion = max(occlusion, (1.0 - screen_shadow_at(in.uv)) * fade);
     }
 
+    // Neutral darkening (the multiply that darkens the scene by Strength where occluded).
     let value = 1.0 - uniforms.strength * occlusion;
-    return vec4f(value, value, value, 1.0);
+    // Colored shadows: bend the multiply toward the skylight tint in proportion to how
+    // shadowed the pixel is. The tint is peak-normalized (a channel is at most 1), so it only
+    // deepens the non-sky channels - shifting the shadow's hue toward the sky - and never
+    // brightens. At tint strength 0 this is exactly the neutral gray multiply above.
+    let tint = vec3f(
+        uniforms.shadow_tint_r, uniforms.shadow_tint_g, uniforms.shadow_tint_b);
+    let tinted = mix(vec3f(1.0), tint, saturate(occlusion) * uniforms.shadow_tint_strength);
+    return vec4f(vec3f(value) * tinted, 1.0);
 }
