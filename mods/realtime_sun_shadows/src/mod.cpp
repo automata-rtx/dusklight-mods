@@ -97,6 +97,9 @@ ConfigVarHandle g_cvarSssEdgeThreshold = 0;
 ConfigVarHandle g_cvarSssContrast = 0;
 ConfigVarHandle g_cvarSssBias = 0;
 ConfigVarHandle g_cvarSssLength = 0;
+ConfigVarHandle g_cvarSssLengthFar = 0;
+ConfigVarHandle g_cvarSssLengthRampStart = 0;
+ConfigVarHandle g_cvarSssLengthRampEnd = 0;
 ConfigVarHandle g_cvarSssIgnoreEdges = 0;
 ConfigVarHandle g_cvarSssFade = 0;
 ConfigVarHandle g_cvarSssFadeStart = 0;
@@ -427,11 +430,15 @@ struct SssUniforms {
     uint32_t ignore_edge_pixels;
     uint32_t debug_mode;
     float receiver_bias;
-    float range_falloff;
-    float _pad0;
-    float _pad1;
-    float _pad2;
+    float range_falloff;      // 1 / near shadow length (0 = full 60px trace)
+    float range_falloff_far;  // 1 / far shadow length, reached at length_ramp_end
+    float length_ramp_start;  // world distance where the near->far length ramp begins
+    float length_ramp_end;    // world distance where the far length is reached
+    float world_from_proj[16];  // scene depth unproject, for the receiver's camera distance
+    float camera_eye[3];
+    float length_ramp_enabled;  // 1 = ramp the shadow length by receiver camera distance
 };
+static_assert(sizeof(SssUniforms) == 144);
 static_assert(sizeof(SssUniforms) % 16 == 0);
 
 struct DrawPayload {
@@ -2269,6 +2276,30 @@ bool push_sss_dispatches(
     const int64_t sssLength = std::clamp<int64_t>(get_int_option(g_cvarSssLength, 20), 4, 60);
     sssUniforms.range_falloff =
         sssLength >= 60 ? 0.0f : 1.0f / static_cast<float>(sssLength);
+    // Distance-ramped shadow length: the near length (above) is the close-range facet-banding
+    // fix and wants to stay short (Link's cap self-shadows cleanly at ~20); distant grass on
+    // grazing ground needs a much longer trace to be shadowed at all. A single global length
+    // cannot serve both, so the length grows with the RECEIVER's world distance from the
+    // camera - short where the shadow map already does the structural work (and where long
+    // traces would band Link and over-darken nearby walls), long only in the far field where
+    // the grass lives. Pairs with Grass Shadows = Near Only: the map carries near grass, this
+    // carries far grass. Enabled only when the far length actually differs from the near one.
+    const int64_t sssLengthFar =
+        std::clamp<int64_t>(get_int_option(g_cvarSssLengthFar, 40), 4, 60);
+    sssUniforms.range_falloff_far =
+        sssLengthFar >= 60 ? 0.0f : 1.0f / static_cast<float>(sssLengthFar);
+    const float rampStart = static_cast<float>(
+        std::clamp<int64_t>(get_int_option(g_cvarSssLengthRampStart, 3000), 0, 60000));
+    const float rampEnd = static_cast<float>(
+        std::clamp<int64_t>(get_int_option(g_cvarSssLengthRampEnd, 12000), 0, 100000));
+    sssUniforms.length_ramp_start = rampStart;
+    sssUniforms.length_ramp_end = std::max(rampEnd, rampStart + 1.0f);
+    sssUniforms.length_ramp_enabled = sssLengthFar != sssLength ? 1.0f : 0.0f;
+    std::memcpy(sssUniforms.world_from_proj, camera.world_from_proj,
+        sizeof(sssUniforms.world_from_proj));
+    sssUniforms.camera_eye[0] = camera.eye[0];
+    sssUniforms.camera_eye[1] = camera.eye[1];
+    sssUniforms.camera_eye[2] = camera.eye[2];
 
     SssComputePayload payload{};
     payload.sceneDepth = resolved.depth;
@@ -2777,12 +2808,26 @@ ModResult build_controls_tab(
     add_number(left, "SSS Contrast", g_cvarSssContrast, 1, 8, 1, nullptr,
         "Contrast boost on the screen-space shadow transition. Higher is harder-edged.");
     add_number(left, "SSS Shadow Length", g_cvarSssLength, 4, 60, 2, nullptr,
-        "Maximum screen-space shadow length, in render pixels, with a smooth falloff. This is "
-        "the facet-banding fix: the banding on low-poly surfaces (Link's cap, hair) is cast "
-        "polygon-by-polygon from tens of pixels away, while genuine micro-detail (the Hylian "
-        "shield insignia, hands, straps) shadows its receiver within a few pixels of contact. "
-        "Shorten until the cap is clean - micro-detail keeps full strength. 60 = the full "
-        "unrestricted trace. Scales with resolution: raise it when supersampling.");
+        "Screen-space shadow length CLOSE to the camera, in render pixels, with a smooth "
+        "falloff. This is the facet-banding fix: the banding on low-poly surfaces (Link's cap, "
+        "hair) is cast polygon-by-polygon from tens of pixels away, while genuine micro-detail "
+        "(the Hylian shield insignia, hands, straps) shadows its receiver within a few pixels "
+        "of contact. Shorten until the cap is clean - micro-detail keeps full strength. 60 = "
+        "the full unrestricted trace. Scales with resolution: raise it when supersampling.");
+    add_number(left, "SSS Far Length", g_cvarSssLengthFar, 4, 60, 2, nullptr,
+        "Screen-space shadow length FAR from the camera. Distant grass and foliage on grazing "
+        "ground need a much longer trace to be shadowed than Link's close-up self-shadows want "
+        "- a single length can't do both, so the length grows with distance from SSS Shadow "
+        "Length (near) to this value (far), across the band below. Raise for stronger distant "
+        "grass shadows; if distant walls/cliffs look over-darkened, lower this or push the "
+        "Far Length Start out. Set equal to SSS Shadow Length to disable the ramp.");
+    add_number(left, "SSS Far Length Start", g_cvarSssLengthRampStart, 0, 60000, 500, nullptr,
+        "Distance from the camera (world units) where the shadow length starts growing from "
+        "SSS Shadow Length toward SSS Far Length. Keep it past your close-up geometry so Link "
+        "and nearby structures keep the clean near length.");
+    add_number(left, "SSS Far Length End", g_cvarSssLengthRampEnd, 0, 100000, 500, nullptr,
+        "Distance from the camera (world units) where SSS Far Length is fully reached. Set "
+        "around where the distant grass you want shadowed sits.");
     add_number(left, "SSS Bias", g_cvarSssBias, 0, 100, 5, "%",
         "Blunt fallback: uniformly pushes the screen-space trace off the receiving surface, "
         "lightening ALL near-surface shadow detail equally. Prefer SSS Shadow Length for "
@@ -2977,6 +3022,18 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return result;
     }
     result = register_int_option("sssLength", 20, g_cvarSssLength, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_int_option("sssLengthFar", 40, g_cvarSssLengthFar, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_int_option("sssLengthRampStart", 3000, g_cvarSssLengthRampStart, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_int_option("sssLengthRampEnd", 12000, g_cvarSssLengthRampEnd, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -3291,6 +3348,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarSlopeBias = g_cvarNormalOffset = 0;
     g_cvarSssThickness = g_cvarSssEdgeThreshold = g_cvarSssContrast = g_cvarSssBias =
         g_cvarSssLength = g_cvarSssIgnoreEdges = 0;
+    g_cvarSssLengthFar = g_cvarSssLengthRampStart = g_cvarSssLengthRampEnd = 0;
     g_cvarSssFade = g_cvarSssFadeStart = g_cvarSssFadeEnd = 0;
     g_cvarIndoorDisable = g_cvarTwoSidedCasters = 0;
     g_cvarCascadeCount = g_cvarCascadeNearPct = g_cvarCascadeMidPct = g_cvarCascadeBlend = 0;

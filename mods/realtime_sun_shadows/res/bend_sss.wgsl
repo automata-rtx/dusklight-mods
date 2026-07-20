@@ -43,10 +43,15 @@ struct SssUniforms {
     ignore_edge_pixels: u32,  // 1 = pixels detected as edges do not cast
     debug_mode: u32,          // 1 = write the edge-detect mask instead of the shadow
     receiver_bias: f32,       // extra receiver offset in shadow-window units; blunt acne knob
-    range_falloff: f32,       // 1 / max shadow length in pixels (0 = full 60px trace)
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    range_falloff: f32,       // 1 / near shadow length in pixels (0 = full 60px trace)
+    range_falloff_far: f32,   // 1 / far shadow length, reached at length_ramp_end
+    length_ramp_start: f32,   // world distance where the near->far length ramp begins
+    length_ramp_end: f32,     // world distance where the far length is reached
+    world_from_proj: mat4x4f, // scene depth unproject, for the receiver's camera distance
+    camera_eye_x: f32,
+    camera_eye_y: f32,
+    camera_eye_z: f32,
+    length_ramp_enabled: f32, // 1 = ramp the shadow length by receiver camera distance
 }
 
 @group(0) @binding(0) var scene_depth: texture_2d<f32>;
@@ -234,7 +239,25 @@ fn cs_main(
     // by band, and that alignment happens at facet-scale distances - tens of pixels - while
     // genuine micro-detail (the Hylian shield insignia) shadows its receiver within a few
     // pixels of contact. Limiting the shadow length prunes the bands and keeps the detail.
-    let range_falloff = uniforms.range_falloff;
+    //
+    // Distance ramp: the near length wants to stay short for that facet fix, but distant grass
+    // on grazing ground needs a long trace to be shadowed at all. So the length grows with the
+    // RECEIVER's world distance from the camera - near length close in, far length out in the
+    // grass field. The receiver pixel is unprojected from its own depth; sky already returned
+    // above, so sampling_depth[0] is valid geometry here.
+    var range_falloff = uniforms.range_falloff;
+    if uniforms.length_ramp_enabled != 0.0 {
+        let dims = vec2f(textureDimensions(scene_depth));
+        let uv = (vec2f(write_xy) + 0.5) / dims;
+        let ndc = vec4f(uv.x * 2.0 - 1.0, 1.0 - 2.0 * uv.y, sampling_depth[0], 1.0);
+        let world4 = uniforms.world_from_proj * ndc;
+        let world = world4.xyz / world4.w;
+        let cam = vec3f(uniforms.camera_eye_x, uniforms.camera_eye_y, uniforms.camera_eye_z);
+        let dist = length(world - cam);
+        let t = saturate((dist - uniforms.length_ramp_start) /
+            max(uniforms.length_ramp_end - uniforms.length_ramp_start, 1.0));
+        range_falloff = mix(uniforms.range_falloff, uniforms.range_falloff_far, t);
+    }
 
     // The first samples produce a hard shadow: a single sample can fully shadow the pixel,
     // trading aliasing for grounding pixels very close to the caster.

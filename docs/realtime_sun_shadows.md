@@ -224,7 +224,9 @@ Space Shadows" is inert when SSS is off.
 | `sssThickness` | 50 | assumed caster thickness, 1/100 % of remaining depth (50 = 0.5%) |
 | `sssEdgeThreshold` | 200 | depth delta treated as an edge, 1/100 % (200 = 2%) |
 | `sssContrast` | 4 | contrast boost on the SSS transition (1–8) |
-| `sssLength` | 20 | max screen-space shadow length in render pixels, smooth falloff (60 = the full trace). The facet-banding fix - see below |
+| `sssLength` | 20 | NEAR screen-space shadow length in render pixels, smooth falloff (60 = the full trace). The facet-banding fix - see below |
+| `sssLengthFar` | 40 | FAR screen-space shadow length; the length ramps from `sssLength` to this by receiver camera distance (see below), so distant grass gets a long trace while Link keeps the short one. Set equal to `sssLength` to disable the ramp |
+| `sssLengthRampStart` / `sssLengthRampEnd` | 3000 / 12000 | world-unit distances over which the SSS length grows from `sssLength` (near) to `sssLengthFar` (far). Keep Start past close-up geometry so Link/near structures keep the clean near length |
 | `sssBias` | 0 | receiver offset in shadow-window %, uniformly lightens ALL near-surface SSS detail. Blunt fallback; prefer `sssLength` |
 | `sssIgnoreEdges` | off | edge pixels don't cast (helps grazing-angle aliasing) |
 | `sssFade` | on | fade the screen-space shadows out with distance so distant fogged geometry isn't full-strength shadowed |
@@ -254,6 +256,22 @@ NOT work, tried and discarded: a constant receiver bias (`sssBias`, kept as a fa
 lightens contact micro-detail exactly as fast as the banding; and receiver-plane slope
 compensation targets nothing — Bend's perspective-corrected model already handles planar
 receiver tilt, which a tilted-plane GPU sweep confirmed (no acne at any tilt).
+
+**Distance-ramped SSS length (1.11.0)**: the short length that fixes facet banding also
+starves *distant* grass — foliage on grazing far ground casts a shadow that stretches across
+many screen pixels, so a 20px trace fades it out before it reaches the occluder. A single
+global length can't serve both regimes because they are separated by camera distance: the
+problem cases for a long trace (Link's facets, over-darkened nearby walls) are all close to
+the camera, where the shadow map already does the structural work; the case that *needs* a
+long trace (distant grass) is far away. So the trace length now grows with the **receiver's
+world distance from the camera** — the compute pass unprojects each receiver pixel from its
+own depth (`world_from_proj` + `camera_eye`, sky already early-outs) and lerps `range_falloff`
+from `sssLength` at `sssLengthRampStart` to `sssLengthFar` at `sssLengthRampEnd`. Link and
+near structures keep the clean near length; only the far field lengthens. This is the natural
+partner to Grass Shadows = Near Only (§ Caster capture): the near cascade's map carries close
+grass, the lengthened SSS carries distant grass. If distant cliffs/walls read as
+over-darkened, lower `sssLengthFar` or push `sssLengthRampStart` out; the ramp self-disables
+when `sssLengthFar == sssLength`.
 
 ## Normals, detail, and the screen-space term (important)
 
