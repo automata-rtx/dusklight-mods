@@ -1244,13 +1244,15 @@ ModResult build_controls_tab(
     control.kind = UI_CONTROL_SELECT;
     control.label = "Mixed Scenes";
     control.help_rml =
-        "How scenes that draw with several fog configurations are handled.<br/>Vanilla: fall "
-        "back to the game's forward fog (exact, but AO/shadows then darken the fog itself at "
-        "range).<br/>Exact (replay): defer every configuration - the opaque geometry is "
-        "replayed once into a per-pixel config-ID buffer and each pixel gets its own exact fog. "
-        "Costs one extra opaque scene of per-frame geometry streaming on mixed frames; with "
-        "heavy shadow-cascade settings this can crowd the engine's fixed streaming buffers, so "
-        "prefer Vanilla there until the adaptive-buffer engine update lands.";
+        "How scenes that draw with several fog configurations are handled.<br/><b>Vanilla</b> "
+        "(default, recommended): in a multi-config scene, revert that scene to the game's own "
+        "forward fog - exactly vanilla - while still deferring in the common single-config scenes "
+        "(so the AO/shadow benefit is kept where it works). Best for matching vanilla.<br/>"
+        "<b>Exact (replay)</b>: always defer, replaying the opaque geometry into a per-pixel "
+        "config-ID buffer. It cannot faithfully reproduce scenes that mix a near fog with a "
+        "separate long-range fog for distant scenery (e.g. Hyrule Field's Death Mountain / the "
+        "Ganon barrier), where it over-fogs the distant subjects - use Vanilla there. Also costs "
+        "one extra opaque geometry pass on mixed frames.";
     control.binding = UI_BINDING_CONFIG_VAR;
     control.config_var = g_cvarFogMixed;
     control.options = kMixedOptions;
@@ -1384,11 +1386,13 @@ ModResult init(ModError* error) {
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogEnabled) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
-    // DEFAULT: mixed-scene mode = Exact replay (1). 0 = Vanilla fallback.
+    // DEFAULT: mixed-scene mode = Vanilla revert (0). 1 = Exact replay. Vanilla matches the game's
+    // fog exactly in multi-config scenes (e.g. Hyrule Field's near + distant-scenery fog), which
+    // Exact cannot reproduce; Exact still defers single-config scenes fine but over-fogs those.
     cvarDesc = CONFIG_VAR_DESC_INIT;
     cvarDesc.name = "fogMixedMode";
     cvarDesc.type = CONFIG_VAR_INT;
-    cvarDesc.default_int = 1;
+    cvarDesc.default_int = 0;
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogMixed) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
