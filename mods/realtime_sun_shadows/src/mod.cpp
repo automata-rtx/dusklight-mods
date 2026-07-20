@@ -322,17 +322,28 @@ constexpr float kMainViewCullMaxRadius = 20000.0f;
 // kPerfLogFrames frames when the Perf Log toggle is on, so in-game reports can drive tuning.
 struct PerfStats {
     double replayMs[kMaxCascades] = {};    // per world cascade; slot 3 = the Link cascade
+    // Where each replay's time goes: [0] setup (camera save, create_pass, state), [1] the
+    // draw-list walk itself, [2] finish (state restore, resolve_pass). Splitting these is
+    // what distinguishes geometry cost (walk) from fixed per-replay overhead (setup+finish)
+    // and from per-frame warmup a first replay pays on behalf of later ones.
+    double replayPhaseMs[kMaxCascades][3] = {};
     uint32_t replayCount[kMaxCascades] = {};
+    uint64_t slotPackets[kMaxCascades] = {};        // mat packets tested per replay slot
+    uint64_t slotPacketsCulled[kMaxCascades] = {};
     double sceneMs = 0.0;                  // SCENE_BEGIN -> FRAME_BEFORE_HUD, game thread
+    double frameMs = 0.0;                  // SCENE_BEGIN -> next SCENE_BEGIN (whole frame)
+    uint32_t frameSamples = 0;
     uint32_t frames = 0;
-    uint64_t replayPackets = 0;            // mat packets tested during replays
-    uint64_t replayPacketsCulled = 0;
     uint64_t mainPackets = 0;              // mat packets tested in the main view
     uint64_t mainPacketsCulled = 0;
 };
 PerfStats g_perf;
 std::chrono::steady_clock::time_point g_sceneBeginTime;
 bool g_sceneBeginTimeValid = false;
+std::chrono::steady_clock::time_point g_prevSceneBeginTime;
+bool g_prevSceneBeginValid = false;
+// Which cascade slot the current replay's packet counters belong to; -1 outside replays.
+int g_replayPerfSlot = -1;
 constexpr uint32_t kPerfLogFrames = 600;
 
 constexpr float kLightDistance = 30000.0f;
@@ -1472,8 +1483,8 @@ HookAction on_mat_packet_draw_pre(ModContext*, void* args, void*, void*) {
         // clears it when the packet draw returns.
         g_insideMatPacketDraw = g_matPacketPostHooked;
         ++g_perf.mainPackets;
-    } else {
-        ++g_perf.replayPackets;
+    } else if (g_replayPerfSlot >= 0 && g_replayPerfSlot < kMaxCascades) {
+        ++g_perf.slotPackets[g_replayPerfSlot];
     }
     J3DMatPacket* matPacket = mods::arg<J3DMatPacket*>(args, 0);
     if (matPacket == nullptr || matPacket->getShapePacket() == nullptr) {
@@ -1499,8 +1510,8 @@ HookAction on_mat_packet_draw_pre(ModContext*, void* args, void*, void*) {
     }
     if (mainViewCull) {
         ++g_perf.mainPacketsCulled;
-    } else {
-        ++g_perf.replayPacketsCulled;
+    } else if (g_replayPerfSlot >= 0 && g_replayPerfSlot < kMaxCascades) {
+        ++g_perf.slotPacketsCulled[g_replayPerfSlot];
     }
     return HOOK_SKIP_ORIGINAL;
 }
@@ -1622,6 +1633,18 @@ void on_scene_begin(ModContext*, const GfxStageContext* stageCtx, void*) {
     ++g_frameIndex;
     g_sceneBeginTime = std::chrono::steady_clock::now();
     g_sceneBeginTimeValid = true;
+    // Whole-frame time (scene begin to scene begin) sizes what happens OUTSIDE the scene
+    // window; deltas over 100 ms are pauses/loads, not frames.
+    if (g_prevSceneBeginValid) {
+        const double delta = std::chrono::duration<double, std::milli>(
+            g_sceneBeginTime - g_prevSceneBeginTime).count();
+        if (delta > 0.0 && delta < 100.0) {
+            g_perf.frameMs += delta;
+            ++g_perf.frameSamples;
+        }
+    }
+    g_prevSceneBeginTime = g_sceneBeginTime;
+    g_prevSceneBeginValid = true;
     tick_retired_sss_targets();
     tick_retired_normal_targets();
     tick_retired_cascade_textures();
@@ -1707,6 +1730,9 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
     const f32 replayProjection[7], bool cameraReplayDebug, uint32_t mapSize, float radius,
     bool linkOnly, bool cull, const float* excludeCenterWorld, float excludeLimit,
     CascadeSlot& out) {
+    const auto perfT0 = std::chrono::steady_clock::now();
+    auto perfT1 = perfT0;
+    auto perfT2 = perfT0;
     Mtx44 lightReplayProjection;
     if (!build_light_replay_projection(lightCamera, replayViewMtx, lightReplayProjection)) {
         return false;
@@ -1800,6 +1826,7 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
     // being dereferenced; restore afterwards.
     J3DModel* savedModel = j3dSys.getModel();
     j3dSys.setModel(nullptr);
+    perfT1 = std::chrono::steady_clock::now();
     {
         replay_scope replay;
         if (linkOnly) {
@@ -1808,6 +1835,7 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
             draw_opaque_scene_lists();
         }
     }
+    perfT2 = std::chrono::steady_clock::now();
     j3dSys.setModel(savedModel);
     g_replayLinkOnly = false;
     g_replayCullActive = false;
@@ -1838,6 +1866,15 @@ bool replay_cascade(const LightCamera& lightCamera, Mtx replayViewMtx,
     out.texelWorld = (2.0f * radius) / static_cast<float>(mapSize);
     copy_projection(lightCamera.vp, out.lightVp);
     out.ready = true;
+    if (g_replayPerfSlot >= 0 && g_replayPerfSlot < kMaxCascades) {
+        const auto perfT3 = std::chrono::steady_clock::now();
+        g_perf.replayPhaseMs[g_replayPerfSlot][0] +=
+            std::chrono::duration<double, std::milli>(perfT1 - perfT0).count();
+        g_perf.replayPhaseMs[g_replayPerfSlot][1] +=
+            std::chrono::duration<double, std::milli>(perfT2 - perfT1).count();
+        g_perf.replayPhaseMs[g_replayPerfSlot][2] +=
+            std::chrono::duration<double, std::milli>(perfT3 - perfT2).count();
+    }
     return true;
 }
 
@@ -2080,14 +2117,17 @@ void render_shadow_map(
             exclusionEligible && freshExclLimit > 0.0f ? innerCenter : nullptr;
         const float exclLimit = exclCenter != nullptr ? freshExclLimit : 0.0f;
         const auto renderStart = std::chrono::steady_clock::now();
+        g_replayPerfSlot = i;
         LightCamera lightCamera{};
         if (!build_light_camera(replayViewMtx, mapSize, radii[i], lightCamera) ||
             !replay_cascade(lightCamera, replayViewMtx, replayProjection, cameraReplayDebug,
                 mapSize, radii[i], false, cull, exclCenter, exclLimit, g_mapPass.cascades[i]))
         {
+            g_replayPerfSlot = -1;
             g_mapPass = {};
             return;
         }
+        g_replayPerfSlot = -1;
         g_perf.replayMs[i] +=
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                 renderStart).count();
@@ -2129,6 +2169,7 @@ void render_shadow_map(
             // A short light distance keeps the ortho depth range tight around the player for
             // maximum depth discrimination on self-shadowing.
             const auto linkStart = std::chrono::steady_clock::now();
+            g_replayPerfSlot = kLinkCascade;
             if (build_light_camera_core(
                     center, linkMapSize, linkRadius, linkRadius * 4.0f + 2000.0f, lightCamera) &&
                 replay_cascade(lightCamera, replayViewMtx, replayProjection, false, linkMapSize,
@@ -2136,6 +2177,7 @@ void render_shadow_map(
             {
                 g_mapPass.linkReady = true;
             }
+            g_replayPerfSlot = -1;
             g_perf.replayMs[kLinkCascade] +=
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                     linkStart).count();
@@ -2457,22 +2499,33 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
 // including the game's own work, so mod changes show up as deltas against it.
 void flush_perf_stats() {
     if (get_bool_option(g_cvarPerfLog, false) && g_perf.frames > 0) {
-        const auto avg = [](int i) {
-            return g_perf.replayCount[i] > 0 ? g_perf.replayMs[i] / g_perf.replayCount[i] : 0.0;
-        };
-        char line[384];
+        char line[448];
         std::snprintf(line, sizeof(line),
-            "perf %u frames: scene %.2f ms/f | replay ms/run (runs/frames): near %.2f (%u) "
-            "mid %.2f (%u) far %.2f (%u) link %.2f (%u) | replay packets culled %llu/%llu | "
-            "main view culled %llu/%llu",
-            g_perf.frames, g_perf.sceneMs / g_perf.frames, avg(0), g_perf.replayCount[0],
-            avg(1), g_perf.replayCount[1], avg(2), g_perf.replayCount[2], avg(kLinkCascade),
-            g_perf.replayCount[kLinkCascade],
-            static_cast<unsigned long long>(g_perf.replayPacketsCulled),
-            static_cast<unsigned long long>(g_perf.replayPackets),
-            static_cast<unsigned long long>(g_perf.mainPacketsCulled),
-            static_cast<unsigned long long>(g_perf.mainPackets));
+            "perf %u frames: frame %.2f ms | scene %.2f ms | main view culled %.0f/%.0f "
+            "pkts/frame",
+            g_perf.frames,
+            g_perf.frameSamples > 0 ? g_perf.frameMs / g_perf.frameSamples : 0.0,
+            g_perf.sceneMs / g_perf.frames,
+            static_cast<double>(g_perf.mainPacketsCulled) / g_perf.frames,
+            static_cast<double>(g_perf.mainPackets) / g_perf.frames);
         svc_log->info(mod_ctx, line);
+        static const char* kSlotNames[kMaxCascades] = {"near", "mid ", "far ", "link"};
+        for (int i = 0; i < kMaxCascades; ++i) {
+            const uint32_t runs = g_perf.replayCount[i];
+            if (runs == 0) {
+                continue;
+            }
+            const double culled = static_cast<double>(g_perf.slotPacketsCulled[i]) / runs;
+            const double drawn =
+                static_cast<double>(g_perf.slotPackets[i]) / runs - culled;
+            std::snprintf(line, sizeof(line),
+                "perf   %s %.2f ms/run x%u = setup %.2f + walk %.2f + finish %.2f | "
+                "pkts/run: %.0f drawn, %.0f culled",
+                kSlotNames[i], g_perf.replayMs[i] / runs, runs,
+                g_perf.replayPhaseMs[i][0] / runs, g_perf.replayPhaseMs[i][1] / runs,
+                g_perf.replayPhaseMs[i][2] / runs, drawn, culled);
+            svc_log->info(mod_ctx, line);
+        }
     }
     g_perf = {};
 }
@@ -3213,6 +3266,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_frameIndex = 0;
     g_perf = {};
     g_sceneBeginTimeValid = false;
+    g_prevSceneBeginValid = false;
+    g_replayPerfSlot = -1;
     g_replayLinkOnly = false;
     g_linkFilterRadiusSq = 0.0f;
     g_drawType = g_sssComputeType = g_normalComputeType = g_cascadeCopyComputeType =

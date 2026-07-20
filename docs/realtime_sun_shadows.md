@@ -231,7 +231,7 @@ Space Shadows" is inert when SSS is off.
 | `noFrustumClipping` | on | the anti-popping clipper bypass (issue 5) |
 | `twoSidedCasters` | on | render casters with backface culling off (issue 6) |
 | `indoorDisable` | on | disable the shadow MAP indoors (game shadows return); screen-space shadows still run (issue 3) |
-| `perfLog` | off | logs averaged game-thread timings every ~600 frames: scene time, per-cascade replay cost and run counts, packet-cull ratios. The tuning feedback channel |
+| `perfLog` | off | logs averaged game-thread timings every ~600 frames: whole-frame + scene time, then one line per cascade splitting its replay into setup / draw-list walk / finish (resolve) phases with per-run drawn/culled packet counts. The tuning feedback channel - the phase split distinguishes geometry cost (walk) from fixed pass overhead (setup+finish) |
 | `debugView` | 0 | map/coverage/factor visualizations + SSS buffer/edge-mask views |
 
 Tuning order for acne: raise `slopeBias` first, then `normalOffset`; lower `bias` if shadows
