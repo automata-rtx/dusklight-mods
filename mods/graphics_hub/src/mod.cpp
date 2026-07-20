@@ -1011,6 +1011,50 @@ bool replay_config_ids(uint32_t width, uint32_t height) {
     return true;
 }
 
+// Diagnostic: dump the frame's captured fog-config table on change, so the exact configs at a
+// spot (uniform vs multiple, their ranges/colors) can be read off in-game. Off by default.
+ConfigVarHandle g_cvarFogLog = 0;
+char g_lastFogLogSig[128] = "";
+
+void log_fog_configs() {
+    if (!get_bool_option(g_cvarFogLog, false)) {
+        g_lastFogLogSig[0] = '\0';
+        return;
+    }
+    const bool exact = exact_mode();
+    // Signature over the table so we only log when it changes.
+    char sig[128];
+    int n = std::snprintf(sig, sizeof(sig), "%d|%u|%u|%.0f|%.0f|%d,%d,%d", exact ? 1 : 0,
+        g_frameConfigCount, static_cast<unsigned>(g_reference.type), g_reference.startZ,
+        g_reference.endZ, g_reference.color.r, g_reference.color.g, g_reference.color.b);
+    for (uint32_t i = 0; i < g_frameConfigCount && n < static_cast<int>(sizeof(sig)); ++i) {
+        n += std::snprintf(sig + n, sizeof(sig) - n, ";%.0f/%.0f", g_frameConfigs[i].startZ,
+            g_frameConfigs[i].endZ);
+    }
+    if (std::strcmp(sig, g_lastFogLogSig) == 0) {
+        return;
+    }
+    std::snprintf(g_lastFogLogSig, sizeof(g_lastFogLogSig), "%s", sig);
+
+    char msg[200];
+    std::snprintf(msg, sizeof(msg),
+        "fog: mode=%s configs=%u  REF type=%u rgb(%u,%u,%u) start=%.0f end=%.0f near=%.1f far=%.0f",
+        exact ? "exact" : "vanilla", g_frameConfigCount, static_cast<unsigned>(g_reference.type),
+        static_cast<unsigned>(g_reference.color.r), static_cast<unsigned>(g_reference.color.g),
+        static_cast<unsigned>(g_reference.color.b), g_reference.startZ, g_reference.endZ,
+        g_reference.nearZ, g_reference.farZ);
+    svc_log->info(mod_ctx, msg);
+    for (uint32_t i = 0; i < g_frameConfigCount; ++i) {
+        const FogConfig& c = g_frameConfigs[i];
+        std::snprintf(msg, sizeof(msg),
+            "  cfg %u: type=%u rgb(%u,%u,%u) start=%.0f end=%.0f near=%.1f far=%.0f", i,
+            static_cast<unsigned>(c.type), static_cast<unsigned>(c.color.r),
+            static_cast<unsigned>(c.color.g), static_cast<unsigned>(c.color.b), c.startZ, c.endZ,
+            c.nearZ, c.farZ);
+        svc_log->info(mod_ctx, msg);
+    }
+}
+
 void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
     g_reference = FogConfig{};
     g_firstDeviant = FogConfig{};
@@ -1108,6 +1152,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
         std::snprintf(g_statusText, sizeof(g_statusText), "Deferring fog (%u draws this frame)",
             g_suppressedCount);
     }
+
+    log_fog_configs();
 }
 
 void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
@@ -1195,6 +1241,18 @@ ModResult build_controls_tab(
     control.config_var = g_cvarFogDebug;
     control.options = kDebugOptions;
     control.option_count = 3;
+    add_control(left, control);
+
+    control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_TOGGLE;
+    control.label = "Log Fog Configs";
+    control.help_rml =
+        "Diagnostic: prints the frame's captured fog configuration table to the log whenever it "
+        "changes - the number of distinct fog configs and each one's type, color, and start/end/"
+        "near/far range. Use it to see what fog a spot actually uses (e.g. is a distant subject one "
+        "config or several).";
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = g_cvarFogLog;
     add_control(left, control);
     return MOD_OK;
 }
@@ -1314,6 +1372,14 @@ ModResult init(ModError* error) {
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogDebug) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
+    // DEFAULT: fog-config diagnostic logging off.
+    cvarDesc = CONFIG_VAR_DESC_INIT;
+    cvarDesc.name = "fogLogConfigs";
+    cvarDesc.type = CONFIG_VAR_BOOL;
+    cvarDesc.default_bool = false;
+    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogLog) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register fog option");
+    }
 
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to query device info");
@@ -1391,7 +1457,8 @@ void shutdown() {
     releaseLayout(g_fogDebugLayout);
     releaseLayout(g_mixedLayout);
     releaseLayout(g_mixedDebugLayout);
-    g_cvarFogEnabled = g_cvarFogMixed = g_cvarFogDebug = 0;
+    g_cvarFogEnabled = g_cvarFogMixed = g_cvarFogDebug = g_cvarFogLog = 0;
+    g_lastFogLogSig[0] = '\0';
     g_controlsWindow = 0;
     g_drawType = g_sceneBeginHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;
     g_scopeActive = g_quadArmed = g_suppressAllowed = g_shapeHookOk = g_wasSuppressing = false;
