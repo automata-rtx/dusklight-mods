@@ -91,15 +91,20 @@ Sun Shadows if Depth to Normal is not installed and enabled. Install both togeth
    whose box contains the receiver, apply that cascade's acne bias and normal-offset receiver
    (`world + n * normal_offset * texel_world[cascade]`), PCF over bilinearly-weighted
    comparison taps (kernel = base + Far Softening × cascade index). **Acne bias — two modes:**
-   with `receiverPlaneBias` on (default), each cascade's world tangents (side-selected one-texel
-   crosses, `res/shadow.wgsl` `world_tangents`) transform through the ortho light matrix to the
-   receiver-plane depth gradient `d(depth)/d(uv)` (`receiver_plane_bias_uv`, Isidoro 2006); each
+   with `receiverPlaneBias` on (default), the surface **normal** (`world_normal_at`, so
+   `normalSmooth` smooths it) spans a tangent plane whose depth gradient `d(depth)/d(uv)` in the
+   ortho light space is solved directly (`receiver_plane_bias_uv_from_normal`, Isidoro 2006); each
    PCF tap then compares against `receiver + base_bias + dot(grad, tapOffset)`, so the comparison
    plane follows the surface under the footprint instead of paying a flat margin that detaches the
    shadow. `base_bias = bias + clamped fractional-sampling error`; the gradient is clamped to
-   `rpdb_max` per texel to stop silhouette derivatives leaking. Off = the classic
-   `bias_eff = bias + slope_bias * tan_t` (tan clamped at 4) flat margin. Biases normalized per
-   cascade against its own light range. Each PCF tap fetches its
+   `rpdb_max` per texel. Off = the classic `bias_eff = bias + slope_bias * tan_t` (tan clamped
+   at 4) flat margin. **Both** modes scale the slope/plane term by a light-facing gate
+   `smoothstep(-0.1, 0.05, n·L)`: a surface facing away from the light is shadowed by the
+   two-sided map's front-most face (occlusion, not self-shadow) so it needs no slope bias, and the
+   old code instead MAXED it there (the `cos_t` 0.05 floor drove `tan_t` to its cap), lifting the
+   comparison until thin low-poly geometry leaked back into light as faceted holes. The constant
+   `bias` and the normal-offset receiver still apply on both faces. Biases normalized per cascade
+   against its own light range. Each PCF tap fetches its
    2×2 depth neighborhood with a single `textureGather` (a mod-owned non-filtering clamp
    sampler, created via raw wgpu since the maps are R32Float and the gfx service exposes no
    sampler API) instead of four `textureLoad`s — a quarter of the texture fetches for the
@@ -230,7 +235,7 @@ Space Shadows" is inert when SSS is off.
 | `linkCoverage` | 300 | Link cascade box radius in world units (100–2000) |
 | `strength` | 60 | shadow darkening % |
 | `shadowTint` | 50 | tint shadows toward the current skylight color (`vrbox_sky_col`, peak-normalized) instead of neutral gray - reads as skylit, follows area/time/weather; hue-only, never brightens. 0 = neutral. Both methods |
-| `receiverPlaneBias` | on | receiver-plane depth bias: derive the exact per-tap bias from the receiver surface's own light-space depth gradient under the PCF footprint (Isidoro 2006), so acne clears with almost no flat margin and shadows stay attached to their casters. When on it **replaces** `slopeBias` (the gradient is the exact slope term) and adds a small clamped fractional-sampling term for the centre texel; `bias` still applies. Off = the old constant + `slopeBias` margins. Cap is a fixed `rpdb_max = 0.02` (max 2% of a cascade's depth range per texel — engages only on near-grazing surfaces / depth edges, preventing silhouette light leaks). Both methods |
+| `receiverPlaneBias` | on | receiver-plane depth bias: derive the exact per-tap bias from the receiver surface's light-space depth gradient (built from the surface **normal**, so `normalSmooth` smooths it too — no per-facet banding), so acne clears with almost no flat margin and shadows stay attached to their casters (Isidoro 2006). When on it **replaces** `slopeBias` (the gradient is the exact slope term) and adds a small clamped fractional-sampling term for the centre texel; `bias` still applies. The whole slope/plane term is scaled by a **light-facing gate** (`smoothstep(-0.1, 0.05, n·L)`) so surfaces turned away from the light get ~none of it — they're darkened by the two-sided map's front-most face, not self-shadow, and biasing them there leaks thin geometry (fingers, facial features) back into light. Off = the old constant + `slopeBias` margins (also light-facing-gated). Cap `rpdb_max = 0.02` (max 2% of a cascade's depth range per texel). Both methods |
 | `bias` | 2 | constant depth bias (normalized against light range), applied every tap. With `receiverPlaneBias` on, keep small; raise only if flat light-facing ground still shows acne |
 | `slopeBias` | 2 | bias added ∝ surface slope vs light. **Ignored when `receiverPlaneBias` is on** (that derives the slope term exactly); manual fallback only |
 | `normalOffset` | 50 | receiver offset, % of one shadow texel's world size (default = 0.5 texel; already conservative — this is a percentage, not a texel count) |
@@ -367,10 +372,11 @@ too far makes shadows detach from objects' feet ("peter-panning").
 - **Normal Offset** — instead of changing the depth comparison, nudges the *tested point*
   slightly off the surface, about one photo-pixel's worth. The most effective acne killer
   with the least detachment. 100–200%.
-- **Normal Smoothing** — Slope Bias and Normal Offset need to know which way the surface
-  faces. GameCube-era models are low-poly: the facing jumps at every polygon edge, so the
-  bias jumps too and paints *faceted bands* on characters. This rounds the facing over a few
-  screen pixels so the bias varies smoothly. 2–4; it's nearly free.
+- **Normal Smoothing** — Receiver-Plane Bias, Slope Bias, and Normal Offset all need to know
+  which way the surface faces. GameCube-era models are low-poly: the facing jumps at every
+  polygon edge, so the bias jumps too and paints *faceted bands / holes* on characters. This
+  rounds the facing over a few screen pixels so the bias varies smoothly. 2–4; it's nearly free.
+  With Receiver-Plane Bias on, this is what keeps its per-pixel bias from faceting on Link.
 - **Two-Sided Casters / No Frustum Clipping / Disable Indoors** — leave on: they fix light
   leaks at level edges, shadows popping with camera turns, and black interiors respectively.
 - **Shadow Map toggle** — off runs only the screen-space shadows and brings back the game's

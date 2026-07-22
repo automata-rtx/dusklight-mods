@@ -297,43 +297,14 @@ fn project_cascade(map: u32, receiver_world: vec3f) -> CascadeProj {
     return out;
 }
 
-// World-space surface tangents for the receiver-plane bias: the change in world position per one
-// screen texel in x and y, side-selected (pick the neighbour on the depth-continuous side) so the
-// tangents follow the surface across depth discontinuities instead of spanning them. textureLoad
-// has no uniformity constraint, so this is safe anywhere in the fragment (unlike dpdx/dpdy).
-struct Tangents {
-    dx: vec3f,
-    dy: vec3f,
-}
-
-fn world_tangents(uv: vec2f, world: vec3f, depth: f32, inv_screen: vec2f) -> Tangents {
-    let du = vec2f(inv_screen.x, 0.0);
-    let dv = vec2f(0.0, inv_screen.y);
-    let d_left = scene_depth_at(uv - du);
-    let d_right = scene_depth_at(uv + du);
-    let d_top = scene_depth_at(uv - dv);
-    let d_bottom = scene_depth_at(uv + dv);
-    var out: Tangents;
-    if abs(d_left - depth) < abs(d_right - depth) {
-        out.dx = world - world_position_at(uv - du, d_left);
-    } else {
-        out.dx = world_position_at(uv + du, d_right) - world;
-    }
-    if abs(d_top - depth) < abs(d_bottom - depth) {
-        out.dy = world - world_position_at(uv - dv, d_top);
-    } else {
-        out.dy = world_position_at(uv + dv, d_bottom) - world;
-    }
-    return out;
-}
-
-// Receiver-plane depth bias gradient for one cascade: d(light depth)/d(light uv), derived from the
-// world tangents. The light projection is orthographic (directional sun/moon), so clip.w is
-// constant (1) and a world DELTA maps to an NDC delta straight through the light matrix with no
-// perspective term. Solve the 2x2 [tangent-in-uv] -> depth system for the gradient (Isidoro 2006).
-fn receiver_plane_bias_uv(map: u32, dWx: vec3f, dWy: vec3f) -> vec2f {
-    let cx = uniforms.light_vp[map] * vec4f(dWx, 0.0);
-    let cy = uniforms.light_vp[map] * vec4f(dWy, 0.0);
+// Receiver-plane depth bias gradient for one cascade: d(light depth)/d(light uv) for the plane
+// spanned by two world tangents. The light projection is orthographic (directional sun/moon), so
+// clip.w is constant (1) and a world DELTA maps to an NDC delta straight through the light matrix
+// with no perspective term. Solve the 2x2 [tangent-in-uv] -> depth system (Isidoro 2006). The
+// result is invariant to the tangents' lengths and to which basis of the plane is chosen.
+fn receiver_plane_bias_uv(map: u32, t1: vec3f, t2: vec3f) -> vec2f {
+    let cx = uniforms.light_vp[map] * vec4f(t1, 0.0);
+    let cy = uniforms.light_vp[map] * vec4f(t2, 0.0);
     // uv = (0.5 + 0.5*ndc.x, 0.5 - 0.5*ndc.y); depth = ndc.z. clip.w = 1 (ortho).
     let ax = vec3f(0.5 * cx.x, -0.5 * cx.y, cx.z);
     let ay = vec3f(0.5 * cy.x, -0.5 * cy.y, cy.z);
@@ -347,14 +318,32 @@ fn receiver_plane_bias_uv(map: u32, dWx: vec3f, dWy: vec3f) -> vec2f {
         (ax.x * ay.z - ay.x * ax.z) * inv_det);
 }
 
+// Receiver-plane gradient from the surface NORMAL rather than raw depth crosses: build any two
+// world tangents spanning the plane perpendicular to n and feed them through the solver above.
+// Sourcing it from the normal means Normal Smoothing (which feeds n) also smooths the bias, so
+// the per-facet gradient jumps that band low-poly characters are gone once smoothing is on -
+// the depth-cross version could not be smoothed and re-introduced the faceting.
+fn receiver_plane_bias_uv_from_normal(map: u32, n: vec3f) -> vec2f {
+    let ref_axis = select(vec3f(0.0, 0.0, 1.0), vec3f(1.0, 0.0, 0.0), abs(n.z) > 0.9);
+    let t1 = normalize(cross(ref_axis, n));
+    let t2 = cross(n, t1);
+    return receiver_plane_bias_uv(map, t1, t2);
+}
+
 // Full occlusion evaluation against one cascade: per-cascade normal-offset receiver, per-cascade
-// acne bias, per-cascade PCF kernel. With Receiver-Plane Bias on, the slope term is replaced by
-// the exact per-tap receiver-plane gradient (from the screen-space world tangents dWx/dWy), which
-// tracks the surface under the PCF footprint instead of adding a flat margin that detaches the
-// shadow; a small clamped fractional-sampling term covers the centre texel. With it off, the
-// original constant + slope-scaled bias applies (dWx/dWy unused).
+// acne bias, per-cascade PCF kernel. With Receiver-Plane Bias on, the slope term is the exact
+// per-tap receiver-plane gradient (from the surface normal), which tracks the surface under the
+// PCF footprint instead of adding a flat margin that detaches the shadow; a small clamped
+// fractional-sampling term covers the centre texel. With it off, the classic constant +
+// slope-scaled bias applies.
+//
+// light_facing (0 back-facing -> 1 front-facing) scales the whole slope/plane term. A surface
+// turned away from the light is darkened by the two-sided map's front-most occluder, NOT by
+// self-shadow, so it needs no slope bias; applying it there (the old code MAXED it, via the
+// cos_t floor) lifts the comparison until thin geometry leaks back into light. The constant
+// bias and the normal-offset receiver still apply on both sides.
 fn cascade_occlusion(
-    map: u32, world: vec3f, n: vec3f, tan_t: f32, dWx: vec3f, dWy: vec3f) -> f32 {
+    map: u32, world: vec3f, n: vec3f, tan_t: f32, light_facing: f32) -> f32 {
     let receiver_world = world + n * (uniforms.normal_offset * uniforms.texel_world[map]);
     let p = project_cascade(map, receiver_world);
     if !p.valid {
@@ -363,16 +352,15 @@ fn cascade_occlusion(
     var base_bias = uniforms.bias[map];
     var bias_uv = vec2f(0.0);
     if uniforms.rpdb_enabled != 0.0 {
-        bias_uv = receiver_plane_bias_uv(map, dWx, dWy);
-        // Clamp the per-texel gradient so silhouette derivatives (neighbouring pixels on a
-        // different surface) can't explode into a light leak; the cap doubles as the grazing-
-        // surface ceiling, where the largest legitimate bias is wanted anyway.
+        bias_uv = receiver_plane_bias_uv_from_normal(map, n) * light_facing;
+        // Clamp the per-texel gradient so a near-grazing plane can't explode into a light leak;
+        // the cap doubles as the grazing-surface ceiling, where the largest bias is wanted anyway.
         let cap = uniforms.rpdb_max * uniforms.map_size[map];
         bias_uv = clamp(bias_uv, vec2f(-cap), vec2f(cap));
         // Fractional sampling error: the receiver's own depth change across ~one texel.
         base_bias += (abs(bias_uv.x) + abs(bias_uv.y)) * uniforms.inv_map_size[map];
     } else {
-        base_bias += uniforms.slope_bias[map] * tan_t;
+        base_bias += uniforms.slope_bias[map] * tan_t * light_facing;
     }
     return sample_shadow_pcf(map, p.uv, p.receiver, base_bias, bias_uv);
 }
@@ -442,18 +430,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     var occlusion = 0.0;
     if map_on {
         let inv_screen = 1.0 / vec2f(textureDimensions(scene_depth));
-        // Screen-space world tangents (one texel step) for the receiver-plane depth bias; always
-        // computed here so cascade_occlusion has them whether or not the normal path runs below.
-        let tangents = world_tangents(in.uv, world, depth, inv_screen);
-        // Receiver-side acne control: the smoothed normal feeds the slope-scaled bias and
-        // the per-cascade normal-offset receivers.
+        // Receiver-side acne control: the (optionally smoothed) surface normal feeds the
+        // slope/plane bias, the light-facing gate, and the per-cascade normal-offset receiver.
         var n = vec3f(0.0);
         var tan_t = 0.0;
-        if uniforms.slope_bias[0] > 0.0 || uniforms.normal_offset > 0.0 {
+        var light_facing = 1.0;
+        if uniforms.rpdb_enabled != 0.0 || uniforms.slope_bias[0] > 0.0 ||
+            uniforms.normal_offset > 0.0
+        {
             n = world_normal_at(in.uv, world, depth, inv_screen);
             let light_dir = vec3f(
                 uniforms.light_dir_world_x, uniforms.light_dir_world_y, uniforms.light_dir_world_z);
-            let cos_t = clamp(dot(n, light_dir), 0.05, 1.0);
+            let ndl = dot(n, light_dir);
+            // 0 where the surface faces away from the light (occluded by the front-most face, not
+            // self-shadowing -> no slope bias), ramping to 1 across a narrow terminator band so
+            // grazing LIT surfaces keep full bias and the transition shows no hard line.
+            light_facing = smoothstep(-0.1, 0.05, ndl);
+            let cos_t = clamp(ndl, 0.05, 1.0);
             tan_t = min(sqrt(max(1.0 - cos_t * cos_t, 0.0)) / cos_t, 4.0);
         }
 
@@ -504,13 +497,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         }
 
         if sel.valid {
-            occlusion = cascade_occlusion(selected, world, n, tan_t, tangents.dx, tangents.dy);
+            occlusion = cascade_occlusion(selected, world, n, tan_t, light_facing);
             let blend_start = 1.0 - uniforms.blend_frac;
             if sel.fit > blend_start && selected + 1u < count {
                 let t = saturate((sel.fit - blend_start) / uniforms.blend_frac);
                 occlusion = mix(
                     occlusion,
-                    cascade_occlusion(selected + 1u, world, n, tan_t, tangents.dx, tangents.dy),
+                    cascade_occlusion(selected + 1u, world, n, tan_t, light_facing),
                     t);
             } else if uniforms.edge_fade != 0.0 && selected + 1u >= count && sel.fit > blend_start {
                 // Outermost cascade: no farther cascade to hand off to, so its box edge is a
@@ -526,7 +519,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         // (an empty map compares as fully lit); max() keeps whichever term is darker.
         var link_occlusion = 0.0;
         if uniforms.link_enabled != 0.0 {
-            link_occlusion = cascade_occlusion(3u, world, n, tan_t, tangents.dx, tangents.dy);
+            link_occlusion = cascade_occlusion(3u, world, n, tan_t, light_facing);
             occlusion = max(occlusion, link_occlusion);
         }
 
