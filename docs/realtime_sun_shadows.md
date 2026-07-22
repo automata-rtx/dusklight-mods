@@ -88,11 +88,18 @@ Sun Shadows if Depth to Normal is not installed and enabled. Install both togeth
    modes so map visualizations stay complete.
 3. **Composite** (`SCENE_AFTER_OPAQUE`, `res/shadow.wgsl`): unproject scene depth to world,
    reconstruct a world normal from depth (side-selected crosses), pick the sharpest cascade
-   whose box contains the receiver, apply that cascade's slope-scaled bias
-   (`bias_eff = bias + slope_bias * tan_t`, tan clamped at 4; biases normalized per cascade
-   against its own light range) and normal-offset receiver
+   whose box contains the receiver, apply that cascade's acne bias and normal-offset receiver
    (`world + n * normal_offset * texel_world[cascade]`), PCF over bilinearly-weighted
-   comparison taps (kernel = base + Far Softening × cascade index). Each PCF tap fetches its
+   comparison taps (kernel = base + Far Softening × cascade index). **Acne bias — two modes:**
+   with `receiverPlaneBias` on (default), each cascade's world tangents (side-selected one-texel
+   crosses, `res/shadow.wgsl` `world_tangents`) transform through the ortho light matrix to the
+   receiver-plane depth gradient `d(depth)/d(uv)` (`receiver_plane_bias_uv`, Isidoro 2006); each
+   PCF tap then compares against `receiver + base_bias + dot(grad, tapOffset)`, so the comparison
+   plane follows the surface under the footprint instead of paying a flat margin that detaches the
+   shadow. `base_bias = bias + clamped fractional-sampling error`; the gradient is clamped to
+   `rpdb_max` per texel to stop silhouette derivatives leaking. Off = the classic
+   `bias_eff = bias + slope_bias * tan_t` (tan clamped at 4) flat margin. Biases normalized per
+   cascade against its own light range. Each PCF tap fetches its
    2×2 depth neighborhood with a single `textureGather` (a mod-owned non-filtering clamp
    sampler, created via raw wgpu since the maps are R32Float and the gfx service exposes no
    sampler API) instead of four `textureLoad`s — a quarter of the texture fetches for the
@@ -223,9 +230,10 @@ Space Shadows" is inert when SSS is off.
 | `linkCoverage` | 300 | Link cascade box radius in world units (100–2000) |
 | `strength` | 60 | shadow darkening % |
 | `shadowTint` | 50 | tint shadows toward the current skylight color (`vrbox_sky_col`, peak-normalized) instead of neutral gray - reads as skylit, follows area/time/weather; hue-only, never brightens. 0 = neutral. Both methods |
-| `bias` | 2 | constant depth bias (normalized against light range) |
-| `slopeBias` | 2 | bias added ∝ surface slope vs light |
-| `normalOffset` | 50 | receiver offset, % of one shadow texel's world size |
+| `receiverPlaneBias` | on | receiver-plane depth bias: derive the exact per-tap bias from the receiver surface's own light-space depth gradient under the PCF footprint (Isidoro 2006), so acne clears with almost no flat margin and shadows stay attached to their casters. When on it **replaces** `slopeBias` (the gradient is the exact slope term) and adds a small clamped fractional-sampling term for the centre texel; `bias` still applies. Off = the old constant + `slopeBias` margins. Cap is a fixed `rpdb_max = 0.02` (max 2% of a cascade's depth range per texel — engages only on near-grazing surfaces / depth edges, preventing silhouette light leaks). Both methods |
+| `bias` | 2 | constant depth bias (normalized against light range), applied every tap. With `receiverPlaneBias` on, keep small; raise only if flat light-facing ground still shows acne |
+| `slopeBias` | 2 | bias added ∝ surface slope vs light. **Ignored when `receiverPlaneBias` is on** (that derives the slope term exactly); manual fallback only |
+| `normalOffset` | 50 | receiver offset, % of one shadow texel's world size (default = 0.5 texel; already conservative — this is a percentage, not a texel count) |
 | `normalSmooth` | 4 | smooths the depth-reconstructed normal that Slope Bias / Normal Offset use (`res/normal_smooth.wgsl`): FULL-resolution per-pixel crosses + one separable depth-aware Gaussian whose radius = `normalSmooth * renderHeight / 1080` px (dense, capped 32). Only affects the shadow-MAP bias — SSS fine detail is independent (see note). One value looks the same at any internal resolution. History of failed approaches, do not repeat: (1) widening a single cross straddles facets and manufactures garbage normals (shattered glass); (2) sparse taps at fixed pixel distances ghost past a resolution-dependent sweet spot; (3) a resolution-CAPPED buffer blurs fine geometry away and needs a lossy upscale. NO light-terminator flip (mirrored the normal across curved surfaces' terminator = hard bias discontinuity on faces). 0 = off (inline 1px cross) |
 | `pcf` | 2 | PCF kernel: 0=1×1 1=3×3 2=5×5 3=7×7 |
 | `contactShadows` | on | the Bend screen-space shadow term (runs even with the map off / indoors) |
@@ -245,7 +253,10 @@ Space Shadows" is inert when SSS is off.
 | `perfLog` | off | logs averaged game-thread timings every ~600 frames: whole-frame + scene time, then one line per cascade splitting its replay into setup / J3D-buffer walk / grass (packet list) / finish (resolve) phases with per-run drawn/culled packet counts. The tuning feedback channel - the phase split separates J3D geometry cost, the grass/flower packet list, and fixed pass overhead |
 | `debugView` | 0 | map/coverage/factor visualizations + SSS buffer/edge-mask views |
 
-Tuning order for acne: raise `slopeBias` first, then `normalOffset`; lower `bias` if shadows
+Tuning order for acne: with `receiverPlaneBias` on (default) the slope term is exact, so most
+acne is already handled — leave `bias`/`slopeBias` low and only raise `normalOffset` slightly
+if a curved surface still bands. With it off, fall back to the manual order: raise `slopeBias`
+first, then `normalOffset`; lower `bias` if shadows
 detach at feet (the screen-space term hides small gaps). Per Bend's guidance, tune
 `sssThickness` in multiples of 2 and scale `sssEdgeThreshold` alongside it; use the "SSS
 Edge Mask" debug view when striated patterns appear on flat surfaces (or turn on
@@ -339,12 +350,20 @@ too far makes shadows detach from objects' feet ("peter-panning").
 - **Strength** — plain darkness of the shadows. Pure taste.
 - **Soft Shadows** — averages neighboring photo pixels at the shadow edge. Higher = softer,
   hides stair-stepping on cliffs. Costs a little GPU. 5×5 or 7×7.
+- **Receiver-Plane Bias** — leave ON. This is the smart version of Bias: instead of a fixed
+  push, it works out *exactly* how much a surface's own depth changes across each photo pixel
+  and biases by precisely that. The result is acne clears with almost no flat push, so shadows
+  stay glued to their casters instead of sliding off — the fix for "the bias cleaned the acne
+  but moved the shadow." When it's on, Slope Bias is unnecessary (it does the slope math
+  exactly), and you can keep Bias near zero. Turn it off only to A/B against the old manual knobs.
 - **Bias** — moves every comparison a fixed distance toward the sun so surfaces stop
-  shadowing themselves. It's the bluntest tool: enough to kill all acne everywhere will
-  visibly detach shadows. Keep it LOW (30–60) and let the next three do the real work.
+  shadowing themselves. The bluntest tool: enough to kill all acne everywhere will visibly
+  detach shadows. With Receiver-Plane Bias on, keep it near zero — raise only if flat,
+  sun-facing ground still sparkles.
 - **Slope Bias** — extra bias applied *only where the surface tilts away from the sun*,
-  which is where acne concentrates (cliffs, rooftops at grazing light). Safe to raise —
-  it does nothing on sun-facing ground. First knob for cliff acne (30–80).
+  which is where acne concentrates (cliffs, rooftops at grazing light). **Ignored when
+  Receiver-Plane Bias is on** — it's the manual stand-in for what that does automatically.
+  Only relevant with Receiver-Plane Bias off; then it's the first knob for cliff acne (30–80).
 - **Normal Offset** — instead of changing the depth comparison, nudges the *tested point*
   slightly off the surface, about one photo-pixel's worth. The most effective acne killer
   with the least detachment. 100–200%.
@@ -357,11 +376,16 @@ too far makes shadows detach from objects' feet ("peter-panning").
 - **Shadow Map toggle** — off runs only the screen-space shadows and brings back the game's
   own character shadows; useful as a comparison baseline and as a cheap mode.
 
-Recommended order: (1) Coverage wide enough for the landscape (16000 for the big vistas),
-3 cascades, splits near-geometric. (2) Bias down to ~40. (3) Raise Normal Offset until flat
-ground is clean. (4) Raise Slope Bias until cliffs are clean. (5) Normal Smoothing 2–4 to
-remove faceted banding on characters. (6) Soft Shadows + Far Softening to taste; widen
-Cascade Blend if a transition line shows. If feet shadows detach: lower Bias first, then
+Recommended order (Receiver-Plane Bias ON — the default): (1) Coverage wide enough for the
+landscape (16000 for the big vistas), 3 cascades, splits near-geometric. (2) Bias and Slope
+Bias near zero — Receiver-Plane Bias handles the acne. (3) Nudge Normal Offset up only if a
+curved surface still bands. (4) Normal Smoothing 2–4 to remove faceted banding on characters.
+(5) Soft Shadows + Far Softening to taste; widen Cascade Blend if a transition line shows.
+
+Legacy order (Receiver-Plane Bias OFF): (1) Coverage + cascades as above. (2) Bias down to ~40.
+(3) Raise Normal Offset until flat ground is clean. (4) Raise Slope Bias until cliffs are clean.
+(5) Normal Smoothing 2–4 to remove faceted banding on characters. (6) Soft Shadows + Far
+Softening to taste; widen Cascade Blend if a transition line shows. If feet shadows detach: lower Bias first, then
 Normal Offset — the screen-space term re-grounds contacts regardless.
 
 ## Known caveats
