@@ -21,6 +21,18 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   normals; composites GI additively and AO multiplicatively in a single blend draw. **Service-only**.
   Docs: `docs/ssilvb_plan.md` (§0 first — see the note below), then `docs/ssilvb.md` once written.
 
+- **`mods/smaa/`** — "SMAA" (subpixel morphological antialiasing): a spatial post-process AA mod
+  (SMAA 1x). Edge detection unions the reference SMAA luma detector with **geometric edges from the
+  Depth to Normal service** (normal-angle + relative-depth discontinuity — catches silhouettes and
+  creases where luma contrast is weak). The expensive blend-weight pass uses **CMAA2-style compute
+  compaction** (Intel 2018): edge pixels in each 16×16 workgroup are packed into contiguous threads
+  via a groupshared list so sparse edges run in fully-occupied warps. Composites at
+  `SCENE_AFTER_OPAQUE` (before bloom/translucency, so the game's post effects operate on
+  antialiased geometry). Three passes: edge-detect (compute) → compacted blend-weights (compute) →
+  neighborhood blend (draw). No LUT assets — orthogonal search is linear, coverage analytic; v1
+  defers diagonals/corners. **Service-only** (gfx/config/ui/resource/log + optional Depth to Normal).
+  The SMAA algorithm is reimplemented from the MIT reference (iryoku/smaa) — Marty's proprietary
+  iMMERSE port was studied for the optimization ideas only, never copied.
 - **`mods/graphics_hub/`** — "[WIP] Graphics Hub": a **combination mod** hosting the screen-space
   infrastructure other mods build on, so effects layer correctly over the game's original rendering.
   It merges two former standalone mods, each in its own namespace inside `src/mod.cpp`
