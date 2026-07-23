@@ -32,7 +32,7 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   neighborhood blend (draw). No LUT assets — orthogonal search is linear, coverage analytic; v1
   defers diagonals/corners. **Service-only** (gfx/config/ui/resource/log + optional Depth to Normal).
   The SMAA algorithm is reimplemented from the MIT reference (iryoku/smaa) — Marty's proprietary
-  iMMERSE port was studied for the optimization ideas only, never copied.
+  iMMERSE port was studied for the optimization ideas only, never copied. Docs: `docs/smaa.md`.
 - **`mods/graphics_hub/`** — "[WIP] Graphics Hub": a **combination mod** hosting the screen-space
   infrastructure other mods build on, so effects layer correctly over the game's original rendering.
   It merges two former standalone mods, each in its own namespace inside `src/mod.cpp`
