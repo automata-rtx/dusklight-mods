@@ -25,7 +25,9 @@
 
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
 #include "JSystem/J3DGraphBase/J3DShape.h"
+#include "d/actor/d_a_player.h"
 #include "d/d_com_inf_game.h"
+#include "f_op/f_op_actor_mng.h"
 #include "dolphin/gf/GFPixel.h"
 #include "dolphin/gx/GXAurora.h"
 #include "dolphin/gx/GXGeometry.h"
@@ -35,6 +37,7 @@
 #include "dolphin/gx/GXTev.h"
 
 #include "depth_to_normal_service.h"
+#include "water_plane_service.h"
 
 #include "mods/hook.hpp"
 #include "mods/service.hpp"
@@ -518,6 +521,87 @@ constexpr DepthToNormalService g_dtnService{
     .get_frame = hub_dtn::get_frame,
 };
 EXPORT_SERVICE(g_dtnService);
+
+// ===========================================================================================
+// SUB-FEATURE: Water Plane   (water-surface height provider service)
+// ===========================================================================================
+namespace hub_water {
+
+// Cached once per frame at scene begin (game thread); get_frame just hands these back. A single
+// horizontal plane for the frame (the water body at the player) - see water_plane_service.h and
+// docs for the flat-plane limitation.
+bool g_hasWater = false;
+float g_waterY = 0.0f;
+GfxStageHookHandle g_sceneBeginHook = 0;
+
+// Probe the water surface at the player's XZ once per frame. This is a PURE QUERY: no draw, no
+// offscreen pass, no GX state touched - so the provider is provably invisible unless a consumer
+// reads it. Runs on the game thread (stage callback), the only place game state is safe to read.
+void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
+    g_hasWater = false;
+    daPy_py_c* player = dComIfGp_getLinkPlayer();
+    // Guard the position too: on the first frames of a scene the actor can exist before its
+    // placement is meaningful (idiom from realtime_sun_shadows's link cascade).
+    if (player != nullptr && std::isfinite(player->current.pos.x) &&
+        std::isfinite(player->current.pos.y) && std::isfinite(player->current.pos.z))
+    {
+        f32 y = 0.0f;
+        // fopAcM_getWaterY(const cXyz* pos, f32* o_waterY): returns nonzero and writes the
+        // surface Y when there is water at pos.xz, else returns 0 (and writes -inf).
+        if (fopAcM_getWaterY(&player->current.pos, &y) != 0) {
+            g_waterY = y;
+            g_hasWater = true;
+        }
+    }
+}
+
+// The exported service entry point (see g_waterService below). Idempotent per frame: returns the
+// frame's cached probe. has_water == false is a valid "no water" result, not an error.
+ModResult get_frame(ModContext*, WaterPlaneFrame* out) {
+    if (out == nullptr || out->struct_size < sizeof(WaterPlaneFrame)) {
+        return MOD_INVALID_ARGUMENT;
+    }
+    out->water_y = g_waterY;
+    out->has_water = g_hasWater;
+    return MOD_OK;
+}
+
+void build_section(UiElementHandle panel) {
+    svc_ui->pane_add_section(mod_ctx, panel, "Water Plane");
+    svc_ui->pane_add_text(mod_ctx, panel,
+        "Probes the water-surface height at the player each frame and provides it to other mods "
+        "(AO / GI) so they can fade their effect underwater. Passive: a pure query with no on/off "
+        "and no cost unless another mod reads it.",
+        nullptr);
+}
+
+ModResult init(ModError* error) {
+    GfxStageHookDesc stageDesc = GFX_STAGE_HOOK_DESC_INIT;
+    stageDesc.callback = on_scene_begin;
+    if (svc_gfx->register_stage_hook(
+            mod_ctx, GFX_STAGE_SCENE_BEGIN, &stageDesc, &g_sceneBeginHook) != MOD_OK)
+    {
+        return mods::set_error(error, MOD_ERROR, "failed to register water scene hook");
+    }
+    return MOD_OK;
+}
+
+void shutdown() {
+    g_sceneBeginHook = 0;
+    g_hasWater = false;
+    g_waterY = 0.0f;
+}
+
+}  // namespace hub_water
+
+// The exported water-plane service. Kept at global scope so EXPORT_SERVICE's generated meta
+// record is a simple token, mirroring g_dtnService above.
+constexpr WaterPlaneService g_waterService{
+    .header =
+        SERVICE_HEADER(WaterPlaneService, WATER_PLANE_SERVICE_MAJOR, WATER_PLANE_SERVICE_MINOR),
+    .get_frame = hub_water::get_frame,
+};
+EXPORT_SERVICE(g_waterService);
 
 // ===========================================================================================
 // SUB-FEATURE: Deferred Fog   (re-applies fog after screen-space effects)
@@ -1387,6 +1471,7 @@ namespace {
 
 ModResult build_combined_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     hub_dtn::build_section(panel);
+    hub_water::build_section(panel);
     hub_fog::build_section(panel);
     return MOD_OK;
 }
@@ -1397,6 +1482,10 @@ extern "C" {
 
 MOD_EXPORT ModResult mod_initialize(ModError* error) {
     ModResult result = hub_dtn::init(error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = hub_water::init(error);
     if (result != MOD_OK) {
         return result;
     }
@@ -1419,6 +1508,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
 
 MOD_EXPORT ModResult mod_shutdown(ModError*) {
     hub_fog::shutdown();
+    hub_water::shutdown();
     hub_dtn::shutdown();
     return MOD_OK;
 }

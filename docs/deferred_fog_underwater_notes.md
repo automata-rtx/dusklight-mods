@@ -1,9 +1,15 @@
-# Deferred Fog — underwater AO fade (DEFERRED / not implemented)
+# Deferred Fog — underwater AO fade (SUPERSEDED — synthesized-fog design not built)
 
-Status: **investigated and designed, intentionally not built.** The user asked to shelve it
-after the design was validated but before shipping. This note captures everything needed to
-resume. Nothing in this doc is wired into the mod; `deferred_fog` on `main`/the branch is at
-1.3.1 with no underwater code.
+> **Superseded.** The underwater AO fade was shipped by a **different, non-destructive** mechanism:
+> a Water Plane service (Graphics Hub `hub_water`) that probes the water height, plus an AO-term fade
+> inside VBAO's / SSILVB's own composite — no painted fog. See `docs/underwater_ao_fade.md`. This
+> note is kept only for the engine investigation in the "Investigation findings" section below (still
+> valid) and to record why the synthesized-fog design here was **rejected**: it adds haze even with
+> no AO, which violates the non-destructive requirement. **Do not build the "Proposed design" below.**
+
+Status (original): **investigated and designed, intentionally not built.** The user asked to shelve
+it after the design was validated but before shipping. Nothing in this doc is wired into the mod; the
+synthesized-fog path here was never added to `deferred_fog`.
 
 ## The problem
 

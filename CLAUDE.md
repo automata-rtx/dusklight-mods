@@ -23,13 +23,22 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
 
 - **`mods/graphics_hub/`** — "[WIP] Graphics Hub": a **combination mod** hosting the screen-space
   infrastructure other mods build on, so effects layer correctly over the game's original rendering.
-  It merges two former standalone mods, each in its own namespace inside `src/mod.cpp`
-  (`hub_dtn` / `hub_fog`) with its own section in the shared UI panel and independent config:
+  It hosts several sub-features, each in its own namespace inside `src/mod.cpp`
+  (`hub_dtn` / `hub_water` / `hub_fog`) with its own section in the shared UI panel and independent
+  config (`hub_dtn` and `hub_fog` began as standalone mods; `hub_water` was added here):
   - **Depth to Normal** (`hub_dtn`): reconstructs a per-pixel world-space surface normal (+ raw
     depth) from the scene depth buffer once per frame (atyuwen's 5-tap method) and **publishes it as
     the mod-exported service** `include/depth_to_normal_service.h` (service id
     `dev.automata.depth_to_normal`, **unchanged** so SSILVB/Realtime Sun Shadows/VBAO resolve it as
     before — they include `../graphics_hub/include`). Passive provider: no on/off, just a debug view.
+  - **Water Plane** (`hub_water`): probes the game's water-surface height at the player once per
+    frame (`fopAcM_getWaterY` at `dComIfGp_getLinkPlayer()->current.pos`) and **publishes it as the
+    mod-exported service** `include/water_plane_service.h` (service id `dev.automata.water_plane`) so
+    screen-space AO/GI mods can **fade their effect with water depth** (a deep submerged lakebed
+    should not keep harsh full-strength AO far out). A **pure query** — draws nothing, touches no GX
+    state — so it is inert (zero visual impact) unless a consumer reads it. Passive provider: no
+    on/off. Consumed by VBAO (SSILVB next) for the underwater AO fade. Docs:
+    `docs/underwater_ao_fade.md`.
   - **Deferred Fog** (`hub_fog`): suppresses the game's per-draw fog during the opaque world lists
     and re-applies it (bit-exact aurora fog math) as a fullscreen pass after every mod's
     `SCENE_AFTER_OPAQUE` composites, so AO/shadows darken surfaces under the fog instead of the fog

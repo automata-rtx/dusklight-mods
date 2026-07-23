@@ -25,6 +25,7 @@ struct Uniforms {
     inverse_projection: mat4x4f,
     reproject: mat4x4f,
     view_from_world: mat4x4f,  // layout-only: unused here, present so the shared uniform matches vbao.wgsl + the host
+    world_from_view: mat4x4f,  // layout-only: matches composite + the host
     size: vec2f,        // AO chain size in pixels (may be half the render size)
     inv_size: vec2f,
     depth_scale: vec2f, // input depth snapshot pixels per chain pixel (1 or 2)
@@ -55,9 +56,9 @@ struct Uniforms {
     radius_ramp_start: f32, // radius ramp band start, world units of view depth
     radius_ramp_end: f32,   // radius ramp band end, world units of view depth
     denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    water_y: f32,           // world-space Y of the water surface (underwater fade)
+    uw_half_depth: f32,     // water-column depth for 50% fade (world units)
+    uw_strength: f32,       // underwater fade strength, 0..1
 }
 
 // The AO chain runs at `size` (chain res, half the render size in Half Res). History, output and

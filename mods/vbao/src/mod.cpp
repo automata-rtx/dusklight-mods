@@ -17,6 +17,7 @@
 
 #include "mods/service.hpp"
 #include "depth_to_normal_service.h"
+#include "water_plane_service.h"
 #include "mods/svc/camera.h"
 #include "mods/svc/config.h"
 #include "mods/svc/gfx.h"
@@ -46,6 +47,10 @@ IMPORT_SERVICE(CameraService, svc_camera);
 // it (full-res, shared with other mods) instead of reconstructing its own. Optional so VBAO still
 // loads and runs standalone, falling back to its own reconstruction.
 IMPORT_OPTIONAL_SERVICE(DepthToNormalService, svc_n2d);
+// Optional: the Graphics Hub Water Plane provider. When present (and there is water at the player),
+// VBAO fades its AO with water depth so a deep submerged lakebed is not darkened at full strength.
+// Optional so VBAO still loads and runs standalone (the fade is simply disabled without it).
+IMPORT_OPTIONAL_SERVICE(WaterPlaneService, svc_water);
 
 namespace {
 
@@ -77,6 +82,9 @@ ConfigVarHandle g_cvarDenoiseStrength = 0;
 ConfigVarHandle g_cvarDistanceFade = 0;
 ConfigVarHandle g_cvarFadeStart = 0;
 ConfigVarHandle g_cvarFadeEnd = 0;
+ConfigVarHandle g_cvarUnderwaterFade = 0;
+ConfigVarHandle g_cvarUnderwaterHalfDepth = 0;
+ConfigVarHandle g_cvarUnderwaterStrength = 0;
 ConfigVarHandle g_cvarHalfRes = 0;
 ConfigVarHandle g_cvarDebugView = 0;
 
@@ -156,6 +164,7 @@ struct AoUniforms {
     float inverse_projection[16];
     float reproject[16];
     float view_from_world[16];  // rotates the Depth to Normal provider's world normal into view
+    float world_from_view[16];  // view->world, for reconstructing per-pixel world Y (underwater fade)
     float size[2];
     float inv_size[2];
     float depth_scale[2];
@@ -179,16 +188,17 @@ struct AoUniforms {
     float fade_end;
     uint32_t debug_view;
     uint32_t frame_index;
-    uint32_t flags; // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
+    uint32_t flags; // bit 0 temporal, bit 1 history valid, bit 2 distance fade,
+                    // bit 3 external normal, bit 4 underwater fade
     float thick_dist_scale;  // extra occluder thickness, fraction of the view-space radius
     float inv_debug_depth;   // debug depth view gradient scale (1 / world units)
     float radius_far;        // far effect radius (fraction of view depth); 0 disables the ramp
     float radius_ramp_start; // radius ramp band start, world units of view depth
     float radius_ramp_end;   // radius ramp band end, world units of view depth
     float denoise_strength;  // spatial denoise blend, 0 raw .. 1 fully blurred
-    float _pad0;
-    float _pad1;
-    float _pad2;
+    float water_y;           // world-space Y of the water surface (underwater fade)
+    float uw_half_depth;     // water-column depth for 50% fade (world units)
+    float uw_strength;       // underwater fade strength, 0..1
 };
 static_assert(sizeof(AoUniforms) % 16 == 0);
 
@@ -783,6 +793,10 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     // For rotating the Depth to Normal provider's world-space normal into view space.
     std::memcpy(
         uniforms.view_from_world, camera.view_from_world, sizeof(uniforms.view_from_world));
+    // For reconstructing per-pixel world-space Y in the composite (underwater fade): the composite
+    // otherwise reconstructs view space only, but water_y is a world-space height.
+    std::memcpy(
+        uniforms.world_from_view, camera.world_from_view, sizeof(uniforms.world_from_view));
     uniforms.size[0] = static_cast<float>(width);
     uniforms.size[1] = static_cast<float>(height);
     uniforms.inv_size[0] = 1.0f / uniforms.size[0];
@@ -841,6 +855,26 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         std::clamp<int64_t>(get_int_option(g_cvarFadeStart, 15000), 0, 200000));
     uniforms.fade_end = static_cast<float>(
         std::clamp<int64_t>(get_int_option(g_cvarFadeEnd, 40000), 500, 200000));
+    // Underwater fade: drive AO back toward "no occlusion" as terrain sinks below the water surface
+    // (the Water Plane service supplies water_y). Non-destructive by construction: when the toggle
+    // is off, the service is absent, or there is no water at the player, underwaterActive stays
+    // false, flag bit 4 is clear, and the composite path is identical to vanilla.
+    const bool underwaterFade = get_bool_option(g_cvarUnderwaterFade, true);
+    uniforms.uw_half_depth = static_cast<float>(
+        std::clamp<int64_t>(get_int_option(g_cvarUnderwaterHalfDepth, 400), 1, 200000));
+    uniforms.uw_strength =
+        static_cast<float>(
+            std::clamp<int64_t>(get_int_option(g_cvarUnderwaterStrength, 100), 0, 100)) /
+        100.0f;
+    uniforms.water_y = 0.0f;
+    bool underwaterActive = false;
+    if (underwaterFade && svc_water != nullptr) {
+        WaterPlaneFrame waterFrame = WATER_PLANE_FRAME_INIT;
+        if (svc_water->get_frame(mod_ctx, &waterFrame) == MOD_OK && waterFrame.has_water) {
+            uniforms.water_y = waterFrame.water_y;
+            underwaterActive = true;
+        }
+    }
     uniforms.inv_far = camera.far_plane > 1.0f ? 1.0f / camera.far_plane : 1.0f / 200000.0f;
     // Calibration aid for the world-unit distance settings above: log the stage's far plane
     // whenever it changes materially (once per change, not per frame).
@@ -866,7 +900,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const bool haveExternalNormal = svc_n2d != nullptr &&
         svc_n2d->get_frame(mod_ctx, &n2dFrame) == MOD_OK && n2dFrame.normal != nullptr;
     uniforms.flags = (temporal ? 1u : 0u) | (g_historyValid ? 2u : 0u) |
-        (distanceFade ? 4u : 0u) | (haveExternalNormal ? 8u : 0u);
+        (distanceFade ? 4u : 0u) | (haveExternalNormal ? 8u : 0u) |
+        (underwaterActive ? 16u : 0u);
 
     GfxRange uniformRange{0, 0};
     if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &uniformRange) != MOD_OK) {
@@ -1105,6 +1140,17 @@ ModResult build_controls_tab(
         "View distance in world units where the AO is fully faded out.", 500, 200000, 500,
         nullptr);
 
+    svc_ui->pane_add_section(mod_ctx, left, "Underwater Fade");
+    add_toggle(left, "Underwater Fade", g_cvarUnderwaterFade,
+        "Fades the AO out under water with depth, so a deep submerged lakebed is not darkened at "
+        "full strength far out (matching how Distance Fade softens above-water AO into fog). Needs "
+        "the Graphics Hub Water Plane provider; no effect where there is no water.");
+    add_number(left, "Half Depth", g_cvarUnderwaterHalfDepth,
+        "Water-column depth (world units below the surface) at which the fade reaches half "
+        "strength. Larger values fade in more gradually with depth.", 1, 200000, 50, nullptr);
+    add_number(left, "Strength", g_cvarUnderwaterStrength,
+        "Maximum fade applied to deep submerged AO.", 0, 100, 5, "%");
+
     svc_ui->pane_add_section(mod_ctx, left, "Debug");
     static const char* kDebugOptions[] = {"Off", "AO", "Normals", "Depth", "Staircase"};
     add_select(left, "Debug View", g_cvarDebugView,
@@ -1214,6 +1260,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"effectEnabled", true, &g_cvarEnabled},
         {"temporal", true, &g_cvarTemporal},
         {"distanceFade", false, &g_cvarDistanceFade},
+        {"underwaterFade", true, &g_cvarUnderwaterFade},
         {"halfRes", false, &g_cvarHalfRes},
     };
     for (const auto& opt : boolOptions) {
@@ -1252,6 +1299,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"denoiseStrength", 60, &g_cvarDenoiseStrength},
         {"fadeStart", 15000, &g_cvarFadeStart},
         {"fadeEnd", 40000, &g_cvarFadeEnd},
+        {"underwaterHalfDepth", 400, &g_cvarUnderwaterHalfDepth},
+        {"underwaterStrength", 100, &g_cvarUnderwaterStrength},
         {"debugMode", 0, &g_cvarDebugView},
     };
     for (const auto& opt : intOptions) {
@@ -1389,6 +1438,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarTemporal = g_cvarTemporalFrames = g_cvarTemporalClamp = g_cvarMotionResponse = 0;
     g_cvarContentThresh = g_cvarDisoccTol = g_cvarDenoisePasses = g_cvarDenoiseStrength = 0;
     g_cvarDistanceFade = g_cvarFadeStart = g_cvarFadeEnd = 0;
+    g_cvarUnderwaterFade = g_cvarUnderwaterHalfDepth = g_cvarUnderwaterStrength = 0;
     g_cvarHalfRes = g_cvarDebugView = 0;
     g_computeType = g_drawType = 0;
     g_afterOpaqueHook = g_beforeHudHook = 0;

@@ -18,6 +18,7 @@ struct Uniforms {
     inverse_projection: mat4x4f,
     reproject: mat4x4f,
     view_from_world: mat4x4f,  // layout-only: unused here, present so the shared uniform matches vbao.wgsl + the host
+    world_from_view: mat4x4f,  // view->world; reconstructs per-pixel world Y for the underwater fade
     size: vec2f,        // AO chain size in pixels (may be half the render size)
     inv_size: vec2f,
     depth_scale: vec2f, // input depth snapshot pixels per chain pixel (1 or 2)
@@ -41,16 +42,17 @@ struct Uniforms {
     fade_end: f32,       // distance fade end, world units of view depth
     debug_view: u32,
     frame_index: u32,
-    flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
+    flags: u32, // bit 0 temporal, bit 1 history valid, bit 2 distance fade,
+                // bit 3 external normal, bit 4 underwater fade
     thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
     inv_debug_depth: f32,   // debug depth view gradient scale (1 / world units)
     radius_far: f32,        // far effect radius (fraction of view depth); 0 disables the ramp
     radius_ramp_start: f32, // radius ramp band start, world units of view depth
     radius_ramp_end: f32,   // radius ramp band end, world units of view depth
     denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    water_y: f32,           // world-space Y of the water surface (underwater fade)
+    uw_half_depth: f32,     // water-column depth for 50% fade (world units)
+    uw_strength: f32,       // underwater fade strength, 0..1
 }
 
 @group(0) @binding(0) var ambient_occlusion: texture_2d<f32>;
@@ -230,6 +232,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         let fade = smoothstep(uniforms.fade_start, max(uniforms.fade_end, uniforms.fade_start + 1.0),
             max(-view_position.z, 0.0));
         visibility = mix(visibility, 1.0, fade);
+    }
+    // Underwater fade: below the water surface, drive AO back toward "no occlusion" as the water
+    // column deepens, so a deep submerged lakebed does not keep harsh full-strength occlusion far
+    // out (matching how the distance fade softens above-water AO into fog). Gated by flags bit 4;
+    // when the bit is clear (no water / provider absent / toggle off) this is a no-op == vanilla.
+    if (uniforms.flags & 16u) != 0u && reference_depth > 0.0 {
+        let view_pos = reconstruct_view_space_position(reference_depth, in.uv);
+        let world = uniforms.world_from_view * vec4f(view_pos, 1.0);
+        let world_y = world.y / world.w;
+        if world_y < uniforms.water_y {
+            let column = uniforms.water_y - world_y;
+            let uw_fade = clamp(
+                (1.0 - exp2(-column / max(uniforms.uw_half_depth, 1.0))) * uniforms.uw_strength,
+                0.0, 1.0);
+            visibility = mix(visibility, 1.0, uw_fade);
+        }
     }
     let value = clamp(mix(1.0, visibility, uniforms.intensity), 0.0, 1.0);
     return vec4f(value, value, value, 1.0);
