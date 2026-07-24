@@ -50,12 +50,16 @@ struct Uniforms {
     sss_fade_start: f32,      // world units; screen-space shadow full below this distance
     sss_fade_end: f32,        // world units; screen-space shadow gone beyond this distance
     edge_fade: f32,           // 1 = fade the outermost cascade's shadow out at its box edge
-    _pad1: f32,
-    _pad2: f32,
+    rpdb_enabled: f32,        // 1 = receiver-plane depth bias (per-tap slope-exact acne control)
+    rpdb_max: f32,            // clamp on the receiver-plane bias, in normalized depth per texel
     shadow_tint_r: f32,       // skylight color (peak-normalized) for colored shadows
     shadow_tint_g: f32,
     shadow_tint_b: f32,
     shadow_tint_strength: f32,  // 0 = neutral gray shadow, 1 = full sky tint
+    terminator_band: f32,     // half-width (in n.L) of the light/shadow transition ramp
+    attached_shadows: f32,    // 1 = also shadow surfaces facing away from the sun (n.L term)
+    _pad3: f32,
+    _pad4: f32,
 }
 
 @group(0) @binding(0) var scene_depth: texture_2d<f32>;
@@ -135,14 +139,19 @@ fn shadow_compare_bilinear(map: u32, light_uv: vec2f, receiver: f32, bias: f32) 
     return mix(top, bottom, fraction.y);
 }
 
-fn sample_shadow_pcf(map: u32, light_uv: vec2f, receiver: f32, bias: f32) -> f32 {
+// base_bias is the constant term applied to every tap; bias_uv is the receiver-plane depth
+// gradient (d(light depth)/d(light uv)) so each PCF tap compares against the depth the receiver
+// surface actually has at that offset - the offset's own depth change is added back instead of
+// paid for as a flat margin. bias_uv = 0 reduces this to the original constant-bias PCF.
+fn sample_shadow_pcf(map: u32, light_uv: vec2f, receiver: f32, base_bias: f32, bias_uv: vec2f) -> f32 {
     let radius = i32(uniforms.pcf_taps[map]);
     var sum = 0.0;
     var count = 0.0;
     for (var y = -radius; y <= radius; y += 1i) {
         for (var x = -radius; x <= radius; x += 1i) {
             let offset = vec2f(f32(x), f32(y)) * uniforms.inv_map_size[map];
-            sum += shadow_compare_bilinear(map, light_uv + offset, receiver, bias);
+            let tap_bias = base_bias + dot(bias_uv, offset);
+            sum += shadow_compare_bilinear(map, light_uv + offset, receiver, tap_bias);
             count += 1.0;
         }
     }
@@ -292,16 +301,72 @@ fn project_cascade(map: u32, receiver_world: vec3f) -> CascadeProj {
     return out;
 }
 
-// Full occlusion evaluation against one cascade: per-cascade normal-offset receiver,
-// per-cascade slope-scaled bias, per-cascade PCF kernel.
-fn cascade_occlusion(map: u32, world: vec3f, n: vec3f, tan_t: f32) -> f32 {
+// Receiver-plane depth bias gradient for one cascade: d(light depth)/d(light uv) for the plane
+// spanned by two world tangents. The light projection is orthographic (directional sun/moon), so
+// clip.w is constant (1) and a world DELTA maps to an NDC delta straight through the light matrix
+// with no perspective term. Solve the 2x2 [tangent-in-uv] -> depth system (Isidoro 2006). The
+// result is invariant to the tangents' lengths and to which basis of the plane is chosen.
+fn receiver_plane_bias_uv(map: u32, t1: vec3f, t2: vec3f) -> vec2f {
+    let cx = uniforms.light_vp[map] * vec4f(t1, 0.0);
+    let cy = uniforms.light_vp[map] * vec4f(t2, 0.0);
+    // uv = (0.5 + 0.5*ndc.x, 0.5 - 0.5*ndc.y); depth = ndc.z. clip.w = 1 (ortho).
+    let ax = vec3f(0.5 * cx.x, -0.5 * cx.y, cx.z);
+    let ay = vec3f(0.5 * cy.x, -0.5 * cy.y, cy.z);
+    let det = ax.x * ay.y - ax.y * ay.x;
+    if abs(det) < 1.0e-12 {
+        return vec2f(0.0);
+    }
+    let inv_det = 1.0 / det;
+    return vec2f(
+        (ay.y * ax.z - ax.y * ay.z) * inv_det,
+        (ax.x * ay.z - ay.x * ax.z) * inv_det);
+}
+
+// Receiver-plane gradient from the surface NORMAL rather than raw depth crosses: build any two
+// world tangents spanning the plane perpendicular to n and feed them through the solver above.
+// Sourcing it from the normal means Normal Smoothing (which feeds n) also smooths the bias, so
+// the per-facet gradient jumps that band low-poly characters are gone once smoothing is on -
+// the depth-cross version could not be smoothed and re-introduced the faceting.
+fn receiver_plane_bias_uv_from_normal(map: u32, n: vec3f) -> vec2f {
+    let ref_axis = select(vec3f(0.0, 0.0, 1.0), vec3f(1.0, 0.0, 0.0), abs(n.z) > 0.9);
+    let t1 = normalize(cross(ref_axis, n));
+    let t2 = cross(n, t1);
+    return receiver_plane_bias_uv(map, t1, t2);
+}
+
+// Full occlusion evaluation against one cascade: per-cascade normal-offset receiver, per-cascade
+// acne bias, per-cascade PCF kernel. With Receiver-Plane Bias on, the slope term is the exact
+// per-tap receiver-plane gradient (from the surface normal), which tracks the surface under the
+// PCF footprint instead of adding a flat margin that detaches the shadow; a small clamped
+// fractional-sampling term covers the centre texel. With it off, the classic constant +
+// slope-scaled bias applies.
+//
+// light_facing (0 back-facing -> 1 front-facing) scales the whole slope/plane term. A surface
+// turned away from the light is darkened by the two-sided map's front-most occluder, NOT by
+// self-shadow, so it needs no slope bias; applying it there (the old code MAXED it, via the
+// cos_t floor) lifts the comparison until thin geometry leaks back into light. The constant
+// bias and the normal-offset receiver still apply on both sides.
+fn cascade_occlusion(
+    map: u32, world: vec3f, n: vec3f, tan_t: f32, light_facing: f32) -> f32 {
     let receiver_world = world + n * (uniforms.normal_offset * uniforms.texel_world[map]);
     let p = project_cascade(map, receiver_world);
     if !p.valid {
         return 0.0;
     }
-    let bias_eff = uniforms.bias[map] + uniforms.slope_bias[map] * tan_t;
-    return sample_shadow_pcf(map, p.uv, p.receiver, bias_eff);
+    var base_bias = uniforms.bias[map];
+    var bias_uv = vec2f(0.0);
+    if uniforms.rpdb_enabled != 0.0 {
+        bias_uv = receiver_plane_bias_uv_from_normal(map, n) * light_facing;
+        // Clamp the per-texel gradient so a near-grazing plane can't explode into a light leak;
+        // the cap doubles as the grazing-surface ceiling, where the largest bias is wanted anyway.
+        let cap = uniforms.rpdb_max * uniforms.map_size[map];
+        bias_uv = clamp(bias_uv, vec2f(-cap), vec2f(cap));
+        // Fractional sampling error: the receiver's own depth change across ~one texel.
+        base_bias += (abs(bias_uv.x) + abs(bias_uv.y)) * uniforms.inv_map_size[map];
+    } else {
+        base_bias += uniforms.slope_bias[map] * tan_t * light_facing;
+    }
+    return sample_shadow_pcf(map, p.uv, p.receiver, base_bias, bias_uv);
 }
 
 @fragment
@@ -368,16 +433,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
 
     var occlusion = 0.0;
     if map_on {
-        // Receiver-side acne control: the smoothed normal feeds the slope-scaled bias and
-        // the per-cascade normal-offset receivers.
+        let inv_screen = 1.0 / vec2f(textureDimensions(scene_depth));
+        // Receiver-side acne control: the (optionally smoothed) surface normal feeds the
+        // slope/plane bias, the light-facing gate, and the per-cascade normal-offset receiver.
         var n = vec3f(0.0);
         var tan_t = 0.0;
-        if uniforms.slope_bias[0] > 0.0 || uniforms.normal_offset > 0.0 {
-            let inv_screen = 1.0 / vec2f(textureDimensions(scene_depth));
+        var light_facing = 1.0;
+        if uniforms.rpdb_enabled != 0.0 || uniforms.slope_bias[0] > 0.0 ||
+            uniforms.normal_offset > 0.0 || uniforms.attached_shadows != 0.0
+        {
             n = world_normal_at(in.uv, world, depth, inv_screen);
             let light_dir = vec3f(
                 uniforms.light_dir_world_x, uniforms.light_dir_world_y, uniforms.light_dir_world_z);
-            let cos_t = clamp(dot(n, light_dir), 0.05, 1.0);
+            let ndl = dot(n, light_dir);
+            // Terminator ramp: 0 where the surface faces away from the light, 1 where it faces it,
+            // smooth across a +/-band window centred on n.L = 0. Drives BOTH the slope-bias gate
+            // (bias only on the lit side - a back-facing surface is darkened by the front-most
+            // occluder, not self-shadow, so biasing it there leaks thin geometry) and the attached
+            // shadow below. Wider band = softer light/shadow boundary on curved surfaces.
+            let band = max(uniforms.terminator_band, 0.02);
+            light_facing = smoothstep(-band, band, ndl);
+            let cos_t = clamp(ndl, 0.05, 1.0);
             tan_t = min(sqrt(max(1.0 - cos_t * cos_t, 0.0)) / cos_t, 4.0);
         }
 
@@ -428,11 +504,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         }
 
         if sel.valid {
-            occlusion = cascade_occlusion(selected, world, n, tan_t);
+            occlusion = cascade_occlusion(selected, world, n, tan_t, light_facing);
             let blend_start = 1.0 - uniforms.blend_frac;
             if sel.fit > blend_start && selected + 1u < count {
                 let t = saturate((sel.fit - blend_start) / uniforms.blend_frac);
-                occlusion = mix(occlusion, cascade_occlusion(selected + 1u, world, n, tan_t), t);
+                occlusion = mix(
+                    occlusion,
+                    cascade_occlusion(selected + 1u, world, n, tan_t, light_facing),
+                    t);
             } else if uniforms.edge_fade != 0.0 && selected + 1u >= count && sel.fit > blend_start {
                 // Outermost cascade: no farther cascade to hand off to, so its box edge is a
                 // hard coverage boundary. Fade the mapped shadow out across the same band so
@@ -447,8 +526,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         // (an empty map compares as fully lit); max() keeps whichever term is darker.
         var link_occlusion = 0.0;
         if uniforms.link_enabled != 0.0 {
-            link_occlusion = cascade_occlusion(3u, world, n, tan_t);
+            link_occlusion = cascade_occlusion(3u, world, n, tan_t, light_facing);
             occlusion = max(occlusion, link_occlusion);
+        }
+
+        // Attached shadow (the half a shadow MAP can't do): a surface facing away from the sun is
+        // dark whether or not anything occludes it, but the map only records CAST (occluded)
+        // shadow - so an unoccluded back-facing surface (Link's nose, protruding tunic/boot
+        // facets when back-lit) reads as fully lit and leaks. Fold in the n.L term: (1 -
+        // light_facing) is 1 on the dark side, 0 on the lit side. max() means already-cast-
+        // shadowed pixels don't darken further; only the leaking back-faces get corrected.
+        if uniforms.attached_shadows != 0.0 {
+            occlusion = max(occlusion, 1.0 - light_facing);
         }
 
         // 14 = cascade coverage: red / green / blue = near / mid / far cascade shading this
