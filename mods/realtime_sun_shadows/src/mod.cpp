@@ -93,6 +93,8 @@ ConfigVarHandle g_cvarContactShadows = 0;
 ConfigVarHandle g_cvarDebugView = 0;
 ConfigVarHandle g_cvarSlopeBias = 0;
 ConfigVarHandle g_cvarRpdb = 0;
+ConfigVarHandle g_cvarAttachedShadows = 0;
+ConfigVarHandle g_cvarTerminatorSoftness = 0;
 ConfigVarHandle g_cvarNormalOffset = 0;
 ConfigVarHandle g_cvarSssThickness = 0;
 ConfigVarHandle g_cvarSssEdgeThreshold = 0;
@@ -409,8 +411,12 @@ struct ShadowUniforms {
     float rpdb_max;            // clamp on the receiver-plane bias, normalized depth per texel
     float shadow_tint[3];      // skylight color (peak-normalized), colored-shadow multiply
     float shadow_tint_strength;  // 0 = neutral gray shadow (original), 1 = full sky tint
+    float terminator_band;     // half-width (in n.L) of the light/shadow transition ramp
+    float attached_shadows;    // 1 = also shadow surfaces facing away from the sun (n.L term)
+    float _pad3;
+    float _pad4;
 };
-static_assert(sizeof(ShadowUniforms) == 512);
+static_assert(sizeof(ShadowUniforms) == 528);
 static_assert(sizeof(ShadowUniforms) % 16 == 0);
 
 // Mirror of the WGSL BlurUniforms struct (keep in sync with res/normal_smooth.wgsl).
@@ -2595,6 +2601,14 @@ void composite_map_pass(int64_t debugMode) {
     // depth range per texel, which only engages on near-grazing surfaces and depth edges.
     uniforms.rpdb_enabled = get_bool_option(g_cvarRpdb, true) ? 1.0f : 0.0f;
     uniforms.rpdb_max = 0.02f;
+    // Attached (n.L) shadow: darken surfaces facing away from the sun, which the cast-only shadow
+    // map cannot reach when they are unoccluded (protruding back-faces). Terminator Softness is
+    // the half-width of the light/shadow transition, in n.L units: 0 -> ~hard boundary (clamped to
+    // 0.02 in-shader), 100 -> 0.5 (very soft). Drives the slope-bias gate too.
+    uniforms.attached_shadows = get_bool_option(g_cvarAttachedShadows, true) ? 1.0f : 0.0f;
+    uniforms.terminator_band =
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarTerminatorSoftness, 20), 0, 100)) /
+        100.0f * 0.5f;
     uniforms.debug_mode = static_cast<uint32_t>(debugMode);
     // Colored shadows: tint the darkening toward the current skylight color so shadows read
     // as skylit instead of neutral gray. 0 strength (or no sky reading) leaves the original
@@ -2845,6 +2859,16 @@ ModResult build_controls_tab(
         "filter footprint, so acne clears with almost no flat margin - shadows stay attached to "
         "their casters instead of sliding off. Leave on; when on it replaces Slope Bias. Turn off "
         "to fall back to the manual Bias / Slope Bias margins.");
+    add_toggle(left, "Attached Shadows", g_cvarAttachedShadows,
+        "Also shadows surfaces that face away from the sun, not just ones with something blocking "
+        "the light. The shadow map alone can only do the second kind, so unblocked back-facing "
+        "detail (a nose, protruding tunic/boot facets when back-lit) reads as fully lit and leaks "
+        "through. This fills that in. Already-shadowed pixels never get darker - only the leaks are "
+        "corrected.");
+    add_number(left, "Terminator Softness", g_cvarTerminatorSoftness, 0, 100, 5, "%",
+        "How gradual the light-to-shadow boundary is on curved surfaces. Low = a crisp, possibly "
+        "hard edge where sun meets shadow; high = a soft, gradual falloff. Drives both Attached "
+        "Shadows and the slope-bias light-facing gate. Start around 20 and adjust to taste.");
     add_number(left, "Bias", g_cvarBias, 0, 200, 5, nullptr,
         "Constant depth bias in world units, applied at every tap. With Receiver-Plane Bias on you "
         "need very little; raise only if flat, light-facing ground still shows acne. Lower to "
@@ -3114,6 +3138,14 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return result;
     }
     result = register_bool_option("receiverPlaneBias", true, g_cvarRpdb, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_bool_option("attachedShadows", true, g_cvarAttachedShadows, error);
+    if (result != MOD_OK) {
+        return result;
+    }
+    result = register_int_option("terminatorSoftness", 20, g_cvarTerminatorSoftness, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -3462,6 +3494,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarStrength = 0;
     g_cvarPcf = g_cvarBias = g_cvarBoxRadius = g_cvarContactShadows = g_cvarDebugView = 0;
     g_cvarSlopeBias = g_cvarRpdb = g_cvarNormalOffset = 0;
+    g_cvarAttachedShadows = g_cvarTerminatorSoftness = 0;
     g_cvarSssThickness = g_cvarSssEdgeThreshold = g_cvarSssContrast = g_cvarSssBias =
         g_cvarSssLength = g_cvarSssIgnoreEdges = 0;
     g_cvarSssLengthFar = g_cvarSssLengthRampStart = g_cvarSssLengthRampEnd = 0;

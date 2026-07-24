@@ -56,6 +56,10 @@ struct Uniforms {
     shadow_tint_g: f32,
     shadow_tint_b: f32,
     shadow_tint_strength: f32,  // 0 = neutral gray shadow, 1 = full sky tint
+    terminator_band: f32,     // half-width (in n.L) of the light/shadow transition ramp
+    attached_shadows: f32,    // 1 = also shadow surfaces facing away from the sun (n.L term)
+    _pad3: f32,
+    _pad4: f32,
 }
 
 @group(0) @binding(0) var scene_depth: texture_2d<f32>;
@@ -436,16 +440,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         var tan_t = 0.0;
         var light_facing = 1.0;
         if uniforms.rpdb_enabled != 0.0 || uniforms.slope_bias[0] > 0.0 ||
-            uniforms.normal_offset > 0.0
+            uniforms.normal_offset > 0.0 || uniforms.attached_shadows != 0.0
         {
             n = world_normal_at(in.uv, world, depth, inv_screen);
             let light_dir = vec3f(
                 uniforms.light_dir_world_x, uniforms.light_dir_world_y, uniforms.light_dir_world_z);
             let ndl = dot(n, light_dir);
-            // 0 where the surface faces away from the light (occluded by the front-most face, not
-            // self-shadowing -> no slope bias), ramping to 1 across a narrow terminator band so
-            // grazing LIT surfaces keep full bias and the transition shows no hard line.
-            light_facing = smoothstep(-0.1, 0.05, ndl);
+            // Terminator ramp: 0 where the surface faces away from the light, 1 where it faces it,
+            // smooth across a +/-band window centred on n.L = 0. Drives BOTH the slope-bias gate
+            // (bias only on the lit side - a back-facing surface is darkened by the front-most
+            // occluder, not self-shadow, so biasing it there leaks thin geometry) and the attached
+            // shadow below. Wider band = softer light/shadow boundary on curved surfaces.
+            let band = max(uniforms.terminator_band, 0.02);
+            light_facing = smoothstep(-band, band, ndl);
             let cos_t = clamp(ndl, 0.05, 1.0);
             tan_t = min(sqrt(max(1.0 - cos_t * cos_t, 0.0)) / cos_t, 4.0);
         }
@@ -521,6 +528,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         if uniforms.link_enabled != 0.0 {
             link_occlusion = cascade_occlusion(3u, world, n, tan_t, light_facing);
             occlusion = max(occlusion, link_occlusion);
+        }
+
+        // Attached shadow (the half a shadow MAP can't do): a surface facing away from the sun is
+        // dark whether or not anything occludes it, but the map only records CAST (occluded)
+        // shadow - so an unoccluded back-facing surface (Link's nose, protruding tunic/boot
+        // facets when back-lit) reads as fully lit and leaks. Fold in the n.L term: (1 -
+        // light_facing) is 1 on the dark side, 0 on the lit side. max() means already-cast-
+        // shadowed pixels don't darken further; only the leaking back-faces get corrected.
+        if uniforms.attached_shadows != 0.0 {
+            occlusion = max(occlusion, 1.0 - light_facing);
         }
 
         // 14 = cascade coverage: red / green / blue = near / mid / far cascade shading this
