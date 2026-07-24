@@ -1,0 +1,7 @@
+{
+  "id": "dev.automata.smaa",
+  "name": "SMAA",
+  "version": "0.1.0",
+  "author": "automata-rtx",
+  "description": "SMAA (subpixel morphological antialiasing), service-only. Detects edges from scene luma unioned with the Depth to Normal service's reconstructed surface normal + depth (so geometric silhouettes and creases are caught even where luma contrast is weak), then reconstructs and blends the aliased edges. The expensive blend-weight pass uses CMAA2-style compute compaction: edge pixels in each workgroup are packed into contiguous threads so sparse edges run in fully-occupied warps. Applies before bloom/translucency so the game's post effects operate on antialiased geometry. Spatial (SMAA 1x); orthogonal patterns in this first version."
+}
