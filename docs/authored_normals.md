@@ -134,6 +134,21 @@ inline reconstruction, and the ping-pong blur targets are released when smoothin
 **So: to see authored normals in the shadow mod, set Normal Smoothing to 0.** That is also the A/B
 for whether the blur can be deleted outright — which is the next item.
 
+### The same trap in VBAO's debug view
+
+Swept for the same class of bug afterwards and found one more, in the debug view rather than in the
+effect: **VBAO's "Normals" view always reconstructed from depth**, even while the AO pass itself was
+consuming the provider's authored normal — its help text claimed it showed "the normals the
+occlusion pass consumes", which was no longer true. It now makes the same choice `vbao.wgsl` makes
+(provider normal when flags bit 3 is set, inline reconstruction otherwise), so it cannot claim a
+source the AO is not using.
+
+Checked and clean: SSILVB (hard service dependency, no inline reconstruction anywhere) and SMAA
+(no normal debug view; its normal is an optional edge-detection input that stands in with the
+colour snapshot). The only remaining inline depth→normal reconstructions in the repo are VBAO's
+fallback for when the provider is absent, the shadow composite's last-resort cross, and the
+provider's own — which is the point.
+
 **Still to do, after verification** (deliberately not in the same push, so each reverts alone):
 
 - Delete `realtime_sun_shadows/res/normal_smooth.wgsl` and its host code (a dense 32-tap separable

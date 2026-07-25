@@ -223,6 +223,8 @@ struct CompositePayload {
     WGPUTextureView aoSource;           // accumulated (temporal) or denoised (fallback) AO
     WGPUTextureView preprocessedDepth;  // debug views reconstruct normals/depth from it
     WGPUTextureView sceneDepth;         // raw snapshot: depth-aware upscale + bypass debug views
+    WGPUTextureView d2nNormal;          // provider normal for the Normals debug view (or a
+                                        // stand-in when absent, as in ComputePayload)
     uint32_t uniform_offset;
     uint32_t uniform_size;
     uint32_t debug_view;
@@ -716,13 +718,13 @@ void on_draw(
         data.debug_view != 0 ? g_compositeDebugPipeline : g_compositePipeline;
     WGPUBindGroupLayout layout = data.debug_view != 0 ? g_compositeDebugLayout : g_compositeLayout;
     if (data.aoSource == nullptr || data.preprocessedDepth == nullptr ||
-        data.sceneDepth == nullptr || pipeline == nullptr)
+        data.sceneDepth == nullptr || data.d2nNormal == nullptr || pipeline == nullptr)
     {
         return;
     }
 
-    WGPUBindGroupEntry entries[4] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
-        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    WGPUBindGroupEntry entries[5] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
     entries[0].binding = 0;
     entries[0].textureView = data.aoSource;
     entries[1].binding = 1;
@@ -733,9 +735,11 @@ void on_draw(
     entries[3].buffer = ctx->uniform_buffer;
     entries[3].offset = data.uniform_offset;
     entries[3].size = data.uniform_size;
+    entries[4].binding = 4;
+    entries[4].textureView = data.d2nNormal;
     WGPUBindGroupDescriptor bindGroupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bindGroupDesc.layout = layout;
-    bindGroupDesc.entryCount = 4;
+    bindGroupDesc.entryCount = 5;
     bindGroupDesc.entries = entries;
     WGPUBindGroup bindGroup = wgpuDeviceCreateBindGroup(ctx->device, &bindGroupDesc);
     if (bindGroup == nullptr) {
@@ -936,7 +940,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         : ((denoisePasses % 2u) != 0u ? g_targets.aoFinalView : g_targets.aoNoisyView);
     const CompositePayload drawPayload{
         temporal ? g_targets.historyViews[writeIdx] : denoisedView, g_targets.preprocessedDepthAll,
-        resolved.depth, uniformRange.offset, uniformRange.size, debugMode};
+        resolved.depth, computePayload.d2nNormal, uniformRange.offset, uniformRange.size,
+        debugMode};
     if (debugMode != 0) {
         // Debug views draw at FRAME_BEFORE_HUD so deferred fog, translucency, and bloom
         // don't paint over them (all payload views stay valid for the rest of the frame).
@@ -1135,8 +1140,9 @@ ModResult build_controls_tab(
     static const char* kDebugOptions[] = {"Off", "AO", "Normals", "Depth", "Staircase"};
     add_select(left, "Debug View", g_cvarDebugView,
         "AO: the final shaped occlusion term as grayscale (accumulated when temporal is "
-        "on).<br/>Normals: the view-space normals the occlusion pass "
-        "consumes.<br/>Depth: the preprocessed depth as a distance "
+        "on).<br/>Normals: the view-space normals the occlusion pass consumes - the Depth to "
+        "Normal provider's (authored, when Graphics Hub has them) or the inline depth "
+        "reconstruction, whichever the AO actually used this frame.<br/>Depth: the preprocessed depth as a distance "
         "gradient.<br/>Staircase: detects quantized depth - smooth depth is "
         "near-black with thin triangle edges, quantized depth lights up across "
         "surfaces.<br/>Debug views draw over the finished frame (after fog and bloom), so "
