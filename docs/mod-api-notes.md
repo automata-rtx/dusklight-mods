@@ -91,3 +91,54 @@ Upstream reference: the fetched `dusklight/docs/modding.md` and `dusklight/sdk/i
   a fast full type-check of mod.cpp against the game headers. Shaders are validated by the game at
   pipeline-creation time — there is no separate offline WGSL validator (it was dropped in the move to
   the pure template; `git log` for `tools/wgsl_validate.cpp` if you want to reinstate it).
+
+## Symbolizing a game crash (do this FIRST, not after guessing)
+
+A Dusklight crash dump gives module-relative RVAs and no symbols. **Resolve them properly — do not
+try to infer the faulting code from the mod's source.** The platform release ships the PDB, so the
+exact function, source file and line are always available:
+
+```sh
+# 1. The Windows build for the pinned platform, from DUSKLIGHT_SDK_STUB_URL's release.
+curl -sSL -o dusk.zip \
+  "https://github.com/automata-rtx/dusklight-ao/releases/download/platform-gbuffer-test/dusklight-UNKNOWN-VERSION-win32-msvc-x86_64.zip"
+unzip -q dusk.zip -d dusk
+
+# 2. debug.7z inside it holds dusklight.pdb (~246 MB). No 7z binary here; py7zr works.
+pip install py7zr
+python3 -c "import py7zr; py7zr.SevenZipFile('dusk/debug.7z').extract(path='dusk', targets=['dusklight.pdb'])"
+
+# 3. llvm-symbolizer needs the PDB beside the exe. Image base is 0x140000000, so VMA = base + rva.
+llvm-symbolizer --obj=dusk/dusklight.exe --functions=linkage --demangle --inlines 0x1403c2828
+```
+
+`--inlines` is the important flag: the outermost entry names the real function, the inner ones the
+inlined accessor chain that actually faulted. That is how the boot-scene crash was pinned to
+`dKy_Indoor_check -> dStage_stagInfo_GetSTType -> BE<u32>::swap` in one step, after two rounds of
+wrong guesses from reading mod source.
+
+Notes:
+
+- Symbolize **every** frame, not just the crash PC. The game-side frames name the stage dispatch
+  (`dusk::mods::gfx_run_stage`) and the game loop, which tells you which callback of yours was
+  running and when.
+- The `.exe` itself is stripped (`objdump -t` shows no symbols) — the PDB is mandatory.
+- Mod-side frames need the matching `mod.dll`, which lives in the CI per-platform artifact. Fetching
+  that needs the artifact host, which the agent proxy may block; the game-side frames are usually
+  enough to identify the call.
+- **A fault address under ~0x100 is a null dereference at that struct offset** — match it against
+  the field offset in the header (`0xc` -> `field_0x0c`) to confirm the object involved.
+
+### Game state that does not exist on the boot/logo scene
+
+Stage callbacks fire on 2D screens too, on the very first frame the window appears. Several game
+accessors are unguarded there, and the game itself never notices because nothing of its own asks
+that early:
+
+- `dKy_Indoor_check()` -> `dStage_stagInfo_GetSTType(getStagInfo())` dereferences the stage info
+  with no null check. `dComIfGp_getStage()->getStagInfo()` is **null until a stage loads**.
+- `dKy_getEnvlight()` returns null there (it is null-checked by callers in our mods — keep it that way).
+
+`draw_lists_ready()` is **not** a general "a scene exists" test: the draw lists are already populated
+on the logo scene while the stage info is still null. Guard each piece of game state on its own
+availability, not on a proxy for it.
