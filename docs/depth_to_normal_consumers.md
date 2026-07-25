@@ -1,11 +1,18 @@
 # Depth to Normal — building on it (future consumer mods)
 
 The **Depth to Normal** provider mod (`dev.automata.depth_to_normal`) publishes one thing: a
-per-pixel **world-space geometric surface normal** (+ raw depth), reconstructed from the scene
-depth buffer once per frame, as a mod-exported service. The game's forward renderer never exposes
-a screen-space normal, so reconstructing one is the single missing ingredient for a whole class of
-screen-space effects. This doc is a menu of what becomes buildable once that normal exists, and how
-cheap each is to reach from the service.
+per-pixel **world-space surface normal** (+ raw depth), computed once per frame, as a mod-exported
+service. The game's forward renderer never exposed a screen-space normal to shaders, so having one
+is the single missing ingredient for a whole class of screen-space effects. This doc is a menu of
+what becomes buildable once that normal exists, and how cheap each is to reach from the service.
+
+> The normal now comes from the game's **authored vertex normals** (the renderer's thin g-buffer),
+> falling back per pixel to the depth-gradient reconstruction where there is none — so it is smooth
+> rather than per-facet. Nothing in the service contract changed: same id, same `rgba32float`
+> layout, same lifetime. Consumers get the better normal for free. See `docs/authored_normals.md`.
+>
+> **If your consumer composites with a render pipeline**, note that it must declare a second color
+> target (see `docs/authored_normals.md` §5) — that part is not automatic.
 
 ## How a consumer taps it (the whole integration)
 

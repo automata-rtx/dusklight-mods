@@ -1,28 +1,51 @@
 // Depth to Normal - reconstruct.wgsl
 //
-// Reconstructs a per-pixel world-space geometric surface normal from the scene depth snapshot,
-// once per frame, for other mods to consume (ambient occlusion, shadows, reflections, outlines).
+// Produces the per-pixel world-space surface normal (+ raw depth) that other mods consume
+// (ambient occlusion, GI, shadows, antialiasing), once per frame. There are two sources:
 //
-// The depth->normal reconstruction is atyuwen's accurate 5-tap method, adapted UNCHANGED from
-// Encounter's ao_mod demo (which ports it from Bevy Engine's SSAO; see res/licenses/). The
-// method is defined in view space (camera at the origin, so the camera-facing test is just
-// dot(normal, position) > 0); the result is rotated into world space for output, so any consumer
+//   * AUTHORED (preferred): the game's own interpolated vertex normal, written by the renderer
+//     into the thin g-buffer's second color attachment and handed to us as a snapshot
+//     (RGBA8Unorm: xyz = view-space normal * 0.5 + 0.5, w = 1 when that draw supplied a normal
+//     attribute). Smooth by construction - no faceting, so no smoothing pass is needed.
+//   * RECONSTRUCTED (fallback): atyuwen's accurate 5-tap depth-gradient method, adapted UNCHANGED
+//     from Encounter's ao_mod demo (which ports it from Bevy Engine's SSAO; see res/licenses/).
+//     A cross product of screen-space position deltas is the flat face normal of the rasterized
+//     triangle, so this is per-facet by construction. Used per-pixel wherever the authored normal
+//     is absent (w = 0: sky, UI, billboards, non-depth-writing effects), and globally when the
+//     user turns authored normals off or the platform has no normal buffer.
+//
+// Both are defined in view space (camera at the origin, so the camera-facing test is just
+// dot(normal, position) > 0) and both are rotated into world space for output, so any consumer
 // gets a canonical world-space normal and rotates to its own space if needed.
 //
 // Output rgba32float: xyz = world-space normal (unit length, camera-facing), w = raw reversed-Z
 // depth (carried along so consumers get a bilateral/rejection reference without a second fetch).
 // Sky / cleared pixels (raw depth 0) are written as (0,0,1, 0): w = 0 marks them invalid.
+//
+// When debug_compare is set, the OTHER normal (whichever of the two did not become the output) is
+// also written to alt_out as xyz = world normal, w = authored validity, purely so the debug view
+// can show the two side by side and diff them. It costs a second full-size target and is only on
+// while a comparison view is selected.
 
 struct Uniforms {
     view_from_proj: mat4x4f,   // depth-buffer -> view-space position (unproject)
     world_from_view: mat4x4f,  // view -> world; its 3x3 rotates the normal to world space
     inv_size: vec2f,           // 1 / render size (full resolution)
-    _pad0: vec2f,
+    use_authored: f32,         // 1 = prefer the authored normal, 0 = always reconstruct
+    debug_compare: f32,        // 1 = also write the other normal to alt_out
+    basis_flip: vec3f,         // per-axis sign for the decoded authored normal (basis diagnostic)
+    _pad0: f32,
 }
 
 @group(0) @binding(0) var scene_depth: texture_2d<f32>;
 @group(0) @binding(1) var normal_out: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(2) var<uniform> uniforms: Uniforms;
+// Authored view-space normal snapshot. Always bound: a 1x1 zero-filled stand-in takes its place
+// when the platform has no normal buffer (a bind group must always match its layout), and a zero
+// texel reads as validity 0, i.e. "reconstruct this pixel".
+@group(0) @binding(3) var authored_normal: texture_2d<f32>;
+// Debug-only alternate output; a 1x1 stand-in when no comparison view is active.
+@group(0) @binding(4) var alt_out: texture_storage_2d<rgba32float, write>;
 
 fn load_depth(coord: vec2<i32>) -> f32 {
     let size = vec2<i32>(textureDimensions(scene_depth));
@@ -80,6 +103,13 @@ fn reconstruct_normal(coord: vec2<i32>, pos: vec3f, depth_center: f32) -> vec3f 
     return n;
 }
 
+// Rotate a view-space normal into world space (3x3 of world_from_view, column-major).
+fn to_world(view_normal: vec3f) -> vec3f {
+    let m = uniforms.world_from_view;
+    return normalize(
+        m[0].xyz * view_normal.x + m[1].xyz * view_normal.y + m[2].xyz * view_normal.z);
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn reconstruct(@builtin(global_invocation_id) gid: vec3u) {
     let size = vec2<i32>(textureDimensions(normal_out));
@@ -87,18 +117,57 @@ fn reconstruct(@builtin(global_invocation_id) gid: vec3u) {
     if coord.x >= size.x || coord.y >= size.y {
         return;
     }
+    let comparing = uniforms.debug_compare > 0.5;
     let uv = (vec2f(coord) + 0.5) * uniforms.inv_size;
     let depth = load_depth(coord);
     if depth <= 0.0 {
         // Sky / cleared: no surface. w = 0 marks the texel invalid for consumers.
         textureStore(normal_out, coord, vec4f(0.0, 0.0, 1.0, 0.0));
+        if comparing {
+            textureStore(alt_out, coord, vec4f(0.0, 0.0, 1.0, 0.0));
+        }
         return;
     }
     let pos = reconstruct_view_space_position(depth, uv);
-    let view_normal = reconstruct_normal(coord, pos, depth);
-    // Rotate the view-space normal into world space (3x3 of world_from_view, column-major).
-    let m = uniforms.world_from_view;
-    let world_normal = normalize(
-        m[0].xyz * view_normal.x + m[1].xyz * view_normal.y + m[2].xyz * view_normal.z);
-    textureStore(normal_out, coord, vec4f(world_normal, depth));
+
+    // Decode the authored normal. Renormalize always: vertex interpolation, 8-bit quantization
+    // and any MSAA resolve all denormalize the stored vector.
+    let a_size = vec2<i32>(textureDimensions(authored_normal));
+    let a = textureLoad(authored_normal, clamp(coord, vec2<i32>(0i), a_size - 1i), 0i);
+    var authored_valid = a.w > 0.5;
+    var authored_view = vec3f(0.0, 0.0, 1.0);
+    if authored_valid {
+        let raw = (a.xyz * 2.0 - 1.0) * uniforms.basis_flip;
+        let len_sq = dot(raw, raw);
+        if len_sq > 1e-8 {
+            authored_view = raw * inverseSqrt(len_sq);
+            // Same camera-facing guard the reconstruction uses. Authored normals can face away
+            // on two-sided or inverted geometry; without this they punch dark holes in AO.
+            if dot(authored_view, pos) > 0.0 {
+                authored_view = -authored_view;
+            }
+        } else {
+            authored_valid = false;
+        }
+    }
+
+    var view_normal: vec3f;
+    var alt_view = vec3f(0.0, 0.0, 1.0);
+    if uniforms.use_authored > 0.5 && authored_valid {
+        view_normal = authored_view;
+        if comparing {
+            alt_view = reconstruct_normal(coord, pos, depth);
+        }
+    } else {
+        // Either the user picked the reconstruction, or this pixel has no authored normal.
+        view_normal = reconstruct_normal(coord, pos, depth);
+        // The alternate is the authored normal where there is one; where there isn't, mirror the
+        // output so a difference view reads zero instead of noise (w = 0 flags it either way).
+        alt_view = select(view_normal, authored_view, authored_valid);
+    }
+
+    textureStore(normal_out, coord, vec4f(to_world(view_normal), depth));
+    if comparing {
+        textureStore(alt_out, coord, vec4f(to_world(alt_view), select(0.0, 1.0, authored_valid)));
+    }
 }

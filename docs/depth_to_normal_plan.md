@@ -1,4 +1,10 @@
-# Depth to Normal — plan (scoped input mod, not implemented)
+# Depth to Normal — plan (scoped input mod)
+
+> **Historical.** This is the original design record. The provider shipped and now lives inside
+> **Graphics Hub** (`hub_dtn`), and its primary normal source is no longer the depth reconstruction
+> described below but the game's **authored vertex normals**, with this reconstruction kept as the
+> per-pixel fallback. Everything below about the service contract, the output format and the
+> world-space choice still holds. Current behaviour: `docs/authored_normals.md`.
 
 Status: **plan for review.** Supersedes the earlier broad "scene reconstruction framework"
 idea. That analysis showed the only genuinely shared, expensive prerequisite between VBAO and
