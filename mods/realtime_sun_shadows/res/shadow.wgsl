@@ -446,6 +446,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         var n = vec3f(0.0);
         var tan_t = 0.0;
         var light_facing = 1.0;
+        // KEEP MIRRORED with `normalConsumers` in mod.cpp, which decides whether the receiver
+        // normal buffer is bound at all. If this condition is true and the host did not bind,
+        // world_normal_at silently returns the inline cross reconstruction - the failure is
+        // invisible, which is exactly how Receiver-Plane Bias and Attached Shadows (both read n,
+        // both default on) once got left out of the host list and ran the shadows on facet
+        // normals. Adding a normal consumer here means adding it there.
         if uniforms.rpdb_enabled != 0.0 || uniforms.slope_bias[0] > 0.0 ||
             uniforms.normal_offset > 0.0 || uniforms.attached_shadows != 0.0
         {
