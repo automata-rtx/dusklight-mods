@@ -1416,11 +1416,29 @@ bool build_light_replay_projection(
 // in the painter than our SCENE_AFTER_TERRAIN hook.
 // Interiors read as fully shadowed under a scene-wide sun map (no sky visibility), so the
 // effect auto-disables there; the hooks then also let the game's own shadows come back.
+bool draw_lists_ready();  // defined below; the readiness gate for touching game state
+
 bool indoor_blocked() {
+    // dKy_Indoor_check() reads the game's environment/stage state, which does not exist on a 2D
+    // screen (logo, file select) - reading it there dereferences null. Every other place that
+    // touches game environment or time state bails on draw_lists_ready() first; this one is
+    // reached from on_scene_begin BEFORE any such gate, so it carries the check itself rather
+    // than relying on each caller to remember. "No scene" is reported as not-blocked: callers
+    // that get that far then hit their own readiness gate and bail anyway.
+    if (!draw_lists_ready()) {
+        return false;
+    }
     return get_bool_option(g_cvarIndoorDisable, true) && dKy_Indoor_check() != 0;
 }
 
 bool compute_dynamic_shadows_wanted() {
+    // Runs from on_scene_begin, which fires on 2D screens too - before the game's environment
+    // and time state is populated. Everything below reaches into that state (indoor_blocked ->
+    // dKy_Indoor_check, compute_light -> dKy_getEnvlight / dComIfGs_getTime), so take the same
+    // readiness gate composite_map_pass and render_shadow_map take before touching game state.
+    if (!draw_lists_ready()) {
+        return false;
+    }
     // Both gates matter: with the shadow map disabled (screen-space-only mode) the game's
     // own real/blob shadows must come back, so the skip hooks go inactive.
     if (!get_bool_option(g_cvarEnabled, true) || !get_bool_option(g_cvarShadowMap, true) ||
@@ -2140,7 +2158,7 @@ void update_cascade_cache(CascadeCacheEntry& cache, const CascadeSlot& slot, flo
 void render_shadow_map(
     const Mtx replayView, const Mtx44 replayProjectionMtx, const f32 replayProjection[7]) {
     if (g_mapPass.ready || !get_bool_option(g_cvarEnabled, true) ||
-        !get_bool_option(g_cvarShadowMap, true) || indoor_blocked())
+        !get_bool_option(g_cvarShadowMap, true))
     {
         return;
     }
@@ -2151,7 +2169,11 @@ void render_shadow_map(
     if (!matrix_ready(replayView)) {
         return;
     }
+    // Before indoor_blocked(): that reads game environment state which is absent on 2D screens.
     if (!draw_lists_ready()) {
+        return;
+    }
+    if (indoor_blocked()) {
         return;
     }
     (void)replayProjectionMtx;
