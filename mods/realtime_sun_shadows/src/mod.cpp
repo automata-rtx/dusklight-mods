@@ -2585,16 +2585,27 @@ void composite_map_pass(int64_t debugMode) {
         return;
     }
 
-    // Receiver normals feed the slope-bias / normal-offset receivers (and the Receiver Normal
-    // debug view); fetched only when those are in play. The SMOOTHING setting no longer gates
-    // this - it only decides whether the provider's normal is blurred on the way through. (It
-    // used to gate it, which meant Normal Smoothing = 0 silently bypassed the provider entirely
-    // and fell back to the composite's inline reconstruction, so authored normals never reached
-    // the shadows in that state.)
-    const int64_t smoothing = std::clamp<int64_t>(get_int_option(g_cvarNormalSmooth, 3), 0, 16);
-    const bool normalsWanted = debugMode == 13 ||
-        (mapReady && (get_int_option(g_cvarSlopeBias, 30) > 0 ||
-                         get_int_option(g_cvarNormalOffset, 100) > 0));
+    // Receiver normals feed the receiver-plane / slope bias, the normal-offset receiver and the
+    // attached-shadow terminator.
+    //
+    // This condition MUST mirror shadow.wgsl's own guard around `n = world_normal_at(...)`
+    // (rpdb_enabled || slope_bias || normal_offset || attached_shadows). If the shader reads n
+    // while no buffer is bound, world_normal_at falls through to its inline cross reconstruction
+    // and NO provider normal - authored or otherwise - reaches the shadow term. Receiver-Plane
+    // Bias and Attached Shadows are both on by default and both read n, so omitting them here
+    // meant that with Slope Bias and Normal Offset at 0 - the natural setup once Receiver-Plane
+    // Bias replaces Slope Bias - the shadows silently ran on facet normals.
+    //
+    // The Receiver Normal debug view deliberately does NOT force the buffer on. Forcing it made
+    // the view report authored normals while the shadow term was still using the inline cross,
+    // which is exactly the kind of lie a debug view must not tell; it now shows what the shadow
+    // path actually gets. (mapReady is still bypassed for it so normals stay inspectable when
+    // the map is suppressed, e.g. indoors.)
+    const int64_t smoothing = std::clamp<int64_t>(get_int_option(g_cvarNormalSmooth, 4), 0, 16);
+    const bool normalConsumers = get_bool_option(g_cvarRpdb, true) ||
+        get_bool_option(g_cvarAttachedShadows, true) ||
+        get_int_option(g_cvarSlopeBias, 2) > 0 || get_int_option(g_cvarNormalOffset, 50) > 0;
+    const bool normalsWanted = normalConsumers && (mapReady || debugMode == 13);
     const WGPUTextureView receiverNormal =
         normalsWanted ? push_normal_dispatches(resolved, smoothing) : nullptr;
     const bool normalsReady = receiverNormal != nullptr;
@@ -2608,7 +2619,7 @@ void composite_map_pass(int64_t debugMode) {
     const float biasWorld =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarBias, 55), 0, 200));
     const float slopeBiasWorld =
-        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarSlopeBias, 30), 0, 200));
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarSlopeBias, 2), 0, 200));
     const int64_t pcfBase = std::clamp<int64_t>(get_int_option(g_cvarPcf, 1), 0, 3);
     const int64_t pcfFarStep = std::clamp<int64_t>(get_int_option(g_cvarPcfFarStep, 1), 0, 2);
     for (int i = 0; i < kMaxCascades; ++i) {
@@ -2629,7 +2640,7 @@ void composite_map_pass(int64_t debugMode) {
         uniforms.pcf_taps[i] = static_cast<float>(std::clamp<int64_t>(pcfBase + step, 0, 3));
     }
     uniforms.normal_offset =
-        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarNormalOffset, 100), 0, 300)) /
+        static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarNormalOffset, 50), 0, 300)) /
         100.0f;
     std::memcpy(uniforms.light_dir_world, dirToLight, sizeof(uniforms.light_dir_world));
     uniforms.map_enabled = mapReady ? 1.0f : 0.0f;
@@ -3068,9 +3079,11 @@ ModResult build_controls_tab(
         "camera<br/>Camera Replay: captures the same draw-list replay from the gameplay "
         "camera (single cascade)<br/>Screen Shadows: the Bend SSS visibility buffer (white = "
         "lit)<br/>SSS Edge Mask: the SSS edge detector, for tuning SSS Edge Threshold<br/>"
-        "Receiver Normal: the surface direction Slope Bias / Normal Offset act on, exactly as "
-        "bound - authored or reconstructed per Graphics Hub, blurred if Normal Smoothing "
-        "is above 0"
+        "Receiver Normal: the surface direction the bias actually uses this frame - authored or "
+        "reconstructed per Graphics Hub, blurred if Normal Smoothing is above 0. It shows the "
+        "real bound buffer, so if every normal consumer (Receiver-Plane Bias, Attached "
+        "Shadows, Slope Bias, Normal Offset) is off, it correctly shows the inline "
+        "depth-reconstructed fallback"
         "<br/>Cascades: which cascade shades each pixel (red = near, green = mid, blue = "
         "far, white overlay = Link cascade active) - tune the splits and blend with this");
     return MOD_OK;

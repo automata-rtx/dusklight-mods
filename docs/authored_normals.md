@@ -134,6 +134,33 @@ inline reconstruction, and the ping-pong blur targets are released when smoothin
 **So: to see authored normals in the shadow mod, set Normal Smoothing to 0.** That is also the A/B
 for whether the blur can be deleted outright — which is the next item.
 
+### …and the gate was still incomplete (second round)
+
+After the above, the Receiver Normal view showed authored normals but the **Shadow Factor** view
+still did not react to the toggle at all. Two defects, both variants of the same mistake:
+
+1. **The host gate did not mirror the shader's own condition.** `shadow.wgsl` reads the normal when
+   `rpdb_enabled || slope_bias || normal_offset || attached_shadows`. The host only bound the
+   buffer for `slopeBias > 0 || normalOffset > 0` — omitting **Receiver-Plane Bias** and
+   **Attached Shadows**, which are *both on by default* and both read `n`. With Slope Bias and
+   Normal Offset turned down to 0 — the natural setup once Receiver-Plane Bias replaces Slope
+   Bias — the shader read `n`, found nothing bound, and fell through to the inline cross. The
+   shadows ran on facet normals with no indication anywhere.
+2. **The debug view forced the buffer on.** The gate began `debugMode == 13 || …`, so the Receiver
+   Normal view bound the provider normal *even when the shadow path would not*. That is why it
+   looked correct while the shadow term was unaffected — the view was reporting a normal the
+   shadows were not using.
+
+Both are fixed: the gate is now `normalConsumers && (mapReady || debugMode == 13)` with
+`normalConsumers` mirroring the shader guard exactly, and the debug view no longer forces
+anything. If every normal consumer is genuinely off, the view now honestly shows the inline
+fallback.
+
+**The rule this keeps violating, stated once:** a host-side "do I need to bind X" gate that
+duplicates a shader-side "do I use X" condition will drift, and the failure is silent because the
+shader has a fallback. When the two must be mirrored, say so at both ends — and never let a debug
+view widen the gate, or it stops describing the thing it is supposed to diagnose.
+
 ### The same trap in VBAO's debug view
 
 Swept for the same class of bug afterwards and found one more, in the debug view rather than in the
