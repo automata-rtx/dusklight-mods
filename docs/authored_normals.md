@@ -138,10 +138,12 @@ same binary run on both platforms.
 pristine upstream Dusklight `76b56cd8`); only the renderer change and the SDK header additions
 differ, so the game-linked mods hook the same functions.
 
-To roll back: set both knobs back to `9361fbd9ea…` / `platform-v2-test` and reinstall that game
-build. The stable release is untouched and still published. The mods themselves need no change to
-run there — every authored-normal path is guarded on `GfxDeviceInfo::normal_format`, which that
-platform reports as `Undefined`, and the provider then reconstructs exactly as before.
+To roll back: set both knobs back to `9361fbd9ea…` / `platform-v2-test`, let CI rebuild, and
+install those `.dusk` files together with that game build. The stable release is untouched and
+still published. **No source change is needed** — every authored-normal path is guarded on
+`GfxDeviceInfo::normal_format`, which that platform reports as `Undefined`, so the provider simply
+reconstructs exactly as before and the second color target is never declared. The game build and
+the `.dusk` files are always a matched pair, in either direction.
 
 ## 7. API surface used
 
