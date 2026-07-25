@@ -282,6 +282,36 @@ MapPassOutput g_mapPass;
 bool g_frameShadowsWanted = false;
 bool g_frameFrustumBypass = false;
 
+// ---------------------------------------------------------------------------------------------
+// STARTUP BREADCRUMBS (temporary diagnostic for the thin-gbuffer startup crash)
+//
+// The mod is being blamed for an access violation that happens as soon as the window appears,
+// three frames deep inside this DLL, and every early path here is guarded on inspection - so
+// inspection is not going to find it. These log the first execution of each early entry point and
+// every step of the first few frames, so the next crash log names the last step that ran. The
+// game's logger flushes per line (the previous crash dump interleaved with game logging), so the
+// final breadcrumb before the dump is the one that faulted.
+//
+// Remove this block once the crash is identified.
+// ---------------------------------------------------------------------------------------------
+constexpr uint64_t kTraceFrames = 4;
+
+void trace(const char* what) {
+    if (g_frameIndex <= kTraceFrames) {
+        svc_log->info(mod_ctx, what);
+    }
+}
+
+// One line the first time a given hook actually runs, whatever frame that is.
+#define TRACE_HOOK_ONCE(name)                                                                      \
+    do {                                                                                           \
+        static bool s_logged = false;                                                              \
+        if (!s_logged) {                                                                           \
+            s_logged = true;                                                                       \
+            svc_log->info(mod_ctx, "trace: first call of " name);                                  \
+        }                                                                                          \
+    } while (false)
+
 bool g_replayingSceneLists = false;
 bool g_replayTwoSided = false;   // twoSidedCasters, latched for the current replay
 bool g_replayLinkOnly = false;   // Link cascade replay: only models anchored near the player draw
@@ -1439,6 +1469,7 @@ bool compute_dynamic_shadows_wanted() {
     if (!draw_lists_ready()) {
         return false;
     }
+    trace("trace: shadow gate - draw lists ready");
     // Both gates matter: with the shadow map disabled (screen-space-only mode) the game's
     // own real/blob shadows must come back, so the skip hooks go inactive.
     if (!get_bool_option(g_cvarEnabled, true) || !get_bool_option(g_cvarShadowMap, true) ||
@@ -1449,9 +1480,12 @@ bool compute_dynamic_shadows_wanted() {
     if (!g_sceneCamera.raw_valid) {
         return false;
     }
+    trace("trace: shadow gate - entering compute_light");
     float dirToLight[3];
     float fade = 0.0f;
-    return compute_light(dirToLight, fade);
+    const bool lit = compute_light(dirToLight, fade);
+    trace("trace: shadow gate - compute_light returned");
+    return lit;
 }
 
 // Refresh the per-frame gate cache (see g_frameShadowsWanted). Called once from on_scene_begin,
@@ -1465,6 +1499,7 @@ void update_frame_shadow_gate() {
 }
 
 HookAction on_game_shadow_pre(ModContext*, void*, void*, void*) {
+    TRACE_HOOK_ONCE("GameShadow hook");
     if (!g_frameShadowsWanted) {
         return HOOK_CONTINUE;
     }
@@ -1472,6 +1507,7 @@ HookAction on_game_shadow_pre(ModContext*, void*, void*, void*) {
 }
 
 HookAction on_frustum_clip_pre(ModContext*, void*, void* retval, void*) {
+    TRACE_HOOK_ONCE("FrustumClip hook");
     if (!g_frameFrustumBypass) {
         return HOOK_CONTINUE;
     }
@@ -1482,6 +1518,7 @@ HookAction on_frustum_clip_pre(ModContext*, void*, void* retval, void*) {
 }
 
 HookAction on_copy_tex_pre(ModContext*, void*, void*, void*) {
+    TRACE_HOOK_ONCE("GXCopyTex hook");
     return g_replayingSceneLists ? HOOK_SKIP_ORIGINAL : HOOK_CONTINUE;
 }
 
@@ -1493,6 +1530,7 @@ HookAction on_copy_tex_pre(ModContext*, void*, void*, void*) {
 //
 // Direct GX drawers pick their cull mode up from this call, so rewriting the argument covers them.
 HookAction on_cull_mode_pre(ModContext*, void* args, void*, void*) {
+    TRACE_HOOK_ONCE("GXSetCullMode hook");
     if (g_replayingSceneLists && g_replayTwoSided) {
         mods::arg_ref<GXCullMode>(args, 0) = GX_CULL_NONE;
     }
@@ -1630,6 +1668,7 @@ bool main_view_culls_sphere(const WorldSphere& s) {
 // shape packet's own model pointer - never j3dSys's current model, which is only valid inside
 // a packet draw (the 1.6.1 stale-model hazard).
 HookAction on_mat_packet_draw_pre(ModContext*, void* args, void*, void*) {
+    TRACE_HOOK_ONCE("J3DMatPacket::draw pre hook");
     bool replayLinkCull = false;
     bool replayWorldCull = false;
     bool mainViewCull = false;
@@ -1681,6 +1720,7 @@ HookAction on_mat_packet_draw_pre(ModContext*, void* args, void*, void*) {
 }
 
 void on_mat_packet_draw_post(ModContext*, void*, void*, void*) {
+    TRACE_HOOK_ONCE("J3DMatPacket::draw post hook");
     g_insideMatPacketDraw = false;
 }
 
@@ -1691,6 +1731,7 @@ void on_mat_packet_draw_post(ModContext*, void*, void*, void*) {
 // as the material — the whole register is rewritten, and stale counts would break alpha-tested
 // casters like foliage — but with culling forced off.
 HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
+    TRACE_HOOK_ONCE("J3DShape::drawFast hook");
     if (!g_replayingSceneLists) {
         // Main-view per-shape cull for mixed mat packets (one on-screen instance keeps the
         // packet; this skips its off-screen siblings). Only inside a J3DMatPacket::draw,
@@ -1823,14 +1864,19 @@ void on_scene_begin(ModContext*, const GfxStageContext* stageCtx, void*) {
     }
     g_prevSceneBeginTime = g_sceneBeginTime;
     g_prevSceneBeginValid = true;
+    trace("trace: scene_begin enter");
     tick_retired_sss_targets();
     tick_retired_normal_targets();
     tick_retired_cascade_textures();
+    trace("trace: scene_begin ticked retired targets");
     restore_actual_light_debug();
+    trace("trace: scene_begin restored light debug");
     capture_scene_camera(stageCtx);
+    trace("trace: scene_begin captured camera");
     // Refresh the game-shadow-skip / frustum-bypass gate for this frame before the game's
     // clip and shadow-control calls fire (they run after this SCENE_BEGIN callback).
     update_frame_shadow_gate();
+    trace("trace: scene_begin updated shadow gate");
     // Main-view culling claws back what the clip bypass costs the game's own scene pass, so
     // it is gated on the same frame flag; the planes come from this frame's scene camera.
     // Everything drawn between here and FRAME_BEFORE_HUD uses that camera (the sky lists draw
@@ -2157,6 +2203,7 @@ void update_cascade_cache(CascadeCacheEntry& cache, const CascadeSlot& slot, flo
 // small box snapped to the player, position-filtered to his models).
 void render_shadow_map(
     const Mtx replayView, const Mtx44 replayProjectionMtx, const f32 replayProjection[7]) {
+    trace("trace: render_shadow_map enter");
     if (g_mapPass.ready || !get_bool_option(g_cvarEnabled, true) ||
         !get_bool_option(g_cvarShadowMap, true))
     {
@@ -2539,6 +2586,7 @@ WGPUTextureView push_normal_dispatches(const GfxResolvedTargets& resolved, int64
 // in screen-space-only mode: the Bend trace supplies the whole occlusion term and the game's
 // own shadows return (dynamic_shadows_wanted is false, so the skip hooks pass through).
 void composite_map_pass(int64_t debugMode) {
+    trace("trace: composite_map_pass enter");
     const MapPassOutput mapPass = std::exchange(g_mapPass, {});
     // No populated 3D scene this frame (a 2D screen like the file-select menu): there is
     // nothing to shadow, and the screen-space-only path would still call into the game's
@@ -3514,6 +3562,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     panelDesc.build = build_panel;
     svc_ui->register_mods_panel(mod_ctx, &panelDesc);
 
+    svc_log->info(mod_ctx, "realtime_sun_shadows ready (hooks registered)");
     return MOD_OK;
 }
 
