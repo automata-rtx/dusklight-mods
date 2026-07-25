@@ -43,7 +43,8 @@ struct Uniforms {
     light_dir_world_x: f32,   // toward the light, world space
     light_dir_world_y: f32,
     light_dir_world_z: f32,
-    smoothed_normals: f32,    // 1 = the smoothed-normal buffer is bound (normal_smooth.wgsl)
+    smoothed_normals: f32,    // 1 = the receiver-normal buffer is bound (raw provider normal,
+                              //     or its normal_smooth.wgsl blur)
     camera_eye_x: f32,        // camera world position (screen-space shadow distance fade)
     camera_eye_y: f32,
     camera_eye_z: f32,
@@ -196,9 +197,15 @@ fn cross_normal(uv: vec2f, world: vec3f, depth: f32, du: vec2f, dv: vec2f) -> ve
 
 // World-space surface normal for the slope-scaled bias and the normal-offset receiver.
 //
-// With Normal Smoothing on, the normal comes from the dedicated buffer (normal_smooth.wgsl),
-// sampled with a depth-weighted bilinear so silhouettes stay crisp. Off (or when the buffer
-// is unavailable), a single side-selected 1px cross reconstructs the raw facet normal inline.
+// The normal comes from the bound receiver-normal buffer, sampled with a depth-weighted bilinear
+// so silhouettes stay crisp. That buffer is the Depth to Normal provider's output - the game's
+// authored vertex normals where it has them - optionally blurred by normal_smooth.wgsl when
+// Normal Smoothing is above 0.
+//
+// The inline 1px cross below is a LAST-RESORT fallback only: no provider normal this frame, or
+// every bilinear tap rejected at a thin silhouette. It reconstructs the raw facet normal from
+// depth, which is precisely what the provider exists to improve on, so it should be rare. (It
+// used to run whenever Normal Smoothing was 0, which quietly bypassed the provider entirely.)
 //
 // The normal is oriented toward the CAMERA (visible surfaces face it). There is deliberately
 // no light-based flip: mirroring the normal wherever the surface crosses the light terminator

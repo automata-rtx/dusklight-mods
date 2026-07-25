@@ -1,15 +1,18 @@
 // Realtime Sun Shadows - smoothed receiver normals (bilateral blur only).
 //
 // The slope-scaled bias and normal-offset receivers need a SMOOTH surface direction: on low-poly
-// (GameCube-era) models a per-pixel normal jumps at every polygon edge, banding the shadows.
-// This pass takes the raw WORLD-SPACE geometric normal from the Depth to Normal provider mod
+// (GameCube-era) models a DEPTH-RECONSTRUCTED normal jumps at every polygon edge, banding the
+// shadows. This pass takes the WORLD-SPACE normal from the Depth to Normal provider mod
 // (dev.automata.depth_to_normal; rgba32float = normal.xyz + raw depth in w) and smooths it with
 // one depth-aware separable Gaussian whose radius scales with the render height, so a given
 // Normal Smoothing setting looks the same at any internal resolution / supersampling factor.
 //
-// The depth->normal reconstruction itself now lives in Depth to Normal, so shadows no longer
-// reconstructs normals - it only applies this smoothing, which is the one normal treatment unique
-// to the shadow bias (AO and other consumers want the raw normal, so smoothing stays here).
+// OPTIONAL as of the authored-normal platform. When the provider is serving the game's authored
+// vertex normals there is no faceting to hide, and this blur only costs frame time and flattens
+// real curvature the bias could have used - Normal Smoothing 0 skips the pass entirely and binds
+// the provider's normal directly. The pass is kept for the depth-reconstruction path (authored
+// normals off, or a game build without the normal buffer), where the faceting is still real.
+// See docs/authored_normals.md.
 //
 // Why a DENSE, bilaterally-weighted blur (learned the hard way): a few sparse taps at a fixed
 // distance average in a displaced copy of the surface - a visible ghost past a resolution-

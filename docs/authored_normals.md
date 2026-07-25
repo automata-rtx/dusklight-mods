@@ -92,12 +92,47 @@ should be seamless, not a visible seam.
 3. **Coverage.** Debug View = Coverage. Confirm the fallback regions are the expected ones.
 4. **The payoff.** Overlay off, VBAO/SSILVB on a low-poly rock face or a character: the faceting
    the reconstruction produced should be gone, with no blur pass involved.
-5. **Shadows.** With the shadow mod's Normal Smoothing still enabled, confirm shadows are unchanged
-   or better.
+5. **Shadows.** Set Normal Smoothing to **0** (see §4a — that is what binds the authored normal
+   unblurred) and check the Receiver Normal debug view, then compare shadow quality against the
+   old default of 4.
 6. **Everything at once.** VBAO/SSILVB + Realtime Sun Shadows + Deferred Fog + SMAA together — each
    pushes a draw into the scene pass, so this is where a missed pipeline surfaces.
 7. **Perf.** Frame time against the `platform-v2-test` baseline. Expect slightly more in the scene
    pass (one extra RGBA8 target), and considerably less once the normal-smoothing pass goes.
+
+## 4a. Realtime Sun Shadows had a second normal path
+
+Found during the first in-game test: the shadow mod appeared not to use authored normals at all —
+its Receiver Normal debug view still showed reconstructed normals and the Use Authored Normals
+toggle made no visible difference, while SSILVB responded correctly.
+
+The cause was **`Normal Smoothing` gating whether the provider was consulted at all**, not just
+whether its output was blurred:
+
+```cpp
+const bool normalsWanted = smoothing > 0 && (...);   // ← the bug
+```
+
+At `Normal Smoothing = 0` the mod never called `get_frame`, bound no normal buffer, and
+`world_normal_at` in `shadow.wgsl` fell through to its **inline 1px cross reconstruction** — a
+second depth→normal path living inside the shadow composite that the provider work never touched.
+And at the default of 4, the dense 32-tap bilateral blur flattens most of the authored-vs-
+reconstructed difference anyway, so the toggle looks inert there too. Both readings of the symptom
+had the same root cause.
+
+Now the provider is consulted at **every** setting and Normal Smoothing is only post-processing:
+
+| Normal Smoothing | Receiver normal |
+|---|---|
+| **0** | The provider's buffer bound directly — authored, unblurred, zero extra cost. |
+| **> 0** | The same buffer, blurred by `normal_smooth.wgsl`. |
+| *(provider unavailable)* | Inline 1px cross — now a genuine last-resort fallback only. |
+
+Every failure path inside the normal setup degrades to the raw provider normal rather than to the
+inline reconstruction, and the ping-pong blur targets are released when smoothing is 0.
+
+**So: to see authored normals in the shadow mod, set Normal Smoothing to 0.** That is also the A/B
+for whether the blur can be deleted outright — which is the next item.
 
 **Still to do, after verification** (deliberately not in the same push, so each reverts alone):
 

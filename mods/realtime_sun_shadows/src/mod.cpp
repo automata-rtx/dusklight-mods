@@ -414,7 +414,7 @@ struct ShadowUniforms {
     float link_enabled;        // 1 = slot 3 is the Link cascade
     float blend_frac;          // cascade cross-fade band, fraction of the light NDC half-extent
     float light_dir_world[3];  // toward the light, world space (slope/offset receivers)
-    float smoothed_normals;    // 1 = the smoothed-normal buffer is bound
+    float smoothed_normals;    // 1 = the receiver-normal buffer is bound (raw or smoothed)
     float camera_eye[3];       // camera world position (screen-space shadow distance fade)
     float sss_fade_start;      // world units; screen-space shadow full below this distance
     float sss_fade_end;        // world units; screen-space shadow gone beyond this distance
@@ -468,7 +468,8 @@ struct DrawPayload {
     WGPUTextureView shadowMap[kMaxCascades];    // frame-pooled (depth stand-ins when unused)
     WGPUTextureView lightColor;                 // far cascade's color (debug views)
     WGPUTextureView screenShadow;  // Bend SSS output (or the depth view when disabled)
-    WGPUTextureView smoothNormal;  // smoothed-normal buffer (or the depth view when disabled)
+    WGPUTextureView smoothNormal;  // receiver normal: the provider's buffer, or the smoothed
+                                   // copy of it; the depth view stands in when unavailable
     uint32_t uniform_offset;
     uint32_t uniform_size;
     uint32_t debug_mode;
@@ -916,14 +917,20 @@ void tick_retired_normal_targets() {
     }
 }
 
-bool ensure_normal_targets(uint32_t width, uint32_t height) {
-    if (g_normalTargets.width == width && g_normalTargets.height == height) {
-        return true;
-    }
+// The ping-pong pair is only needed while Normal Smoothing is on; park it when it is not, so
+// turning smoothing off gives the memory back (two full-res rgba32float targets).
+void retire_normal_targets() {
     if (g_normalTargets.width != 0) {
         g_retiredNormalTargets.push_back(
             RetiredNormalTargets{std::exchange(g_normalTargets, NormalTargets{}), 4});
     }
+}
+
+bool ensure_normal_targets(uint32_t width, uint32_t height) {
+    if (g_normalTargets.width == width && g_normalTargets.height == height) {
+        return true;
+    }
+    retire_normal_targets();
     for (int i = 0; i < 2; ++i) {
         WGPUTextureDescriptor texDesc = WGPU_TEXTURE_DESCRIPTOR_INIT;
         texDesc.label = {"smoothed normals", WGPU_STRLEN};
@@ -2450,23 +2457,33 @@ bool push_sss_dispatches(
     return svc_gfx->push_compute(mod_ctx, g_sssComputeType, &payload, sizeof(payload)) == MOD_OK;
 }
 
-// Game thread: build the full-resolution smoothed-normal buffer for this frame's composite.
 // The blur radius scales with render height so `smoothing` covers the same fraction of the
 // screen (and looks the same) at any internal resolution. Returns false when the buffer
 // isn't available (composite falls back to the inline per-pixel cross).
-bool push_normal_dispatches(const GfxResolvedTargets& resolved, int64_t smoothing) {
+// Resolves this frame's receiver-normal buffer and queues whatever work it needs. Returns the
+// view the composite should bind, or nullptr when there is no normal to be had (a 2D screen).
+//
+// The normal ALWAYS comes from the Depth to Normal provider - authored vertex normals where the
+// game supplies them, its depth reconstruction elsewhere. Normal Smoothing is post-processing on
+// top of that, not the switch that decides whether the provider is consulted: with it at 0 the
+// provider's normal is bound directly, and every failure path below degrades to that same raw
+// normal rather than to the composite's inline reconstruction.
+WGPUTextureView push_normal_dispatches(const GfxResolvedTargets& resolved, int64_t smoothing) {
+    DepthToNormalFrame frame = DEPTH_TO_NORMAL_FRAME_INIT;
+    if (svc_n2d->get_frame(mod_ctx, &frame) != MOD_OK || frame.normal == nullptr) {
+        return nullptr;
+    }
+    // Smoothing off: bind the provider's normal as-is. With authored normals there is no
+    // reconstruction faceting left to blur away, so this is both the cheapest and the sharpest
+    // option - and the only way to see what the provider actually hands the bias.
+    if (smoothing <= 0) {
+        retire_normal_targets();
+        return frame.normal;
+    }
     if (g_normalBlurHPipeline == nullptr || resolved.height == 0 ||
         !ensure_normal_targets(resolved.width, resolved.height))
     {
-        return false;
-    }
-
-    // The raw world-space normal comes from the Depth to Normal provider (this frame). It has no
-    // normal to smooth if there is no populated scene (a 2D screen), which the composite already
-    // gates on - so a failure here just drops the smoothed-normal buffer for the frame.
-    DepthToNormalFrame frame = DEPTH_TO_NORMAL_FRAME_INIT;
-    if (svc_n2d->get_frame(mod_ctx, &frame) != MOD_OK || frame.normal == nullptr) {
-        return false;
+        return frame.normal;
     }
 
     // Setting 1 ~ 1 texel of radius at the reference height; scaled to the real height and
@@ -2478,7 +2495,7 @@ bool push_normal_dispatches(const GfxResolvedTargets& resolved, int64_t smoothin
     blurUniforms.sigma = std::max(radius * 0.5f, 0.5f);
     GfxRange blurRange{0, 0};
     if (svc_gfx->push_uniform(mod_ctx, &blurUniforms, sizeof(blurUniforms), &blurRange) != MOD_OK) {
-        return false;
+        return frame.normal;
     }
 
     NormalComputePayload payload{};
@@ -2489,8 +2506,10 @@ bool push_normal_dispatches(const GfxResolvedTargets& resolved, int64_t smoothin
     payload.blurUniformSize = blurRange.size;
     payload.width = resolved.width;
     payload.height = resolved.height;
-    return svc_gfx->push_compute(mod_ctx, g_normalComputeType, &payload, sizeof(payload)) ==
-           MOD_OK;
+    if (svc_gfx->push_compute(mod_ctx, g_normalComputeType, &payload, sizeof(payload)) != MOD_OK) {
+        return frame.normal;
+    }
+    return g_normalTargets.views[0];
 }
 
 // Game thread: consume the frame's map pass and push the deferred composite draw at the
@@ -2566,16 +2585,19 @@ void composite_map_pass(int64_t debugMode) {
         return;
     }
 
-    // Smoothed receiver normals feed the slope-bias / normal-offset receivers (and the
-    // Receiver Normal debug view); needed only when those are in play. 0 = off (the composite
-    // then falls back to an inline per-pixel cross for whichever receiver is active).
+    // Receiver normals feed the slope-bias / normal-offset receivers (and the Receiver Normal
+    // debug view); fetched only when those are in play. The SMOOTHING setting no longer gates
+    // this - it only decides whether the provider's normal is blurred on the way through. (It
+    // used to gate it, which meant Normal Smoothing = 0 silently bypassed the provider entirely
+    // and fell back to the composite's inline reconstruction, so authored normals never reached
+    // the shadows in that state.)
     const int64_t smoothing = std::clamp<int64_t>(get_int_option(g_cvarNormalSmooth, 3), 0, 16);
-    const bool normalsWanted =
-        smoothing > 0 &&
-        (debugMode == 13 ||
-            (mapReady && (get_int_option(g_cvarSlopeBias, 30) > 0 ||
-                             get_int_option(g_cvarNormalOffset, 100) > 0)));
-    const bool normalsReady = normalsWanted && push_normal_dispatches(resolved, smoothing);
+    const bool normalsWanted = debugMode == 13 ||
+        (mapReady && (get_int_option(g_cvarSlopeBias, 30) > 0 ||
+                         get_int_option(g_cvarNormalOffset, 100) > 0));
+    const WGPUTextureView receiverNormal =
+        normalsWanted ? push_normal_dispatches(resolved, smoothing) : nullptr;
+    const bool normalsReady = receiverNormal != nullptr;
 
     ShadowUniforms uniforms{};
     std::memcpy(uniforms.world_from_proj, camera.world_from_proj, sizeof(uniforms.world_from_proj));
@@ -2689,7 +2711,7 @@ void composite_map_pass(int64_t debugMode) {
         mapReady ? mapPass.cascades[mapPass.cascadeCount - 1].lightColor : nullptr;
     payload.lightColor = farLightColor != nullptr ? farLightColor : resolved.depth;
     payload.screenShadow = sssReady ? g_sssTarget.view : resolved.depth;
-    payload.smoothNormal = normalsReady ? g_normalTargets.views[0] : resolved.depth;
+    payload.smoothNormal = normalsReady ? receiverNormal : resolved.depth;
     payload.uniform_offset = uniformRange.offset;
     payload.uniform_size = uniformRange.size;
     payload.debug_mode = static_cast<uint32_t>(debugMode);
@@ -2927,11 +2949,15 @@ ModResult build_controls_tab(
         "shadow-map texel. The most effective acne fix with the least peter-panning; 100% = one "
         "texel.");
     add_number(left, "Normal Smoothing", g_cvarNormalSmooth, 0, 16, 1, nullptr,
-        "Rounds the surface direction Slope Bias and Normal Offset rely on (like smooth "
-        "shading), removing the faceted bias bands low-poly models can show. The blur radius "
-        "scales with your render resolution, so one value looks the same at any internal "
-        "resolution / supersampling factor. Only affects the shadow-map bias. Higher = "
-        "smoother; 0 = off.");
+        "Extra blur on the surface direction Slope Bias and Normal Offset rely on. It exists to "
+        "hide the faceted bias bands that DEPTH-RECONSTRUCTED normals produce on low-poly "
+        "models. With Graphics Hub's Use Authored Normals on, the incoming normal is already "
+        "smooth (it is the game's own vertex normal), so this has little left to do and flattens "
+        "real curvature - <strong>set it to 0 to see the authored normal unblurred</strong>. 0 is "
+        "also the cheapest setting by far: this is a dense 32-tap separable blur over the whole "
+        "screen. The radius scales with your render resolution, so one value looks the same at "
+        "any internal resolution / supersampling factor. Only affects the shadow-map bias. "
+        "Higher = smoother; 0 = the raw normal straight from the provider.");
     add_toggle(left, "No Frustum Clipping", g_cvarNoFrustumClipping,
         "Keeps camera-frustum-culled objects in the draw lists so off-screen objects still cast "
         "map shadows. Fixes shadows popping in and out with camera direction (distant mountains, "
@@ -3042,7 +3068,9 @@ ModResult build_controls_tab(
         "camera<br/>Camera Replay: captures the same draw-list replay from the gameplay "
         "camera (single cascade)<br/>Screen Shadows: the Bend SSS visibility buffer (white = "
         "lit)<br/>SSS Edge Mask: the SSS edge detector, for tuning SSS Edge Threshold<br/>"
-        "Receiver Normal: the smoothed surface direction Slope Bias / Normal Offset act on"
+        "Receiver Normal: the surface direction Slope Bias / Normal Offset act on, exactly as "
+        "bound - authored or reconstructed per Graphics Hub, blurred if Normal Smoothing "
+        "is above 0"
         "<br/>Cascades: which cascade shades each pixel (red = near, green = mid, blue = "
         "far, white overlay = Link cascade active) - tune the splits and blend with this");
     return MOD_OK;
