@@ -374,6 +374,23 @@ too far makes shadows detach from objects' feet ("peter-panning").
 - **Normal Offset** — instead of changing the depth comparison, nudges the *tested point*
   slightly off the surface, about one photo-pixel's worth. The most effective acne killer
   with the least detachment. 100–200%.
+- **Two normals, two jobs (do not merge them again).** The shadow term consumes the surface
+  direction twice, and the two uses want *different* normals:
+  - **Shading normal** (the provider's, authored/smooth) — the `n·L` terminator, Attached Shadows,
+    and the Normal Offset receiver. These are lighting/shading quantities; a smooth direction is
+    what makes the light-to-shadow boundary roll across curvature instead of stepping per facet.
+  - **Geometric face normal** (`geometric_normal_at`, from the depth buffer) — Receiver-Plane Bias
+    and Slope Bias. These solve the receiver's depth gradient / tilt in light space, which is a
+    property of *the triangle the pixel actually sits on*. A smooth normal tilts the comparison
+    plane away from the real triangle by the shading-vs-face angle, so every facet gets a
+    systematically wrong bias and the shadow factor breaks into per-triangle patches **even though
+    the normal buffer is perfectly smooth**.
+
+  Authored normals are what exposed this: a depth-reconstructed normal *is* the face normal, so the
+  two uses coincided and the bug was invisible. Switching the provider to smooth normals maximised
+  the gap. `normalSmooth` was the earlier partial workaround from the same confusion — it traded
+  bias banding at facet edges for bias error inside facets, which is why raising it never fully
+  worked.
 - **Normal Smoothing** — Receiver-Plane Bias, Slope Bias, Normal Offset, and the Attached
   Shadows terminator all need to know which way the surface faces. GameCube-era models are
   low-poly: the facing jumps at every polygon edge, so the bias jumps too and paints *faceted
