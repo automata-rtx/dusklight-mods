@@ -65,9 +65,42 @@ that has never been checked on a GPU.
   it with **Authored Basis** (As-is / Flip Y / Flip Z / Flip Y and Z) and report which one landed;
   the winning flip then gets folded into the shader as the default.
 
-Note the camera-facing guard (`dot(n, pos) > 0 → negate`) is applied to the authored normal too,
-so a *global* sign error is largely self-correcting on front-facing surfaces — a Y flip or an axis
-swap is the failure mode that would actually show.
+Note a camera-facing guard is applied to the authored normal too (see §2a), so a *global* sign
+error is largely self-correcting on front-facing surfaces — a Y flip or an axis swap is the failure
+mode that would actually show.
+
+## 2a. The camera-facing guard must not use a zero threshold
+
+The reconstruction ends with `if dot(n, pos) > 0 { n = -n }`, forcing the normal toward the camera.
+That is safe for a **face** normal: on a front-facing triangle it never legitimately points away, so
+the test only fires on numerical noise.
+
+Applied to an **authored** normal it is wrong, and visibly so. A smooth, interpolated normal field
+crosses `dot(n, view) = 0` *at the visual silhouette by construction*, and on low-poly geometry it
+travels well past perpendicular before the triangle ends — an 8-sided cylinder reaches about 22°,
+`dot ≈ 0.37`. A zero threshold negates every pixel in that band. Symptoms:
+
+- a **wrong-coloured band hugging every silhouette** in the normal debug view, which *widens and
+  narrows as the camera moves* — because the size of the region where `dot(n, view) > 0` is itself
+  view-dependent. (That view-dependence is what distinguishes this from an MSAA resolve artifact,
+  which would be a fixed ~1px rim. MSAA is in fact off: Dusklight never assigns `AuroraConfig::msaa`
+  and `aurora.cpp:116` defaults it to 1.)
+- the shadow mod's **attached-shadow term failing on curved back-lit features** — a flipped normal
+  inverts `n·L`, so a surface facing away from the sun reads as facing it and the term switches off.
+  Nose tip, boot and tunic edges, exactly the high-curvature silhouette-adjacent geometry.
+
+The threshold is now **0.5** — flip only what is *clearly* inverted, i.e. a two-sided sheet seen
+from behind, whose normal points nearly straight away (0.7–1.0). A silhouette band tops out near
+0.4, so the two cases separate cleanly.
+
+This is not a new idea in the repo: **VBAO and SSILVB already guard with a 0.15 margin** and say why
+— *"Face the normal toward the camera only when CLEARLY back-facing… the margin keeps grazing
+surfaces from toggling per pixel."* The provider was the one place using a hard zero. Because those
+mods re-apply their own guard, AO keeps the orientation it wants, while consumers needing the true
+surface direction (the shadow bias and its `n·L` terminator) now get it.
+
+**Rule for the service:** it returns the true surface direction, not a camera-facing one. Anything
+that wants strictly camera-facing normals applies its own guard *with a margin*.
 
 ## 3. Coverage and the fallback
 

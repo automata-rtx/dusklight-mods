@@ -165,9 +165,27 @@ fn reconstruct(@builtin(global_invocation_id) gid: vec3u) {
             authored_valid = false;
         } else {
             authored_view = raw / len;
-            // Same camera-facing guard the reconstruction uses. Authored normals can face away
-            // on two-sided or inverted geometry; without this they punch dark holes in AO.
-            if dot(authored_view, pos) > 0.0 {
+            // Flip ONLY when the surface is clearly inverted - a two-sided sheet (foliage, cloth)
+            // seen from behind, whose normal points almost straight away from the camera.
+            //
+            // This deliberately does NOT use the reconstruction's zero threshold. That test is
+            // safe for a FACE normal, which on a front-facing triangle never legitimately points
+            // away. It is wrong for an AUTHORED normal: a smooth, interpolated normal field
+            // crosses dot(n, view) = 0 exactly at the visual silhouette by construction, and on
+            // low-poly geometry it goes well past perpendicular before the triangle ends (an
+            // 8-sided cylinder reaches ~22 degrees, dot ~ 0.37). A zero threshold negates every
+            // one of those pixels, which showed up as a wrong-coloured band hugging every
+            // silhouette - widening and narrowing with camera angle, since the size of the region
+            // where dot(n, view) > 0 is itself view-dependent - and, through the service, as the
+            // shadow mod's attached-shadow term failing on curved back-lit features, because a
+            // flipped normal inverts n.L.
+            //
+            // 0.5 separates the two cases cleanly: a silhouette band tops out near 0.4, while a
+            // genuinely inverted back-face points nearly straight away (0.7 to 1.0). VBAO and
+            // SSILVB already re-apply their own camera-facing guard with a 0.15 margin for the
+            // same reason, so AO keeps the orientation it wants while consumers that need the
+            // true surface direction (the shadow bias and its n.L terminator) now get it.
+            if dot(authored_view, normalize(pos)) > 0.5 {
                 authored_view = -authored_view;
             }
         }

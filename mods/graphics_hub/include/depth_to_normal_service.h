@@ -31,8 +31,16 @@
 
 typedef struct DepthToNormalFrame {
     uint32_t struct_size;
-    WGPUTextureView normal; /* rgba32float: xyz = world-space geometric normal (unit,
-                             * camera-facing), w = raw reversed-Z depth. Frame-valid. */
+    WGPUTextureView normal; /* rgba32float: xyz = world-space surface normal (unit), w = raw
+                             * reversed-Z depth. Frame-valid.
+                             *
+                             * Orientation: the TRUE surface direction, not forced camera-facing.
+                             * Only clearly inverted geometry (a two-sided sheet seen from behind)
+                             * is flipped. Near a silhouette a smooth authored normal legitimately
+                             * turns past perpendicular to the view, and forcing it toward the
+                             * camera there corrupts it - which matters to anything using n.L.
+                             * Consumers that want a strictly camera-facing normal (AO) should
+                             * apply their own guard WITH A MARGIN, as vbao/ssilvb do. */
     uint32_t width;
     uint32_t height;
 } DepthToNormalFrame;
