@@ -606,17 +606,30 @@ void add_control(UiElementHandle pane, const UiControlDesc& desc) {
 
 bool authored_unavailable(ModContext*, void*) { return !g_authoredAvailable; }
 
-// Live readout of which source the provider is actually feeding consumers.
+char g_statusText[160] = "Waiting for a scene frame";
+
+// Live readout of which source the provider is actually feeding consumers, plus the MSAA sample
+// count - which belongs here because it directly limits how much of the screen CAN use authored
+// normals: the host resolves the normal target by averaging samples, so every partially covered
+// pixel carries a blended normal that this mod has to reject and reconstruct instead.
 void status_get(ModContext*, void*, UiControlValue* outValue) {
+    const char* source;
     if (!g_authoredAvailable) {
-        outValue->string_value = "Reconstructed - this game build has no normal buffer";
+        source = "Reconstructed - this game build has no normal buffer";
     } else if (!get_bool_option(g_cvarUseAuthored, true)) {
-        outValue->string_value = "Reconstructed from depth (authored normals off)";
+        source = "Reconstructed from depth (authored normals off)";
     } else if (g_frameUsedAuthored) {
-        outValue->string_value = "Authored, reconstructing where absent";
+        source = "Authored, reconstructing where absent";
     } else {
-        outValue->string_value = "Authored - waiting for a scene frame";
+        source = "Authored - waiting for a scene frame";
     }
+    if (g_deviceInfo.sample_count > 1) {
+        std::snprintf(g_statusText, sizeof(g_statusText), "%s [MSAA %ux - silhouettes blend]",
+            source, g_deviceInfo.sample_count);
+    } else {
+        std::snprintf(g_statusText, sizeof(g_statusText), "%s [no MSAA]", source);
+    }
+    outValue->string_value = g_statusText;
 }
 void status_set(ModContext*, void*, const UiControlValue*) {}
 bool status_disabled(ModContext*, void*) { return true; }

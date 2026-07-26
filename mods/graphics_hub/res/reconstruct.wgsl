@@ -138,16 +138,38 @@ fn reconstruct(@builtin(global_invocation_id) gid: vec3u) {
     var authored_view = vec3f(0.0, 0.0, 1.0);
     if authored_valid {
         let raw = (a.xyz * 2.0 - 1.0) * uniforms.basis_flip;
-        let len_sq = dot(raw, raw);
-        if len_sq > 1e-8 {
-            authored_view = raw * inverseSqrt(len_sq);
+        // Length is the confidence signal. A texel written by ONE surface decodes to a unit
+        // vector - 8-bit quantization moves it by well under 0.01. Anything materially shorter
+        // is a HARDWARE MSAA RESOLVE AVERAGE, and its direction is a blend that corresponds to
+        // no real surface:
+        //
+        //   * partial coverage against unwritten (cleared) samples decodes to k*n + (k-1),
+        //     which for k = 0.75 is barely half unit length and points somewhere else entirely;
+        //   * a silhouette pixel shared by two surfaces decodes to (n1 + n2) / 2, whose length
+        //     is cos(half the angle between them).
+        //
+        // The alpha channel does NOT catch either case: it averages to k, so any pixel more than
+        // half covered still reads valid, and a two-surface pixel reads a fully-confident 1.0.
+        // That is why these texels survived the validity test and showed up as a wrong-coloured
+        // rim on silhouettes - and, downstream, as the shadow mod's attached-shadow term failing
+        // on exactly the thin back-lit features (a nose tip, boot and tunic edges) whose pixels
+        // are partially covered.
+        //
+        // Rejecting them here hands those pixels to the depth reconstruction, which is built for
+        // silhouettes (side-selected taps). 0.92 keeps genuine curvature - adjacent samples a few
+        // degrees apart still measure ~0.999 - while rejecting blends past about 45 degrees.
+        // With MSAA off every covered texel measures 1.0, so this costs nothing and changes
+        // nothing there.
+        let len = length(raw);
+        if len < 0.92 {
+            authored_valid = false;
+        } else {
+            authored_view = raw / len;
             // Same camera-facing guard the reconstruction uses. Authored normals can face away
             // on two-sided or inverted geometry; without this they punch dark holes in AO.
             if dot(authored_view, pos) > 0.0 {
                 authored_view = -authored_view;
             }
-        } else {
-            authored_valid = false;
         }
     }
 

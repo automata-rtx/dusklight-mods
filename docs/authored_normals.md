@@ -241,8 +241,46 @@ quantization and any MSAA resolve all denormalize it. The attachment is cleared 
 the frame's first EFB pass and loaded on resumed segments, so a snapshot taken at
 `SCENE_AFTER_OPAQUE` holds every opaque draw so far.
 
-Two renderer paths remain untested (both flagged in `dusklight-ao/docs/thin-gbuffer-normals.md`
-§12): **MSAA** (the normal target resolves like the color target; renormalizing on read covers most
-of it, slight silhouette error is expected) and **precision** (if RGBA8 banding shows on smooth
-surfaces under strong AO, the fix is `NormalBufferFormat` → `RGB10A2Unorm`, which keeps the
-validity channel — that is an `aurora-ao` change, so report it rather than working around it here).
+### MSAA silhouettes — resolved by rejecting blended texels
+
+The renderer resolves the normal target with a **hardware MSAA resolve** (`g_normalBufferResolved`,
+`aurora-ao/lib/webgpu/gpu.cpp:1116`, wired at `common.cpp:473`), which *averages* samples. For an
+encoded normal that is not a harmless approximation — it produces directions that correspond to no
+surface at all:
+
+| case | decoded value | length |
+|---|---|---|
+| one surface, full coverage | `n` | 1 |
+| partial coverage vs cleared samples (fraction `k`) | `k·n + (k−1)` | far below 1 |
+| silhouette shared by two surfaces | `(n1 + n2) / 2` | `cos(½ angle)` |
+
+The design note in §12 of the renderer doc predicted "slight silhouette error… acceptable". In
+practice it was neither slight nor confined to appearance:
+
+- a **wrong-coloured rim** on every silhouette in the normal debug view (partial-coverage texels
+  get flipped by the camera-facing guard, landing on a roughly camera-facing direction);
+- the shadow mod's **attached-shadow term failing** on thin back-lit features — a nose tip, boot
+  and tunic edges — because `n·L` computed from a blended normal can read as sun-facing, switching
+  the term off exactly where it is needed.
+
+**The validity alpha does not catch this.** It averages to `k`, so any pixel over half covered
+still reads valid, and a two-surface pixel reads a fully confident `1.0`. That is why Coverage
+showed green across the whole screen while the normals were wrong.
+
+`reconstruct.wgsl` now uses the **decoded length as a confidence signal**: a texel written by one
+surface decodes to unit length (8-bit quantization moves it under 0.01), so anything below **0.92**
+is a resolve average and is handed to the depth reconstruction instead, which is built for
+silhouettes. Genuine curvature is untouched — adjacent samples a few degrees apart still measure
+~0.999. With MSAA off every covered texel measures 1.0, so the check is inert.
+
+After this change, silhouette rims show **red in the Coverage view** — that is the fallback working,
+not a regression. The Depth to Normal status line reports the sample count so the MSAA state is
+visible without leaving the game.
+
+If the remaining reconstructed rim is objectionable, the renderer-side fix is to skip the hardware
+resolve for normals and take a single sample (or the sample whose depth matches the resolved
+depth) instead of averaging. That is an `aurora-ao` change.
+
+**Precision** remains untested: if RGBA8 banding shows on smooth surfaces under strong AO, the fix
+is `NormalBufferFormat` → `RGB10A2Unorm`, which keeps the validity channel — also an `aurora-ao`
+change, so report it rather than working around it here.
