@@ -565,7 +565,7 @@ bool get_bool_option(ConfigVarHandle handle, bool fallback) {
 }
 
 int64_t get_debug_mode() {
-    return std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 14);
+    return std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 15);
 }
 
 bool matrix_ready(const Mtx m) {
@@ -3100,8 +3100,9 @@ ModResult build_controls_tab(
         "overhead.");
     static const char* kDebugOptions[] = {"Off", "Shadow Map", "Shadow Factor", "Occlusion",
         "Light UV", "Compare Sign", "Depth Values", "Receiver Range", "Bounds", "Light View",
-        "Camera Replay", "Screen Shadows", "SSS Edge Mask", "Receiver Normal", "Cascades"};
-    add_select(left, "Debug View", g_cvarDebugView, kDebugOptions, 15,
+        "Camera Replay", "Screen Shadows", "SSS Edge Mask", "Receiver Normal", "Cascades",
+        "Shadow Terms"};
+    add_select(left, "Debug View", g_cvarDebugView, kDebugOptions, 16,
         "Shadow Map: the cascade depth buffers tiled 2x2 (near / mid / far / Link)<br/>"
         "Shadow Factor: final darkening term<br/>Occlusion: map comparison result<br/>Light "
         "UV: receiver projection coverage in the selected cascade<br/>Compare Sign: current "
@@ -3118,7 +3119,12 @@ ModResult build_controls_tab(
         "Shadows, Slope Bias, Normal Offset) is off, it correctly shows the inline "
         "depth-reconstructed fallback"
         "<br/>Cascades: which cascade shades each pixel (red = near, green = mid, blue = "
-        "far, white overlay = Link cascade active) - tune the splits and blend with this");
+        "far, white overlay = Link cascade active) - tune the splits and blend with this<br/>"
+        "Shadow Terms: which term is shadowing each pixel - RED = the shadow map comparison, "
+        "GREEN = the attached n.L term, YELLOW = both, BLACK = neither (the pixel is being "
+        "reported as fully lit). Use this on a wrongly-lit patch: black tells you nothing is "
+        "shadowing it, and which channel is missing says whether the map or the surface normal "
+        "is at fault");
     return MOD_OK;
 }
 
