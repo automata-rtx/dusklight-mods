@@ -18,8 +18,15 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   with a one-bounce indirect-diffuse accumulate; with the bounce toggled off it doubles as a
   standalone directional-AO mod. Consumes the scene-color snapshot as its light input and the
   Depth to Normal service (hard dependency, now exported by **Graphics Hub**) for per-sample
-  normals; composites GI additively and AO multiplicatively in a single blend draw. **Service-only**.
-  Docs: `docs/ssilvb_plan.md` (§0 first — see the note below), then `docs/ssilvb.md` once written.
+  normals; composites GI additively and AO multiplicatively in a single blend draw. Since 0.10.0 it
+  also carries an **environment probe**: a persistent world-space ambient cube (6 axes + coverage
+  confidence, 8×1 texture) measured from MIP 4 of its own colour chain in one workgroup, evaluated
+  in each slice's bent direction and applied through the sectors the march found *nothing* in — so
+  it fills exactly the light the bounce structurally cannot see (off-screen, beyond radius) with no
+  possibility of double counting. It persists across frames per-direction, which is what stops
+  light popping at the screen edge. The old sky-only ambient remains as the fallback when the probe
+  is off. **Service-only**. Docs: `docs/ssilvb_plan.md` (§0 first — see the note below) and
+  `docs/ssilvb_environment_light.md`.
 
 - **`mods/smaa/`** — "SMAA" (subpixel morphological antialiasing): a spatial post-process AA mod
   (SMAA 1x). Edge detection unions the reference SMAA luma detector with **geometric edges from the

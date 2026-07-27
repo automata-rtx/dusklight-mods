@@ -20,7 +20,7 @@
 //
 // Debug views (drawn with the no-blend pipeline at FRAME_BEFORE_HUD so fog/bloom cannot repaint
 // them): 1 = bounce light only, 2 = AO only, 3 = albedo proxy, 4 = light input MIP (what the
-// bounce actually sees), 5 = provider world normals.
+// bounce actually sees), 5 = provider world normals, 6 = environment probe along the normal.
 
 struct Uniforms {
     projection: mat4x4f,
@@ -51,7 +51,8 @@ struct Uniforms {
     debug_view: u32,
     frame_index: u32,
     flags: u32, // bit 0 temporal, bit 1 history valid, bit 2 distance fade,
-                // bit 3 GI enabled, bit 4 AO apply, bit 5 white bounce proxy
+                // bit 3 GI enabled, bit 4 AO apply, bit 5 white bounce proxy,
+                // bit 6 emissive bounce, bit 7 sky fill, bit 8 environment probe
     thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
     radius_far: f32,        // far effect radius (fraction of view depth); 0 disables the ramp
     radius_ramp_start: f32, // radius ramp band start, world units of view depth
@@ -64,7 +65,11 @@ struct Uniforms {
     sky_intensity: f32,      // directional sky-light strength (0 disables in the sampler)
     sky_saturation: f32,     // sky tint saturation: 0 = white light at sky brightness, 1 = full
     gi_saturation: f32,      // bounce chroma boost applied in the composite (1 = neutral)
+    probe_intensity: f32,    // environment-probe ambient strength (0 disables it in the sampler)
+    probe_saturation: f32,   // probe tint saturation: 0 = neutral grey at the probe's brightness
+    probe_response: f32,     // probe adaptation rate scale (1 = the ~0.3s default)
     _pad0: f32,
+    _pad1: f32,
 }
 
 @group(0) @binding(0) var gi_source: texture_2d<f32>;          // (GI.rgb linear, AO)
@@ -74,6 +79,7 @@ struct Uniforms {
 @group(0) @binding(4) var scene_color: texture_2d<f32>;        // full-res snapshot (albedo proxy)
 @group(0) @binding(5) var d2n_normal: texture_2d<f32>;         // provider normals (debug view)
 @group(0) @binding(6) var color_chain: texture_2d<f32>;        // linear light MIPs (debug view)
+@group(0) @binding(7) var env_probe: texture_2d<f32>;          // ambient cube (debug view)
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -181,11 +187,12 @@ fn albedo_proxy(uv: vec2f) -> vec3f {
 }
 
 // Shaped bounce light in gamma space (what gets added to the gamma-encoded scene target).
-// The gi channel carries bounce AND directional sky light, so it stays live if EITHER is on
-// (the host pre-divides sky_intensity by gi_intensity so the sky strength is independent of
-// the bounce slider despite sharing this multiply).
+// The gi channel carries bounce light, environment-probe ambient, and the sky fallback, so it
+// stays live if ANY of them is on (the host pre-divides sky_intensity and probe_intensity by
+// gi_intensity, so those sliders stay independent of the bounce slider despite sharing this
+// multiply).
 fn shape_gi(gi_linear: vec3f, uv: vec2f, fade: f32) -> vec3f {
-    if (uniforms.flags & (8u | 128u)) == 0u {
+    if (uniforms.flags & (8u | 128u | 256u)) == 0u {
         return vec3f(0.0);
     }
     // Saturation boost: the MIP pre-average and the temporal filter both wash chroma out of the
@@ -194,7 +201,11 @@ fn shape_gi(gi_linear: vec3f, uv: vec2f, fade: f32) -> vec3f {
     var gi = max(gi_linear, vec3f(0.0));
     let gi_luma = dot(gi, vec3f(0.299, 0.587, 0.114));
     gi = max(mix(vec3f(gi_luma), gi, clamp(uniforms.gi_saturation, 0.0, 3.0)), vec3f(0.0));
-    let lit = gi * albedo_proxy(uv) * uniforms.gi_intensity * (1.0 - fade);
+    // The floor matches the divisor the host pre-divides the probe/sky sliders by, so turning the
+    // BOUNCE slider to zero leaves the ambient that shares this channel intact (ambient-only is a
+    // legitimate mode - directional AO plus environment light, no screen-space bounce). At the
+    // floor the bounce itself contributes 1% of its raw value, which is not visible.
+    let lit = gi * albedo_proxy(uv) * max(uniforms.gi_intensity, 0.01) * (1.0 - fade);
     return pow(lit, vec3f(1.0 / 2.2));
 }
 
@@ -220,6 +231,33 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         let texel = clamp(vec2<i32>(in.uv * n_dims), vec2<i32>(0i), vec2<i32>(n_dims) - 1i);
         let world_n = textureLoad(d2n_normal, texel, 0i).xyz;
         return vec4f(world_n * 0.5 + 0.5, 1.0);
+    }
+    if uniforms.debug_view == 6u {
+        // The environment probe evaluated straight down each surface's own normal, ignoring
+        // occlusion: "what ambient does this direction see?" A wall facing a torch should read
+        // warm, the ceiling above it dark, an open floor sky-colored. Reads flat and blotchy by
+        // design - it is a six-value cube, not an image.
+        let n_dims = vec2f(textureDimensions(d2n_normal));
+        let texel = clamp(vec2<i32>(in.uv * n_dims), vec2<i32>(0i), vec2<i32>(n_dims) - 1i);
+        let n = normalize(textureLoad(d2n_normal, texel, 0i).xyz);
+        let bp = max(n, vec3f(0.0));
+        let bn = max(-n, vec3f(0.0));
+        let wp = bp * bp;
+        let wn = bn * bn;
+        var amb = vec3f(0.0);
+        var conf = 0.0;
+        var w = array<f32, 6>(wp.x, wp.y, wp.z, wn.x, wn.y, wn.z);
+        for (var i = 0u; i < 6u; i += 1u) {
+            let t = textureLoad(env_probe, vec2<i32>(i32(i), 0i), 0i);
+            amb += t.rgb * w[i];
+            conf += t.a * w[i];
+        }
+        let global = textureLoad(env_probe, vec2<i32>(6i, 0i), 0i).rgb;
+        // probe_intensity arrives pre-divided by the composite's gi multiply; undo it so this
+        // view shows the ambient at the strength actually applied.
+        let gain = uniforms.probe_intensity * max(uniforms.gi_intensity, 0.01);
+        let value = mix(global, amb, clamp(conf, 0.0, 1.0)) * gain;
+        return vec4f(pow(max(value, vec3f(0.0)), vec3f(1.0 / 2.2)), 1.0);
     }
 
     // The GI source is either full-res (temporal history, or full-res mode) or half-res (temporal
