@@ -13,6 +13,17 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   optional Link-only cascade) with PCF, slope-scaled bias, normal-offset receiver, two-sided
   casters, Bend-style screen-space shadows, and indoor auto-disable. **Game-linked**: it
   includes game headers and hooks game functions, so it is coupled to the pinned game build.
+  Derives its light direction from the time of day rather than reading `sun_pos`, so it imports
+  the **Celestial Orbit** service (soft dependency) to follow a retilted sun/moon path.
+- **`mods/celestial_orbit/`** — "Celestial Orbit": raises the sun/moon travel path. TP sweeps both
+  bodies around a great circle tilted so its peak is only 59° (`z = y * 48000/80000`), which caps
+  how expressive realtime shadows can be; the mod post-hooks `dScnKy_env_light_c::setSunpos` and
+  re-derives `z` from `y` with `ratio = cot(peak elevation)` (**capped at 80°** — at 90° the arc
+  crosses the zenith and a shadow map's light-space up vector degenerates), plus an optional yaw
+  of the whole orbit plane. The sweep is untouched, so no timing, palette schedule, or day/night
+  transition changes. Exports the orbit as `dev.automata.celestial_orbit` with the shared
+  `celestial_orbit_apply_offset()` both it and Realtime Sun Shadows apply, so they cannot drift
+  apart. **Game-linked**. Docs: `docs/celestial_orbit.md`.
 - **`mods/ssilvb/`** — "SSILVB" (Screen Space Indirect Lighting with Visibility Bitmask,
   Therrien et al. 2023 — the mod carries the paper's name): VBAO's bitmask sampling chain extended
   with a one-bounce indirect-diffuse accumulate; with the bounce toggled off it doubles as a
@@ -85,8 +96,8 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
 
 Each mod is `src/mod.cpp` (host code: pipelines, config vars, UI panel) plus `res/*.wgsl`
 (shaders). Deep documentation: `docs/vbao.md`, `docs/realtime_sun_shadows.md`,
-`docs/deferred_fog.md`, and `docs/mod-api-notes.md` (pitfalls — read before touching
-uniforms or render code).
+`docs/deferred_fog.md`, `docs/celestial_orbit.md`, and `docs/mod-api-notes.md` (pitfalls — read
+before touching uniforms or render code).
 
 ## Build model (official mod template)
 

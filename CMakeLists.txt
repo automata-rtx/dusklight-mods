@@ -36,9 +36,11 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/FetchDusklight.cmake")
 
 add_subdirectory("${DUSKLIGHT_DIR}/sdk" dusklight-sdk EXCLUDE_FROM_ALL)
 
-# Graphics Hub exports the depth-to-normal service; add it before its consumers (ssilvb,
-# realtime_sun_shadows), which add its include/ for the shared service header.
+# Graphics Hub exports the depth-to-normal service and Celestial Orbit the sun/moon orbit service;
+# add both before their consumers (ssilvb, realtime_sun_shadows), which add their include/ for the
+# shared service headers.
 add_subdirectory(mods/graphics_hub)
+add_subdirectory(mods/celestial_orbit)
 add_subdirectory(mods/vbao)
 add_subdirectory(mods/ssilvb)
 add_subdirectory(mods/realtime_sun_shadows)

@@ -11,3 +11,8 @@ add_mod(realtime_sun_shadows
 # Graphics Hub.
 target_include_directories(realtime_sun_shadows PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../graphics_hub/include)
+
+# Optional: if the Celestial Orbit mod is loaded, follow the sun/moon path it retilts instead of
+# the vanilla one (shared header carries the transform both sides apply).
+target_include_directories(realtime_sun_shadows PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../celestial_orbit/include)

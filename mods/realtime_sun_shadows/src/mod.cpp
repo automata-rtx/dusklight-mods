@@ -20,6 +20,7 @@
 #include "global.h"
 
 #include "bend_sss_cpu.h"
+#include "celestial_orbit_service.h"
 #include "depth_to_normal_service.h"
 
 #include "JSystem/J3DGraphAnimator/J3DModel.h"
@@ -76,6 +77,11 @@ IMPORT_SERVICE(LogService, svc_log);
 // the loader disables this mod if the provider is absent). Shadows reconstructs no normals of
 // its own anymore - it only smooths the provider's world-space normal for the bias receivers.
 IMPORT_SERVICE(DepthToNormalService, svc_n2d);
+// Celestial Orbit retilts the sun/moon path by rewriting sun_pos / moon_pos, but this mod derives
+// its light direction from the time of day instead of reading those (see compute_light_uncached),
+// so it has to apply the same retilt itself or the shadows would disagree with the visible sun.
+// Soft dependency: absent provider (or the feature switched off) leaves the vanilla orbit.
+IMPORT_OPTIONAL_SERVICE(CelestialOrbitService, svc_orbit);
 
 namespace {
 
@@ -702,12 +708,24 @@ float sun_moon_angle(float daytime) {
     return angle;
 }
 
-cXyz sun_moon_offset(float daytime) {
+// The vanilla body offset from the camera eye, plus the Celestial Orbit retilt when that mod is
+// loaded and active. `moon` picks which of its two peak-elevation knobs applies; the transform
+// itself is the provider's own celestial_orbit_apply_offset, so this lands on exactly the position
+// Celestial Orbit writes into sun_pos / moon_pos.
+cXyz sun_moon_offset(float daytime, bool moon) {
     const float angle = DEG_TO_RAD(sun_moon_angle(daytime));
     const float angleSin = sinf(angle);
     const float angleCos = cosf(angle);
-    return cXyz{
-        angleSin * kSunMoonDistance, -angleCos * kSunMoonDistance, angleCos * kSunMoonZDistance};
+    float x = angleSin * kSunMoonDistance;
+    float y = -angleCos * kSunMoonDistance;
+    float z = angleCos * kSunMoonZDistance;
+
+    CelestialOrbitState orbit = CELESTIAL_ORBIT_STATE_INIT;
+    if (svc_orbit != nullptr && svc_orbit->get_state(mod_ctx, &orbit) == MOD_OK && orbit.active) {
+        const float ratio = moon ? orbit.moon_z_ratio : orbit.sun_z_ratio;
+        celestial_orbit_apply_offset(ratio, orbit.yaw_sin, orbit.yaw_cos, &x, &y, &z);
+    }
+    return cXyz{x, y, z};
 }
 
 bool build_composite_pipeline(
@@ -1201,9 +1219,9 @@ bool compute_light_uncached(float outDirToLight[3], float& outFade) {
     // The packet positions can be stale when this runs before the world lists are consumed.
     // Mirror dScnKy_env_light_c::setSunpos() so --time-of-day directly moves the debug light.
     const float daytime = wrap_daytime(dComIfGs_getTime());
-    cXyz offset = sun_moon_offset(daytime);
+    cXyz offset = sun_moon_offset(daytime, false);
     if (offset.y <= 0.0f) {
-        offset = sun_moon_offset(daytime + 180.0f);
+        offset = sun_moon_offset(daytime + 180.0f, true);
     }
     const float length = std::sqrt(offset.x * offset.x + offset.y * offset.y + offset.z * offset.z);
     if (length < 1.0f) {
