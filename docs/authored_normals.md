@@ -211,9 +211,12 @@ provider's own — which is the point.
 
 **Still to do, after verification** (deliberately not in the same push, so each reverts alone):
 
-- Delete `realtime_sun_shadows/res/normal_smooth.wgsl` and its host code (a dense 32-tap separable
-  bilateral — the single most expensive thing in the shadow chain). Its own header says it exists
-  solely to smooth reconstruction faceting, and there is none left to smooth.
+- ~~Delete `realtime_sun_shadows/res/normal_smooth.wgsl`~~ — **done.** The shader, both blur
+  pipelines, the two full-res `rgba32float` ping-pong targets and their retire scheme, the compute
+  payload and type, and the `normalSmooth` config var and UI control are all gone. The shadow mod
+  binds the provider's normal directly. Its own header said it existed solely to smooth
+  reconstruction faceting; authored normals have none, so it was pure cost — a dense 32-tap
+  separable blur over the full screen — and it flattened the real curvature the bias could use.
 - Retune the shadow mod's slope-scaled bias and normal-offset magnitudes. They were tuned against
   *blurred* normals; authored normals are smooth but not blurred, so they keep real curvature the
   blur was flattening. Expect both to want to come down.

@@ -89,7 +89,6 @@ namespace {
 ConfigVarHandle g_cvarEnabled = 0;
 ConfigVarHandle g_cvarShadowMap = 0;
 ConfigVarHandle g_cvarMapSize = 0;
-ConfigVarHandle g_cvarNormalSmooth = 0;
 ConfigVarHandle g_cvarNoFrustumClipping = 0;
 ConfigVarHandle g_cvarStrength = 0;
 ConfigVarHandle g_cvarShadowTint = 0;
@@ -135,7 +134,6 @@ ConfigVarHandle g_cvarPerfLog = 0;
 
 GfxDrawTypeHandle g_drawType = 0;
 GfxComputeTypeHandle g_sssComputeType = 0;
-GfxComputeTypeHandle g_normalComputeType = 0;
 GfxComputeTypeHandle g_cascadeCopyComputeType = 0;
 GfxStageHookHandle g_sceneBeginHook = 0;
 GfxStageHookHandle g_sceneAfterTerrainHook = 0;
@@ -144,7 +142,6 @@ GfxStageHookHandle g_frameBeforeHudHook = 0;
 UiWindowHandle g_controlsWindow = 0;
 ResourceBuffer g_shaderSource = RESOURCE_BUFFER_INIT;
 ResourceBuffer g_sssShaderSource = RESOURCE_BUFFER_INIT;
-ResourceBuffer g_normalShaderSource = RESOURCE_BUFFER_INIT;
 ResourceBuffer g_cascadeCopyShaderSource = RESOURCE_BUFFER_INIT;
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
 // Set by the render worker when a draw's pass layout stops matching the pipelines built at init
@@ -159,12 +156,6 @@ WGPUBindGroupLayout g_compositeDebugLayout = nullptr;
 WGPUComputePipeline g_sssPipeline = nullptr;  // Bend screen-space shadow trace
 WGPUBindGroupLayout g_sssLayout = nullptr;
 WGPUSampler g_shadowSampler = nullptr;  // non-filtering clamp sampler for the PCF textureGather
-// The bilateral blur over the Depth to Normal provider's world-space normal (normal_smooth.wgsl).
-// Reconstruction (depth -> raw normal) lives in the provider now; shadows only smooths.
-WGPUComputePipeline g_normalBlurHPipeline = nullptr;
-WGPUComputePipeline g_normalBlurVPipeline = nullptr;
-WGPUBindGroupLayout g_normalBlurHLayout = nullptr;
-WGPUBindGroupLayout g_normalBlurVLayout = nullptr;
 // Staggered cascades: copies a rendered cascade's frame-pooled depth resolve into a mod-owned
 // texture so frames that skip that cascade's replay can composite from the last rendered map.
 WGPUComputePipeline g_cascadeCopyPipeline = nullptr;
@@ -185,23 +176,6 @@ struct RetiredSssTarget {
     int framesLeft = 0;
 };
 std::vector<RetiredSssTarget> g_retiredSssTargets;
-
-// Smoothed-normal ping-pong buffers (rgba32float: normal.xyz + raw depth) at full render
-// resolution. The blur radius scales with render height (kNormalReferenceHeight) so a given
-// Normal Smoothing setting looks identical at any internal resolution. Same retire scheme.
-constexpr float kNormalReferenceHeight = 1080.0f;
-struct NormalTargets {
-    uint32_t width = 0;
-    uint32_t height = 0;
-    WGPUTexture textures[2] = {};
-    WGPUTextureView views[2] = {};
-};
-NormalTargets g_normalTargets;
-struct RetiredNormalTargets {
-    NormalTargets targets;
-    int framesLeft = 0;
-};
-std::vector<RetiredNormalTargets> g_retiredNormalTargets;
 
 // One rendered shadow cascade. Slots 0..2 are the world cascades (near -> far), slot 3 is the
 // optional Link-only cascade (a small box snapped to the player; combined additively in the
@@ -431,15 +405,6 @@ struct ShadowUniforms {
 static_assert(sizeof(ShadowUniforms) == 528);
 static_assert(sizeof(ShadowUniforms) % 16 == 0);
 
-// Mirror of the WGSL BlurUniforms struct (keep in sync with res/normal_smooth.wgsl).
-struct NormalBlurUniforms {
-    float sigma;
-    float radius;
-    float _pad0;
-    float _pad1;
-};
-static_assert(sizeof(NormalBlurUniforms) % 16 == 0);
-
 // Mirror of the WGSL SssUniforms struct (keep in sync with res/bend_sss.wgsl). One slot is
 // pushed per Bend dispatch: the light coordinate and tuning are shared, the wave offset is
 // per-dispatch.
@@ -476,18 +441,6 @@ struct DrawPayload {
 };
 static_assert(sizeof(DrawPayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
 static_assert(std::is_trivially_copyable_v<DrawPayload>);
-
-struct NormalComputePayload {
-    WGPUTextureView d2nNormal;   // Depth to Normal provider output (external, frame-valid)
-    WGPUTextureView normalA;     // mod-owned ping-pong (blur H D2N->B, blur V B->A)
-    WGPUTextureView normalB;
-    uint32_t blurUniformOffset;
-    uint32_t blurUniformSize;
-    uint32_t width;
-    uint32_t height;
-};
-static_assert(sizeof(NormalComputePayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
-static_assert(std::is_trivially_copyable_v<NormalComputePayload>);
 
 // Copies a rendered cascade's depth resolve (frame-pooled, this frame only) into the mod-owned
 // cache texture that staggered frames composite from.
@@ -830,13 +783,6 @@ bool build_sss_pipeline() {
         "bend screen-space shadows", g_sssShaderSource, "cs_main", g_sssPipeline, g_sssLayout);
 }
 
-bool build_normal_pipelines() {
-    return build_compute_pipeline("smoothed normals blur h", g_normalShaderSource,
-               "normal_blur_h", g_normalBlurHPipeline, g_normalBlurHLayout) &&
-           build_compute_pipeline("smoothed normals blur v", g_normalShaderSource,
-               "normal_blur_v", g_normalBlurVPipeline, g_normalBlurVLayout);
-}
-
 bool build_cascade_copy_pipeline() {
     return build_compute_pipeline("cascade depth copy", g_cascadeCopyShaderSource, "cs_main",
         g_cascadeCopyPipeline, g_cascadeCopyLayout);
@@ -887,67 +833,6 @@ bool ensure_sss_target(uint32_t width, uint32_t height) {
     }
     g_sssTarget.width = width;
     g_sssTarget.height = height;
-    return true;
-}
-
-void release_normal_targets(NormalTargets& targets) {
-    for (auto*& view : targets.views) {
-        if (view != nullptr) {
-            wgpuTextureViewRelease(view);
-            view = nullptr;
-        }
-    }
-    for (auto*& texture : targets.textures) {
-        if (texture != nullptr) {
-            wgpuTextureRelease(texture);
-            texture = nullptr;
-        }
-    }
-    targets.width = targets.height = 0;
-}
-
-void tick_retired_normal_targets() {
-    for (auto it = g_retiredNormalTargets.begin(); it != g_retiredNormalTargets.end();) {
-        if (--it->framesLeft <= 0) {
-            release_normal_targets(it->targets);
-            it = g_retiredNormalTargets.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-// The ping-pong pair is only needed while Normal Smoothing is on; park it when it is not, so
-// turning smoothing off gives the memory back (two full-res rgba32float targets).
-void retire_normal_targets() {
-    if (g_normalTargets.width != 0) {
-        g_retiredNormalTargets.push_back(
-            RetiredNormalTargets{std::exchange(g_normalTargets, NormalTargets{}), 4});
-    }
-}
-
-bool ensure_normal_targets(uint32_t width, uint32_t height) {
-    if (g_normalTargets.width == width && g_normalTargets.height == height) {
-        return true;
-    }
-    retire_normal_targets();
-    for (int i = 0; i < 2; ++i) {
-        WGPUTextureDescriptor texDesc = WGPU_TEXTURE_DESCRIPTOR_INIT;
-        texDesc.label = {"smoothed normals", WGPU_STRLEN};
-        texDesc.usage = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding;
-        texDesc.size = {width, height, 1};
-        texDesc.format = WGPUTextureFormat_RGBA32Float;
-        g_normalTargets.textures[i] = wgpuDeviceCreateTexture(g_deviceInfo.device, &texDesc);
-        if (g_normalTargets.textures[i] != nullptr) {
-            g_normalTargets.views[i] = wgpuTextureCreateView(g_normalTargets.textures[i], nullptr);
-        }
-        if (g_normalTargets.views[i] == nullptr) {
-            release_normal_targets(g_normalTargets);
-            return false;
-        }
-    }
-    g_normalTargets.width = width;
-    g_normalTargets.height = height;
     return true;
 }
 
@@ -1054,65 +939,6 @@ void on_cascade_copy_compute(
 // Render worker thread: smooth the provider's world-space normal - one separable depth-aware
 // Gaussian (H: D2N->B, V: B->A) whose radius came from the host, so A holds the final smoothed
 // normals. Reconstruction is the Depth to Normal provider's job now; this only blurs.
-void on_normal_compute(
-    ModContext*, const GfxComputeContext* ctx, const void* payload, size_t payloadSize, void*) {
-    if (payloadSize != sizeof(NormalComputePayload)) {
-        return;
-    }
-    NormalComputePayload data;
-    std::memcpy(&data, payload, sizeof(data));
-    if (data.d2nNormal == nullptr || data.normalA == nullptr || data.normalB == nullptr ||
-        g_normalBlurHPipeline == nullptr)
-    {
-        return;
-    }
-
-    const auto makeGroup = [&](WGPUBindGroupLayout layout, WGPUTextureView in, WGPUTextureView out,
-                               uint32_t uniformOffset, uint32_t uniformSize) {
-        WGPUBindGroupEntry entries[3] = {
-            WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
-        entries[0].binding = 0;
-        entries[0].textureView = in;
-        entries[1].binding = 1;
-        entries[1].textureView = out;
-        entries[2].binding = 2;
-        entries[2].buffer = ctx->uniform_buffer;
-        entries[2].offset = uniformOffset;
-        entries[2].size = uniformSize;
-        WGPUBindGroupDescriptor bindGroupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-        bindGroupDesc.layout = layout;
-        bindGroupDesc.entryCount = 3;
-        bindGroupDesc.entries = entries;
-        return wgpuDeviceCreateBindGroup(ctx->device, &bindGroupDesc);
-    };
-
-    // H reads the provider's normal into B, V smooths B back into A; the composite reads A.
-    WGPUBindGroup blurH = makeGroup(g_normalBlurHLayout, data.d2nNormal, data.normalB,
-        data.blurUniformOffset, data.blurUniformSize);
-    WGPUBindGroup blurV = makeGroup(g_normalBlurVLayout, data.normalB, data.normalA,
-        data.blurUniformOffset, data.blurUniformSize);
-    if (blurH != nullptr && blurV != nullptr) {
-        WGPUComputePassDescriptor passDesc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
-        passDesc.label = {"smoothed normals", WGPU_STRLEN};
-        WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(ctx->encoder, &passDesc);
-        const uint32_t groupsX = div_ceil(data.width, 8);
-        const uint32_t groupsY = div_ceil(data.height, 8);
-        wgpuComputePassEncoderSetPipeline(pass, g_normalBlurHPipeline);
-        wgpuComputePassEncoderSetBindGroup(pass, 0, blurH, 0, nullptr);
-        wgpuComputePassEncoderDispatchWorkgroups(pass, groupsX, groupsY, 1);
-        wgpuComputePassEncoderSetPipeline(pass, g_normalBlurVPipeline);
-        wgpuComputePassEncoderSetBindGroup(pass, 0, blurV, 0, nullptr);
-        wgpuComputePassEncoderDispatchWorkgroups(pass, groupsX, groupsY, 1);
-        wgpuComputePassEncoderEnd(pass);
-        wgpuComputePassEncoderRelease(pass);
-    }
-    for (WGPUBindGroup group : {blurH, blurV}) {
-        if (group != nullptr) {
-            wgpuBindGroupRelease(group);
-        }
-    }
-}
-
 // Render worker thread: the Bend screen-space shadow trace, one dispatch per quadrant
 // rectangle from BuildDispatchList (all sharing the depth snapshot and output).
 void on_sss_compute(
@@ -1835,7 +1661,6 @@ void on_scene_begin(ModContext*, const GfxStageContext* stageCtx, void*) {
     g_prevSceneBeginTime = g_sceneBeginTime;
     g_prevSceneBeginValid = true;
     tick_retired_sss_targets();
-    tick_retired_normal_targets();
     tick_retired_cascade_textures();
     restore_actual_light_debug();
     capture_scene_camera(stageCtx);
@@ -2490,59 +2315,19 @@ bool push_sss_dispatches(
     return svc_gfx->push_compute(mod_ctx, g_sssComputeType, &payload, sizeof(payload)) == MOD_OK;
 }
 
-// The blur radius scales with render height so `smoothing` covers the same fraction of the
-// screen (and looks the same) at any internal resolution. Returns false when the buffer
-// isn't available (composite falls back to the inline per-pixel cross).
-// Resolves this frame's receiver-normal buffer and queues whatever work it needs. Returns the
-// view the composite should bind, or nullptr when there is no normal to be had (a 2D screen).
+// The receiver normal for this frame: the Depth to Normal provider's buffer, bound directly.
 //
-// The normal ALWAYS comes from the Depth to Normal provider - authored vertex normals where the
-// game supplies them, its depth reconstruction elsewhere. Normal Smoothing is post-processing on
-// top of that, not the switch that decides whether the provider is consulted: with it at 0 the
-// provider's normal is bound directly, and every failure path below degrades to that same raw
-// normal rather than to the composite's inline reconstruction.
-WGPUTextureView push_normal_dispatches(const GfxResolvedTargets& resolved, int64_t smoothing) {
+// There was a bilateral blur here (normal_smooth.wgsl) that existed solely to hide the faceting
+// a depth-reconstructed normal has by construction. Authored normals are smooth at the source, so
+// there is nothing left for it to smooth - and it actively cost: a dense 32-tap separable pass
+// over the full screen plus two full-res rgba32float ping-pong targets, and it flattened the real
+// curvature the bias could have used. Removed. See docs/authored_normals.md.
+WGPUTextureView receiver_normal_view() {
     DepthToNormalFrame frame = DEPTH_TO_NORMAL_FRAME_INIT;
-    if (svc_n2d->get_frame(mod_ctx, &frame) != MOD_OK || frame.normal == nullptr) {
+    if (svc_n2d->get_frame(mod_ctx, &frame) != MOD_OK) {
         return nullptr;
     }
-    // Smoothing off: bind the provider's normal as-is. With authored normals there is no
-    // reconstruction faceting left to blur away, so this is both the cheapest and the sharpest
-    // option - and the only way to see what the provider actually hands the bias.
-    if (smoothing <= 0) {
-        retire_normal_targets();
-        return frame.normal;
-    }
-    if (g_normalBlurHPipeline == nullptr || resolved.height == 0 ||
-        !ensure_normal_targets(resolved.width, resolved.height))
-    {
-        return frame.normal;
-    }
-
-    // Setting 1 ~ 1 texel of radius at the reference height; scaled to the real height and
-    // capped to the shader's MAX_BLUR_RADIUS (32). sigma = radius/2 (a full Gaussian bell).
-    const float radius = std::min(32.0f,
-        static_cast<float>(smoothing) * static_cast<float>(resolved.height) / kNormalReferenceHeight);
-    NormalBlurUniforms blurUniforms{};
-    blurUniforms.radius = radius;
-    blurUniforms.sigma = std::max(radius * 0.5f, 0.5f);
-    GfxRange blurRange{0, 0};
-    if (svc_gfx->push_uniform(mod_ctx, &blurUniforms, sizeof(blurUniforms), &blurRange) != MOD_OK) {
-        return frame.normal;
-    }
-
-    NormalComputePayload payload{};
-    payload.d2nNormal = frame.normal;
-    payload.normalA = g_normalTargets.views[0];
-    payload.normalB = g_normalTargets.views[1];
-    payload.blurUniformOffset = blurRange.offset;
-    payload.blurUniformSize = blurRange.size;
-    payload.width = resolved.width;
-    payload.height = resolved.height;
-    if (svc_gfx->push_compute(mod_ctx, g_normalComputeType, &payload, sizeof(payload)) != MOD_OK) {
-        return frame.normal;
-    }
-    return g_normalTargets.views[0];
+    return frame.normal;
 }
 
 // Game thread: consume the frame's map pass and push the deferred composite draw at the
@@ -2634,13 +2419,12 @@ void composite_map_pass(int64_t debugMode) {
     // which is exactly the kind of lie a debug view must not tell; it now shows what the shadow
     // path actually gets. (mapReady is still bypassed for it so normals stay inspectable when
     // the map is suppressed, e.g. indoors.)
-    const int64_t smoothing = std::clamp<int64_t>(get_int_option(g_cvarNormalSmooth, 4), 0, 16);
     const bool normalConsumers = get_bool_option(g_cvarRpdb, true) ||
         get_bool_option(g_cvarAttachedShadows, true) ||
         get_int_option(g_cvarSlopeBias, 2) > 0 || get_int_option(g_cvarNormalOffset, 50) > 0;
     const bool normalsWanted = normalConsumers && (mapReady || debugMode == 13);
     const WGPUTextureView receiverNormal =
-        normalsWanted ? push_normal_dispatches(resolved, smoothing) : nullptr;
+        normalsWanted ? receiver_normal_view() : nullptr;
     const bool normalsReady = receiverNormal != nullptr;
 
     ShadowUniforms uniforms{};
@@ -2992,16 +2776,6 @@ ModResult build_controls_tab(
         "Shifts the shadow-map lookup point along the surface normal, scaled to the size of one "
         "shadow-map texel. The most effective acne fix with the least peter-panning; 100% = one "
         "texel.");
-    add_number(left, "Normal Smoothing", g_cvarNormalSmooth, 0, 16, 1, nullptr,
-        "Extra blur on the surface direction Slope Bias and Normal Offset rely on. It exists to "
-        "hide the faceted bias bands that DEPTH-RECONSTRUCTED normals produce on low-poly "
-        "models. With Graphics Hub's Use Authored Normals on, the incoming normal is already "
-        "smooth (it is the game's own vertex normal), so this has little left to do and flattens "
-        "real curvature - <strong>set it to 0 to see the authored normal unblurred</strong>. 0 is "
-        "also the cheapest setting by far: this is a dense 32-tap separable blur over the whole "
-        "screen. The radius scales with your render resolution, so one value looks the same at "
-        "any internal resolution / supersampling factor. Only affects the shadow-map bias. "
-        "Higher = smoother; 0 = the raw normal straight from the provider.");
     add_toggle(left, "No Frustum Clipping", g_cvarNoFrustumClipping,
         "Keeps camera-frustum-culled objects in the draw lists so off-screen objects still cast "
         "map shadows. Fixes shadows popping in and out with camera direction (distant mountains, "
@@ -3201,10 +2975,6 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (result != MOD_OK || g_sssShaderSource.data == nullptr) {
         return mods::set_error(error, result, "failed to load bend_sss.wgsl");
     }
-    result = svc_resource->load(mod_ctx, "normal_smooth.wgsl", &g_normalShaderSource);
-    if (result != MOD_OK || g_normalShaderSource.data == nullptr) {
-        return mods::set_error(error, result, "failed to load normal_smooth.wgsl");
-    }
     result = svc_resource->load(mod_ctx, "shadow_copy.wgsl", &g_cascadeCopyShaderSource);
     if (result != MOD_OK || g_cascadeCopyShaderSource.data == nullptr) {
         return mods::set_error(error, result, "failed to load shadow_copy.wgsl");
@@ -3219,10 +2989,6 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return result;
     }
     result = register_int_option("mapSize", 2, g_cvarMapSize, error);
-    if (result != MOD_OK) {
-        return result;
-    }
-    result = register_int_option("normalSmooth", 4, g_cvarNormalSmooth, error);
     if (result != MOD_OK) {
         return result;
     }
@@ -3406,10 +3172,6 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return mods::set_error(
             error, MOD_ERROR, "failed to create screen-space shadow pipeline");
     }
-    if (!build_normal_pipelines()) {
-        return mods::set_error(
-            error, MOD_ERROR, "failed to create normal smoothing pipelines");
-    }
     if (!build_cascade_copy_pipeline()) {
         return mods::set_error(error, MOD_ERROR, "failed to create cascade copy pipeline");
     }
@@ -3440,12 +3202,6 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     computeDesc.label = "bend screen-space shadows";
     computeDesc.callback = on_sss_compute;
     if (svc_gfx->register_compute_type(mod_ctx, &computeDesc, &g_sssComputeType) != MOD_OK) {
-        return mods::set_error(error, MOD_ERROR, "failed to register compute type");
-    }
-    computeDesc = GFX_COMPUTE_TYPE_DESC_INIT;
-    computeDesc.label = "smoothed normals";
-    computeDesc.callback = on_normal_compute;
-    if (svc_gfx->register_compute_type(mod_ctx, &computeDesc, &g_normalComputeType) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register compute type");
     }
     computeDesc = GFX_COMPUTE_TYPE_DESC_INIT;
@@ -3548,18 +3304,12 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     restore_actual_light_debug();
     svc_resource->free(mod_ctx, &g_shaderSource);
     svc_resource->free(mod_ctx, &g_sssShaderSource);
-    svc_resource->free(mod_ctx, &g_normalShaderSource);
     svc_resource->free(mod_ctx, &g_cascadeCopyShaderSource);
     release_sss_target(g_sssTarget);
     for (auto& retired : g_retiredSssTargets) {
         release_sss_target(retired.target);
     }
     g_retiredSssTargets.clear();
-    release_normal_targets(g_normalTargets);
-    for (auto& retired : g_retiredNormalTargets) {
-        release_normal_targets(retired.targets);
-    }
-    g_retiredNormalTargets.clear();
     for (auto& cache : g_cascadeCache) {
         release_cascade_cache_texture(cache);
         cache = {};
@@ -3597,11 +3347,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
             layout = nullptr;
         }
     };
-    releaseComputePipeline(g_normalBlurHPipeline);
-    releaseComputePipeline(g_normalBlurVPipeline);
     releaseComputePipeline(g_cascadeCopyPipeline);
-    releaseLayout(g_normalBlurHLayout);
-    releaseLayout(g_normalBlurVLayout);
     releaseLayout(g_cascadeCopyLayout);
     if (g_compositePipeline != nullptr) {
         wgpuRenderPipelineRelease(g_compositePipeline);
@@ -3620,7 +3366,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         g_compositeDebugLayout = nullptr;
     }
     g_cvarEnabled = g_cvarShadowMap = 0;
-    g_cvarMapSize = g_cvarNormalSmooth = 0;
+    g_cvarMapSize = 0;
     g_cvarNoFrustumClipping = 0;
     g_cvarStrength = 0;
     g_cvarPcf = g_cvarBias = g_cvarBoxRadius = g_cvarContactShadows = g_cvarDebugView = 0;
@@ -3653,7 +3399,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_replayPerfSlot = -1;
     g_replayLinkOnly = false;
     g_linkFilterRadiusSq = 0.0f;
-    g_drawType = g_sssComputeType = g_normalComputeType = g_cascadeCopyComputeType =
+    g_drawType = g_sssComputeType = g_cascadeCopyComputeType =
         g_sceneBeginHook = g_sceneAfterTerrainHook = g_sceneAfterOpaqueHook =
             g_frameBeforeHudHook = 0;
     g_controlsWindow = 0;

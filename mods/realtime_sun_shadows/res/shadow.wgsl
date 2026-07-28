@@ -43,8 +43,7 @@ struct Uniforms {
     light_dir_world_x: f32,   // toward the light, world space
     light_dir_world_y: f32,
     light_dir_world_z: f32,
-    smoothed_normals: f32,    // 1 = the receiver-normal buffer is bound (raw provider normal,
-                              //     or its normal_smooth.wgsl blur)
+    smoothed_normals: f32,    // 1 = the receiver-normal buffer (the provider's) is bound
     camera_eye_x: f32,        // camera world position (screen-space shadow distance fade)
     camera_eye_y: f32,
     camera_eye_z: f32,
@@ -222,9 +221,9 @@ fn geometric_normal_at(uv: vec2f, world: vec3f, depth: f32, inv_screen: vec2f) -
 // World-space surface normal for the slope-scaled bias and the normal-offset receiver.
 //
 // The normal comes from the bound receiver-normal buffer, sampled with a depth-weighted bilinear
-// so silhouettes stay crisp. That buffer is the Depth to Normal provider's output - the game's
-// authored vertex normals where it has them - optionally blurred by normal_smooth.wgsl when
-// Normal Smoothing is above 0.
+// so silhouettes stay crisp. That buffer is the Depth to Normal provider's output directly - the
+// game's authored vertex normals where it has them. (A bilateral blur used to sit in between; it
+// existed only to hide depth-reconstruction faceting, which authored normals do not have.)
 //
 // The inline 1px cross below is a LAST-RESORT fallback only: no provider normal this frame, or
 // every bilinear tap rejected at a thin silhouette. It reconstructs the raw facet normal from
