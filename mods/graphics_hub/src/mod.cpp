@@ -47,6 +47,7 @@
 #include "mods/svc/ui.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -72,6 +73,11 @@ namespace hub_dtn {
 
 ResourceBuffer g_shaderSource = RESOURCE_BUFFER_INIT;
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
+// Set by the render worker when a draw's pass layout stops matching the pipelines built at init
+// (the host's thin g-buffer was toggled mid-session). Logged once from the game thread; the
+// render worker must not touch the log service.
+std::atomic<bool> g_normalFormatMismatch{false};
+bool g_loggedNormalMismatch = false;
 WGPUComputePipeline g_pipeline = nullptr;
 WGPUBindGroupLayout g_layout = nullptr;
 GfxComputeTypeHandle g_computeType = 0;
@@ -220,8 +226,21 @@ bool build_debug_pipeline() {
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = module;
     fragment.entryPoint = {"fs_main", WGPU_STRLEN};
-    fragment.targetCount = 1;
-    fragment.targets = &colorTarget;
+    // Thin g-buffer (platform-gbuffer-test and later): when the host writes the game's authored
+    // normals to a SECOND color attachment, every pipeline recorded into the scene pass must
+    // declare a matching second target - WebGPU requires the attachment counts to agree, and a
+    // one-target pipeline is rejected outright. This effect never writes normals, so the target
+    // exists purely to match the pass and its write mask is off. Undefined (buffer disabled, and
+    // every platform before it) leaves this at a single target, unchanged.
+    WGPUColorTargetState colorTargets[2] = {colorTarget, WGPU_COLOR_TARGET_STATE_INIT};
+    uint32_t colorTargetCount = 1;
+    if (g_deviceInfo.normal_format != WGPUTextureFormat_Undefined) {
+        colorTargets[1].format = g_deviceInfo.normal_format;
+        colorTargets[1].writeMask = WGPUColorWriteMask_None;
+        colorTargetCount = 2;
+    }
+    fragment.targetCount = colorTargetCount;
+    fragment.targets = colorTargets;
     WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
     depthStencil.format = g_deviceInfo.depth_format;
     depthStencil.depthWriteEnabled = WGPUOptionalBool_False;
@@ -245,6 +264,14 @@ bool build_debug_pipeline() {
 
 void on_debug_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
+    // Scene-pass attachment guard (thin g-buffer): our pipelines declare the target count the
+    // device reported at init. If the host's normal buffer has been toggled since, that count no
+    // longer matches this pass and recording the draw would be a WebGPU validation error - skip
+    // it instead and let the game thread report it. Reloading the mod rebuilds the pipelines.
+    if (ctx->normal_format != g_deviceInfo.normal_format) {
+        g_normalFormatMismatch.store(true, std::memory_order_relaxed);
+        return;
+    }
     if (payloadSize != sizeof(DebugDrawPayload)) {
         return;
     }
@@ -540,6 +567,11 @@ GfxStageHookHandle g_sceneAfterOpaqueHook = 0;
 GfxStageHookHandle g_frameBeforeHudHook = 0;
 ResourceBuffer g_shaderSource = RESOURCE_BUFFER_INIT;
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
+// Set by the render worker when a draw's pass layout stops matching the pipelines built at init
+// (the host's thin g-buffer was toggled mid-session). Logged once from the game thread; the
+// render worker must not touch the log service.
+std::atomic<bool> g_normalFormatMismatch{false};
+bool g_loggedNormalMismatch = false;
 WGPURenderPipeline g_fogPipeline = nullptr;
 WGPURenderPipeline g_fogDebugPipeline = nullptr;
 WGPURenderPipeline g_mixedPipeline = nullptr;
@@ -808,6 +840,14 @@ HookAction on_set_fog_pre(ModContext*, void* args, void*, void*) {
 
 void on_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
+    // Scene-pass attachment guard (thin g-buffer): our pipelines declare the target count the
+    // device reported at init. If the host's normal buffer has been toggled since, that count no
+    // longer matches this pass and recording the draw would be a WebGPU validation error - skip
+    // it instead and let the game thread report it. Reloading the mod rebuilds the pipelines.
+    if (ctx->normal_format != g_deviceInfo.normal_format) {
+        g_normalFormatMismatch.store(true, std::memory_order_relaxed);
+        return;
+    }
     if (payloadSize != sizeof(DrawPayload)) {
         return;
     }
@@ -1234,8 +1274,21 @@ bool build_fog_pipeline(bool blend, const char* entryPoint, WGPURenderPipeline& 
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = module;
     fragment.entryPoint = {entryPoint, WGPU_STRLEN};
-    fragment.targetCount = 1;
-    fragment.targets = &colorTarget;
+    // Thin g-buffer (platform-gbuffer-test and later): when the host writes the game's authored
+    // normals to a SECOND color attachment, every pipeline recorded into the scene pass must
+    // declare a matching second target - WebGPU requires the attachment counts to agree, and a
+    // one-target pipeline is rejected outright. This effect never writes normals, so the target
+    // exists purely to match the pass and its write mask is off. Undefined (buffer disabled, and
+    // every platform before it) leaves this at a single target, unchanged.
+    WGPUColorTargetState colorTargets[2] = {colorTarget, WGPU_COLOR_TARGET_STATE_INIT};
+    uint32_t colorTargetCount = 1;
+    if (g_deviceInfo.normal_format != WGPUTextureFormat_Undefined) {
+        colorTargets[1].format = g_deviceInfo.normal_format;
+        colorTargets[1].writeMask = WGPUColorWriteMask_None;
+        colorTargetCount = 2;
+    }
+    fragment.targetCount = colorTargetCount;
+    fragment.targets = colorTargets;
     WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
     depthStencil.format = g_deviceInfo.depth_format;
     depthStencil.depthWriteEnabled = WGPUOptionalBool_False;
@@ -1414,6 +1467,18 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 }
 
 MOD_EXPORT ModResult mod_update(ModError*) {
+    if (!hub_dtn::g_loggedNormalMismatch && hub_dtn::g_normalFormatMismatch.load(std::memory_order_relaxed)) {
+        hub_dtn::g_loggedNormalMismatch = true;
+        svc_log->warn(mod_ctx,
+            "scene pass normal-target layout changed since init; composite skipped - "
+            "reload this mod to rebuild its pipelines");
+    }
+    if (!hub_fog::g_loggedNormalMismatch && hub_fog::g_normalFormatMismatch.load(std::memory_order_relaxed)) {
+        hub_fog::g_loggedNormalMismatch = true;
+        svc_log->warn(mod_ctx,
+            "scene pass normal-target layout changed since init; composite skipped - "
+            "reload this mod to rebuild its pipelines");
+    }
     return MOD_OK;
 }
 

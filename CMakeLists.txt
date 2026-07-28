@@ -11,8 +11,31 @@ project(dusklight_mods CXX)
 # streaming buffers the shadow mod needs); everything else is the template unchanged.
 #
 # To move to a newer base game, bump DUSKLIGHT_VERSION (one line) and reconfigure.
+#
+# Currently the THIN G-BUFFER platform (tag platform-gbuffer-test, branch
+# claude/thin-gbuffer-authored-normals-wgqupt). It appends fields to four gfx service structs
+# (GfxDeviceInfo::normal_format, GfxDrawContext::normal_format, GfxResolveDesc::normal,
+# GfxResolvedTargets::normal[_format]). The host validates callers with
+# `caller->struct_size < sizeof(host struct) -> reject`, so mods built against the OLDER SDK are
+# rejected outright by this game build: every webgpu mod died with "failed to query device info"
+# and the service consumers then failed on the missing depth_to_normal import. Building against
+# this SDK fixes that, and stays compatible with platform-v2-test as well - a LARGER struct_size
+# passes the older host's check and the appended fields simply keep their GFX_*_INIT defaults
+# (normal buffer absent), which is exactly the right semantic there.
 if (NOT DUSKLIGHT_VERSION)
-    set(DUSKLIGHT_VERSION "9361fbd9ea6f14a4cc0307c9ca9252e6f6ffb73d")
+    set(DUSKLIGHT_VERSION "b96bf5ec01c09d93c0957bae72f713081ca58f2f")
+endif ()
+
+# The thin-gbuffer commit records an extern/aurora pin (5aa41bf5) that no longer exists: the
+# aurora-ao branch was force-pushed to 3ba95790 ("docs: sync thin g-buffer doc") after the game
+# build was cut, leaving the submodule pointer dangling, so `git submodule update` fails with
+# "upload-pack: not our ref". Aurora contributes only the Dawn/WebGPU headers to a MOD build (no
+# aurora source is compiled into a .dusk), and 3ba95790 is the same code with an amended doc
+# commit, so overriding the pin is safe here. Remove this once dusklight-ao re-points the
+# submodule at a commit that exists.
+if (NOT DEFINED DUSKLIGHT_AURORA_VERSION)
+    set(DUSKLIGHT_AURORA_VERSION "3ba9579091e4011bdb4797b4c6c3d08085651416"
+            CACHE STRING "Override for the extern/aurora submodule commit (empty = use the pin)")
 endif ()
 
 # Knob 1: fetch the SDK from our fork instead of upstream Dusklight (enlarged buffers + the exact
@@ -23,12 +46,14 @@ if (NOT DEFINED DUSKLIGHT_REPOSITORY)
 endif ()
 
 # Knob 2: the SDK auto-downloads the per-arch link stub (Windows/macOS/Android) from this URL.
-# Upstream's default (encounter/dusklight) is private, so point it at our public platform-v2-test
-# release, which publishes windows-<arch>.lib and stub-<platform> as top-level assets. (Linux needs
-# no stub — game symbols resolve at load via --allow-shlib-undefined.)
+# Upstream's default (encounter/dusklight) is private, so point it at our public release, which
+# publishes windows-<arch>.lib and stub-<platform> as top-level assets. Must match
+# DUSKLIGHT_VERSION above: platform-gbuffer-test for the thin g-buffer platform, platform-v2-test
+# for the stable one. (Linux needs no stub — game symbols resolve at load via
+# --allow-shlib-undefined.)
 if (NOT DEFINED DUSKLIGHT_SDK_STUB_URL)
     set(DUSKLIGHT_SDK_STUB_URL
-            "https://github.com/automata-rtx/dusklight-ao/releases/download/platform-v2-test"
+            "https://github.com/automata-rtx/dusklight-ao/releases/download/platform-gbuffer-test"
             CACHE STRING "Base URL for game link stubs downloaded by out-of-tree mod builds")
 endif ()
 
