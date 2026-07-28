@@ -585,9 +585,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         // facets when back-lit) reads as fully lit and leaks. Fold in the n.L term: (1 -
         // light_facing) is 1 on the dark side, 0 on the lit side. max() means already-cast-
         // shadowed pixels don't darken further; only the leaking back-faces get corrected.
-        let map_occlusion = occlusion;  // before the attached term, for debug view 15
+        var map_occlusion = occlusion;  // before the attached term, for debug view 15
         if uniforms.attached_shadows != 0.0 {
-            occlusion = max(occlusion, 1.0 - light_facing);
+            // Weight the MAP by how much the surface actually faces the light, then take the
+            // stronger of that and the n.L term.
+            //
+            // The map comparison is only trustworthy where the surface faces the light. As it
+            // turns edge-on, one shadow texel spans an ever larger depth range, so the comparison
+            // is dominated by bias error rather than by geometry - that band is where acne and
+            // light leaks both live, and on a back-lit character it is most of the visible
+            // surface. Fading the map out across exactly that band costs nothing, because the n.L
+            // term is already driving those pixels dark: at light_facing 0.5 the result is 0.5
+            // either way, so the fade is invisible but the noise is gone.
+            //
+            //   light_facing 1 (facing the light) -> occlusion = map_occlusion, cast shadows and
+            //                                        their detail are completely unchanged
+            //   light_facing 0 (facing away)      -> occlusion = 1, from n.L alone, map ignored
+            //
+            // Monotone in both inputs, so no seam appears where the two hand over.
+            map_occlusion = map_occlusion * light_facing;
+            occlusion = max(map_occlusion, 1.0 - light_facing);
         }
 
         // 15 = which term is doing the shadowing, so a wrong-looking pixel names its own cause
