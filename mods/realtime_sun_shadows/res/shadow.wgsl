@@ -367,6 +367,11 @@ fn receiver_plane_bias_uv_from_normal(map: u32, n: vec3f) -> vec2f {
 // self-shadow, so it needs no slope bias; applying it there (the old code MAXED it, via the
 // cos_t floor) lifts the comparison until thin geometry leaks back into light. The constant
 // bias and the normal-offset receiver still apply on both sides.
+// Hard ceiling on the receiver-plane fractional-sampling term, as a fraction of a cascade's
+// light-space depth range. 0.1% is ample for texel quantization (tens of world units on a wide
+// cascade) while staying far below the scale of the geometry that has to self-shadow.
+const kMaxFractionalBias: f32 = 0.001;
+
 fn cascade_occlusion(map: u32, world: vec3f, n: vec3f, n_geom: vec3f, ndl: f32, tan_t: f32,
     light_facing: f32) -> f32 {
     // Normal-offset receiver uses the SHADING normal (Holbert): it is a shading-space nudge, and
@@ -395,8 +400,23 @@ fn cascade_occlusion(map: u32, world: vec3f, n: vec3f, n_geom: vec3f, ndl: f32, 
         // the cap doubles as the grazing-surface ceiling, where the largest bias is wanted anyway.
         let cap = uniforms.rpdb_max * uniforms.map_size[map];
         bias_uv = clamp(bias_uv, vec2f(-cap), vec2f(cap));
-        // Fractional sampling error: the receiver's own depth change across ~one texel.
-        base_bias += (abs(bias_uv.x) + abs(bias_uv.y)) * uniforms.inv_map_size[map];
+        // Fractional sampling error: the receiver's own depth change across the centre tap's
+        // half-texel offset.
+        //
+        // This term must be capped in its own right. It is derived from the ALREADY-CLAMPED
+        // gradient, and at grazing incidence that gradient sits exactly at `cap` - so this line
+        // used to add up to 2 * rpdb_max = 4% of the cascade's light-space depth range as a FLAT
+        // margin, reintroducing as a constant precisely the explosion the clamp exists to
+        // prevent. On a cascade covering ~25000 world units that is several hundred world units
+        // of bias, against a character about 150 units tall: a character's own self-shadowing
+        // leaked straight through it.
+        //
+        // It is scaled by light_facing (through bias_uv), so it fired ONLY on surfaces facing the
+        // light - exactly where it was seen: the up-facing boot tops, belt and tunic folds of a
+        // back-lit character, the one place n.L correctly abstains and the map works alone. That
+        // is why tuning the constant Bias never reached it.
+        let fractional = (abs(bias_uv.x) + abs(bias_uv.y)) * uniforms.inv_map_size[map] * 0.5;
+        base_bias += min(fractional, kMaxFractionalBias);
     } else {
         base_bias += uniforms.slope_bias[map] * tan_t * light_facing;
     }
