@@ -142,3 +142,32 @@ that early:
 `draw_lists_ready()` is **not** a general "a scene exists" test: the draw lists are already populated
 on the logo scene while the stage info is still null. Guard each piece of game state on its own
 availability, not on a proxy for it.
+
+## Debugging methodology (learned the expensive way)
+
+These cost multiple days across the authored-normals work. Full case studies in
+`docs/authored_normals.md` §8.
+
+- **A debug view is only trustworthy if it samples the same resource the effect does, under the
+  same gate.** Three separate views in this repo showed one thing while the effect consumed another,
+  each sending an investigation the wrong way for rounds. If a view forces a resource on that the
+  effect would not have bound, it is lying.
+- **A view that shows a *combined* result cannot diagnose which input failed.** Build the view that
+  separates the terms *before* theorising. The shadow mod's "Shadow Terms" (view 15) exists because
+  rounds were spent guessing between two opposite bugs that look identical in "Shadow Factor".
+- **Never ship a fix built on an unverified premise.** If the premise is checkable in the source or
+  a binary, check it first — `grep -rn "config.msaa" src/` disproved an entire theory in one
+  command, but only after a fix had already been written and shipped for it.
+- **Symbolize crashes; do not infer them.** See the runbook above. Two wrong fixes preceded the one
+  `llvm-symbolizer --inlines` call that gave the exact answer.
+- **Read the user's observation literally.** "The affected area changes with camera position and
+  aim" instantly discriminated between two theories — it was already in hand when the wrong fix was
+  written.
+- **A host-side "do I need to bind X" gate that duplicates a shader-side "do I use X" condition will
+  drift, and the failure is silent** when the shader has a fallback. Mirror them explicitly and say
+  so at both ends. Prefer having the host set a "this is bound" uniform that the shader trusts, as
+  the shadow mod's `map_enabled` / `link_enabled` / `contact_enabled` flags do — those never drifted
+  precisely because there is one source of truth.
+- **CI is ~5 minutes for all seven platforms.** Shipping a build that adds a diagnostic is cheap;
+  a round trip through the user's testing is not. Prefer the view that answers the question over
+  another guess.

@@ -10,9 +10,14 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   survive game updates without a rebuild.
 - **`mods/realtime_sun_shadows/`** — "Realtime Sun Shadows": real-geometry sun/moon cascaded
   shadow maps (game draw-list replay into up to 3 nested light-space depth passes, plus an
-  optional Link-only cascade) with PCF, slope-scaled bias, normal-offset receiver, two-sided
-  casters, Bend-style screen-space shadows, and indoor auto-disable. **Game-linked**: it
-  includes game headers and hooks game functions, so it is coupled to the pinned game build.
+  optional Link-only cascade) with PCF, receiver-plane + slope bias, sin-scaled normal-offset
+  receiver, two-sided casters, Bend-style screen-space shadows, and indoor auto-disable.
+  **Game-linked**: it includes game headers and hooks game functions, so it is coupled to the
+  pinned game build. **Two normals, never interchangeable**: the *shading* normal (the provider's
+  authored one) drives `n·L` / attached shadows / normal offset, the *geometric* face normal drives
+  the bias — see `docs/realtime_sun_shadows.md` "Shadow term assembly" and
+  `docs/authored_normals.md` §8.6. The `normalSmooth` blur pass was **deleted**; do not
+  reintroduce it. Debug View 15 ("Shadow Terms") is the view that diagnoses wrongly-lit pixels.
   Derives its light direction from the time of day rather than reading `sun_pos`, so it imports
   the **Celestial Orbit** service (soft dependency) to follow a retilted sun/moon path.
 - **`mods/celestial_orbit/`** — "Celestial Orbit": raises the sun/moon travel path. TP sweeps both
@@ -82,7 +87,13 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
     `fogLogConfigs` toggle dumps the frame's captured fog-config table.
 
   **Game-linked** (Deferred Fog hooks game functions) + webgpu. Docs: `docs/deferred_fog.md`,
-  `docs/authored_normals.md`, `docs/depth_to_normal_plan.md`, `docs/depth_to_normal_consumers.md`.
+  **`docs/authored_normals.md`** (§0 = state of play, §8 = the findings that each cost hours —
+  read both before theorising about normals or shadows), `docs/depth_to_normal_plan.md`,
+  `docs/depth_to_normal_consumers.md`.
+
+  The service returns the **true surface direction**, not a camera-facing one. Consumers wanting
+  camera-facing normals apply their own guard *with a margin* (VBAO and SSILVB already do, at 0.15);
+  a hard zero threshold corrupts smooth normals near every silhouette.
 - **`mods/effect_remover/`** — "Effect Remover": a **combination mod** that cuts down TP's built-in
   fake-shading so it doesn't fight the realtime stack. It merges three former standalone mods, each
   in its own namespace inside `src/mod.cpp` (`er_psr` / `er_tsr` / `er_vu`) with its own UI section

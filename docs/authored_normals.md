@@ -1,7 +1,12 @@
 # Authored normals (thin g-buffer) — consuming them, and how to A/B them
 
-**Status:** landed in the mods, **pending in-game verification**. The platform side is done,
+**Status:** landed in the mods. Partly verified in-game — see §0. The platform side is done,
 merged and published (`platform-gbuffer-test`).
+
+> **Cold-start readers:** read §0 first. It is the state of play — what is done, what is confirmed
+> in-game, what is still open, and which debug views answer which question. §8 is the list of
+> findings that each cost hours; read it before forming any theory about normals or shadows, since
+> most of the obvious theories were tried and were wrong for reasons that are now written down.
 
 The game's forward renderer now writes its own **authored, interpolated vertex normals** into a
 second RGBA8 color attachment on the scene (EFB) pass, and the mod API exposes a per-frame snapshot
@@ -16,6 +21,74 @@ normals are smooth by construction, which removes the faceting *at the source* r
 it away afterwards. See `dusklight-ao/docs/thin-gbuffer-normals.md` for the renderer-side design.
 
 ---
+
+## 0. State of play (read first)
+
+**Branch:** `claude/authored-normal-buffer-testing-6sxm4m` in `automata-rtx/dusklight-mods`.
+**Platform:** `DUSKLIGHT_VERSION = b96bf5ec01`, `DUSKLIGHT_SDK_STUB_URL` → `platform-gbuffer-test`.
+The user must run the `win32-msvc-x86_64` build from that release; game build and `.dusk` files are
+always a matched pair, in both directions (see §6 for rollback).
+
+### What landed, in order
+
+| Commit | What |
+|---|---|
+| `9cd2ca9` | Second color target on every mod pipeline recorded into the scene pass (§5). Six sites. |
+| `731dd44` | Platform pinned to `platform-gbuffer-test`. |
+| `83e39f1` | Provider consumes authored normals + the A/B toggle, comparison debug views, basis diagnostic (§1). |
+| `c27ab29` | Shadow mod consults the provider at **every** Normal Smoothing setting (§4a). |
+| `44d4e18` | VBAO's "Normals" debug view shows what the AO actually consumes (§8.3). |
+| `773e034` | Shadow mod's normal gate mirrors the shader's own condition (§4a, second round). |
+| `915f92a` | **Boot-scene crash fix**: null stage info before `dKy_Indoor_check` (§8.4). |
+| `311aa47` | Crash-symbolization runbook in `docs/mod-api-notes.md`. |
+| `db1dff2` | Authored normals no longer flipped at silhouettes (§2a). |
+| `5300789` | Bias uses the geometric face normal; terminator uses the shading normal (§8.6). |
+| `9af4701` | `sin`-scaled normal offset (Holbert) + **Shadow Terms** debug view (§8.7). |
+| `317111b` | Map comparison faded across the terminator band (§8.7). |
+| `aa2c723` | **Receiver-plane fractional-sampling bias capped** (§8.8). |
+| `38386e4` | Normal Smoothing pass deleted outright (§8.9). |
+
+### Confirmed in-game by the user
+
+- Authored normals reach **SSILVB** and visibly change its output.
+- Authored normals reach the **shadow mod** (Receiver Normal view shows them) after `773e034`.
+- **Coverage is green across the whole screen** — every visible pixel has an authored normal. Any
+  theory that depends on missing coverage is dead.
+- The normal buffer itself is **smooth** — confirmed against a faceted Shadow Factor in the same
+  frame, which is what proved the faceting was downstream of the normal (§8.6).
+- The startup crash is gone (later builds run).
+
+### NOT yet verified — the open question
+
+Everything from `5300789` onward is **unverified in-game**. The last user report still showed
+wrongly-lit patches on Link's boots, torso and lower tunic when back-lit. Since then, four changes
+landed that each plausibly address it, the strongest being the **fractional-bias cap** (`aa2c723`,
+§8.8) — that one is arithmetic, not inference: the term was contributing several hundred world units
+of flat bias against a ~150-unit-tall character.
+
+**Next step:** Shadow Factor + Shadow Terms on back-lit Link, same frame. Then the bias retune
+(below).
+
+### Open items
+
+1. **Bias default retune.** `Normal Offset`'s units changed with `sin` scaling (`9af4701`) — it is
+   now the grazing-incidence maximum, not a flat amount — and it is now the *only* normal-derived
+   acne control since Normal Smoothing is gone. Needs a screenshot-driven pass, not guessed values.
+2. If flat sunlit ground shows acne, `rpdb_max` (currently `0.02`) is the knob; the fractional cap
+   `kMaxFractionalBias` (`0.001`) is deliberately tight.
+3. Renderer-side follow-ups, both in `aurora-ao`, neither blocking: normal-target precision
+   (`RGB10A2Unorm` if RGBA8 banding shows), and MSAA handling if MSAA is ever enabled (§8.5).
+
+### Debug views — which question each answers
+
+| View | Where | Answers |
+|---|---|---|
+| **Coverage** | Graphics Hub → Normal Controls | Does this pixel have an authored normal at all? (green/red) |
+| **Authored / Reconstructed / Difference** | Graphics Hub | What do the two sources look like, and where do they disagree? |
+| **Receiver Normal** (13) | Shadow mod | The normal the shadow bias *actually* uses this frame, as bound. |
+| **Shadow Terms** (15) | Shadow mod | **Which term is shadowing each pixel.** Red = shadow map, green = attached `n·L`, yellow = both, **black = neither, i.e. reported fully lit**. This is the view that separates "the map missed an occluder" from "`n·L` misread the surface" — two bugs with identical symptoms. |
+| **Shadow Factor** (2) | Shadow mod | The combined result only. **Cannot** distinguish the two failure modes; do not diagnose from it alone (§8.7). |
+
 
 ## 1. The A/B, in one switch
 
@@ -320,3 +393,169 @@ depth) instead of averaging. That is an `aurora-ao` change.
 **Precision** remains untested: if RGBA8 banding shows on smooth surfaces under strong AO, the fix
 is `NormalBufferFormat` → `RGB10A2Unorm`, which keeps the validity channel — also an `aurora-ao`
 change, so report it rather than working around it here.
+
+---
+
+## 8. Findings that cost the most time
+
+Each of these blocked progress for a long stretch. They are recorded with the **wrong theory** as
+well as the right one, because the wrong theories were plausible and will re-suggest themselves.
+
+### 8.1 A debug view is only trustworthy if it reads the buffer the effect reads
+
+Hit **three separate times** in this work. Every time, a view showed one thing while the effect
+consumed another, and the mismatch sent the investigation in the wrong direction for rounds:
+
+1. The shadow mod's Receiver Normal view bound the provider normal *because the view asked for it*,
+   while the shadow term itself had no buffer bound and silently used an inline reconstruction.
+2. VBAO's "Normals" view always reconstructed from depth, while the AO pass consumed the provider —
+   and its help text claimed it showed "the normals the occlusion pass consumes".
+3. The Shadow Factor view shows `max(map, attached)` only. Two opposite bugs — the map missing an
+   occluder, and `n·L` misreading a surface — produce *identical* bright pixels in it. Rounds were
+   spent alternating between those two explanations before **Shadow Terms** (view 15) was built to
+   separate them.
+
+**Rule:** before diagnosing from a debug view, verify it samples the same resource the effect does,
+under the same gate. If it forces a resource on that the effect wouldn't have, it is lying. And if a
+view shows a *combined* result, it cannot diagnose which input failed — build the view that splits
+them before theorising, not after.
+
+### 8.2 Host-side "do I need to bind X" gates that duplicate shader-side "do I use X" conditions
+
+`shadow.wgsl` reads the receiver normal when
+`rpdb_enabled || slope_bias || normal_offset || attached_shadows`. The host bound the buffer for a
+*narrower* condition, and `world_normal_at` has a silent fallback — so the mismatch produced no
+error, just quietly wrong shading. This happened twice in a row:
+
+- First the gate required `Normal Smoothing > 0`, so at 0 the provider was never consulted at all.
+- Then the corrected gate still omitted **Receiver-Plane Bias** and **Attached Shadows**, which are
+  *both on by default* and both read the normal. With Slope Bias and Normal Offset at 0 — the
+  natural setup once Receiver-Plane Bias replaces Slope Bias — the shadows ran on facet normals.
+
+Both conditions now carry a `KEEP MIRRORED` comment pointing at each other. **Adding a normal
+consumer to the shader means adding it to `normalConsumers` in `mod.cpp`.**
+
+Note the *other* capability gates in the shadow mod (`map_enabled`, `link_enabled`,
+`contact_enabled`) are safe by construction: the host sets each uniform flag from the same variable
+that chose what to bind, so there is one source of truth and nothing to drift. The receiver normal
+was the only one where the shader re-derived the condition independently.
+
+### 8.3 Symbolize crashes immediately; do not infer them from source
+
+A startup crash cost two wrong "fixes" before the binary was consulted. The platform release ships
+`debug.7z` containing `dusklight.pdb`; `llvm-symbolizer --inlines` turned the backtrace into an
+exact inline chain in one step. Full runbook: `docs/mod-api-notes.md` → "Symbolizing a game crash".
+
+The first wrong fix guarded `indoor_blocked()` with `draw_lists_ready()` on the assumption that it
+meant "a scene exists". **It does not** — the draw lists are already populated on the logo scene
+while the stage info is still null. Two independent pieces of state; the guard was inert.
+
+### 8.4 Game accessors that are unguarded before a stage loads
+
+`dKy_Indoor_check()` → `dStage_stagInfo_GetSTType(getStagInfo())` is
+`return (pstag->field_0x0c >> 16) & 7;` with **no null check** (`d_stage.h`).
+`dComIfGp_getStage()->getStagInfo()` is null until a stage loads, so it faults at address `0xc` —
+matching `field_0x0c` exactly. The game never trips this because nothing of its own asks whether it
+is indoors that early; a mod stage hook does, on the first frame the window appears.
+
+**A fault address under ~0x100 is a null dereference at that struct offset.** Match it against the
+header's field offsets to identify the object immediately.
+
+### 8.5 MSAA is OFF — do not build theories on it
+
+A silhouette rim artifact was attributed to hardware MSAA resolve averaging normals. **Wrong.**
+Dusklight never assigns `AuroraConfig::msaa`, and `aurora-ao/lib/aurora.cpp:116` defaults `0` → `1`.
+`g_normalBufferResolved` is therefore never created. The length-based rejection added for it
+(`reconstruct.wgsl`, threshold 0.92) is **inert** and kept only as a cheap robustness guard should
+MSAA ever be enabled.
+
+The distinguishing evidence was the user's: the artifact's **extent changed with camera position and
+aim**. An MSAA resolve artifact would be a fixed ~1px rim. A view-dependent band is the signature of
+a `dot(n, view) > 0` region — which led to 8.6.
+
+### 8.6 The two normals do different jobs — never feed one to both
+
+This is the single most important structural finding in the shadow mod.
+
+- **Shading normal** (authored, smooth) — the `n·L` terminator, Attached Shadows, and the
+  normal-offset receiver. Lighting quantities.
+- **Geometric face normal** (from the depth buffer, `geometric_normal_at`) — Receiver-Plane Bias and
+  the slope-bias `tan_t`. These solve the receiver's depth gradient *in light space*, a property of
+  the triangle the pixel physically sits on.
+
+Feeding the smooth normal to the bias tilts the comparison plane away from the real triangle by the
+shading-vs-face angle, so every facet gets a systematically wrong bias — **per-facet patches in the
+Shadow Factor with a perfectly smooth normal buffer**. That contradiction (smooth normals, faceted
+shadows, same frame) is what proved it.
+
+Authored normals *exposed* this rather than causing it: a depth-reconstructed normal **is** the face
+normal, so the two uses coincided and the bug could not show. `normalSmooth` was an earlier partial
+workaround from the same confusion — it traded bias banding at facet edges for bias error inside
+facets, which is why no value of it ever looked right.
+
+**Related:** the camera-facing guard has the same shape of error. A zero threshold is right for a
+face normal and wrong for a smooth one, which legitimately turns past perpendicular near a
+silhouette (§2a).
+
+### 8.7 Acne and light leaks are the same failure with opposite sign
+
+A shadow-map comparison is only trustworthy where the surface faces the light. As it turns edge-on,
+one shadow texel spans an ever-larger depth range, so the result is decided by bias error rather
+than geometry. Too little bias there → acne; too much → leaks. **No setting of Bias, Slope Bias,
+Normal Offset or Normal Smoothing can fix one without producing the other**, because they are two
+ends of one broken input. This is why the tuning knobs felt like they were going in circles: they
+were.
+
+Fixes applied:
+- `occlusion = max(map_occlusion * light_facing, 1 - light_facing)` — the map fades out exactly
+  where it cannot be trusted, and `n·L` already dominates there, so nothing visible is lost. Cast
+  shadows on lit surfaces (`light_facing = 1`) are completely unchanged. Monotone, so no seam.
+- The normal offset was missing half of Holbert's method: it must scale by `sin(angle to light)`.
+  A constant offset is simultaneously too small at grazing (acne) and too large head-on
+  (peter-panning). **This changed what the Normal Offset number means** — it is now the
+  grazing-incidence maximum.
+
+### 8.8 The receiver-plane fractional-sampling term was larger than the geometry
+
+The bug that best matches the long-running "improperly lit patches":
+
+```wgsl
+let cap = rpdb_max * map_size;                       // 0.02 * 4096 = 81.92
+bias_uv = clamp(bias_uv, -cap, cap);
+base_bias += (|bias_uv.x| + |bias_uv.y|) * inv_map_size;   // → up to 0.04
+```
+
+The term is derived from the **already-clamped** gradient. At grazing incidence the gradient sits
+*at* the cap, so this added up to `2 × rpdb_max` = **4% of the cascade's light-space depth range as
+a flat margin** — reintroducing as a constant precisely the explosion the clamp exists to prevent.
+On a cascade covering ~25000 world units that is several hundred world units, against a character
+roughly 150 units tall. **The bias was larger than the geometry it was biasing**, so a character's
+own self-shadowing leaked straight through.
+
+Why it evaded everything: it is scaled by `light_facing`, so it only fires on surfaces facing the
+light — the up-facing boot tops, belt and tunic folds of a back-lit character, exactly where `n·L`
+correctly abstains and the map works alone. And the constant `Bias` default is **2 world units**,
+four orders of magnitude smaller, so moving `Bias` across its whole range did nothing.
+
+Now taken over a half-texel and hard-capped at `kMaxFractionalBias = 0.001` (0.1% of the cascade
+depth range).
+
+### 8.9 Normal Smoothing is gone
+
+Deleted entirely in `38386e4` — shader, both blur pipelines, the two full-res `rgba32float`
+ping-pong targets and their retire scheme, the compute payload and type, the config var and the UI
+control. It existed solely to hide depth-reconstruction faceting; authored normals have none. It was
+a dense 32-tap separable blur over the full screen, and after 8.6 it was actively harmful, flattening
+the curvature the shading normal carries.
+
+### 8.10 Process notes
+
+- **Do not ship a fix built on an unverified premise.** Two rounds were lost this way (the
+  `draw_lists_ready` guard, the MSAA length check). If a premise is checkable in the source or the
+  binary, check it before writing the fix — both of those were.
+- **Verify the claim, not the plausibility.** `AuroraConfig::msaa` took one grep to disprove.
+- **Read the user's observation literally.** "The affected area changes with camera position"
+  discriminated between two theories instantly; it was in hand before the wrong fix was written.
+- **CI is ~5 minutes for all 7 platforms.** A build that adds a diagnostic is cheap; a round trip
+  through the user's testing is not. Prefer shipping the view that answers the question over
+  shipping another guess.

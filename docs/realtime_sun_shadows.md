@@ -421,6 +421,66 @@ Legacy order (Receiver-Plane Bias OFF): (1) Coverage + cascades as above. (2) Bi
 Softening to taste; widen Cascade Blend if a transition line shows. If feet shadows detach: lower Bias first, then
 Normal Offset — the screen-space term re-grounds contacts regardless.
 
+## Shadow term assembly (current, post authored-normals work)
+
+The occlusion for a pixel is built in this order. Every step here was arrived at by fixing a
+specific bug — see `docs/authored_normals.md` §8 for the failures and why the obvious alternatives
+are wrong.
+
+```wgsl
+// 1. TWO normals, never interchangeable (authored_normals.md 8.6)
+n      = world_normal_at(...)        // SHADING: provider's authored normal. n.L, attached
+                                     //          shadow, normal-offset receiver.
+n_geom = geometric_normal_at(...)    // GEOMETRIC: face normal from depth. Receiver-plane bias
+                                     //            and slope-bias tan_t ONLY.
+
+// 2. Terminator from the SHADING normal
+ndl          = dot(n, light_dir)
+light_facing = smoothstep(-band, band, ndl)     // band from terminatorSoftness
+
+// 3. Per cascade: normal offset scaled by sin (Holbert, complete form)
+receiver = world + n * (normal_offset * texel_world[map] * sqrt(1 - ndl*ndl))
+
+// 4. Receiver-plane bias from the GEOMETRIC normal, its fractional term hard-capped
+bias_uv    = receiver_plane_bias_uv_from_normal(map, n_geom) * light_facing
+bias_uv    = clamp(bias_uv, -cap, cap)                     // cap = rpdb_max * map_size
+fractional = (|bias_uv.x| + |bias_uv.y|) * inv_map_size * 0.5
+base_bias  = bias[map] + min(fractional, kMaxFractionalBias)   // 0.001 — see 8.8
+
+// 5. Combine: the map only counts where the surface faces the light
+occlusion = max(map_occlusion * light_facing, 1 - light_facing)
+```
+
+**Step 5 is the one to understand before touching any bias knob.** A shadow-map comparison is only
+meaningful where the surface faces the light; edge-on, one texel spans a huge depth range and the
+comparison is decided by bias error, not geometry. Acne and light leaks are therefore *the same
+failure with opposite sign*, and no bias setting fixes one without causing the other. Fading the map
+across that band removes the failure rather than trading it. `light_facing = 1` leaves cast shadows
+completely untouched.
+
+**Step 4's cap is not optional.** Uncapped, that term inherits the clamped gradient and contributes
+up to `2 × rpdb_max` = 4% of the cascade depth range as a *flat* margin — hundreds of world units on
+a wide cascade, more than a character is tall, which leaks self-shadowing straight through. It is
+gated by `light_facing`, so it only ever showed on sunlit-facing surfaces of a back-lit character.
+
+### Debug View 15 — "Shadow Terms"
+
+Renders which term is shadowing each pixel: **red** = the map comparison, **green** = the attached
+`n·L` term, **yellow** = both, **black** = neither, i.e. the pixel is reported fully lit.
+
+Use it on any wrongly-lit pixel. The Shadow Factor view shows only `max(...)` of the two, so it
+cannot tell "the map missed an occluder" from "`n·L` misread the surface" — two bugs with identical
+symptoms and opposite fixes. Diagnose from view 15, not from Shadow Factor.
+
+### Normal Smoothing: removed
+
+There was a `normalSmooth` setting and a `normal_smooth.wgsl` bilateral blur. Both are gone
+(`38386e4`). It existed only to hide the faceting a depth-reconstructed normal has by construction;
+the provider now supplies the game's authored vertex normals, which are smooth at the source. After
+the two-normal split it was also actively harmful — it flattened the curvature the shading normal
+carries. Do not reintroduce it: if bias faceting appears, the cause is a bias term reading the
+shading normal instead of `n_geom`.
+
 ## Known caveats
 
 - **2D-menu crash (fixed in 1.6.3)**: with the mod enabled but the shadow map off, the
