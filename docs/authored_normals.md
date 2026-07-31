@@ -7,6 +7,9 @@ merged and published (`platform-gbuffer-test`).
 > in-game, what is still open, and which debug views answer which question. §8 is the list of
 > findings that each cost hours; read it before forming any theory about normals or shadows, since
 > most of the obvious theories were tried and were wrong for reasons that are now written down.
+> §9 answers "could a mod build this buffer instead, without the aurora change?" — including the
+> one route that genuinely would work, why it is still the wrong build, and the upstream-drift
+> notes (an `GfxDeviceInfo` ABI collision) that matter on the next re-platform.
 
 The game's forward renderer now writes its own **authored, interpolated vertex normals** into a
 second RGBA8 color attachment on the scene (EFB) pass, and the mod API exposes a per-frame snapshot
@@ -559,3 +562,159 @@ the curvature the shading normal carries.
 - **CI is ~5 minutes for all 7 platforms.** A build that adds a diagnostic is cheap; a round trip
   through the user's testing is not. Prefer shipping the view that answers the question over
   shipping another guess.
+
+## 9. Could a mod produce this buffer without the aurora change?
+
+Investigated against **upstream `TwilitRealm/dusklight` HEAD `4504e5009`** (28 commits past our base
+`76b56cd8`, which is a clean ancestor) — `docs/modding.md`, the whole `sdk/include/mods/` tree, and
+aurora's GX code generator. Question: can a mod-API-only provider mod produce the authored-normal
+buffer we currently get from the renderer, so the aurora/SDK delta could be dropped?
+
+### 9.0 Verdict
+
+| | |
+|---|---|
+| Does the mod API expose per-draw authored normals, MRT, or the game's geometry? | **No.** Nothing in GfxService 1.0 or 1.1 reaches a draw's vertex attributes or adds an attachment to a pass. |
+| Is there *any* mod-only route to true authored normals? | **Yes, exactly one** — hijack GX's per-vertex lighting so the game's own shaders rasterize the normal as colour, into a replayed offscreen pass (§9.2). |
+| Should we do it? | **No.** It is strictly worse on every axis that matters here (§9.3) and it does not remove the aurora fork (§9.4). |
+| Is there a way to stop carrying the delta? | **Yes — upstream it** (§9.5). That is the real answer to the question behind the question. |
+
+### 9.1 What the mod API actually offers
+
+`GfxService` gives a mod four ways to touch rendering, and none of them can see a draw's normals:
+
+- **`push_draw`** records a *mod-authored* pipeline into the current pass. Its vertex data comes from
+  the mod's own `push_verts`/`push_indices`. `GfxDrawContext` does hand over `vertex_buffer` /
+  `index_buffer`, but those are aurora's shared per-frame streaming buffers — the mod has no map of
+  what the game put in them, in what layout, at what offset. Aurora decides that per draw while
+  decoding GX display lists.
+- **`create_pass` + `resolve_pass`** open an offscreen colour+depth pass (surface format, cleared to
+  `(0,0,0,0)`) and snapshot it. This is how Realtime Sun Shadows renders its cascades.
+- **Stage hooks** (`SCENE_BEGIN` … `FRAME_AFTER_HUD`) are timing points, not attachment control.
+- **Present targets** (new in GfxService **1.1**, upstream commit `7305ef09b`) render a mod's own
+  content into an *extra window or surface* alongside WindowService. Despite the name "external
+  rendering" this has nothing to do with extra targets in the scene pass.
+
+`GfxDeviceInfo` gained `instance` / `adapter` in 1.1; `GfxResolveDesc` / `GfxResolvedTargets` are
+unchanged. **Upstream still has no normal buffer of any kind.**
+
+The value we need — `mv_nrm` — exists only inside the *generated* GX vertex shader
+(`aurora/lib/gx/shader.cpp:1022-1025`). Routing it anywhere is a shader-generator change, and the
+shader generator is aurora.
+
+### 9.2 The one route that does work: hijack GX lighting during a replay
+
+GX computes per-vertex lighting from the authored normal, and aurora implements that faithfully
+(`lib/gx/shader.cpp`, `build_light_source`):
+
+```wgsl
+lighting = amb;
+for each enabled light {
+    ldir = normalize(light.pos - mv_pos);   // aurora treats every light as positional
+    attn = 1.0;                             // GX_AF_NONE
+    diff = dot(ldir, mv_nrm);               // GX_DF_SIGN — signed, unclamped
+    lighting += attn * diff * light.color;
+}
+out.cc0 = mat * clamp(lighting, 0, 1);
+```
+
+Set three lights very far along the view-space axes (`GXInitLightPos` takes view-space coordinates,
+so `ldir` is the axis to within `|mv_pos| / D`), give them colours `(k,0,0)`, `(0,k,0)`, `(0,0,k)`,
+set the ambient register to `(a,a,a)` and the material register to white, with
+`GXSetChanCtrl(GX_COLOR0A0, enable, GX_SRC_REG, GX_SRC_REG, lightMask, GX_DF_SIGN, GX_AF_NONE)`:
+
+```
+out.cc0 = a + k * mv_nrm
+```
+
+With `k = 127/255`, `a = 128/255` that is **the same encoding the g-buffer writes**, in the same
+space, at the same 8-bit precision, and it never trips the `clamp`. Interpolation is equivalent:
+encode is affine, so interpolating the encoded value equals encoding the interpolated normal, and
+consumers renormalize on read anyway. Point the last TEV stage's colour output at `RASC`
+(`GXSetTevColorIn(stage, ZERO, ZERO, ZERO, RASC)` + `GXSetTevColorOp(..., GX_TEVPREV)`) and the
+framebuffer receives the encoded normal.
+
+The plumbing all exists on our side already:
+
+- `DEFINE_HOOK(GXCopyTex, …)` and `DEFINE_HOOK(GXSetCullMode, …)` in Realtime Sun Shadows prove GX
+  entry points are hookable **and** callable from a mod (`dolphin/gx/GXLighting.h` declares the
+  whole lighting API, and aurora implements it in `lib/dolphin/gx/GXLighting.cpp`).
+- The injection point is a **pre-hook on `J3DShape::drawFast`** — after the material has loaded its
+  GX state, before the shape streams vertices. Graphics Hub already holds that hook for Deferred Fog
+  and Realtime Sun Shadows already holds `J3DMatPacket::draw`.
+- The replay itself is the shadow mod's existing mechanism: `create_pass(w, h)` at render resolution
+  with the main camera, then `dComIfGd_drawOpaListBG/DarkBG/Middle/…()`, then `resolve_pass(color)`.
+- Validity needs no extra channel: a unit normal can never encode to `(0,0,0)` (that would be
+  `n = (-1,-1,-1)`, length √3), and the offscreen pass clears to `(0,0,0,0)`, so "decoded length ≉ 1"
+  *is* the validity test — the same length test §8.5 left inert would become the live one.
+
+So the idea is sound, not hand-waving. It is still the wrong thing to build.
+
+### 9.3 Why it is worse in practice
+
+1. **It costs a second full opaque replay every frame.** Not a cheap one: the normal buffer must
+   cover every visible surface at full resolution, so none of the shadow mod's levers apply — no
+   light-column culling, no `casterMinTexels`, no staggering, no reduced map size. It is ~1× the
+   main scene's geometry walk and vertex streaming, added to the **game thread**.
+2. **It runs straight into the per-frame streaming budget**, the one whose overflow is an
+   unconditional `abort()` (`ByteBuffer::resize`) — the v1.6.0 instant-crash-to-desktop. See
+   `realtime_sun_shadows.md`. The renderer-side buffer streams *zero* extra vertices: it writes one
+   more 4-byte value per fragment already being rasterized.
+3. **Alpha-tested cutouts.** Forcing the colour path is safe; the alpha path is not. Leaves, grass,
+   chains and ladders need their texture alpha test intact, and TP materials vary in which stage and
+   map supply it. Get it wrong and foliage becomes solid quads in the normal buffer — wrong normals
+   over exactly the geometry AO and shadows care most about.
+4. **Coverage is strictly worse.** The renderer gates the normal write on `depthCompare &&
+   depthUpdate`, so coverage matches the depth buffer *by construction*, including depth-writing
+   transparencies. A replay only covers what the replayed lists contain; direct GX drawers (the
+   grass/flower packet list is called out in the shadow docs) and anything outside those lists write
+   whatever their own TEV state produces — garbage in the normal target unless individually handled.
+5. **State leakage.** The shadow mod already has an open item to widen GX save/restore around its
+   replays. This proposal hijacks channel control, eight light objects, and TEV stage state per
+   shape, and must restore all of it. That is a much bigger blast radius on the same known-fragile
+   seam.
+6. **The provider becomes deeply game-linked.** Depth to Normal's normal path is service-only today.
+   This would couple *the thing every other mod depends on* to J3D internals and TP's material
+   conventions — the exact ABI treadmill CLAUDE.md tells us to keep the provider off.
+7. **More code, in the hardest place.** The renderer delta is ~90 lines of additive aurora code plus
+   five `struct_size`-guarded SDK fields. The mod version is a per-material state machine over TEV,
+   lighting and alpha, plus a replay, plus a budget story.
+
+### 9.4 It would not remove the aurora fork
+
+`aurora-ao` carries **two** deltas, and the thin g-buffer is only one of them. The other is the
+enlarged per-frame streaming buffers (Index 4 MB, Vertex 16 MB, Storage 16 MB, Uniform/TextureUpload
+24 MB), which exist because the shadow mod's replays overflow stock aurora's 1 MB index / 5 MB
+vertex. Adding a second full-scene replay would need *more* headroom, not less. The trade buys
+nothing on the axis it was proposed for.
+
+### 9.5 The actual way to stop carrying the delta
+
+Upstream it. The change is small, additive, off by default, and useful to any aurora consumer:
+
+- **aurora** (`encounter/aurora`): `AuroraConfig::enableNormalBuffer` → optional second colour target
+  + the `@location(1)` write. Documented end to end in `dusklight/docs/thin-gbuffer-normals.md`.
+- **Dusklight** (`TwilitRealm/dusklight`): the five appended `struct_size`-guarded SDK fields, which
+  is exactly the shape of change GfxService 1.1 already made for present targets — it would land as
+  GfxService **1.2**.
+
+That removes the fork properly and leaves every consumer mod unchanged, whereas §9.2 removes nothing
+and makes the provider fragile.
+
+### 9.6 Upstream drift since our base (rebase notes)
+
+Checked while investigating; relevant whenever we re-platform.
+
+- `76b56cd8` (our base) is an ancestor of upstream HEAD `4504e5009` — **28 commits**, so a rebase is
+  clean in principle.
+- **ABI collision to watch.** Upstream appended `WGPUInstance instance; WGPUAdapter adapter;` to
+  `GfxDeviceInfo` — the same slot where our fork appended `WGPUTextureFormat normal_format;`. On a
+  rebase, ours must be re-appended **after** theirs and the service minor bumped to 1.2. Re-applying
+  our diff blindly would silently mis-map the struct. `GfxResolveDesc` / `GfxResolvedTargets` are
+  untouched upstream, so those merge cleanly.
+- **SDK source renames that touch our three game-linked mods** (`7305ef09b`):
+  `mods/hook.hpp` → `mods/svc/hook.hpp`, and `mods::hook_add_pre/add_post/replace(svc_hook, fn)` →
+  `mods::hook::add_pre/add_post/replace(fn)` (the service argument is now an optional overload).
+  We already use the `mods::` namespace, so `dusk::mods::` → `mods::` costs us nothing.
+- **New and free if we want it:** an `fmt` feature with `mods/svc/log.hpp` formatted logging, UI
+  toasts (`push_toast`), WindowService, and GfxService present targets.
