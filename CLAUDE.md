@@ -62,12 +62,16 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   - **Terrain Shadow Removal** (`er_tsr`): the *other* fake shadow — a drifting dapple **overlay
     baked as a second TEV texture stage inside the terrain material** (not moya — moya count reads 0
     there). `dKy_cloudshadow_scroll` scrolls **texmtx 1** of `MA00`/`MA01`/`MA16` by the `vrkumo`
-    packet (the sway); `dKy_bg_MAxx_proc` sets **TEV KColor 1**'s red to env fog density on
-    `MA00`/`MA01`/`MA04`/`MA16`. That red is a *wash-out* control (in-game test: 0 = **darker**, max
-    = washed out), so `er_tsr` **post-hooks `dKy_bg_MAxx_proc`** and pins KColor 1's red to **255**
-    (== max fog density, engine-faithful) — white into the shadow stage, base ground (stage 0)
-    untouched, so it **does not hole the floor**. **`MA04` is the confirmed Faron forest-floor
-    shade.** Per-code toggles + logger. Off by default (global terrain change).
+    packet (the sway); `dKy_bg_MAxx_proc` sets **TEV KColor 1**'s red to `g_env_light.mFogDensity`
+    on `MA00`/`MA01`/`MA04`/`MA16` — **which is not fog density**: the game's own slider labels that
+    field 雲影の濃さ, *cloud shadow* density, so this feature overrides the game's own cloud-shadow
+    strength control (`docs/japanese-naming.md` §4.1). That red measures as a *wash-out* control
+    (in-game test: 0 = **darker**, max = washed out), so `er_tsr` **post-hooks `dKy_bg_MAxx_proc`**
+    and pins KColor 1's red to **255** — white into the shadow stage, base ground (stage 0)
+    untouched, so it **does not hole the floor**. The polarity is **known-effective, not yet
+    known-faithful**: the label predicts the opposite sign and the TEV equation is baked in the
+    `.bmd`. **`MA04` is the confirmed Faron forest-floor shade.** Per-code toggles + logger. Off by
+    default (global terrain change).
   - **Unbaked Vertex Lighting** (`er_vu`): post-hooks the J3D model loader
     (`J3DModelLoaderDataBase::load`/`loadBinaryDisplayList`) and rewrites each model's CLR0/CLR1
     vertex-color arrays in place — `rgb' = mix(white, rgb, vertexLight/100)` — 100 = vanilla, 0 =
@@ -87,6 +91,43 @@ Each mod is `src/mod.cpp` (host code: pipelines, config vars, UI panel) plus `re
 (shaders). Deep documentation: `docs/vbao.md`, `docs/realtime_sun_shadows.md`,
 `docs/deferred_fog.md`, and `docs/mod-api-notes.md` (pitfalls — read before touching
 uniforms or render code).
+
+## The game's code is named in Japanese, and our mods are built on those names
+
+**Every game identifier our game-linked mods hook, read or include is the original
+Japanese team's name, preserved 1:1 by the decompilation** — romaji, abbreviated
+Japanese, and English spelled by ear. `drawCloudShadow`, `mMoyaMode`, `dKy_bg_MAxx_proc`,
+`mpVrkumoPacket`, `dComIfGd_drawOpaListBG` are all of that kind. Read as English they
+produce confident, wrong answers, and one already reached our own documentation.
+
+`kankyo` (環境) is *environment* — hence `dKy_`. `moya` (靄) is mist/haze. `kumo` (雲) is
+cloud. `dKyw_wether_move` is the **weather** system and `wether` is not a typo to fix.
+
+**`docs/japanese-naming.md` is the reference for this repo** — self-contained, because a
+mod session attaches only `dusklight-mods`. Four things to internalise now:
+
+- **Search Japanese with ripgrep, not `grep -P`.** 496 files in the game tree contain
+  literal kana/kanji — the original team's own debug-panel labels, which are the most
+  authoritative documentation of what any field means. This container's locale is
+  `POSIX`, and under it `grep -P '\p{Han}'` silently matches **nothing** while a raw
+  kana/kanji character class silently matches **too much**. `rg` — and the Claude Code
+  `Grep` tool, which is ripgrep — is correct either way. Measured table in
+  `docs/japanese-naming.md` §2.2. The game tree itself is at `dusklight/` after any
+  CMake configure (git-ignored, fetched at `DUSKLIGHT_VERSION`).
+- **Search in both romanizations.** The tree mixes kunrei-shiki (`si`, `tu`, `ti`, `sya`)
+  with Hepburn (`shi`, `tsu`, `chi`, `sha`) *for the same word*. Either spelling alone
+  finds none of the other half. An empty search is not evidence of absence.
+- **A header field name is not an authored name.** Function and global-data symbols are
+  the original team's; struct *member* names were reconstructed by the decompilation, so
+  a member name is a hypothesis until an authored string agrees with it. This is what
+  caught `mFogDensity` (it is *cloud-shadow* density) — see `er_tsr` above.
+- **Never rename or "correct" a game symbol**, and gloss one on first use in any document
+  here. Our own code in `mods/` stays ordinary English; the convention describes the code
+  we *read*.
+
+Run `python3 tools/check_japanese_naming.py` after editing that document — it verifies
+every game symbol it names still exists in the fetched tree, and skips cleanly when the
+tree is not present.
 
 ## Build model (official mod template)
 

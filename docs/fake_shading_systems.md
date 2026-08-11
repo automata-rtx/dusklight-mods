@@ -58,13 +58,25 @@ texture (the "two textures interacting" the ground shows).
   matrix 1** of the `MA00`/`MA01`/`MA16` materials by the drifting cloud (`vrkumo`) packet
   translation (`g_env_light.mpVrkumoPacket->field_0x1150/0x1154`). **This scroll is the sway.**
 - `dKy_bg_MAxx_proc(void* bg_model)` in `d/d_kankyo.h` (public symbol) — per frame, sets **TEV
-  KColor register 1**'s **red channel** to the environment fog density (`g_env_light.mFogDensity`)
-  on the `MA00`/`MA01`/`MA04`/`MA16` materials. **This red channel is the shadow's wash-out
-  control.**
+  KColor register 1**'s **red channel** to `g_env_light.mFogDensity` on the
+  `MA00`/`MA01`/`MA04`/`MA16` materials. **This red channel is the shadow's wash-out control.**
 
-**Key gotcha (learned in-game):** KColor 1's red is a *wash-out*, **not** a darkener. Forcing it to
-**0** makes the shade **darker**; **maximum** fog density washes it out. So removal = **pin it to
+  **`mFogDensity` is not fog density.** The name is a decompilation reconstruction; the original
+  team's own slider calls the field **雲影の濃さ — "cloud shadow density"** (`d_kankyo.cpp:5003`),
+  and its only other consumer is `dKy_cloudshadow_scroll` (`d_kankyo.cpp:4511`), the function that
+  scrolls this same overlay. So this feature is not fighting an incidental fog term that happens to
+  land on terrain — **it is overriding the game's own cloud-shadow strength control.** See
+  `docs/japanese-naming.md` §4.1.
+
+**Key gotcha (learned in-game):** KColor 1's red behaves as a *wash-out*, **not** a darkener.
+Forcing it to **0** makes the shade **darker**; **maximum** washes it out. So removal = **pin it to
 255**, not zero.
+
+**Unresolved, and worth knowing before tuning this.** 濃さ means density/darkness, so the game's own
+label predicts the opposite polarity from what we measured. Both facts are solid; the TEV equation
+that reconciles them is baked into the `.bmd` material and is not in the source tree. It *is*
+readable — aurora generates the WGSL for that draw (`aurora-ao/docs/japanese-naming.md` §3). Until
+someone reads it, pinning 255 is **known-effective, not known-faithful**.
 
 **How Effect Remover disables it (`er_tsr`):** a **post-hook on `dKy_bg_MAxx_proc`** (runs right
 after the game sets the register, so our value is the one that draws) that, for the enabled material
