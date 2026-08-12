@@ -41,6 +41,8 @@
 #include "mods/svc/camera.h"
 #include "mods/svc/config.h"
 #include "mods/svc/gfx.h"
+
+#include "gfx_normal_compat.h"
 #include "mods/svc/hook.h"
 #include "mods/svc/log.h"
 #include "mods/svc/resource.h"
@@ -317,8 +319,8 @@ bool build_debug_pipeline() {
     // every platform before it) leaves this at a single target, unchanged.
     WGPUColorTargetState colorTargets[2] = {colorTarget, WGPU_COLOR_TARGET_STATE_INIT};
     uint32_t colorTargetCount = 1;
-    if (g_deviceInfo.normal_format != WGPUTextureFormat_Undefined) {
-        colorTargets[1].format = g_deviceInfo.normal_format;
+    if (gfx_compat::normal_format(g_deviceInfo) != WGPUTextureFormat_Undefined) {
+        colorTargets[1].format = gfx_compat::normal_format(g_deviceInfo);
         colorTargets[1].writeMask = WGPUColorWriteMask_None;
         colorTargetCount = 2;
     }
@@ -351,7 +353,7 @@ void on_debug_draw(
     // device reported at init. If the host's normal buffer has been toggled since, that count no
     // longer matches this pass and recording the draw would be a WebGPU validation error - skip
     // it instead and let the game thread report it. Reloading the mod rebuilds the pipelines.
-    if (ctx->normal_format != g_deviceInfo.normal_format) {
+    if (gfx_compat::normal_format(*ctx) != gfx_compat::normal_format(g_deviceInfo)) {
         g_normalFormatMismatch.store(true, std::memory_order_relaxed);
         return;
     }
@@ -507,7 +509,7 @@ ModResult get_frame(ModContext*, DepthToNormalFrame* out) {
         // Only pay for the normal snapshot when something will read it: with authored normals
         // switched off and no comparison view up, this is exactly the old depth-only path, which
         // is what makes the A/B toggle an honest performance comparison too.
-        resolveDesc.normal = g_authoredAvailable && (useAuthored || wantCompare);
+        gfx_compat::request_normal(resolveDesc, g_authoredAvailable && (useAuthored || wantCompare));
         GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
         if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) != MOD_OK ||
             resolved.depth == nullptr || resolved.width == 0 || resolved.height == 0)
@@ -532,7 +534,7 @@ ModResult get_frame(ModContext*, DepthToNormalFrame* out) {
         std::memcpy(uniforms.world_from_view, g_worldFromView, sizeof(uniforms.world_from_view));
         uniforms.inv_size[0] = 1.0f / static_cast<float>(resolved.width);
         uniforms.inv_size[1] = 1.0f / static_cast<float>(resolved.height);
-        const bool authoredBound = resolved.normal != nullptr;
+        const bool authoredBound = gfx_compat::resolved_normal(resolved) != nullptr;
         uniforms.use_authored = (authoredBound && useAuthored) ? 1.0f : 0.0f;
         uniforms.debug_compare = comparing ? 1.0f : 0.0f;
         // Basis diagnostic: the authored normal is rotated by GX's model-view matrix while the
@@ -551,7 +553,7 @@ ModResult get_frame(ModContext*, DepthToNormalFrame* out) {
         ComputePayload payload{};
         payload.sceneDepth = resolved.depth;
         payload.normalOut = g_target.view;
-        payload.authoredNormal = authoredBound ? resolved.normal : g_dummyAuthoredView;
+        payload.authoredNormal = authoredBound ? gfx_compat::resolved_normal(resolved) : g_dummyAuthoredView;
         payload.altOut = comparing ? g_altTarget.view : g_dummyAltView;
         payload.uniformOffset = range.offset;
         payload.uniformSize = range.size;
@@ -770,7 +772,7 @@ ModResult init(ModError* error) {
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to query device info");
     }
-    g_authoredAvailable = g_deviceInfo.normal_format != WGPUTextureFormat_Undefined;
+    g_authoredAvailable = gfx_compat::normal_format(g_deviceInfo) != WGPUTextureFormat_Undefined;
     if (!build_dummy_textures()) {
         return mods::set_error(error, MOD_ERROR, "failed to create stand-in textures");
     }
@@ -1258,7 +1260,7 @@ void on_draw(
     // device reported at init. If the host's normal buffer has been toggled since, that count no
     // longer matches this pass and recording the draw would be a WebGPU validation error - skip
     // it instead and let the game thread report it. Reloading the mod rebuilds the pipelines.
-    if (ctx->normal_format != g_deviceInfo.normal_format) {
+    if (gfx_compat::normal_format(*ctx) != gfx_compat::normal_format(g_deviceInfo)) {
         g_normalFormatMismatch.store(true, std::memory_order_relaxed);
         return;
     }
@@ -1764,8 +1766,8 @@ bool build_fog_pipeline(bool blend, const char* entryPoint, WGPURenderPipeline& 
     // every platform before it) leaves this at a single target, unchanged.
     WGPUColorTargetState colorTargets[2] = {colorTarget, WGPU_COLOR_TARGET_STATE_INIT};
     uint32_t colorTargetCount = 1;
-    if (g_deviceInfo.normal_format != WGPUTextureFormat_Undefined) {
-        colorTargets[1].format = g_deviceInfo.normal_format;
+    if (gfx_compat::normal_format(g_deviceInfo) != WGPUTextureFormat_Undefined) {
+        colorTargets[1].format = gfx_compat::normal_format(g_deviceInfo);
         colorTargets[1].writeMask = WGPUColorWriteMask_None;
         colorTargetCount = 2;
     }

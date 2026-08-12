@@ -48,6 +48,8 @@
 #include "mods/svc/camera.h"
 #include "mods/svc/config.h"
 #include "mods/svc/gfx.h"
+
+#include "gfx_normal_compat.h"
 #include "mods/svc/hook.h"
 #include "mods/svc/log.h"
 #include "mods/svc/resource.h"
@@ -725,8 +727,8 @@ bool build_composite_pipeline(
     // every platform before it) leaves this at a single target, unchanged.
     WGPUColorTargetState colorTargets[2] = {colorTarget, WGPU_COLOR_TARGET_STATE_INIT};
     uint32_t colorTargetCount = 1;
-    if (g_deviceInfo.normal_format != WGPUTextureFormat_Undefined) {
-        colorTargets[1].format = g_deviceInfo.normal_format;
+    if (gfx_compat::normal_format(g_deviceInfo) != WGPUTextureFormat_Undefined) {
+        colorTargets[1].format = gfx_compat::normal_format(g_deviceInfo);
         colorTargets[1].writeMask = WGPUColorWriteMask_None;
         colorTargetCount = 2;
     }
@@ -1002,7 +1004,7 @@ void on_draw(
     // device reported at init. If the host's normal buffer has been toggled since, that count no
     // longer matches this pass and recording the draw would be a WebGPU validation error - skip
     // it instead and let the game thread report it. Reloading the mod rebuilds the pipelines.
-    if (ctx->normal_format != g_deviceInfo.normal_format) {
+    if (gfx_compat::normal_format(*ctx) != gfx_compat::normal_format(g_deviceInfo)) {
         g_normalFormatMismatch.store(true, std::memory_order_relaxed);
         return;
     }

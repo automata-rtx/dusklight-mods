@@ -238,12 +238,19 @@ The user typically does not build locally. Iteration loop:
   current frame only. Objects the mod creates are released in `mod_shutdown`.
 - **Reversed-Z everywhere** (1 = near). Sky pixels have raw depth 0.
 - **Every render pipeline recorded into the scene pass must declare TWO color targets** when
-  `GfxDeviceInfo::normal_format != WGPUTextureFormat_Undefined` — target 1 in that format with
-  `writeMask = None`. The platform's thin g-buffer adds a second attachment to the EFB pass, and
+  `gfx_compat::normal_format(g_deviceInfo) != WGPUTextureFormat_Undefined` — target 1 in that format
+  with `writeMask = None`. The platform's thin g-buffer adds a second attachment to the EFB pass, and
   WebGPU rejects any pipeline whose target count does not match the pass. Every stage that pushes
   draws lands in that pass; there is no exempt stage. Keep the `!= Undefined` guard so the same
   binary still runs on `platform-v2-test`. Offscreen `create_pass` targets stay single-target.
   See `docs/authored_normals.md` §5.
+- **Never touch an SDK normal-buffer field directly** — `GfxDeviceInfo::normal_format`,
+  `GfxDrawContext::normal_format`, `GfxResolveDesc::normal`, `GfxResolvedTargets::normal`. Go through
+  `common/gfx_normal_compat.h` (`gfx_compat::normal_format` / `request_normal` / `resolved_normal`),
+  which detects each field at compile time and degrades to "no normal buffer" when it is absent.
+  Those fields are **fork-local** — upstream Dusklight has none — so a direct access compiles today
+  and breaks the whole tree on the next re-platform. Verified by building against a stripped SDK;
+  see `docs/normal_buffer_portability.md`.
 - **VBAO stays service-only.** If a feature seems to need game code, it belongs in the shadow
   mod or needs an upstream service extension — don't add game includes to `vbao`.
 - **The ABI pin**: the platform is pinned by **`DUSKLIGHT_VERSION` in the top-level `CMakeLists.txt`**
