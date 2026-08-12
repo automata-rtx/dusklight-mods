@@ -1279,7 +1279,8 @@ bool compute_dynamic_shadows_wanted() {
         return false;
     }
     // Both gates matter: with the shadow map disabled (screen-space-only mode) the game's
-    // own real/blob shadows must come back, so the skip hooks go inactive.
+    // own simple/real shadows (dDlst_shadowSimple_c / dDlst_shadowReal_c) must come back,
+    // so the skip hooks go inactive.
     if (!get_bool_option(g_cvarEnabled, true) || !get_bool_option(g_cvarShadowMap, true) ||
         indoor_blocked())
     {
@@ -3240,9 +3241,18 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
 
-    // Skip the game's own shadow rendering while the dynamic pass is active: the
-    // shadowControl pair covers the actor real/blob shadows, drawCloudShadow the weather
-    // cloud shadows.
+    // Skip the game's own shadow rendering while the dynamic pass is active. The
+    // shadowControl pair covers the actor simple/real shadows.
+    //
+    // drawCloudShadow is NOT a shadow routine, despite the name. It draws the whole *moya*
+    // (靄, mist/haze) packet: camera-facing haze billboards with the depth test disabled
+    // (d_kankyo_rain.cpp:4594), five of whose twelve modes blend additively and so can only
+    // brighten (:4587) — and, at mMoyaMode >= 50, the framebuffer heat-shimmer / wolf-senses
+    // distortion, which is the same function's other branch (:4549). on_game_shadow_pre has
+    // no mMoyaMode check, so enabling the shadow map currently suppresses all of that too;
+    // that is the documented "distortion particles vanish with the map on" symptom. Effect
+    // Remover's er_psr hooks the same function and deliberately spares modes > 11.
+    // See docs/fake_shading_systems.md §1 and docs/japanese-naming.md.
     if (mods::hook_add_pre<GameShadowImageDraw>(svc_hook, on_game_shadow_pre) !=
             MOD_OK ||
         mods::hook_add_pre<GameShadowDraw>(svc_hook, on_game_shadow_pre) !=

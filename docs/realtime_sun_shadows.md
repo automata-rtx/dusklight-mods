@@ -218,7 +218,7 @@ Space Shadows" is inert when SSS is off.
 | Var | Default | Meaning |
 |---|---|---|
 | `effectEnabled` | on | master toggle |
-| `shadowMapEnabled` | on | off = screen-space-only mode: no map render/composite, the game's own real/blob shadows return (the skip hooks go inactive), the Bend SSS term still applies |
+| `shadowMapEnabled` | on | off = screen-space-only mode: no map render/composite, the game's own simple/real shadows return (the skip hooks go inactive), the Bend SSS term still applies |
 | `mapSize` | 2 | EACH world cascade's map: 0=1024 1=2048 2=4096 3=8192 |
 | `boxRadius` | 25000 | full coverage radius in world units (1000–30000) = the FAR cascade |
 | `cascadeCount` | 2 | world cascades minus one (UI select "1/2/3"): 0=single map, 1=two cascades, 2=three (default). See the streaming-budget caveat; the enlarged platform buffers carry 3 in normal play |
@@ -499,9 +499,13 @@ shading normal instead of `n_geom`.
   something the replay *does* (a GX/PE or texture-cache state it leaves dirty), not when it
   runs. Next step is to widen the GX-state save/restore around the replay. That toggle was
   removed since it did nothing.
-- **Midna**: the game's projected blob shadow (which the mod hooks out) is where Midna
+- **Midna**: the game's projected shadow (which the mod hooks out) is where Midna
   "lives" during her summon/emergence animation. A retain path (re-enable the game shadow
   for Link only, or anchor her to our sun ground-projection) is a known follow-up.
+  Naming note: the game's own classes are `dDlst_shadowSimple_c` and `dDlst_shadowReal_c`
+  (`d_drawlist.h:202`, `:254`), and `d_bg_s.cpp` calls the projected geometry kind
+  リアル影 ("real *kage*"). **"Blob shadow" is this project's coinage, not the game's word** —
+  it is fine when describing the look to a player, but do not grep the game for it.
 - **The per-frame streaming budget (the v1.6.0/1.6.1 startup crash)**: aurora streams ALL
   GX geometry into fixed-size per-frame buffers — 5 MB vertex, **1 MB index**, 8 MB
   storage, 24 MB uniform (`extern/aurora/lib/gfx/common.hpp:176`) — and these are mapped,

@@ -122,12 +122,17 @@ HookAction on_cloud_shadow_pre(ModContext*, void*, void*, void*) {
     return HOOK_CONTINUE;
 }
 
+// Labels for the modes whose source of assignment has been verified in the game tree. Modes
+// 3, 4, 6, 10 and 11 take an additive blend (d_kankyo_rain.cpp:4587), so they can only ever
+// BRIGHTEN the frame - they are glare/dust/storm haze, never shadows. Unlabelled modes fall
+// through to a bare number rather than guessing.
 const char* mode_label(int mode) {
     switch (mode) {
-    case 0: return "Mode 0 — default wind drift";
-    case 4: return "Mode 4 — wind cloud shadows";
-    case 5: return "Mode 5 — slow-sway canopy shade";
-    case 11: return "Mode 11 — strong wind drift";
+    case 0: return "Mode 0 — default drift";
+    case 4: return "Mode 4 — event wind gust (additive, brightens)";
+    case 5: return "Mode 5 — slow sway";
+    case 7: return "Mode 7 — Hyrule Field / Faron / fishing hole haze";
+    case 11: return "Mode 11 — storm drift (additive, brightens)";
     default: return nullptr;
     }
 }
@@ -144,10 +149,10 @@ ModResult build_modes_tab(
             label = kGenericLabels[mode];
         }
         add_toggle(left, label, g_cvarSuppress[mode],
-            "Removes this projected-shade effect. Use Log Active Mode to find which number an "
-            "on-screen effect uses. Mode 5 (default on) is the slow-swaying canopy shade; the "
-            "wind-driven cloud shadows are usually a different mode, left on so Hyrule Field "
-            "keeps its drifting shadows.");
+            "Removes this haze effect. Use Log Active Mode to find which number an on-screen "
+            "effect uses. Mode 5 (default on) is the slow-swaying one. Modes 3, 4, 6, 10 and 11 "
+            "are additive - they brighten rather than darken, so they are haze and glare, not "
+            "shadows. Hyrule Field's own haze is mode 7.");
     }
     return MOD_OK;
 }
@@ -173,10 +178,14 @@ void on_open_modes(ModContext*, void*) {
 }
 
 void build_section(UiElementHandle panel) {
-    svc_ui->pane_add_section(mod_ctx, panel, "Projected Shadow Removal (moya)");
+    // "moya" is the game's own word (Japanese, mist/haze) and is meaningless to a player unless
+    // glossed here - it is the only place the term is user-facing.
+    svc_ui->pane_add_section(mod_ctx, panel, "Projected Shadow Removal (moya = mist/haze)");
     add_toggle(panel, "Enabled", g_cvarEnabled,
-        "Master switch for the per-mode moya suppression. Removes TP's fake projected ground "
-        "shade (the wind/animation-driven particle field projected on the ground).");
+        "Master switch for the per-mode moya suppression. Removes TP's drifting haze layer: "
+        "camera-facing mist, dust and steam cards drawn over the scene. Despite this feature's "
+        "name they are NOT projected onto the ground - the swaying dapple on a forest floor is "
+        "Terrain Shadow Removal's target instead. Several modes brighten rather than darken.");
     add_toggle(panel, "Log Active Mode", g_cvarLogMode,
         "Prints the live projected-shade mode AND count to the log whenever either changes. Walk "
         "into a spot to read off its mode; a persistent shade with count 0 is NOT this system "
@@ -305,9 +314,15 @@ int shadow_code_index(const char* name) {
 
 // Post-hook on dKy_bg_MAxx_proc(void* bg_model_p). The game has just written the shadow-strength
 // KColor on the terrain materials; the shadow TEV stage treats KColor register 1's red channel as
-// a WASH-OUT amount (0 = full shadow, max = washed out — the value maximum fog density produces).
+// a WASH-OUT amount (0 = full shadow, max = washed out). The value the game puts there is
+// g_env_light.mFogDensity, which despite its decompiled name is NOT fog density: the authors'
+// own slider labels it 雲影の濃さ, "cloud shadow density" (d_kankyo.cpp:5003), and it is loaded
+// from a palette column named cloud_shadow_density (d_stage.h:150). 255 is the engine's own
+// "no cloud shadow" value — the game itself forces mFogDensity = -1 (read as 255) in the wolf's
+// enhanced-senses state (d_kankyo.cpp:2427), where it deliberately flattens the look.
 // Pinning it to 255 feeds white into the shadow stage so it stops darkening the ground; the base
 // ground texture (stage 0) is untouched, so this does not hole the floor.
+// Background: docs/japanese-naming.md §4.1.
 void on_maxx_post(ModContext*, void* args, void*, void*) {
     if (!g_enabledCached) {
         return;
