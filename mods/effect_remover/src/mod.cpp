@@ -2,9 +2,10 @@
 // realtime graphical effects. It bundles three independently-toggleable removers, each targeting
 // one of TP's "fake shading" systems so realtime shadows / GI can carry the look instead:
 //
-//   * Projected Shadow Removal — suppresses the game's "moya" projected ground shade (the kankyo
-//     cloud packet: swaying forest-canopy dapple, rolling Hyrule-Field cloud shadows, drifting
-//     mist), per mMoyaMode, so you keep the effects you want and drop the ones you don't.
+//   * Haze Removal — suppresses the game's "moya" layer (moya is Japanese for mist/haze; see
+//     docs/japanese-naming.md), per mMoyaMode, so you keep the effects you want and drop the
+//     ones you don't. These are camera-facing haze cards drawn with the depth test off, NOT
+//     shade projected onto the ground — the swaying forest-floor dapple is er_tsr's target.
 //   * Terrain Shadow Removal — washes out the animated shadow overlay baked into the terrain
 //     material itself (the MA00/MA01/MA16/MA04 cloud-shadow texture stage), per material code.
 //   * Unbaked Vertex Lighting — fades out the lighting baked into geometry's vertex colors
@@ -87,7 +88,9 @@ ModResult register_bool(const char* name, bool def, ConfigVarHandle& out, ModErr
 }  // namespace
 
 // ===========================================================================================
-// SUB-FEATURE: Projected Shadow Removal   (moya projected ground shade, per mMoyaMode)
+// SUB-FEATURE: Haze Removal   (the moya haze layer, per mMoyaMode)
+// Internal name stays er_psr and the config keys stay psr* on purpose: those keys are
+// persisted, and renaming them would silently reset every user's saved per-mode toggles.
 // ===========================================================================================
 namespace er_psr {
 
@@ -166,7 +169,7 @@ void on_open_modes(ModContext*, void*) {
         return;
     }
     UiTabDesc tabs[1] = {UI_TAB_DESC_INIT};
-    tabs[0].title = "Moya Modes";
+    tabs[0].title = "Haze Modes";
     tabs[0].build = build_modes_tab;
     UiWindowDesc desc = UI_WINDOW_DESC_INIT;
     desc.tabs = tabs;
@@ -180,14 +183,14 @@ void on_open_modes(ModContext*, void*) {
 void build_section(UiElementHandle panel) {
     // "moya" is the game's own word (Japanese, mist/haze) and is meaningless to a player unless
     // glossed here - it is the only place the term is user-facing.
-    svc_ui->pane_add_section(mod_ctx, panel, "Projected Shadow Removal (moya = mist/haze)");
+    svc_ui->pane_add_section(mod_ctx, panel, "Haze Removal (moya)");
     add_toggle(panel, "Enabled", g_cvarEnabled,
         "Master switch for the per-mode moya suppression. Removes TP's drifting haze layer: "
         "camera-facing mist, dust and steam cards drawn over the scene. Despite this feature's "
         "name they are NOT projected onto the ground - the swaying dapple on a forest floor is "
         "Terrain Shadow Removal's target instead. Several modes brighten rather than darken.");
     add_toggle(panel, "Log Active Mode", g_cvarLogMode,
-        "Prints the live projected-shade mode AND count to the log whenever either changes. Walk "
+        "Prints the live haze mode AND count to the log whenever either changes. Walk "
         "into a spot to read off its mode; a persistent shade with count 0 is NOT this system "
         "(try Terrain Shadow Removal below).");
     UiControlDesc control = UI_CONTROL_DESC_INIT;
@@ -218,7 +221,7 @@ ModResult init(ModError* error) {
         }
     }
     if (mods::hook_add_pre<CloudShadow>(svc_hook, on_cloud_shadow_pre) != MOD_OK) {
-        return mods::set_error(error, MOD_ERROR, "failed to hook the projected-shade draw");
+        return mods::set_error(error, MOD_ERROR, "failed to hook the moya haze draw");
     }
     return MOD_OK;
 }
@@ -240,7 +243,7 @@ void update() {
         g_lastLoggedMode = mode;
         g_lastLoggedCount = count;
         char msg[80];
-        std::snprintf(msg, sizeof(msg), "projected-shade: moya mode = %d, count = %d", mode, count);
+        std::snprintf(msg, sizeof(msg), "haze: moya mode = %d, count = %d", mode, count);
         svc_log->info(mod_ctx, msg);
     }
 }
@@ -340,12 +343,6 @@ void on_maxx_post(ModContext*, void* args, void*, void*) {
         return;
     }
 
-    J3DGXColor wash;
-    wash.r = 255;
-    wash.g = 0;
-    wash.b = 0;
-    wash.a = 0;
-
     const u16 count = modelData->getMaterialNum();
     for (u16 i = 0; i < count; ++i) {
         const int code = shadow_code_index(nametab->getName(i));
@@ -358,10 +355,29 @@ void on_maxx_post(ModContext*, void* args, void*, void*) {
             continue;
         }
         J3DMaterial* material = modelData->getMaterialNodePointer(i);
-        if (material != nullptr) {
-            material->setTevKColor(1, &wash);
-            ++g_hitAccum;
+        if (material == nullptr) {
+            continue;
         }
+        // Only the RED channel is the cloud-shadow strength this feature overrides. The other
+        // three are the game's and must be left alone - alpha in particular is load-bearing on
+        // MA01: while the camera is underwater the game raises it to 255 and, in the same
+        // branch, swaps in an alpha test that only passes above 128 and enables Z writes
+        // (d_kankyo.cpp:11459-11470, l_alphaCompInfo at :11340). Writing a flat 0 there fails
+        // that test, which can drop the surface entirely. Because this is a POST-hook the game
+        // has already written its value, so reading it back and replacing only red is both
+        // correct for every code and immune to the game changing the other channels later.
+        J3DGXColor wash;
+        wash.r = 255;
+        wash.g = 0;
+        wash.b = 0;
+        wash.a = 0;
+        if (const J3DGXColor* current = material->getTevKColor(1)) {
+            wash.g = current->g;
+            wash.b = current->b;
+            wash.a = current->a;
+        }
+        material->setTevKColor(1, &wash);
+        ++g_hitAccum;
     }
 }
 

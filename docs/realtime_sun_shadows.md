@@ -142,8 +142,10 @@ Sun Shadows if Depth to Normal is not installed and enabled. Install both togeth
    thickness threshold is a fraction of the pixel's remaining depth range, the term resolves
    contact detail and thin casters at *any* distance — it pairs with a reduced `boxRadius`
    (sharper map texels up close, screen-space detail everywhere).
-5. **Game-shadow suppression**: pre-hooks skip `dDlst_shadowControl_c::imageDraw/draw` and
-   `drawCloudShadow` while the mod is active (typed hooks only — no symbol manifest needed).
+5. **Game-shadow suppression**: pre-hooks skip `dDlst_shadowControl_c::imageDraw/draw` while
+   the mod is active (typed hooks only — no symbol manifest needed). `drawCloudShadow` was
+   skipped here too until it was established that it is the *moya* (靄, mist/haze) packet
+   rather than a shadow routine — see "Known caveats".
 6. **Indoor auto-disable**: `dKy_Indoor_check() != 0` (+ `indoorDisable` on) suppresses the
    shadow MAP render and its composite path (interiors read as fully shadowed under a
    sky-light map), and the suppression hooks go inactive so the game's own shadows return —
@@ -491,14 +493,29 @@ shading normal instead of `n_geom`.
   the game-state calls or the offscreen pass there. Same readiness gate the replay already
   used, so real scenes are unaffected.
 - **Distortion particles vanish with the map on** (heat-haze / steam / wind in Kakariko
-  Village, Goron Springs) — *open*. Only the shadow **map** triggers it; screen-space-only
-  mode (Shadow Map off) shows the particles normally, so that's the current workaround.
-  An `earlyShadowPass` experiment that moved the offscreen replay from `SCENE_AFTER_TERRAIN`
-  to `SCENE_BEGIN` made *no* difference in-game, which rules out the replay's *timing*
-  relative to the framebuffer capture (`GXCopyTex` → `getFrameBufferTex`) as the cause — it's
-  something the replay *does* (a GX/PE or texture-cache state it leaves dirty), not when it
-  runs. Next step is to widen the GX-state save/restore around the replay. That toggle was
-  removed since it did nothing.
+  Village, Goron Springs) — **RESOLVED. The mod was deleting them itself.**
+
+  The cause was not dirty GX state and not the replay. Alongside the game's two real shadow
+  routines, the mod also pre-hooked `drawCloudShadow` and skipped it unconditionally whenever
+  the shadow map was active. `drawCloudShadow` is **not a shadow routine** — the name is
+  romanized-Japanese shorthand, and it draws the whole *moya* (靄, mist/haze) packet: the
+  drifting haze, mist and steam, and at `mMoyaMode >= 50` the framebuffer heat-shimmer and
+  wolf-senses distortion (`d_kankyo_rain.cpp:4549` splits the two branches). The handler had no
+  mode check, so turning on the shadow map deleted all of it.
+
+  That explains every symptom that was recorded here, including the one that misled the
+  investigation: the `earlyShadowPass` experiment changed nothing because the effects were
+  never being drawn at all, so *when* the map rendered was always irrelevant. The previous
+  conclusion in this entry — "it's something the replay does, a GX/PE or texture-cache state it
+  leaves dirty" — was wrong, and it is what sent sessions after a phantom bug in innocent code.
+
+  **Fix:** the `drawCloudShadow` hook was removed from this mod entirely. Nothing it drew was a
+  projected shadow this mod replaces, and Effect Remover's **Haze Removal** already owns moya
+  with per-mode toggles that deliberately spare the `>= 50` modes. A side effect of the old
+  hook was that it silently overrode those toggles whenever both mods were installed; that is
+  fixed too. **Expected change in game:** with the shadow map on, drifting haze/steam and the
+  heat-shimmer now appear where they previously did not. If you want them gone, that is Haze
+  Removal's job — per mode, which is the control the old behaviour bypassed.
 - **Midna**: the game's projected shadow (which the mod hooks out) is where Midna
   "lives" during her summon/emergence animation. A retain path (re-enable the game shadow
   for Link only, or anchor her to our sun ground-projection) is a known follow-up.

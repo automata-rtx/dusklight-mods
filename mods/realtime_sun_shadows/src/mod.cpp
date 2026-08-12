@@ -356,7 +356,6 @@ constexpr float kSunMoonZDistance = -48000.0f;
 // mod_initialize. J3DUClipper::clip is overloaded, so the exact overload is selected by cast.
 DEFINE_HOOK(&dDlst_shadowControl_c::imageDraw, GameShadowImageDraw);
 DEFINE_HOOK(&dDlst_shadowControl_c::draw, GameShadowDraw);
-DEFINE_HOOK(&drawCloudShadow, CloudShadowDraw);
 DEFINE_HOOK(
     static_cast<int (J3DUClipper::*)(f32 const (*)[4], Vec, f32) const>(&J3DUClipper::clip),
     ClipperSphereClip);
@@ -3244,20 +3243,24 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // Skip the game's own shadow rendering while the dynamic pass is active. The
     // shadowControl pair covers the actor simple/real shadows.
     //
-    // drawCloudShadow is NOT a shadow routine, despite the name. It draws the whole *moya*
-    // (靄, mist/haze) packet: camera-facing haze billboards with the depth test disabled
-    // (d_kankyo_rain.cpp:4594), five of whose twelve modes blend additively and so can only
-    // brighten (:4587) — and, at mMoyaMode >= 50, the framebuffer heat-shimmer / wolf-senses
-    // distortion, which is the same function's other branch (:4549). on_game_shadow_pre has
-    // no mMoyaMode check, so enabling the shadow map currently suppresses all of that too;
-    // that is the documented "distortion particles vanish with the map on" symptom. Effect
-    // Remover's er_psr hooks the same function and deliberately spares modes > 11.
-    // See docs/fake_shading_systems.md §1 and docs/japanese-naming.md.
+    // drawCloudShadow used to be skipped here too, and that was a bug born of reading its name
+    // as English. It is NOT a shadow routine: it draws the whole moya (mist/haze) packet —
+    // camera-facing haze cards with the depth test disabled (d_kankyo_rain.cpp:4594), five of
+    // whose twelve modes blend additively and so can only BRIGHTEN (:4587) — and, at
+    // mMoyaMode >= 50, the framebuffer heat-shimmer / wolf-senses distortion, which is the same
+    // function's other branch (:4549). Nothing it draws is a projected shadow this mod replaces.
+    //
+    // Because on_game_shadow_pre skips unconditionally, enabling the shadow map deleted all of
+    // it. That is the whole of the long-standing "distortion particles vanish with the map on"
+    // report: the effects were never drawn, which is also why moving the replay earlier in the
+    // frame changed nothing. The hook is gone, so they come back.
+    //
+    // Moya suppression belongs to Effect Remover's Haze Removal, which owns it per mode and
+    // deliberately spares modes > 11. Do not re-add a hook here: it would silently override
+    // those per-mode toggles. See docs/fake_shading_systems.md §1.
     if (mods::hook_add_pre<GameShadowImageDraw>(svc_hook, on_game_shadow_pre) !=
             MOD_OK ||
-        mods::hook_add_pre<GameShadowDraw>(svc_hook, on_game_shadow_pre) !=
-            MOD_OK ||
-        mods::hook_add_pre<CloudShadowDraw>(svc_hook, on_game_shadow_pre) != MOD_OK)
+        mods::hook_add_pre<GameShadowDraw>(svc_hook, on_game_shadow_pre) != MOD_OK)
     {
         return mods::set_error(error, MOD_ERROR, "failed to hook game shadow rendering");
     }

@@ -13,7 +13,9 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   optional Link-only cascade) with PCF, receiver-plane + slope bias, sin-scaled normal-offset
   receiver, two-sided casters, Bend-style screen-space shadows, and indoor auto-disable.
   **Game-linked**: it includes game headers and hooks game functions, so it is coupled to the
-  pinned game build. **Two normals, never interchangeable**: the *shading* normal (the provider's
+  pinned game build. It does **not** hook `drawCloudShadow` — that is the moya haze packet, not a
+  shadow, and suppressing it was the cause of the long-standing "distortion particles vanish"
+  bug; moya belongs to Effect Remover's Haze Removal. **Two normals, never interchangeable**: the *shading* normal (the provider's
   authored one) drives `n·L` / attached shadows / normal offset, the *geometric* face normal drives
   the bias — see `docs/realtime_sun_shadows.md` "Shadow term assembly" and
   `docs/authored_normals.md` §8.6. The `normalSmooth` blur pass was **deleted**; do not
@@ -100,7 +102,8 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   fake-shading so it doesn't fight the realtime stack. It merges three former standalone mods, each
   in its own namespace inside `src/mod.cpp` (`er_psr` / `er_tsr` / `er_vu`) with its own UI section
   and independent config:
-  - **Projected Shadow Removal** (`er_psr`): pre-hooks `drawCloudShadow` and cancels it **per
+  - **Haze Removal** (`er_psr` — internal name and `psr*` config keys kept so saved settings
+    survive the rename): pre-hooks `drawCloudShadow` and cancels it **per
     `mMoyaMode`**. **Despite the feature's name, moya (靄, mist/haze) is not a projected ground
     shade**: it is camera-facing haze billboards drawn with the depth test disabled
     (`d_kankyo_rain.cpp:4594`), and five of its twelve modes blend additively so they can only

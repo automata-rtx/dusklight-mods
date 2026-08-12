@@ -77,7 +77,7 @@ default. Examples (all in `mods/effect_remover/src/mod.cpp`):
     // Terrain Shadow Removal ships OFF; make it ON by default:
     register_bool("tsrEnabled", false, g_cvarEnabled, error);   //  false -> true
 
-    // Projected Shadow Removal master switch (ships ON):
+    // Haze Removal master switch (ships ON):
     register_bool("psrEnabled", true, g_cvarEnabled, error);    //  true -> false
 ```
 
@@ -182,7 +182,7 @@ the mod manager that you installed a newer build.
   - Depth to Normal: namespace `hub_dtn`, option `normalsDebug`.
   - Deferred Fog: namespace `hub_fog`, options `fogEnabled`, `fogMixedMode`, `fogDebug`.
 - **Effect Remover** — `mods/effect_remover/src/mod.cpp`
-  - Projected Shadow Removal: namespace `er_psr`, options `psrEnabled`, `psrLogMode`,
+  - Haze Removal (formerly "Projected Shadow Removal"): namespace `er_psr`, options `psrEnabled`, `psrLogMode`,
     `psrSuppress0`…`psrSuppress11`.
   - Terrain Shadow Removal: namespace `er_tsr`, options `tsrEnabled`, `tsrLog`, `tsrRemoveMA00`,
     `tsrRemoveMA01`, `tsrRemoveMA16`, `tsrRemoveMA04`.

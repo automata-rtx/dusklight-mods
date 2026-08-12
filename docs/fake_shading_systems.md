@@ -185,9 +185,11 @@ it. See `docs/japanese-naming.md` §5.
 
 ## Which system is which? (in-game triage)
 
-1. Turn on **Projected Shadow Removal → Log Active Mode**. Walk to the shade.
+1. Turn on **Haze Removal → Log Active Mode**. Walk to the shade.
    - If the log shows a moya **mode with count > 0**, it's **system 1** — toggle that mode off.
    - If the log shows **count 0**, moya isn't drawing it → go to step 2.
+   - Remember system 1 cannot darken the ground at all, so a *shadow* on the floor is almost
+     certainly system 2 even if a moya mode is also active.
 2. Turn on **Terrain Shadow Removal → Log Overlay Materials** and **Enabled**.
    - If the "seen" count rises (e.g. `seen 72 (MA04)`), it's **system 2** — it'll wash out.
 3. If neither logger reacts and the whole scene just looks flatly pre-shaded (not a discrete

@@ -18,10 +18,16 @@ fetch it. **This file is the reference** — longer versions exist in the retire
 `dusklight-ao` / `aurora-ao` forks, but those repos are no longer the platform and are
 historical only.
 
-**Status: reference, not an audit.** Everything in §4 was verified against the game
-tree at the pinned `DUSKLIGHT_VERSION`. §5 lists what has *not* been checked. No mod
-code was changed to produce this document — two documentation sentences were, and
-§4.1 says exactly which.
+**Status.** Everything in §4 was verified against the game tree at the pinned
+`DUSKLIGHT_VERSION` — re-verified line by line after the move to upstream Dusklight, so the
+citations match the source the mods are actually built against. §5 says which of the
+questions this document raised are now answered and which are still open.
+
+Findings here have since driven mod changes, not just prose: the `mFogDensity` reading
+corrected Effect Remover's terrain feature, "Projected Shadow Removal" was renamed **Haze
+Removal** because moya is not a projected shadow, and Realtime Sun Shadows' `drawCloudShadow`
+hook was removed once that name was read correctly. Where a section says something is
+unresolved, that is meant literally — do not build on it without checking.
 
 ---
 
@@ -163,7 +169,7 @@ Glossed because these are the names in `mods/effect_remover/src/mod.cpp`,
 | Romaji | Japanese | Meaning | Where it reaches our mods |
 | :-- | :-- | :-- | :-- |
 | kankyo | 環境 | environment | everything `dKy_*` |
-| moya | 靄 | mist, haze | `mMoyaMode` / `mMoyaCount` — Effect Remover's Projected Shadow Removal (`er_psr`) switches on exactly this |
+| moya | 靄 | mist, haze | `mMoyaMode` / `mMoyaCount` — Effect Remover's **Haze Removal** (`er_psr`) switches on exactly this |
 | kumo | 雲 | cloud | `drawCloudShadow` is the moya packet; 雲影 *kumokage* = cloud shadow |
 | vrkumo | VR box + 雲 | the drifting skybox cloud packet | `mpVrkumoPacket` — its translation is what scrolls the terrain shadow overlay `er_tsr` removes |
 | kasumi | 霞 | horizon haze band | `vrbox_kasumi_*_col`; **`outer` is the near band, `inner` is the far one** — the opposite of the English |
