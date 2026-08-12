@@ -42,7 +42,8 @@ struct Uniforms {
     debug_view: u32,
     frame_index: u32,
     flags: u32, // bit 0 temporal, bit 1 history valid, bit 2 distance fade,
-                // bit 3 GI enabled, bit 4 AO apply, bit 5 white bounce proxy
+                // bit 3 GI enabled, bit 4 AO apply, bit 5 white bounce proxy,
+                // bit 6 emissive bounce, bit 7 sky fill, bit 8 environment probe
     thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
     radius_far: f32,        // far effect radius (fraction of view depth); 0 disables the ramp
     radius_ramp_start: f32, // radius ramp band start, world units of view depth
@@ -55,7 +56,11 @@ struct Uniforms {
     sky_intensity: f32,      // directional sky-light strength (0 disables in the sampler)
     sky_saturation: f32,     // sky tint saturation: 0 = white light at sky brightness, 1 = full
     gi_saturation: f32,      // bounce chroma boost applied in the composite (1 = neutral)
+    probe_intensity: f32,    // environment-probe ambient strength (0 disables it in the sampler)
+    probe_saturation: f32,   // probe tint saturation: 0 = neutral grey at the probe's brightness
+    probe_response: f32,     // probe adaptation rate scale (1 = the ~0.3s default)
     _pad0: f32,
+    _pad1: f32,
 }
 
 @group(0) @binding(0) var input_depth: texture_2d<f32>;

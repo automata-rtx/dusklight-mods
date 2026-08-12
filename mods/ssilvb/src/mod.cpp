@@ -7,8 +7,19 @@
 // With the bounce toggled off the mod degenerates to a standalone directional AO (the sampling
 // loop skips every color/normal fetch and costs the same as VBAO).
 //
+// ENVIRONMENT LIGHT (the probe): the bounce above only sees what is on screen and within the
+// march radius. Sectors the march finds NOTHING in are lit instead by a persistent world-space
+// ambient cube - six axis radiances measured from the frame itself (MIP 4 of the color chain,
+// one workgroup) and carried forward across frames in proportion to how well each frame
+// constrained each direction. Because it persists, light keeps arriving from surfaces that have
+// scrolled off screen, which is the failure mode a pure screen-space gather cannot fix. The two
+// terms are disjoint by construction - a sector is either occluded (bounce) or visible (probe) -
+// so they cannot double count. The older sky-only ambient remains as the fallback when the probe
+// is switched off, so that switch restores the previous look exactly.
+//
 // Chain (per frame, GFX_STAGE_SCENE_AFTER_OPAQUE): depth MIP prefilter -> color MIP prefilter
-// (gamma decode + box chain) -> SSILVB sampling -> edge-aware spatial denoise (rgba) ->
+// (gamma decode + box chain) -> sky reduce -> environment probe accumulate -> SSILVB sampling ->
+// edge-aware spatial denoise (rgba) ->
 // temporal accumulation (rgba history + split depth plane) -> composite. The composite outputs
 // (GI_add.rgb, AO_mul) in one draw and the blend state combines both with the scene:
 // out = GI + dst * AO (Add mode) or out = GI * (1 - dst) + dst * AO (Screen mode, default).
@@ -64,6 +75,10 @@ ConfigVarHandle g_cvarEmissiveBounce = 0;
 ConfigVarHandle g_cvarEmissiveBoost = 0;
 ConfigVarHandle g_cvarEmissiveThreshold = 0;
 ConfigVarHandle g_cvarSkyLight = 0;
+ConfigVarHandle g_cvarEnvProbe = 0;
+ConfigVarHandle g_cvarProbeIntensity = 0;
+ConfigVarHandle g_cvarProbeSaturation = 0;
+ConfigVarHandle g_cvarProbeResponse = 0;
 ConfigVarHandle g_cvarSkyIntensity = 0;
 ConfigVarHandle g_cvarSkySaturation = 0;
 ConfigVarHandle g_cvarGiSaturation = 0;
@@ -112,12 +127,18 @@ ResourceBuffer g_temporalSource = RESOURCE_BUFFER_INIT;
 ResourceBuffer g_compositeSource = RESOURCE_BUFFER_INIT;
 
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
+// Set by the render worker when a draw's pass layout stops matching the pipelines built at init
+// (the host's thin g-buffer was toggled mid-session). Logged once from the game thread; the
+// render worker must not touch the log service.
+std::atomic<bool> g_normalFormatMismatch{false};
+bool g_loggedNormalMismatch = false;
 WGPUComputePipeline g_preprocessPipeline = nullptr;
 WGPUComputePipeline g_mip4Pipeline = nullptr;
 WGPUComputePipeline g_colorMip0Pipeline = nullptr;
 WGPUComputePipeline g_colorReducePipeline = nullptr;
 WGPUComputePipeline g_emissivePipeline = nullptr;
 WGPUComputePipeline g_skyReducePipeline = nullptr;
+WGPUComputePipeline g_probePipeline = nullptr;
 WGPUComputePipeline g_ssilvbPipeline = nullptr;
 WGPUComputePipeline g_denoisePipeline = nullptr;
 WGPUComputePipeline g_temporalPipeline = nullptr;
@@ -127,6 +148,7 @@ WGPUBindGroupLayout g_colorMip0Layout = nullptr;
 WGPUBindGroupLayout g_colorReduceLayout = nullptr;
 WGPUBindGroupLayout g_emissiveLayout = nullptr;
 WGPUBindGroupLayout g_skyReduceLayout = nullptr;
+WGPUBindGroupLayout g_probeLayout = nullptr;
 WGPUBindGroupLayout g_ssilvbLayout = nullptr;
 WGPUBindGroupLayout g_denoiseLayout = nullptr;
 WGPUBindGroupLayout g_temporalLayout = nullptr;
@@ -157,6 +179,7 @@ struct TargetViews {
     WGPUTextureView emissive = nullptr;  // prev-frame emissive delta (full res, linear)
     WGPUTextureView skyPartial = nullptr; // per-workgroup sky sums (chain/8, rgba32float)
     WGPUTextureView sky[2] = {};          // smoothed 1x1 sky estimate, ping-ponged per frame
+    WGPUTextureView probe[2] = {};        // 8x1 environment ambient cube, ping-ponged per frame
 };
 
 // Chain targets, recreated when the render size (or halfRes) changes. Old sets are retired for a
@@ -183,6 +206,11 @@ struct Targets {
     // reduce can read last frame's value while writing this frame's).
     WGPUTexture skyPartial = nullptr;
     WGPUTexture sky[2] = {};
+    // Environment probe: an 8x1 world-space ambient cube (texels 0..5 = +X,+Y,+Z,-X,-Y,-Z as
+    // rgb radiance + coverage confidence, texel 6 = frame-wide mean). Ping-ponged because each
+    // frame's accumulation blends against the previous one - that persistence is what carries
+    // light from directions the camera is no longer pointing at.
+    WGPUTexture probe[2] = {};
     TargetViews* views = nullptr;
 };
 Targets g_targets;
@@ -237,7 +265,7 @@ struct SsilvbUniforms {
     uint32_t frame_index;
     uint32_t flags; // bit 0 temporal, bit 1 history valid, bit 2 distance fade,
                     // bit 3 GI enabled, bit 4 AO apply, bit 5 white bounce proxy,
-                    // bit 6 emissive bounce, bit 7 sky light
+                    // bit 6 emissive bounce, bit 7 sky fill, bit 8 environment probe
     float thick_dist_scale;  // extra occluder thickness, fraction of the view-space radius
     float radius_far;        // far effect radius (fraction of view depth); 0 disables the ramp
     float radius_ramp_start; // radius ramp band start, world units of view depth
@@ -250,7 +278,11 @@ struct SsilvbUniforms {
     float sky_intensity;     // directional sky-light strength (0 disables in the sampler)
     float sky_saturation;    // sky tint saturation: 0 = white light at sky brightness, 1 = full
     float gi_saturation;     // bounce chroma boost applied in the composite (1 = neutral)
+    float probe_intensity;   // environment-probe ambient strength (0 disables it in the sampler)
+    float probe_saturation;  // probe tint saturation: 0 = neutral grey at the probe's brightness
+    float probe_response;    // probe adaptation rate scale (1 = the ~0.3s default)
     float _pad0;
+    float _pad1;
 };
 static_assert(sizeof(SsilvbUniforms) % 16 == 0);
 
@@ -265,8 +297,9 @@ struct ComputePayload {
     uint32_t chainSize;      // chain (half) resolution, packed
     uint32_t fullSize;       // full render resolution, packed
     uint32_t run_temporal;
-    uint32_t run_gi;         // bit 0: color prefilter + sky estimate (bounce OR sky light on),
-                             // bit 1: color MIP reductions (bounce on - only the march reads them)
+    uint32_t run_gi;         // bit 0: color prefilter + sky estimate (any GI source on),
+                             // bit 1: color MIP reductions (march reads 0-4, probe reads 4),
+                             // bit 2: environment probe accumulation
     uint32_t denoise_passes; // 0-3; ping-pongs giNoisy <-> giFinal
     uint32_t history_write;  // temporal ping-pong write index (read = 1 - write)
     uint32_t sky_write;      // sky-estimate ping-pong write index (flips every frame)
@@ -281,6 +314,7 @@ struct CompositePayload {
     WGPUTextureView sceneColor;         // raw snapshot (receiver albedo proxy + debug view)
     WGPUTextureView d2nNormal;          // provider normals (debug view)
     WGPUTextureView colorChain;         // linear light MIPs (debug view)
+    WGPUTextureView envProbe;           // environment ambient cube (debug view)
     uint32_t uniform_offset;
     uint32_t uniform_size;
     uint32_t debug_view;
@@ -438,8 +472,21 @@ bool build_composite_pipeline(
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = module;
     fragment.entryPoint = {"fs_main", WGPU_STRLEN};
-    fragment.targetCount = 1;
-    fragment.targets = &colorTarget;
+    // Thin g-buffer (platform-gbuffer-test and later): when the host writes the game's authored
+    // normals to a SECOND color attachment, every pipeline recorded into the scene pass must
+    // declare a matching second target - WebGPU requires the attachment counts to agree, and a
+    // one-target pipeline is rejected outright. This effect never writes normals, so the target
+    // exists purely to match the pass and its write mask is off. Undefined (buffer disabled, and
+    // every platform before it) leaves this at a single target, unchanged.
+    WGPUColorTargetState colorTargets[2] = {colorTarget, WGPU_COLOR_TARGET_STATE_INIT};
+    uint32_t colorTargetCount = 1;
+    if (g_deviceInfo.normal_format != WGPUTextureFormat_Undefined) {
+        colorTargets[1].format = g_deviceInfo.normal_format;
+        colorTargets[1].writeMask = WGPUColorWriteMask_None;
+        colorTargetCount = 2;
+    }
+    fragment.targetCount = colorTargetCount;
+    fragment.targets = colorTargets;
     // Depth state must match the EFB pass despite never touching depth.
     WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
     depthStencil.format = g_deviceInfo.depth_format;
@@ -546,6 +593,8 @@ void release_targets(Targets& targets) {
         releaseView(targets.views->skyPartial);
         releaseView(targets.views->sky[0]);
         releaseView(targets.views->sky[1]);
+        releaseView(targets.views->probe[0]);
+        releaseView(targets.views->probe[1]);
         delete targets.views;
         targets.views = nullptr;
     }
@@ -562,6 +611,8 @@ void release_targets(Targets& targets) {
     releaseTexture(targets.skyPartial);
     releaseTexture(targets.sky[0]);
     releaseTexture(targets.sky[1]);
+    releaseTexture(targets.probe[0]);
+    releaseTexture(targets.probe[1]);
     targets.width = targets.height = 0;
 }
 
@@ -626,7 +677,13 @@ bool ensure_targets(uint32_t width, uint32_t height, uint32_t fullWidth, uint32_
               createStorageTexture("SSILVB sky estimate 0", WGPUTextureFormat_RGBA16Float, 1,
                   1, 1, g_targets.sky[0]) &&
               createStorageTexture("SSILVB sky estimate 1", WGPUTextureFormat_RGBA16Float, 1,
-                  1, 1, g_targets.sky[1]);
+                  1, 1, g_targets.sky[1]) &&
+              // rgba32float, not 16: the probe integrates weighted radiance sums over thousands
+              // of texels and then divides, and half precision loses the small-weight axes.
+              createStorageTexture("SSILVB env probe 0", WGPUTextureFormat_RGBA32Float, 1,
+                  8, 1, g_targets.probe[0]) &&
+              createStorageTexture("SSILVB env probe 1", WGPUTextureFormat_RGBA32Float, 1,
+                  8, 1, g_targets.probe[1]);
     if (ok) {
         g_targets.views = new TargetViews{};
         for (uint32_t mip = 0; mip < 5 && ok; ++mip) {
@@ -656,12 +713,14 @@ bool ensure_targets(uint32_t width, uint32_t height, uint32_t fullWidth, uint32_
         v.skyPartial = wgpuTextureCreateView(g_targets.skyPartial, nullptr);
         v.sky[0] = wgpuTextureCreateView(g_targets.sky[0], nullptr);
         v.sky[1] = wgpuTextureCreateView(g_targets.sky[1], nullptr);
+        v.probe[0] = wgpuTextureCreateView(g_targets.probe[0], nullptr);
+        v.probe[1] = wgpuTextureCreateView(g_targets.probe[1], nullptr);
         ok = v.preprocessedDepthAll != nullptr && v.colorChainAll != nullptr &&
              v.giNoisy != nullptr && v.depthDifferences != nullptr && v.giFinal != nullptr &&
              v.historyColor[0] != nullptr && v.historyColor[1] != nullptr &&
              v.historyDepth[0] != nullptr && v.historyDepth[1] != nullptr &&
              v.emissive != nullptr && v.skyPartial != nullptr && v.sky[0] != nullptr &&
-             v.sky[1] != nullptr;
+             v.sky[1] != nullptr && v.probe[0] != nullptr && v.probe[1] != nullptr;
     }
     if (!ok) {
         release_targets(g_targets);
@@ -765,12 +824,24 @@ void on_compute(
             colorOk = colorReduceGroups[mip - 1] != nullptr;
         }
     }
+    // Environment probe: reads the finished color chain (MIP 4) and this frame's sky estimate,
+    // blends against the previous frame's probe. Must be dispatched after the MIP reductions
+    // and the sky reduce, and before the sampling pass that reads it.
+    WGPUBindGroup probeGroup = nullptr;
+    if ((data.run_gi & 4u) != 0u) {
+        probeGroup = makeBindGroup(g_probeLayout,
+            {uniformEntry(2), textureEntry(14, views.colorChainAll),
+                textureEntry(15, views.probe[skyRead]), textureEntry(16, views.sky[skyWrite]),
+                textureEntry(17, views.probe[skyWrite])});
+        colorOk = colorOk && probeGroup != nullptr;
+    }
     WGPUBindGroup ssilvbGroup = makeBindGroup(
         g_ssilvbLayout, {textureEntry(0, views.preprocessedDepthAll),
                             textureEntry(1, g_hilbertLutView), textureEntry(2, views.giNoisy),
                             textureEntry(3, views.depthDifferences), uniformEntry(4),
                             textureEntry(5, data.d2nNormal), textureEntry(6, views.colorChainAll),
-                            textureEntry(7, views.sky[skyWrite])});
+                            textureEntry(7, views.sky[skyWrite]),
+                            textureEntry(8, views.probe[skyWrite])});
     // Denoise ping-pongs giNoisy <-> giFinal; the last-written buffer feeds temporal/composite
     // (the game thread computes the same parity for the composite payload).
     const uint32_t denoisePasses = std::min(data.denoise_passes, 3u);
@@ -808,6 +879,7 @@ void on_compute(
         for (auto* group : colorReduceGroups) {
             release(group);
         }
+        release(probeGroup);
         release(ssilvbGroup);
         for (auto* group : denoiseGroups) {
             release(group);
@@ -848,6 +920,12 @@ void on_compute(
                     pass, div_ceil(mipWidth, 8), div_ceil(mipHeight, 8), 1);
             }
         }
+        if (probeGroup != nullptr) {
+            // One workgroup: it sweeps ~2k MIP-4 texels and reduces them to the 8x1 cube.
+            wgpuComputePassEncoderSetPipeline(pass, g_probePipeline);
+            wgpuComputePassEncoderSetBindGroup(pass, 0, probeGroup, 0, nullptr);
+            wgpuComputePassEncoderDispatchWorkgroups(pass, 1, 1, 1);
+        }
     }
     wgpuComputePassEncoderSetPipeline(pass, g_ssilvbPipeline);
     wgpuComputePassEncoderSetBindGroup(pass, 0, ssilvbGroup, 0, nullptr);
@@ -879,6 +957,7 @@ void on_compute(
     for (auto* group : colorReduceGroups) {
         release(group);
     }
+    release(probeGroup);
     release(ssilvbGroup);
     for (auto* group : denoiseGroups) {
         release(group);
@@ -939,6 +1018,14 @@ void on_emissive_compute(
 // Render worker thread: composite GI + AO over the scene (or show a debug view).
 void on_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
+    // Scene-pass attachment guard (thin g-buffer): our pipelines declare the target count the
+    // device reported at init. If the host's normal buffer has been toggled since, that count no
+    // longer matches this pass and recording the draw would be a WebGPU validation error - skip
+    // it instead and let the game thread report it. Reloading the mod rebuilds the pipelines.
+    if (ctx->normal_format != g_deviceInfo.normal_format) {
+        g_normalFormatMismatch.store(true, std::memory_order_relaxed);
+        return;
+    }
     if (payloadSize != sizeof(CompositePayload)) {
         return;
     }
@@ -958,14 +1045,14 @@ void on_draw(
     }
     if (data.giSource == nullptr || data.preprocessedDepth == nullptr ||
         data.sceneDepth == nullptr || data.sceneColor == nullptr || data.d2nNormal == nullptr ||
-        data.colorChain == nullptr || pipeline == nullptr)
+        data.colorChain == nullptr || data.envProbe == nullptr || pipeline == nullptr)
     {
         return;
     }
 
-    WGPUBindGroupEntry entries[7] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+    WGPUBindGroupEntry entries[8] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
         WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
-        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
     entries[0].binding = 0;
     entries[0].textureView = data.giSource;
     entries[1].binding = 1;
@@ -982,9 +1069,11 @@ void on_draw(
     entries[5].textureView = data.d2nNormal;
     entries[6].binding = 6;
     entries[6].textureView = data.colorChain;
+    entries[7].binding = 7;
+    entries[7].textureView = data.envProbe;
     WGPUBindGroupDescriptor bindGroupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bindGroupDesc.layout = layout;
-    bindGroupDesc.entryCount = 7;
+    bindGroupDesc.entryCount = 8;
     bindGroupDesc.entries = entries;
     WGPUBindGroup bindGroup = wgpuDeviceCreateBindGroup(ctx->device, &bindGroupDesc);
     if (bindGroup == nullptr) {
@@ -1102,9 +1191,16 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     // Sky light rides the shared gi channel, which the composite multiplies by gi_intensity.
     // Pre-divide so the sky slider is independent of the bounce slider (100 = the measured sky
     // tint applied as-is).
-    uniforms.sky_intensity =
-        percent(g_cvarSkyIntensity, 75, 0, 400) / std::max(uniforms.gi_intensity, 0.01f);
+    // Sky light and the environment probe ride the shared gi channel, which the composite
+    // multiplies by max(gi_intensity, 0.01). Pre-divide by the SAME floored value so both stay
+    // independent of the bounce slider - including at bounce 0, where the floor keeps ambient
+    // alive instead of multiplying the whole channel away.
+    const float giScale = std::max(uniforms.gi_intensity, 0.01f);
+    uniforms.sky_intensity = percent(g_cvarSkyIntensity, 75, 0, 400) / giScale;
     uniforms.sky_saturation = percent(g_cvarSkySaturation, 65, 0, 150);
+    uniforms.probe_intensity = percent(g_cvarProbeIntensity, 100, 0, 400) / giScale;
+    uniforms.probe_saturation = percent(g_cvarProbeSaturation, 100, 0, 200);
+    uniforms.probe_response = percent(g_cvarProbeResponse, 100, 20, 400);
     uniforms.contrast = percent(g_cvarContrast, 150, 50, 300);
     uniforms.thickness = percent(g_cvarThickness, 150, 25, 400);
     uniforms.black_point = percent(g_cvarBlackPoint, 3, 0, 30);
@@ -1145,7 +1241,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         svc_log->info(mod_ctx, msg);
     }
     const uint32_t debugMode =
-        static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 5));
+        static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 6));
     uniforms.debug_view = debugMode;
     // The noise advances per frame only while accumulating; pinned otherwise (the spatial
     // denoiser alone then sees a stable pattern, matching the single-frame fallback).
@@ -1156,12 +1252,15 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     // Emissive capture only matters while the bounce runs, and only once a previous camera
     // exists (the reprojection of the delta needs it).
     const bool emissiveBounce = giEnabled && get_bool_option(g_cvarEmissiveBounce, true);
-    // Sky light works with the bounce off (directional-AO + sky ambient mode); it needs the
-    // color prefilter (for the sky estimate) but not the MIP reductions.
+    // The environment probe supersedes the sky-only ambient: when it is on, skyLight only
+    // controls whether the measured sky fills the probe's up axis. When it is off, the older
+    // sky-only path runs unchanged, so turning the probe off restores the previous look exactly.
+    const bool envProbe = get_bool_option(g_cvarEnvProbe, true);
     const bool skyLight = get_bool_option(g_cvarSkyLight, true);
     uniforms.flags = (temporal ? 1u : 0u) | (g_historyValid ? 2u : 0u) |
         (distanceFade ? 4u : 0u) | (giEnabled ? 8u : 0u) | (aoApply ? 16u : 0u) |
-        (bounceWhite ? 32u : 0u) | (emissiveBounce ? 64u : 0u) | (skyLight ? 128u : 0u);
+        (bounceWhite ? 32u : 0u) | (emissiveBounce ? 64u : 0u) | (skyLight ? 128u : 0u) |
+        (envProbe ? 256u : 0u);
 
     GfxRange uniformRange{0, 0};
     if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &uniformRange) != MOD_OK) {
@@ -1183,10 +1282,15 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     computePayload.chainSize = (width << 16) | height;
     computePayload.fullSize = (resolved.width << 16) | resolved.height;
     computePayload.run_temporal = temporal ? 1u : 0u;
-    computePayload.run_gi = ((giEnabled || skyLight) ? 1u : 0u) | (giEnabled ? 2u : 0u);
+    // bit 0 color prefilter + sky estimate, bit 1 color MIP reductions (the march reads them,
+    // and so does the probe at MIP 4), bit 2 probe accumulation.
+    computePayload.run_gi = ((giEnabled || skyLight || envProbe) ? 1u : 0u) |
+        ((giEnabled || envProbe) ? 2u : 0u) | (envProbe ? 4u : 0u);
     computePayload.denoise_passes = denoisePasses;
     computePayload.history_write = writeIdx;
-    computePayload.sky_write = g_skyWriteIndex;
+    // Capture before the flip: the composite must read the probe the chain is about to WRITE.
+    const uint32_t skyWrite = g_skyWriteIndex;
+    computePayload.sky_write = skyWrite;
     g_skyWriteIndex ^= 1u;
     if (svc_gfx->push_compute(mod_ctx, g_computeType, &computePayload, sizeof(computePayload)) !=
         MOD_OK)
@@ -1203,8 +1307,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const CompositePayload drawPayload{
         temporal ? g_targets.views->historyColor[writeIdx] : denoisedView,
         g_targets.views->preprocessedDepthMips[0], resolved.depth, resolved.color,
-        n2dFrame.normal, g_targets.views->colorChainAll, uniformRange.offset, uniformRange.size,
-        debugMode, blendMode};
+        n2dFrame.normal, g_targets.views->colorChainAll, g_targets.views->probe[skyWrite],
+        uniformRange.offset, uniformRange.size, debugMode, blendMode};
     if (debugMode != 0) {
         // Debug views draw at FRAME_BEFORE_HUD so deferred fog, translucency, and bloom
         // don't paint over them (all payload views stay valid for the rest of the frame).
@@ -1347,11 +1451,37 @@ ModResult build_controls_tab(
         "Raise if fog or subtle effects start glowing; lower if faint glows (fairies at a "
         "distance) stop contributing.",
         0, 50, 1, "%");
+    add_toggle(left, "Environment Light", g_cvarEnvProbe,
+        "Directional ambient from the whole environment, not just the sky. Builds a running "
+        "six-direction picture of how bright and what color the world is around you, then feeds "
+        "it to each surface through the directions that surface can actually see - a floor picks "
+        "up what is above it, a wall picks up the room it faces, an alcove only what its opening "
+        "points at. Because the picture PERSISTS, light keeps arriving from things that have "
+        "scrolled off screen: walk past a torch, turn away, and the wall in front of you still "
+        "catches its warmth. That is the main thing the screen-space bounce cannot do on its "
+        "own. Works with Indirect Bounce off. Turn this off to fall back to the older sky-only "
+        "ambient below.");
+    add_number(left, "Environment Intensity", g_cvarProbeIntensity,
+        "Strength of the environment ambient. 100 applies the measured surroundings as-is. This "
+        "is independent of Bounce Intensity, so you can run ambient-only by setting the bounce "
+        "to 0.",
+        0, 400, 5, "%");
+    add_number(left, "Environment Saturation", g_cvarProbeSaturation,
+        "How much of the environment's COLOR the ambient carries. 100 uses the measured tint; "
+        "lower keeps the brightness and direction but pulls the hue toward neutral if an area's "
+        "dominant color is washing the scene.",
+        0, 200, 5, "%");
+    add_number(left, "Environment Response", g_cvarProbeResponse,
+        "How fast the ambient adapts when the surroundings change. 100 settles in roughly a "
+        "third of a second. Raise if it lags walking into a cave; lower if it feels twitchy. "
+        "Large brightness changes (room loads, cutscene cuts) always snap faster than this.",
+        20, 400, 10, "%");
     add_toggle(left, "Sky Light", g_cvarSkyLight,
-        "Directional ambient from the sky: surfaces open to the sky receive its light "
-        "(measured live from the on-screen skybox, so it follows the time-of-day tint), while "
-        "covered surfaces don't. Works even with Indirect Bounce off. Fades out gradually "
-        "indoors.");
+        "With Environment Light ON: lets the measured sky fill in the UPWARD direction, which "
+        "the camera rarely looks at but every floor faces. With Environment Light OFF: the "
+        "older sky-only ambient - surfaces open to the sky receive its light, covered surfaces "
+        "don't. Either way it is measured live from the on-screen skybox, so it follows the "
+        "time-of-day tint, and it fades out gradually indoors.");
     add_number(left, "Sky Light Intensity", g_cvarSkyIntensity,
         "Strength of the sky's directional ambient. 100 applies the measured sky tint as-is.",
         0, 400, 5, "%");
@@ -1472,14 +1602,18 @@ ModResult build_controls_tab(
 
     svc_ui->pane_add_section(mod_ctx, left, "Debug");
     static const char* kDebugOptions[] = {
-        "Off", "Bounce Light", "AO", "Albedo Proxy", "Light Input", "Normals"};
+        "Off", "Bounce Light", "AO", "Albedo Proxy", "Light Input", "Normals", "Environment"};
     add_select(left, "Debug View", g_cvarDebugView,
         "Bounce Light: the added indirect light over black.<br/>AO: the shaped occlusion term "
         "as grayscale.<br/>Albedo Proxy: the receiver tint derived from the scene (see Chroma "
         "Lift).<br/>Light Input: the prefiltered scene radiance the bounce actually samples."
-        "<br/>Normals: the Depth to Normal provider's world-space normals.<br/>Debug views draw "
-        "over the finished frame (after fog and bloom), so other effects never obscure them.",
-        kDebugOptions, 6);
+        "<br/>Normals: the Depth to Normal provider's world-space normals.<br/>Environment: the "
+        "ambient each surface's own normal sees, occlusion ignored - flat and blotchy by design, "
+        "it is a six-direction estimate rather than an image. Use it to check the environment "
+        "light is picking up the colors you expect (turn to face a torch and watch it warm).<br/>"
+        "Debug views draw over the finished frame (after fog and bloom), so other effects never "
+        "obscure them.",
+        kDebugOptions, 7);
     return MOD_OK;
 }
 
@@ -1585,6 +1719,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"bounceWhite", false, &g_cvarBounceWhite},
         {"emissiveBounce", true, &g_cvarEmissiveBounce},
         {"skyLight", true, &g_cvarSkyLight},
+        {"envProbe", true, &g_cvarEnvProbe},
         {"aoApply", true, &g_cvarAoApply},
         {"temporal", true, &g_cvarTemporal},
         {"distanceFade", false, &g_cvarDistanceFade},
@@ -1609,6 +1744,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"emissiveThreshold", 10, &g_cvarEmissiveThreshold},
         {"skyIntensity", 75, &g_cvarSkyIntensity},
         {"skySaturation", 65, &g_cvarSkySaturation},
+        {"probeIntensity", 100, &g_cvarProbeIntensity},
+        {"probeSaturation", 100, &g_cvarProbeSaturation},
+        {"probeResponse", 100, &g_cvarProbeResponse},
         {"aoIntensity", 150, &g_cvarAoIntensity},
         {"contrast", 150, &g_cvarContrast},
         {"blackPoint", 3, &g_cvarBlackPoint},
@@ -1657,6 +1795,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
             g_emissivePipeline, g_emissiveLayout) ||
         !build_compute_pipeline("SSILVB sky reduce", g_colorSource, "reduce_sky",
             g_skyReducePipeline, g_skyReduceLayout) ||
+        !build_compute_pipeline("SSILVB env probe", g_colorSource, "accumulate_probe",
+            g_probePipeline, g_probeLayout) ||
         !build_compute_pipeline(
             "SSILVB sampling", g_ssilvbSource, "ssilvb", g_ssilvbPipeline, g_ssilvbLayout) ||
         !build_compute_pipeline("SSILVB denoise", g_denoiseSource, "spatial_denoise",
@@ -1719,6 +1859,12 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 }
 
 MOD_EXPORT ModResult mod_update(ModError*) {
+    if (!g_loggedNormalMismatch && g_normalFormatMismatch.load(std::memory_order_relaxed)) {
+        g_loggedNormalMismatch = true;
+        svc_log->warn(mod_ctx,
+            "scene pass normal-target layout changed since init; composite skipped - "
+            "reload this mod to rebuild its pipelines");
+    }
     if (!g_loggedChain && g_chainExecuted.load(std::memory_order_acquire)) {
         g_loggedChain = true;
         svc_log->info(mod_ctx, "SSILVB chain executed OK");
@@ -1764,6 +1910,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     releasePipeline(g_colorReducePipeline);
     releasePipeline(g_emissivePipeline);
     releasePipeline(g_skyReducePipeline);
+    releasePipeline(g_probePipeline);
     releasePipeline(g_ssilvbPipeline);
     releasePipeline(g_denoisePipeline);
     releasePipeline(g_temporalPipeline);
@@ -1773,6 +1920,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     releaseLayout(g_colorReduceLayout);
     releaseLayout(g_emissiveLayout);
     releaseLayout(g_skyReduceLayout);
+    releaseLayout(g_probeLayout);
     releaseLayout(g_ssilvbLayout);
     releaseLayout(g_denoiseLayout);
     releaseLayout(g_temporalLayout);
@@ -1794,6 +1942,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarChromaLift = g_cvarBounceWhite = g_cvarAoApply = g_cvarAoIntensity = 0;
     g_cvarEmissiveBounce = g_cvarEmissiveBoost = g_cvarEmissiveThreshold = 0;
     g_cvarSkyLight = g_cvarSkyIntensity = g_cvarSkySaturation = g_cvarGiSaturation = 0;
+    g_cvarEnvProbe = g_cvarProbeIntensity = g_cvarProbeSaturation = g_cvarProbeResponse = 0;
     g_cvarContrast = g_cvarBlackPoint = 0;
     g_cvarQuality = g_cvarCustomSlices = g_cvarCustomSteps = 0;
     g_cvarRadius = g_cvarRadiusFar = g_cvarRadiusRampStart = g_cvarRadiusRampEnd = 0;

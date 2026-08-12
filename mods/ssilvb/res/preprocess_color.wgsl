@@ -62,7 +62,7 @@ struct Uniforms {
     frame_index: u32,
     flags: u32, // bit 0 temporal, bit 1 history valid, bit 2 distance fade,
                 // bit 3 GI enabled, bit 4 AO apply, bit 5 white bounce proxy,
-                // bit 6 emissive bounce, bit 7 sky light
+                // bit 6 emissive bounce, bit 7 sky fill, bit 8 environment probe
     thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
     radius_far: f32,        // far effect radius (fraction of view depth); 0 disables the ramp
     radius_ramp_start: f32, // radius ramp band start, world units of view depth
@@ -75,7 +75,11 @@ struct Uniforms {
     sky_intensity: f32,      // directional sky-light strength (0 disables in the sampler)
     sky_saturation: f32,     // sky tint saturation: 0 = white light at sky brightness, 1 = full
     gi_saturation: f32,      // bounce chroma boost applied in the composite (1 = neutral)
+    probe_intensity: f32,    // environment-probe ambient strength (0 disables it in the sampler)
+    probe_saturation: f32,   // probe tint saturation: 0 = neutral grey at the probe's brightness
+    probe_response: f32,     // probe adaptation rate scale (1 = the ~0.3s default)
     _pad0: f32,
+    _pad1: f32,
 }
 
 @group(0) @binding(0) var scene_color: texture_2d<f32>;
@@ -97,6 +101,12 @@ struct Uniforms {
 @group(0) @binding(11) var sky_partial_in: texture_2d<f32>;
 @group(0) @binding(12) var sky_prev: texture_2d<f32>;
 @group(0) @binding(13) var sky_out: texture_storage_2d<rgba16float, write>;
+// accumulate_probe entry point only: the finished color MIP chain (read at MIP 4), the previous
+// frame's probe, this frame's sky estimate (for the up-axis fill), and the new probe.
+@group(0) @binding(14) var probe_color: texture_2d<f32>;
+@group(0) @binding(15) var probe_prev: texture_2d<f32>;
+@group(0) @binding(16) var probe_sky: texture_2d<f32>;
+@group(0) @binding(17) var probe_out: texture_storage_2d<rgba32float, write>;
 
 fn decode(encoded: vec3f) -> vec3f {
     return pow(max(encoded, vec3f(0.0)), vec3f(2.2));
@@ -282,4 +292,164 @@ fn extract_emissive(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let opaque = decode(textureLoad(opaque_color, c, 0i).rgb);
     let delta = max(late - opaque - vec3f(uniforms.emissive_threshold), vec3f(0.0));
     textureStore(emissive_out, p, vec4f(delta, 1.0));
+}
+
+// =================================================================================================
+// ENVIRONMENT PROBE
+//
+// A world-space AMBIENT CUBE (Valve's HL2 basis): six radiance values, one per world axis, plus a
+// coverage confidence each. It answers "how bright, and what color, is the world in direction d?"
+// for the directions a pixel's visibility bitmask found NOTHING in - the light that arrives from
+// beyond the march's reach. That is the one thing screen-space bounce structurally cannot do.
+//
+// WHY AN AMBIENT CUBE AND NOT SH9: for any unit direction the three facing axes' squared cosines
+// sum to exactly 1 (d.x^2 + d.y^2 + d.z^2 = 1), so evaluation is an exact partition of unity -
+// no normalization, no ringing, never negative, and no chance of the ambient gaining or losing
+// energy as a surface turns. SH9 would ring badly on the narrow, partial angular coverage a
+// single camera frustum provides, and ringing shows up as dark or oversaturated blotches.
+//
+// WHERE THE RADIANCE COMES FROM: MIP 4 of the color chain this pass already built - roughly 2k
+// pre-averaged texels covering the whole frame. Each is projected onto the six axes by its world
+// direction, weighted by the solid angle a screen-uniform texel actually subtends. No geometry is
+// re-rendered and no game code is touched; the capture is one workgroup reading a tiny texture.
+//
+// HOW IT COVERS WHAT IS OFF-SCREEN: the probe PERSISTS. Each axis is updated only in proportion
+// to how much the current frame constrained it, so directions the camera is not looking at keep
+// what was measured when it last did. Walk past a torch and turn away and the torch's warmth
+// stays in the -Z axis for as long as the adaptation rate holds it. This is what removes the
+// screen-edge popping of a pure screen-space gather: the light does not vanish when it leaves
+// the frame, it decays.
+//
+// The trade, stated plainly: directions the camera has NEVER looked at are unknown, and fall
+// back to the frame's overall mean (plus the sky estimate for "up", which is the direction a
+// player looks at least and every floor pixel faces most).
+// =================================================================================================
+
+// 64 threads x 6 axes of (radiance-weighted sum, weight sum). Axis order is +X,+Y,+Z,-X,-Y,-Z so
+// the three positive and three negative weights each pack into one vec3.
+var<workgroup> wg_probe: array<vec4f, 384>;
+
+const PROBE_LUMA = vec3f(0.299, 0.587, 0.114);
+
+@compute
+@workgroup_size(64, 1, 1)
+fn accumulate_probe(@builtin(local_invocation_index) local_index: u32) {
+    let dims = max(vec2<i32>(uniforms.size) >> vec2<u32>(4u), vec2<i32>(1i));
+    let texel_count = dims.x * dims.y;
+    let r = uniforms.view_from_world;
+    // The same firefly ceiling the march uses. This is a ~2k-sample average, so one boosted
+    // emissive texel would otherwise swing the whole environment estimate.
+    let luma_cap = max(4.0, 2.0 * uniforms.emissive_boost);
+
+    var acc = array<vec4f, 6>(vec4f(0.0), vec4f(0.0), vec4f(0.0),
+        vec4f(0.0), vec4f(0.0), vec4f(0.0));
+    for (var t = i32(local_index); t < texel_count; t += 64i) {
+        let p = vec2<i32>(t % dims.x, t / dims.x);
+        let uv = (vec2f(p) + 0.5) / vec2f(dims);
+        // Ray direction through this texel. Every point on the ray normalizes to the same
+        // direction, so the depth passed here is arbitrary.
+        let vdir = normalize(reconstruct_view_space_position(0.5, uv));
+        // A screen-uniform texel subtends solid angle proportional to cos^3 of its angle off the
+        // view axis, so frame corners must not count as much as the center.
+        let cos_theta = max(-vdir.z, 0.0);
+        let solid = cos_theta * cos_theta * cos_theta;
+        if solid <= 1.0e-4 {
+            continue;
+        }
+        // View -> world. view_from_world is orthonormal, so its transpose inverts it.
+        let d = normalize(
+            vec3f(dot(vdir, r[0].xyz), dot(vdir, r[1].xyz), dot(vdir, r[2].xyz)));
+
+        var radiance = textureLoad(probe_color, p, 4i).rgb;
+        let luma = dot(radiance, PROBE_LUMA);
+        radiance *= min(1.0, luma_cap / max(luma, 1.0e-4));
+
+        let dp = max(d, vec3f(0.0));
+        let dn = max(-d, vec3f(0.0));
+        let wp = dp * dp * solid;
+        let wn = dn * dn * solid;
+        acc[0] += vec4f(radiance * wp.x, wp.x);
+        acc[1] += vec4f(radiance * wp.y, wp.y);
+        acc[2] += vec4f(radiance * wp.z, wp.z);
+        acc[3] += vec4f(radiance * wn.x, wn.x);
+        acc[4] += vec4f(radiance * wn.y, wn.y);
+        acc[5] += vec4f(radiance * wn.z, wn.z);
+    }
+    for (var i = 0u; i < 6u; i += 1u) {
+        wg_probe[local_index * 6u + i] = acc[i];
+    }
+    for (var stride = 32u; stride > 0u; stride >>= 1u) {
+        workgroupBarrier();
+        if local_index < stride {
+            for (var i = 0u; i < 6u; i += 1u) {
+                wg_probe[local_index * 6u + i] += wg_probe[(local_index + stride) * 6u + i];
+            }
+        }
+    }
+    if local_index != 0u {
+        return;
+    }
+
+    var total = vec4f(0.0);
+    for (var i = 0u; i < 6u; i += 1u) {
+        total += wg_probe[i];
+    }
+    let global_mean = select(
+        vec3f(0.0), total.rgb / max(total.w, 1.0e-6), total.w > 1.0e-6);
+
+    // Texel 6 carries the frame-wide mean and the "probe has ever been primed" marker.
+    let prev_global = textureLoad(probe_prev, vec2<i32>(6i, 0i), 0i);
+    let primed = prev_global.a > 0.001;
+
+    // Adaptation rate. A large swing in overall brightness - a cave mouth, a room load, a
+    // cutscene cut - accelerates it, so ambient does not lag a hard transition by half a second
+    // while still being too slow to flicker on ordinary frame-to-frame noise.
+    let prev_luma = dot(prev_global.rgb, PROBE_LUMA);
+    let new_luma = dot(global_mean, PROBE_LUMA);
+    let change = abs(new_luma - prev_luma) / max(max(prev_luma, new_luma), 0.02);
+    let base_alpha = clamp(0.05 * uniforms.probe_response, 0.004, 0.5);
+    var alpha = clamp(base_alpha * (1.0 + 6.0 * change), base_alpha, 0.6);
+    if !primed {
+        alpha = 1.0; // first frame ever (or after a resize): lock on rather than fade up
+    }
+
+    // Sky fill: the measured skybox radiance stands in for "up" where the camera has not
+    // actually looked up. Outdoors this is usually redundant (sky is on screen and already in
+    // the +Y bucket); it matters when the player is looking at their feet.
+    let sky = textureLoad(probe_sky, vec2<i32>(0i, 0i), 0i);
+    let sky_on = (uniforms.flags & 128u) != 0u && sky.a > 0.001;
+    let sky_luma = dot(sky.rgb, PROBE_LUMA);
+    // The cube stores RAW linear radiance (the sampler applies probe_intensity and the composite
+    // the gi multiply), but sky_intensity arrives pre-divided by that same gi multiply - so undo
+    // the pre-division here to put the fill in the same units as the measured axes.
+    let sky_fill = mix(vec3f(sky_luma), sky.rgb, clamp(uniforms.sky_saturation, 0.0, 1.5)) *
+        (sky.a * uniforms.sky_intensity * max(uniforms.gi_intensity, 0.01));
+
+    for (var i = 0u; i < 6u; i += 1u) {
+        let s = wg_probe[i];
+        // Coverage = this axis's share of the frame's total sampling weight against an even
+        // six-way split. An axis pointing behind the camera collects nothing and lands at 0.
+        let coverage = clamp((s.w / max(total.w, 1.0e-6)) * 6.0, 0.0, 1.0);
+        let measured = select(global_mean, s.rgb / max(s.w, 1.0e-6), s.w > 1.0e-6);
+
+        let prev_axis = textureLoad(probe_prev, vec2<i32>(i32(i), 0i), 0i);
+        // THE KEY LINE: each axis moves toward this frame's measurement only as far as this
+        // frame actually saw that direction. Unseen directions keep their history intact.
+        let axis_alpha = select(alpha * coverage, 1.0, !primed);
+        var value = mix(prev_axis.rgb, measured, axis_alpha);
+        // Confidence tracks coverage slowly in both directions, so a direction measured a while
+        // ago stays trusted for a while and a never-seen one stays at the global fallback.
+        var conf = select(mix(prev_axis.a, coverage, 0.05), coverage, !primed);
+
+        if i == 1u && sky_on {
+            // +Y only, and only to the extent direct coverage is missing.
+            value = mix(value, sky_fill, (1.0 - conf) * clamp(sky.a, 0.0, 1.0));
+            conf = max(conf, sky.a);
+        }
+        textureStore(probe_out, vec2<i32>(i32(i), 0i),
+            vec4f(max(value, vec3f(0.0)), clamp(conf, 0.0, 1.0)));
+    }
+    textureStore(probe_out, vec2<i32>(6i, 0i),
+        vec4f(max(mix(prev_global.rgb, global_mean, alpha), vec3f(0.0)), 1.0));
+    textureStore(probe_out, vec2<i32>(7i, 0i), vec4f(0.0, 0.0, 0.0, 1.0));
 }

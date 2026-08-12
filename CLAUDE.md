@@ -29,8 +29,15 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   with a one-bounce indirect-diffuse accumulate; with the bounce toggled off it doubles as a
   standalone directional-AO mod. Consumes the scene-color snapshot as its light input and the
   Depth to Normal service (hard dependency, now exported by **Graphics Hub**) for per-sample
-  normals; composites GI additively and AO multiplicatively in a single blend draw. **Service-only**.
-  Docs: `docs/ssilvb_plan.md` (§0 first — see the note below), then `docs/ssilvb.md` once written.
+  normals; composites GI additively and AO multiplicatively in a single blend draw. Since 0.10.0 it
+  also carries an **environment probe**: a persistent world-space ambient cube (6 axes + coverage
+  confidence, 8×1 texture) measured from MIP 4 of its own colour chain in one workgroup, evaluated
+  in each slice's bent direction and applied through the sectors the march found *nothing* in — so
+  it fills exactly the light the bounce structurally cannot see (off-screen, beyond radius) with no
+  possibility of double counting. It persists across frames per-direction, which is what stops
+  light popping at the screen edge. The old sky-only ambient remains as the fallback when the probe
+  is off. **Service-only**. Docs: `docs/ssilvb_plan.md` (§0 first — see the note below) and
+  `docs/ssilvb_environment_light.md`.
 
 - **`mods/smaa/`** — "SMAA" (subpixel morphological antialiasing): a spatial post-process AA mod
   (SMAA 1x). Edge detection unions the reference SMAA luma detector with **geometric edges from the
@@ -218,15 +225,31 @@ The user typically does not build locally. Iteration loop:
   mod or needs an upstream service extension — don't add game includes to `vbao`.
 - **The ABI pin**: the platform is pinned by **`DUSKLIGHT_VERSION` in the top-level `CMakeLists.txt`**
   (fetched from `DUSKLIGHT_REPOSITORY`, our `automata-rtx/dusklight-ao` fork). It currently points at
-  commit `9361fbd9ea` on branch `claude/dusklight-platform-rebuild-rqhsaw` — **pristine upstream
-  Dusklight `76b56cd8`** (the base the official mod template pins) plus exactly two deltas: the
-  release-publishing job and `extern/aurora` repointed to our enlarged-buffer aurora fork. That
-  platform is published as the **`platform-v2-test`** release. The mods must be built against the SDK
-  matching the game build the user runs. Linux links with `--allow-shlib-undefined` (no game lib);
-  Windows/macOS/Android **auto-download** their per-arch link stub from `DUSKLIGHT_SDK_STUB_URL` (our
-  `platform-v2-test` release, which publishes `windows-<arch>.lib` and `stub-<platform>` as top-level
-  assets). Bump `DUSKLIGHT_VERSION` **only** when deliberately re-platforming, never as a side effect
-  of a mod change.
+  commit `b96bf5ec01` on branch `claude/thin-gbuffer-authored-normals-wgqupt`, published as the
+  **`platform-gbuffer-test`** release — that is `platform-v2-test` (pristine upstream Dusklight
+  `76b56cd8` + the release job + the enlarged-buffer aurora fork) **plus the thin g-buffer**: aurora
+  writes the game's authored view-space normals to a second RGBA8 target, exposed to mods as
+  `GfxResolveDesc::normal` / `GfxResolvedTargets::normal`. `DUSKLIGHT_SDK_STUB_URL` must always point
+  at the release matching this pin.
+  - **Struct-size ABI is one-directional.** The host rejects callers whose
+    `struct_size < sizeof(host struct)`, so mods built against an OLDER SDK are refused outright by a
+    newer game (symptom: every webgpu mod dies at init with `failed to query device info`, and the
+    service consumers then fail on the missing `depth_to_normal` import). The reverse is fine — a
+    LARGER `struct_size` passes an older host's check and the appended fields keep their `GFX_*_INIT`
+    defaults — so mods built here also run on `platform-v2-test`. **When in doubt build against the
+    newest platform.**
+  - **Two color attachments.** When the host's normal buffer is enabled the scene pass has two color
+    targets, and *every* pipeline recorded into it must declare two or WebGPU rejects the draw. All
+    five scene-pass composites (ssilvb, vbao, realtime_sun_shadows, graphics_hub's deferred fog,
+    smaa) declare a write-masked second target when `GfxDeviceInfo::normal_format` is set, and skip
+    the draw if `GfxDrawContext::normal_format` ever disagrees at record time. **Any new mod that
+    draws into the scene pass must do the same.**
+  - `DUSKLIGHT_AURORA_VERSION` (third fork knob) overrides the `extern/aurora` submodule pin, which
+    the thin-gbuffer commit left dangling after an aurora-ao force-push. Drop it once that pin is
+    repaired upstream.
+  - Linux links with `--allow-shlib-undefined` (no game lib); Windows/macOS/Android **auto-download**
+    their per-arch link stub from `DUSKLIGHT_SDK_STUB_URL`. Bump `DUSKLIGHT_VERSION` **only** when
+    deliberately re-platforming, never as a side effect of a mod change.
 
 ## Re-platforming (moving to a newer base game)
 
@@ -258,9 +281,14 @@ pristine apart from the deltas above so upstream's SDK (auto-stub-download, `cl`
 ## Related repos (context only — not needed for day-to-day mod work)
 
 - `automata-rtx/dusklight-ao` — our Dusklight fork.
-  - Branch `claude/dusklight-platform-rebuild-rqhsaw` = **the current mod platform** (pristine upstream
-    Dusklight `76b56cd8` + the release job + the aurora-ao submodule repoint), published as
-    `platform-v2-test`. This is what `DUSKLIGHT_VERSION` pins (commit `9361fbd9ea`).
+  - Branch `claude/thin-gbuffer-authored-normals-wgqupt` = **the current mod platform**
+    (`platform-v2-test` + the thin g-buffer authored-normal target), published as
+    `platform-gbuffer-test`. This is what `DUSKLIGHT_VERSION` pins (commit `b96bf5ec01`). Its
+    `extern/aurora` pin is dangling — see `DUSKLIGHT_AURORA_VERSION` above.
+  - Branch `main` = the stable platform (pristine upstream Dusklight `76b56cd8` + the release job +
+    the aurora-ao submodule repoint), published as `platform-v2-test`. Mods built against the
+    g-buffer SDK still run on it (struct-size ABI is one-directional — see The ABI pin).
+    Note `claude/dusklight-platform-rebuild-rqhsaw` (commit `9361fbd9ea`) was the previous pin.
   - Branch `claude/standalone-final` + the `standalone-final` release = the pre-mod-API aurora-fork
     build; that build is the ONLY way the graphics features run on iOS (code mods cannot run there —
     dlopen restriction), so never delete it. (`mod-platform` / `platform-v1` are the superseded
