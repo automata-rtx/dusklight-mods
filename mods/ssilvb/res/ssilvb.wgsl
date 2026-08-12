@@ -51,7 +51,8 @@ struct Uniforms {
     debug_view: u32,
     frame_index: u32,
     flags: u32, // bit 0 temporal, bit 1 history valid, bit 2 distance fade,
-                // bit 3 GI enabled, bit 4 AO apply, bit 5 white bounce proxy
+                // bit 3 GI enabled, bit 4 AO apply, bit 5 white bounce proxy,
+                // bit 6 emissive bounce, bit 7 sky fill, bit 8 environment probe
     thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
     radius_far: f32,        // far effect radius (fraction of view depth); 0 disables the ramp
     radius_ramp_start: f32, // radius ramp band start, world units of view depth
@@ -64,7 +65,11 @@ struct Uniforms {
     sky_intensity: f32,      // directional sky-light strength (0 disables in the sampler)
     sky_saturation: f32,     // sky tint saturation: 0 = white light at sky brightness, 1 = full
     gi_saturation: f32,      // bounce chroma boost applied in the composite (1 = neutral)
+    probe_intensity: f32,    // environment-probe ambient strength (0 disables it in the sampler)
+    probe_saturation: f32,   // probe tint saturation: 0 = neutral grey at the probe's brightness
+    probe_response: f32,     // probe adaptation rate scale (1 = the ~0.3s default)
     _pad0: f32,
+    _pad1: f32,
 }
 
 @group(0) @binding(0) var preprocessed_depth: texture_2d<f32>;
@@ -80,6 +85,10 @@ struct Uniforms {
 // Smoothed 1x1 sky estimate (preprocess_color.wgsl reduce_sky): rgb = linear sky radiance
 // sampled from the game's own time-of-day-tinted skybox pixels, a = confidence.
 @group(0) @binding(7) var sky_ambient: texture_2d<f32>;
+// Environment probe (preprocess_color.wgsl accumulate_probe), 8x1: texels 0..5 are the world-axis
+// ambient cube (+X,+Y,+Z,-X,-Y,-Z) as rgb = linear radiance, a = coverage confidence; texel 6 is
+// the frame-wide mean used where confidence is low.
+@group(0) @binding(8) var env_probe: texture_2d<f32>;
 
 const PI: f32 = 3.141592653589793;
 const HALF_PI: f32 = 1.5707963267948966;
@@ -310,13 +319,42 @@ fn ssilvb(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let steps = max(uniforms.steps_per_side, 1.0);
     let gi_enabled = (uniforms.flags & 8u) != 0u;
 
-    // Directional sky light: the smoothed sky radiance arrives through each slice's VISIBLE
-    // sectors, weighted by how sky-facing the visible arc's bent direction is (world up rotated
-    // into view space). A floor pixel under open sky gets the full tint; a wall gets partial;
-    // anything under cover gets none - the paper's "directionally occluded ambient" with the
-    // game's own time-of-day sky as the ambient source.
+    // ENVIRONMENT AMBIENT, through each slice's still-VISIBLE sectors. Two sources, mutually
+    // exclusive so they can never double count:
+    //
+    //  - the environment probe (preferred): a world-space ambient cube measured from the frame
+    //    and PERSISTED, so it carries light from directions currently off screen. Evaluated in
+    //    each slice's bent direction, it gives a floor lit from above, a wall lit from the room
+    //    it faces, and an alcove lit only by what its opening actually points at.
+    //  - the older sky-only term (fallback when the probe is off): the same idea with a single
+    //    measured sky color and a hand-rolled "how sky-facing is this" gate.
+    //
+    // Both fill only the sectors the march found NOTHING in, which is exactly the light that
+    // would have come from beyond its reach - so neither can overlap the bounce.
+    let probe_on = (uniforms.flags & 256u) != 0u && uniforms.probe_intensity > 0.0;
+
+    // Probe fetched once per pixel (an 8x1 texture - always resident) and evaluated per slice.
+    // Saturation is folded in here rather than per slice: same result, a sixth of the work.
+    let probe_sat = clamp(uniforms.probe_saturation, 0.0, 2.0);
+    let probe_gain = uniforms.probe_intensity;
+    var pr = array<vec4<f32>, 6>(vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0),
+        vec4<f32>(0.0), vec4<f32>(0.0), vec4<f32>(0.0));
+    var pr_global = vec3<f32>(0.0);
+    if probe_on {
+        for (var i = 0u; i < 6u; i += 1u) {
+            let t = textureLoad(env_probe, vec2<i32>(i32(i), 0i), 0i);
+            let l = dot(t.rgb, vec3<f32>(0.299, 0.587, 0.114));
+            pr[i] = vec4<f32>(mix(vec3<f32>(l), t.rgb, probe_sat) * probe_gain, t.a);
+        }
+        let g = textureLoad(env_probe, vec2<i32>(6i, 0i), 0i).rgb;
+        let gl = dot(g, vec3<f32>(0.299, 0.587, 0.114));
+        pr_global = mix(vec3<f32>(gl), g, probe_sat) * probe_gain;
+    }
+
+    // Sky-only fallback (unused when the probe is on).
     let sky = textureLoad(sky_ambient, vec2<i32>(0i, 0i), 0i);
-    let sky_on = (uniforms.flags & 128u) != 0u && sky.a > 0.001 && uniforms.sky_intensity > 0.0;
+    let sky_on = !probe_on && (uniforms.flags & 128u) != 0u && sky.a > 0.001 &&
+        uniforms.sky_intensity > 0.0;
     // Saturation control: full sky color can cast a blue pall over warm areas (a light-blue
     // zenith over orange desert); pulling the tint toward its own luminance keeps the
     // brightness-and-direction behavior while softening the hue shift.
@@ -324,6 +362,7 @@ fn ssilvb(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let sky_tint = mix(vec3<f32>(sky_luma), sky.rgb, clamp(uniforms.sky_saturation, 0.0, 1.5));
     let sky_radiance = sky_tint * (sky.a * uniforms.sky_intensity);
     let up_view = normalize(uniforms.view_from_world[1].xyz); // world +Y in view space
+    let vfw = uniforms.view_from_world;
 
     var visibility = 0.0;
     var gi = vec3<f32>(0.0);
@@ -385,15 +424,36 @@ fn ssilvb(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // direction gates it by sky-facingness, letting light in sideways through a window but
         // not "up" through a ceiling.
         let visible_count = f32(countOneBits(occ));
-        if sky_on && visible_count > 0.0 {
+        if (probe_on || sky_on) && visible_count > 0.0 {
             let lo = f32(firstTrailingBit(occ));
             let hi = f32(firstLeadingBit(occ));
             let mid = unwarp_sector(((lo + hi) * 0.5 + 0.5) / 32.0);
             // Invert the sector mapping: hh = (angle + n)/PI + 0.5 (pre-warp).
             let bent_angle = PI * (mid - 0.5) - n;
             let bent_dir = cos(bent_angle) * view_vec + sin(bent_angle) * tang;
-            let sky_facing = smoothstep(-0.15, 0.5, dot(bent_dir, up_view));
-            slice_gi += sky_radiance * (visible_count / 32.0) * sky_facing;
+            let openness = visible_count / 32.0;
+            if probe_on {
+                // Bent direction view -> world (view_from_world is orthonormal: transpose it).
+                let bw = normalize(vec3<f32>(dot(bent_dir, vfw[0].xyz),
+                    dot(bent_dir, vfw[1].xyz), dot(bent_dir, vfw[2].xyz)));
+                // Ambient cube evaluation. The three facing axes' squared cosines sum to exactly
+                // 1, so this is an exact partition of unity - no normalization needed and the
+                // ambient can neither gain nor lose energy as the direction turns.
+                let bp = max(bw, vec3<f32>(0.0));
+                let bn = max(-bw, vec3<f32>(0.0));
+                let wp = bp * bp;
+                let wn = bn * bn;
+                let directional = pr[0].rgb * wp.x + pr[1].rgb * wp.y + pr[2].rgb * wp.z +
+                    pr[3].rgb * wn.x + pr[4].rgb * wn.y + pr[5].rgb * wn.z;
+                // Confidence interpolates the same way, so directions the camera has never seen
+                // fall back to the frame-wide mean instead of to whatever stale value sits there.
+                let conf = pr[0].a * wp.x + pr[1].a * wp.y + pr[2].a * wp.z +
+                    pr[3].a * wn.x + pr[4].a * wn.y + pr[5].a * wn.z;
+                slice_gi += mix(pr_global, directional, clamp(conf, 0.0, 1.0)) * openness;
+            } else {
+                let sky_facing = smoothstep(-0.15, 0.5, dot(bent_dir, up_view));
+                slice_gi += sky_radiance * openness * sky_facing;
+            }
         }
 
         // Slice visibility = fraction of sectors still unoccluded; both terms weighted by the

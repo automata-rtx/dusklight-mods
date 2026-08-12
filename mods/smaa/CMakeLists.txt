@@ -11,4 +11,5 @@ add_mod(smaa
 # the normal + depth drive geometric edge detection. Optional so the mod still loads and does
 # luma-only SMAA when the provider is absent.
 target_include_directories(smaa PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../graphics_hub/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../graphics_hub/include
+    ${CMAKE_SOURCE_DIR}/common)

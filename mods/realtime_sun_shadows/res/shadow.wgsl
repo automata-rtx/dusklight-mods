@@ -43,7 +43,7 @@ struct Uniforms {
     light_dir_world_x: f32,   // toward the light, world space
     light_dir_world_y: f32,
     light_dir_world_z: f32,
-    smoothed_normals: f32,    // 1 = the smoothed-normal buffer is bound (normal_smooth.wgsl)
+    smoothed_normals: f32,    // 1 = the receiver-normal buffer (the provider's) is bound
     camera_eye_x: f32,        // camera world position (screen-space shadow distance fade)
     camera_eye_y: f32,
     camera_eye_z: f32,
@@ -194,11 +194,41 @@ fn cross_normal(uv: vec2f, world: vec3f, depth: f32, du: vec2f, dv: vec2f) -> ve
     return normal / len;
 }
 
+// GEOMETRIC (face) normal of the triangle under this pixel, from the depth buffer.
+//
+// This is deliberately NOT the shading normal. The receiver-plane bias solves the receiver's
+// depth gradient in light space, and the slope bias sizes a depth margin from the surface's tilt
+// relative to the light - both are properties of the PLANE THE PIXEL ACTUALLY SITS ON, not of the
+// interpolated shading direction. Feed them a smooth normal and the comparison plane tilts away
+// from the real triangle by the shading-vs-face angle, so every facet gets a systematically wrong
+// bias: some pass, some fail, and the shadow factor breaks into per-triangle patches even though
+// the normal buffer is perfectly smooth. That is exactly what authored normals exposed - they
+// maximise the shading-vs-face gap that a depth-reconstructed normal never had.
+fn geometric_normal_at(uv: vec2f, world: vec3f, depth: f32, inv_screen: vec2f) -> vec3f {
+    var normal = cross_normal(uv, world, depth, vec2f(inv_screen.x, 0.0), vec2f(0.0, inv_screen.y));
+    // Orient toward the camera (the near-plane center approximates its position).
+    let camera = world_position_at(vec2f(0.5, 0.5), 1.0);
+    if dot(normal, world - camera) > 0.0 {
+        normal = -normal;
+    }
+    let len = length(normal);
+    if len < 1.0e-8 {
+        return vec3f(0.0, 1.0, 0.0);
+    }
+    return normal / len;
+}
+
 // World-space surface normal for the slope-scaled bias and the normal-offset receiver.
 //
-// With Normal Smoothing on, the normal comes from the dedicated buffer (normal_smooth.wgsl),
-// sampled with a depth-weighted bilinear so silhouettes stay crisp. Off (or when the buffer
-// is unavailable), a single side-selected 1px cross reconstructs the raw facet normal inline.
+// The normal comes from the bound receiver-normal buffer, sampled with a depth-weighted bilinear
+// so silhouettes stay crisp. That buffer is the Depth to Normal provider's output directly - the
+// game's authored vertex normals where it has them. (A bilateral blur used to sit in between; it
+// existed only to hide depth-reconstruction faceting, which authored normals do not have.)
+//
+// The inline 1px cross below is a LAST-RESORT fallback only: no provider normal this frame, or
+// every bilinear tap rejected at a thin silhouette. It reconstructs the raw facet normal from
+// depth, which is precisely what the provider exists to improve on, so it should be rare. (It
+// used to run whenever Normal Smoothing was 0, which quietly bypassed the provider entirely.)
 //
 // The normal is oriented toward the CAMERA (visible surfaces face it). There is deliberately
 // no light-based flip: mirroring the normal wherever the surface crosses the light terminator
@@ -232,19 +262,9 @@ fn world_normal_at(uv: vec2f, world: vec3f, depth: f32, inv_screen: vec2f) -> ve
         }
     }
     if length(normal) < 1.0e-6 {
-        normal = cross_normal(
-            uv, world, depth, vec2f(inv_screen.x, 0.0), vec2f(0.0, inv_screen.y));
-        // Orient toward the camera (the near-plane center approximates its position).
-        let camera = world_position_at(vec2f(0.5, 0.5), 1.0);
-        if dot(normal, world - camera) > 0.0 {
-            normal = -normal;
-        }
+        return geometric_normal_at(uv, world, depth, inv_screen);
     }
-    let len = length(normal);
-    if len < 1.0e-8 {
-        return vec3f(0.0, 1.0, 0.0);
-    }
-    return normal / len;
+    return normalize(normal);
 }
 
 fn scene_depth_at(uv: vec2f) -> f32 {
@@ -346,9 +366,27 @@ fn receiver_plane_bias_uv_from_normal(map: u32, n: vec3f) -> vec2f {
 // self-shadow, so it needs no slope bias; applying it there (the old code MAXED it, via the
 // cos_t floor) lifts the comparison until thin geometry leaks back into light. The constant
 // bias and the normal-offset receiver still apply on both sides.
-fn cascade_occlusion(
-    map: u32, world: vec3f, n: vec3f, tan_t: f32, light_facing: f32) -> f32 {
-    let receiver_world = world + n * (uniforms.normal_offset * uniforms.texel_world[map]);
+// Hard ceiling on the receiver-plane fractional-sampling term, as a fraction of a cascade's
+// light-space depth range. 0.1% is ample for texel quantization (tens of world units on a wide
+// cascade) while staying far below the scale of the geometry that has to self-shadow.
+const kMaxFractionalBias: f32 = 0.001;
+
+fn cascade_occlusion(map: u32, world: vec3f, n: vec3f, n_geom: vec3f, ndl: f32, tan_t: f32,
+    light_facing: f32) -> f32 {
+    // Normal-offset receiver uses the SHADING normal (Holbert): it is a shading-space nudge, and
+    // the smooth direction is what keeps it from stepping per facet. The bias plane below uses the
+    // GEOMETRIC normal, because it has to describe the triangle this pixel is actually on.
+    //
+    // Scale by sin(angle to light) - the half of Holbert's method that was missing. A shadow texel
+    // covers a world footprint whose depth spread grows as the surface turns edge-on to the light,
+    // so the offset needed to clear it is proportional to sin, not constant. A fixed offset is
+    // simultaneously too small at grazing incidence (acne survives, and grazing is most of a
+    // back-lit character) and too large head-on (pure peter-panning, shadows detaching from their
+    // casters for nothing). This makes one Normal Offset setting behave the same across the whole
+    // range of surface orientations.
+    let sin_l = sqrt(max(1.0 - ndl * ndl, 0.0));
+    let receiver_world =
+        world + n * (uniforms.normal_offset * uniforms.texel_world[map] * sin_l);
     let p = project_cascade(map, receiver_world);
     if !p.valid {
         return 0.0;
@@ -356,13 +394,28 @@ fn cascade_occlusion(
     var base_bias = uniforms.bias[map];
     var bias_uv = vec2f(0.0);
     if uniforms.rpdb_enabled != 0.0 {
-        bias_uv = receiver_plane_bias_uv_from_normal(map, n) * light_facing;
+        bias_uv = receiver_plane_bias_uv_from_normal(map, n_geom) * light_facing;
         // Clamp the per-texel gradient so a near-grazing plane can't explode into a light leak;
         // the cap doubles as the grazing-surface ceiling, where the largest bias is wanted anyway.
         let cap = uniforms.rpdb_max * uniforms.map_size[map];
         bias_uv = clamp(bias_uv, vec2f(-cap), vec2f(cap));
-        // Fractional sampling error: the receiver's own depth change across ~one texel.
-        base_bias += (abs(bias_uv.x) + abs(bias_uv.y)) * uniforms.inv_map_size[map];
+        // Fractional sampling error: the receiver's own depth change across the centre tap's
+        // half-texel offset.
+        //
+        // This term must be capped in its own right. It is derived from the ALREADY-CLAMPED
+        // gradient, and at grazing incidence that gradient sits exactly at `cap` - so this line
+        // used to add up to 2 * rpdb_max = 4% of the cascade's light-space depth range as a FLAT
+        // margin, reintroducing as a constant precisely the explosion the clamp exists to
+        // prevent. On a cascade covering ~25000 world units that is several hundred world units
+        // of bias, against a character about 150 units tall: a character's own self-shadowing
+        // leaked straight through it.
+        //
+        // It is scaled by light_facing (through bias_uv), so it fired ONLY on surfaces facing the
+        // light - exactly where it was seen: the up-facing boot tops, belt and tunic folds of a
+        // back-lit character, the one place n.L correctly abstains and the map works alone. That
+        // is why tuning the constant Bias never reached it.
+        let fractional = (abs(bias_uv.x) + abs(bias_uv.y)) * uniforms.inv_map_size[map] * 0.5;
+        base_bias += min(fractional, kMaxFractionalBias);
     } else {
         base_bias += uniforms.slope_bias[map] * tan_t * light_facing;
     }
@@ -436,16 +489,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         let inv_screen = 1.0 / vec2f(textureDimensions(scene_depth));
         // Receiver-side acne control: the (optionally smoothed) surface normal feeds the
         // slope/plane bias, the light-facing gate, and the per-cascade normal-offset receiver.
-        var n = vec3f(0.0);
+        var n = vec3f(0.0);       // shading normal: terminator, attached shadow, normal offset
+        var n_geom = vec3f(0.0);  // face normal: receiver-plane bias, slope bias
+        var ndl = 0.0;            // shading n.L: terminator + normal-offset sin scaling
         var tan_t = 0.0;
         var light_facing = 1.0;
+        // KEEP MIRRORED with `normalConsumers` in mod.cpp, which decides whether the receiver
+        // normal buffer is bound at all. If this condition is true and the host did not bind,
+        // world_normal_at silently returns the inline cross reconstruction - the failure is
+        // invisible, which is exactly how Receiver-Plane Bias and Attached Shadows (both read n,
+        // both default on) once got left out of the host list and ran the shadows on facet
+        // normals. Adding a normal consumer here means adding it there.
         if uniforms.rpdb_enabled != 0.0 || uniforms.slope_bias[0] > 0.0 ||
             uniforms.normal_offset > 0.0 || uniforms.attached_shadows != 0.0
         {
             n = world_normal_at(in.uv, world, depth, inv_screen);
+            n_geom = geometric_normal_at(in.uv, world, depth, inv_screen);
             let light_dir = vec3f(
                 uniforms.light_dir_world_x, uniforms.light_dir_world_y, uniforms.light_dir_world_z);
-            let ndl = dot(n, light_dir);
+            // Terminator / attached shadow is a LIGHTING term: it wants the smooth shading normal,
+            // so the light-to-shadow boundary rolls across curvature instead of stepping per facet.
+            ndl = dot(n, light_dir);
             // Terminator ramp: 0 where the surface faces away from the light, 1 where it faces it,
             // smooth across a +/-band window centred on n.L = 0. Drives BOTH the slope-bias gate
             // (bias only on the lit side - a back-facing surface is darkened by the front-most
@@ -453,7 +517,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
             // shadow below. Wider band = softer light/shadow boundary on curved surfaces.
             let band = max(uniforms.terminator_band, 0.02);
             light_facing = smoothstep(-band, band, ndl);
-            let cos_t = clamp(ndl, 0.05, 1.0);
+            // Slope bias is a GEOMETRIC term: how steeply the actual triangle is tilted away
+            // from the light decides how much depth margin one texel of footprint needs. Taking
+            // it from the shading normal mis-sizes the margin on every facet whose true slope
+            // differs, which is the per-facet acne authored normals made obvious.
+            let cos_t = clamp(dot(n_geom, light_dir), 0.05, 1.0);
             tan_t = min(sqrt(max(1.0 - cos_t * cos_t, 0.0)) / cos_t, 4.0);
         }
 
@@ -504,13 +572,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         }
 
         if sel.valid {
-            occlusion = cascade_occlusion(selected, world, n, tan_t, light_facing);
+            occlusion = cascade_occlusion(selected, world, n, n_geom, ndl, tan_t, light_facing);
             let blend_start = 1.0 - uniforms.blend_frac;
             if sel.fit > blend_start && selected + 1u < count {
                 let t = saturate((sel.fit - blend_start) / uniforms.blend_frac);
                 occlusion = mix(
                     occlusion,
-                    cascade_occlusion(selected + 1u, world, n, tan_t, light_facing),
+                    cascade_occlusion(selected + 1u, world, n, n_geom, ndl, tan_t, light_facing),
                     t);
             } else if uniforms.edge_fade != 0.0 && selected + 1u >= count && sel.fit > blend_start {
                 // Outermost cascade: no farther cascade to hand off to, so its box edge is a
@@ -526,7 +594,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         // (an empty map compares as fully lit); max() keeps whichever term is darker.
         var link_occlusion = 0.0;
         if uniforms.link_enabled != 0.0 {
-            link_occlusion = cascade_occlusion(3u, world, n, tan_t, light_facing);
+            link_occlusion = cascade_occlusion(3u, world, n, n_geom, ndl, tan_t, light_facing);
             occlusion = max(occlusion, link_occlusion);
         }
 
@@ -536,8 +604,38 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         // facets when back-lit) reads as fully lit and leaks. Fold in the n.L term: (1 -
         // light_facing) is 1 on the dark side, 0 on the lit side. max() means already-cast-
         // shadowed pixels don't darken further; only the leaking back-faces get corrected.
+        var map_occlusion = occlusion;  // before the attached term, for debug view 15
         if uniforms.attached_shadows != 0.0 {
-            occlusion = max(occlusion, 1.0 - light_facing);
+            // Weight the MAP by how much the surface actually faces the light, then take the
+            // stronger of that and the n.L term.
+            //
+            // The map comparison is only trustworthy where the surface faces the light. As it
+            // turns edge-on, one shadow texel spans an ever larger depth range, so the comparison
+            // is dominated by bias error rather than by geometry - that band is where acne and
+            // light leaks both live, and on a back-lit character it is most of the visible
+            // surface. Fading the map out across exactly that band costs nothing, because the n.L
+            // term is already driving those pixels dark: at light_facing 0.5 the result is 0.5
+            // either way, so the fade is invisible but the noise is gone.
+            //
+            //   light_facing 1 (facing the light) -> occlusion = map_occlusion, cast shadows and
+            //                                        their detail are completely unchanged
+            //   light_facing 0 (facing away)      -> occlusion = 1, from n.L alone, map ignored
+            //
+            // Monotone in both inputs, so no seam appears where the two hand over.
+            map_occlusion = map_occlusion * light_facing;
+            occlusion = max(map_occlusion, 1.0 - light_facing);
+        }
+
+        // 15 = which term is doing the shadowing, so a wrong-looking pixel names its own cause
+        // instead of being guessed at:
+        //   RED   = the shadow MAP comparison (cast shadow / self-shadow acne lives here)
+        //   GREEN = the attached n.L term (surfaces turned away from the sun)
+        //   YELLOW = both      BLACK = neither, i.e. this pixel is being reported as fully LIT
+        // A bright patch that should be dark is black here, and the channel that SHOULD have been
+        // lit tells you which half of the model to fix: black on a back-facing surface means n.L
+        // read it as sun-facing; red-free black on a surface behind a caster means the map missed.
+        if uniforms.debug_mode == 15u {
+            return vec4f(saturate(map_occlusion), saturate(1.0 - light_facing), 0.0, 1.0);
         }
 
         // 14 = cascade coverage: red / green / blue = near / mid / far cascade shading this

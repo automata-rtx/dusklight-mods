@@ -9,7 +9,10 @@
 //
 // Debug views:
 //   1 = AO visibility as grayscale (the exact term the composite would apply)
-//   2 = view-space normals reconstructed from depth (keep in sync with vbao.wgsl)
+//   2 = the view-space normals the AO pass consumes: the Depth to Normal provider's normal
+//       (authored where the game supplies one) when flags bit 3 is set, else the inline
+//       depth reconstruction - the same choice vbao.wgsl makes, so the view never claims
+//       a normal source the AO isn't actually using
 //   3 = the preprocessed depth input
 //   4 = depth staircase detector
 
@@ -17,7 +20,7 @@ struct Uniforms {
     projection: mat4x4f,
     inverse_projection: mat4x4f,
     reproject: mat4x4f,
-    view_from_world: mat4x4f,  // layout-only: unused here, present so the shared uniform matches vbao.wgsl + the host
+    view_from_world: mat4x4f,  // rotates the provider's world normal into view (debug view 2)
     size: vec2f,        // AO chain size in pixels (may be half the render size)
     inv_size: vec2f,
     depth_scale: vec2f, // input depth snapshot pixels per chain pixel (1 or 2)
@@ -57,6 +60,10 @@ struct Uniforms {
 @group(0) @binding(1) var preprocessed_depth: texture_2d<f32>;
 @group(0) @binding(2) var scene_depth_raw: texture_2d<f32>;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
+// The provider's world-space normal, for debug view 2. Read only when flags bit 3 is set; the
+// depth snapshot stands in (also a texture_2d<f32>) otherwise so the bind group is always
+// complete.
+@group(0) @binding(4) var d2n_normal: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -166,9 +173,21 @@ fn reconstruct_normal(pixel_coordinates: vec2<i32>, pixel_position: vec3f, depth
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     if uniforms.debug_view == 2u {
-        // Reconstructed view-space normals, [-1,1] -> RGB
+        // The view-space normal the AO pass consumes, [-1,1] -> RGB.
         let pixel = vec2<i32>(in.uv * uniforms.size);
         let depth = load_depth(pixel);
+        if (uniforms.flags & 8u) != 0u {
+            // Provider normal: sample at this pixel's full-res position (the provider buffer is
+            // full resolution even when the AO chain is half), then rotate world -> view.
+            let n_dims = vec2f(textureDimensions(d2n_normal));
+            let n_texel =
+                clamp(vec2<i32>(in.uv * n_dims), vec2<i32>(0i), vec2<i32>(n_dims) - vec2<i32>(1i));
+            let world_n = textureLoad(d2n_normal, n_texel, 0i).xyz;
+            let r = uniforms.view_from_world;
+            let normal = normalize(
+                r[0].xyz * world_n.x + r[1].xyz * world_n.y + r[2].xyz * world_n.z);
+            return vec4f(normal * 0.5 + 0.5, 1.0);
+        }
         let uv = (vec2f(pixel) + 0.5) * uniforms.inv_size;
         let position = reconstruct_view_space_position(depth, uv);
         let normal = reconstruct_normal(pixel, position, depth);

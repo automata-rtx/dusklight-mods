@@ -91,8 +91,9 @@ Sun Shadows if Depth to Normal is not installed and enabled. Install both togeth
    whose box contains the receiver, apply that cascade's acne bias and normal-offset receiver
    (`world + n * normal_offset * texel_world[cascade]`), PCF over bilinearly-weighted
    comparison taps (kernel = base + Far Softening × cascade index). **Acne bias — two modes:**
-   with `receiverPlaneBias` on (default), the surface **normal** (`world_normal_at`, so
-   `normalSmooth` smooths it) spans a tangent plane whose depth gradient `d(depth)/d(uv)` in the
+   with `receiverPlaneBias` on (default), the **geometric face normal** (`geometric_normal_at`,
+   from the depth buffer — see the two-normals note below) spans a tangent plane whose depth
+   gradient `d(depth)/d(uv)` in the
    ortho light space is solved directly (`receiver_plane_bias_uv_from_normal`, Isidoro 2006); each
    PCF tap then compares against `receiver + base_bias + dot(grad, tapOffset)`, so the comparison
    plane follows the surface under the footprint instead of paying a flat margin that detaches the
@@ -235,13 +236,12 @@ Space Shadows" is inert when SSS is off.
 | `linkCoverage` | 300 | Link cascade box radius in world units (100–2000) |
 | `strength` | 60 | shadow darkening % |
 | `shadowTint` | 50 | tint shadows toward the current skylight color (`vrbox_sky_col`, peak-normalized) instead of neutral gray - reads as skylit, follows area/time/weather; hue-only, never brightens. 0 = neutral. Both methods |
-| `receiverPlaneBias` | on | receiver-plane depth bias: derive the exact per-tap bias from the receiver surface's light-space depth gradient (built from the surface **normal**, so `normalSmooth` smooths it too — no per-facet banding), so acne clears with almost no flat margin and shadows stay attached to their casters (Isidoro 2006). When on it **replaces** `slopeBias` (the gradient is the exact slope term) and adds a small clamped fractional-sampling term for the centre texel; `bias` still applies. The whole slope/plane term is scaled by the **light-facing gate** (`smoothstep(-band, band, n·L)`, `band` from `terminatorSoftness`) so surfaces turned away from the light get ~none of it — they're darkened by the two-sided map's front-most face, not self-shadow, and biasing them there leaks thin geometry (fingers, facial features) back into light. Off = the old constant + `slopeBias` margins (also light-facing-gated). Cap `rpdb_max = 0.02` (max 2% of a cascade's depth range per texel). Both methods |
+| `receiverPlaneBias` | on | receiver-plane depth bias: derive the exact per-tap bias from the receiver surface's light-space depth gradient (built from the **geometric face normal**, not the shading normal — see the two-normals note), so acne clears with almost no flat margin and shadows stay attached to their casters (Isidoro 2006). When on it **replaces** `slopeBias` (the gradient is the exact slope term) and adds a fractional-sampling term for the centre texel, taken over half a texel and **hard-capped at 0.1% of the cascade depth range** (uncapped it inherited the clamped gradient and contributed up to 4% — hundreds of world units, more than a character is tall, which leaked self-shadowing straight through); `bias` still applies. The whole slope/plane term is scaled by the **light-facing gate** (`smoothstep(-band, band, n·L)`, `band` from `terminatorSoftness`) so surfaces turned away from the light get ~none of it — they're darkened by the two-sided map's front-most face, not self-shadow, and biasing them there leaks thin geometry (fingers, facial features) back into light. Off = the old constant + `slopeBias` margins (also light-facing-gated). Cap `rpdb_max = 0.02` (max 2% of a cascade's depth range per texel). Both methods |
 | `bias` | 2 | constant depth bias (normalized against light range), applied every tap. With `receiverPlaneBias` on, keep small; raise only if flat light-facing ground still shows acne |
 | `slopeBias` | 2 | bias added ∝ surface slope vs light. **Ignored when `receiverPlaneBias` is on** (that derives the slope term exactly); manual fallback only |
 | `attachedShadows` | on | also shadow surfaces facing **away** from the sun (the `n·L` term), which a cast-only shadow map cannot reach when they are unoccluded (a back-lit nose, protruding tunic/boot facets). Folds `1 - smoothstep(-band, band, n·L)` in via `max()`, so already-cast-shadowed pixels never darken further — only the leaking back-faces get corrected. Off = map-only (those back-faces read as fully lit) |
 | `terminatorSoftness` | 20 | half-width of the light→shadow transition (`band = terminatorSoftness/100 × 0.5`, in `n·L`; floored at 0.02 in-shader). Low = crisp/hard sun-shadow boundary on curved surfaces; high = soft, gradual falloff. Drives both `attachedShadows` and the slope-bias light-facing gate |
 | `normalOffset` | 50 | receiver offset, % of one shadow texel's world size (default = 0.5 texel; already conservative — this is a percentage, not a texel count) |
-| `normalSmooth` | 4 | smooths the depth-reconstructed normal that Slope Bias / Normal Offset use (`res/normal_smooth.wgsl`): FULL-resolution per-pixel crosses + one separable depth-aware Gaussian whose radius = `normalSmooth * renderHeight / 1080` px (dense, capped 32). Only affects the shadow-MAP bias — SSS fine detail is independent (see note). One value looks the same at any internal resolution. History of failed approaches, do not repeat: (1) widening a single cross straddles facets and manufactures garbage normals (shattered glass); (2) sparse taps at fixed pixel distances ghost past a resolution-dependent sweet spot; (3) a resolution-CAPPED buffer blurs fine geometry away and needs a lossy upscale. NO light-terminator flip (mirrored the normal across curved surfaces' terminator = hard bias discontinuity on faces). 0 = off (inline 1px cross) |
 | `pcf` | 2 | PCF kernel: 0=1×1 1=3×3 2=5×5 3=7×7 |
 | `contactShadows` | on | the Bend screen-space shadow term (runs even with the map off / indoors) |
 | `sssThickness` | 150 | assumed caster thickness, 1/100 % of remaining depth (50 = 0.5%) |
@@ -305,11 +305,10 @@ The reconstructed surface normal is used ONLY for the shadow-map receiver's slop
 and normal offset. The screen-space shadow term (`screen_shadow_at`) reads the depth
 buffer directly and never touches the normal, so all the fine SSS detail (Hylian shield
 insignia, Master Sword sheath geometry) is independent of how the normal is computed.
-That means smoothing the normal cannot remove that detail — and for the coarse shadow
-map, a smooth normal is actively better (per-facet normal jumps are what band the
-shadows). So `normalSmooth` can go as high as needed for smooth shading with no loss of
-screen-space detail. This is why we use cheap depth-reconstructed normals rather than
-the game's per-vertex normals.
+That means the map's normal treatment cannot remove that detail — the screen-space term carries
+the fine self-shadowing regardless. The shading normal now comes from the game's own **authored
+vertex normals** via the Depth to Normal provider, which are smooth at the source, so the blur
+that used to sit here (`normalSmooth`) has been removed entirely.
 
 ## Shadow-map tuning guide (plain language)
 
@@ -374,12 +373,23 @@ too far makes shadows detach from objects' feet ("peter-panning").
 - **Normal Offset** — instead of changing the depth comparison, nudges the *tested point*
   slightly off the surface, about one photo-pixel's worth. The most effective acne killer
   with the least detachment. 100–200%.
-- **Normal Smoothing** — Receiver-Plane Bias, Slope Bias, Normal Offset, and the Attached
-  Shadows terminator all need to know which way the surface faces. GameCube-era models are
-  low-poly: the facing jumps at every polygon edge, so the bias jumps too and paints *faceted
-  bands / holes* on characters. This rounds the facing over a few screen pixels so it varies
-  smoothly. 2–4; it's nearly free. This is the **foundation** knob — everything else reads the
-  normal it produces, so set it first.
+- **Two normals, two jobs (do not merge them again).** The shadow term consumes the surface
+  direction twice, and the two uses want *different* normals:
+  - **Shading normal** (the provider's, authored/smooth) — the `n·L` terminator, Attached Shadows,
+    and the Normal Offset receiver. These are lighting/shading quantities; a smooth direction is
+    what makes the light-to-shadow boundary roll across curvature instead of stepping per facet.
+  - **Geometric face normal** (`geometric_normal_at`, from the depth buffer) — Receiver-Plane Bias
+    and Slope Bias. These solve the receiver's depth gradient / tilt in light space, which is a
+    property of *the triangle the pixel actually sits on*. A smooth normal tilts the comparison
+    plane away from the real triangle by the shading-vs-face angle, so every facet gets a
+    systematically wrong bias and the shadow factor breaks into per-triangle patches **even though
+    the normal buffer is perfectly smooth**.
+
+  Authored normals are what exposed this: a depth-reconstructed normal *is* the face normal, so the
+  two uses coincided and the bug was invisible. Switching the provider to smooth normals maximised
+  the gap. `normalSmooth` was the earlier partial workaround from the same confusion — it traded
+  bias banding at facet edges for bias error inside facets, which is why raising it never fully
+  worked.
 - **Attached Shadows** — leave ON. A shadow *map* can only darken a surface when something
   *blocks* the sun from it (a cast shadow). It cannot darken a surface that simply *faces away*
   from the sun with nothing in front of it — so a back-lit nose, or protruding tunic/boot
@@ -397,8 +407,7 @@ too far makes shadows detach from objects' feet ("peter-panning").
 
 Recommended order (Receiver-Plane Bias + Attached Shadows ON — the defaults): (1) Coverage wide
 enough for the landscape (16000 for the big vistas), 3 cascades, splits near-geometric.
-(2) **Normal Smoothing first** (3–5) — it's the foundation the rest read; raise it if the
-light/shadow edge on characters looks jagged, lower it if fine detail (fingers, folds) rounds
+(2) light/shadow edge on characters looks jagged, lower it if fine detail (fingers, folds) rounds
 away. (3) **Terminator Softness** to taste (~20): raise for a softer sun-shadow boundary, lower
 for a crisper one; back off if lit surfaces start going dark. (4) Bias and Slope Bias near zero —
 Receiver-Plane Bias handles map acne; nudge **Normal Offset** up only if a curved *lit* surface
@@ -408,9 +417,69 @@ at the feet) or *lit* surfaces go dark, you've gone too far — back off.
 
 Legacy order (Receiver-Plane Bias OFF): (1) Coverage + cascades as above. (2) Bias down to ~40.
 (3) Raise Normal Offset until flat ground is clean. (4) Raise Slope Bias until cliffs are clean.
-(5) Normal Smoothing 2–4 to remove faceted banding on characters. (6) Soft Shadows + Far
+(5) Soft Shadows + Far
 Softening to taste; widen Cascade Blend if a transition line shows. If feet shadows detach: lower Bias first, then
 Normal Offset — the screen-space term re-grounds contacts regardless.
+
+## Shadow term assembly (current, post authored-normals work)
+
+The occlusion for a pixel is built in this order. Every step here was arrived at by fixing a
+specific bug — see `docs/authored_normals.md` §8 for the failures and why the obvious alternatives
+are wrong.
+
+```wgsl
+// 1. TWO normals, never interchangeable (authored_normals.md 8.6)
+n      = world_normal_at(...)        // SHADING: provider's authored normal. n.L, attached
+                                     //          shadow, normal-offset receiver.
+n_geom = geometric_normal_at(...)    // GEOMETRIC: face normal from depth. Receiver-plane bias
+                                     //            and slope-bias tan_t ONLY.
+
+// 2. Terminator from the SHADING normal
+ndl          = dot(n, light_dir)
+light_facing = smoothstep(-band, band, ndl)     // band from terminatorSoftness
+
+// 3. Per cascade: normal offset scaled by sin (Holbert, complete form)
+receiver = world + n * (normal_offset * texel_world[map] * sqrt(1 - ndl*ndl))
+
+// 4. Receiver-plane bias from the GEOMETRIC normal, its fractional term hard-capped
+bias_uv    = receiver_plane_bias_uv_from_normal(map, n_geom) * light_facing
+bias_uv    = clamp(bias_uv, -cap, cap)                     // cap = rpdb_max * map_size
+fractional = (|bias_uv.x| + |bias_uv.y|) * inv_map_size * 0.5
+base_bias  = bias[map] + min(fractional, kMaxFractionalBias)   // 0.001 — see 8.8
+
+// 5. Combine: the map only counts where the surface faces the light
+occlusion = max(map_occlusion * light_facing, 1 - light_facing)
+```
+
+**Step 5 is the one to understand before touching any bias knob.** A shadow-map comparison is only
+meaningful where the surface faces the light; edge-on, one texel spans a huge depth range and the
+comparison is decided by bias error, not geometry. Acne and light leaks are therefore *the same
+failure with opposite sign*, and no bias setting fixes one without causing the other. Fading the map
+across that band removes the failure rather than trading it. `light_facing = 1` leaves cast shadows
+completely untouched.
+
+**Step 4's cap is not optional.** Uncapped, that term inherits the clamped gradient and contributes
+up to `2 × rpdb_max` = 4% of the cascade depth range as a *flat* margin — hundreds of world units on
+a wide cascade, more than a character is tall, which leaks self-shadowing straight through. It is
+gated by `light_facing`, so it only ever showed on sunlit-facing surfaces of a back-lit character.
+
+### Debug View 15 — "Shadow Terms"
+
+Renders which term is shadowing each pixel: **red** = the map comparison, **green** = the attached
+`n·L` term, **yellow** = both, **black** = neither, i.e. the pixel is reported fully lit.
+
+Use it on any wrongly-lit pixel. The Shadow Factor view shows only `max(...)` of the two, so it
+cannot tell "the map missed an occluder" from "`n·L` misread the surface" — two bugs with identical
+symptoms and opposite fixes. Diagnose from view 15, not from Shadow Factor.
+
+### Normal Smoothing: removed
+
+There was a `normalSmooth` setting and a `normal_smooth.wgsl` bilateral blur. Both are gone
+(`38386e4`). It existed only to hide the faceting a depth-reconstructed normal has by construction;
+the provider now supplies the game's authored vertex normals, which are smooth at the source. After
+the two-normal split it was also actively harmful — it flattened the curvature the shading normal
+carries. Do not reintroduce it: if bias faceting appears, the cause is a bias term reading the
+shading normal instead of `n_geom`.
 
 ## Known caveats
 

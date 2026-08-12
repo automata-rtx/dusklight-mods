@@ -20,6 +20,8 @@
 #include "mods/svc/camera.h"
 #include "mods/svc/config.h"
 #include "mods/svc/gfx.h"
+
+#include "gfx_normal_compat.h"
 #include "mods/svc/log.h"
 #include "mods/svc/resource.h"
 #include "mods/svc/ui.h"
@@ -93,6 +95,11 @@ ResourceBuffer g_temporalSource = RESOURCE_BUFFER_INIT;
 ResourceBuffer g_compositeSource = RESOURCE_BUFFER_INIT;
 
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
+// Set by the render worker when a draw's pass layout stops matching the pipelines built at init
+// (the host's thin g-buffer was toggled mid-session). Logged once from the game thread; the
+// render worker must not touch the log service.
+std::atomic<bool> g_normalFormatMismatch{false};
+bool g_loggedNormalMismatch = false;
 WGPUComputePipeline g_preprocessPipeline = nullptr;
 WGPUComputePipeline g_mip4Pipeline = nullptr;
 WGPUComputePipeline g_vbaoPipeline = nullptr;
@@ -218,6 +225,8 @@ struct CompositePayload {
     WGPUTextureView aoSource;           // accumulated (temporal) or denoised (fallback) AO
     WGPUTextureView preprocessedDepth;  // debug views reconstruct normals/depth from it
     WGPUTextureView sceneDepth;         // raw snapshot: depth-aware upscale + bypass debug views
+    WGPUTextureView d2nNormal;          // provider normal for the Normals debug view (or a
+                                        // stand-in when absent, as in ComputePayload)
     uint32_t uniform_offset;
     uint32_t uniform_size;
     uint32_t debug_view;
@@ -349,8 +358,21 @@ bool build_composite_pipeline(
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = module;
     fragment.entryPoint = {"fs_main", WGPU_STRLEN};
-    fragment.targetCount = 1;
-    fragment.targets = &colorTarget;
+    // Thin g-buffer (platform-gbuffer-test and later): when the host writes the game's authored
+    // normals to a SECOND color attachment, every pipeline recorded into the scene pass must
+    // declare a matching second target - WebGPU requires the attachment counts to agree, and a
+    // one-target pipeline is rejected outright. This effect never writes normals, so the target
+    // exists purely to match the pass and its write mask is off. Undefined (buffer disabled, and
+    // every platform before it) leaves this at a single target, unchanged.
+    WGPUColorTargetState colorTargets[2] = {colorTarget, WGPU_COLOR_TARGET_STATE_INIT};
+    uint32_t colorTargetCount = 1;
+    if (gfx_compat::normal_format(g_deviceInfo) != WGPUTextureFormat_Undefined) {
+        colorTargets[1].format = gfx_compat::normal_format(g_deviceInfo);
+        colorTargets[1].writeMask = WGPUColorWriteMask_None;
+        colorTargetCount = 2;
+    }
+    fragment.targetCount = colorTargetCount;
+    fragment.targets = colorTargets;
     // Depth state must match the EFB pass despite never touching depth.
     WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
     depthStencil.format = g_deviceInfo.depth_format;
@@ -681,6 +703,14 @@ void on_compute(
 // Render worker thread: composite the AO over the scene (or show it, in debug view).
 void on_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
+    // Scene-pass attachment guard (thin g-buffer): our pipelines declare the target count the
+    // device reported at init. If the host's normal buffer has been toggled since, that count no
+    // longer matches this pass and recording the draw would be a WebGPU validation error - skip
+    // it instead and let the game thread report it. Reloading the mod rebuilds the pipelines.
+    if (gfx_compat::normal_format(*ctx) != gfx_compat::normal_format(g_deviceInfo)) {
+        g_normalFormatMismatch.store(true, std::memory_order_relaxed);
+        return;
+    }
     if (payloadSize != sizeof(CompositePayload)) {
         return;
     }
@@ -690,13 +720,13 @@ void on_draw(
         data.debug_view != 0 ? g_compositeDebugPipeline : g_compositePipeline;
     WGPUBindGroupLayout layout = data.debug_view != 0 ? g_compositeDebugLayout : g_compositeLayout;
     if (data.aoSource == nullptr || data.preprocessedDepth == nullptr ||
-        data.sceneDepth == nullptr || pipeline == nullptr)
+        data.sceneDepth == nullptr || data.d2nNormal == nullptr || pipeline == nullptr)
     {
         return;
     }
 
-    WGPUBindGroupEntry entries[4] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
-        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    WGPUBindGroupEntry entries[5] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
     entries[0].binding = 0;
     entries[0].textureView = data.aoSource;
     entries[1].binding = 1;
@@ -707,9 +737,11 @@ void on_draw(
     entries[3].buffer = ctx->uniform_buffer;
     entries[3].offset = data.uniform_offset;
     entries[3].size = data.uniform_size;
+    entries[4].binding = 4;
+    entries[4].textureView = data.d2nNormal;
     WGPUBindGroupDescriptor bindGroupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bindGroupDesc.layout = layout;
-    bindGroupDesc.entryCount = 4;
+    bindGroupDesc.entryCount = 5;
     bindGroupDesc.entries = entries;
     WGPUBindGroup bindGroup = wgpuDeviceCreateBindGroup(ctx->device, &bindGroupDesc);
     if (bindGroup == nullptr) {
@@ -910,7 +942,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         : ((denoisePasses % 2u) != 0u ? g_targets.aoFinalView : g_targets.aoNoisyView);
     const CompositePayload drawPayload{
         temporal ? g_targets.historyViews[writeIdx] : denoisedView, g_targets.preprocessedDepthAll,
-        resolved.depth, uniformRange.offset, uniformRange.size, debugMode};
+        resolved.depth, computePayload.d2nNormal, uniformRange.offset, uniformRange.size,
+        debugMode};
     if (debugMode != 0) {
         // Debug views draw at FRAME_BEFORE_HUD so deferred fog, translucency, and bloom
         // don't paint over them (all payload views stay valid for the rest of the frame).
@@ -1109,8 +1142,9 @@ ModResult build_controls_tab(
     static const char* kDebugOptions[] = {"Off", "AO", "Normals", "Depth", "Staircase"};
     add_select(left, "Debug View", g_cvarDebugView,
         "AO: the final shaped occlusion term as grayscale (accumulated when temporal is "
-        "on).<br/>Normals: the view-space normals the occlusion pass "
-        "consumes.<br/>Depth: the preprocessed depth as a distance "
+        "on).<br/>Normals: the view-space normals the occlusion pass consumes - the Depth to "
+        "Normal provider's (authored, when Graphics Hub has them) or the inline depth "
+        "reconstruction, whichever the AO actually used this frame.<br/>Depth: the preprocessed depth as a distance "
         "gradient.<br/>Staircase: detects quantized depth - smooth depth is "
         "near-black with thin triangle edges, quantized depth lights up across "
         "surfaces.<br/>Debug views draw over the finished frame (after fog and bloom), so "
@@ -1321,6 +1355,12 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 }
 
 MOD_EXPORT ModResult mod_update(ModError*) {
+    if (!g_loggedNormalMismatch && g_normalFormatMismatch.load(std::memory_order_relaxed)) {
+        g_loggedNormalMismatch = true;
+        svc_log->warn(mod_ctx,
+            "scene pass normal-target layout changed since init; composite skipped - "
+            "reload this mod to rebuild its pipelines");
+    }
     if (!g_loggedChain && g_chainExecuted.load(std::memory_order_acquire)) {
         g_loggedChain = true;
         svc_log->info(mod_ctx, "Enhanced AO chain executed OK");

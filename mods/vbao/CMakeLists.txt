@@ -10,4 +10,5 @@ add_mod(vbao
 # Optional integration with the depth-to-normal service (shared header), now exported by
 # Graphics Hub.
 target_include_directories(vbao PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../graphics_hub/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../graphics_hub/include
+    ${CMAKE_SOURCE_DIR}/common)

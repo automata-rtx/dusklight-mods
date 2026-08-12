@@ -11,4 +11,5 @@ add_mod(ssilvb
 # Hard dependency on the depth-to-normal service (shared header), now exported by Graphics Hub:
 # the GI accumulate needs a surface normal at every marched sample.
 target_include_directories(ssilvb PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../graphics_hub/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../graphics_hub/include
+    ${CMAKE_SOURCE_DIR}/common)

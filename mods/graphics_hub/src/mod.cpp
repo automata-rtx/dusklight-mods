@@ -41,13 +41,17 @@
 #include "mods/svc/camera.h"
 #include "mods/svc/config.h"
 #include "mods/svc/gfx.h"
+
+#include "gfx_normal_compat.h"
 #include "mods/svc/hook.h"
 #include "mods/svc/log.h"
 #include "mods/svc/resource.h"
 #include "mods/svc/ui.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <type_traits>
@@ -72,6 +76,11 @@ namespace hub_dtn {
 
 ResourceBuffer g_shaderSource = RESOURCE_BUFFER_INIT;
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
+// Set by the render worker when a draw's pass layout stops matching the pipelines built at init
+// (the host's thin g-buffer was toggled mid-session). Logged once from the game thread; the
+// render worker must not touch the log service.
+std::atomic<bool> g_normalFormatMismatch{false};
+bool g_loggedNormalMismatch = false;
 WGPUComputePipeline g_pipeline = nullptr;
 WGPUBindGroupLayout g_layout = nullptr;
 GfxComputeTypeHandle g_computeType = 0;
@@ -82,7 +91,15 @@ WGPURenderPipeline g_debugPipeline = nullptr;
 WGPUBindGroupLayout g_debugLayout = nullptr;
 GfxDrawTypeHandle g_debugDrawType = 0;
 GfxStageHookHandle g_frameBeforeHudHook = 0;
-ConfigVarHandle g_cvarNormalsDebug = 0;  // DEFAULT below in init()
+ConfigVarHandle g_cvarNormalsDebug = 0;   // DEFAULT below in init()
+ConfigVarHandle g_cvarDebugMode = 0;      // DEFAULT below in init()
+ConfigVarHandle g_cvarUseAuthored = 0;    // DEFAULT below in init()
+ConfigVarHandle g_cvarAuthoredBasis = 0;  // DEFAULT below in init()
+UiWindowHandle g_controlsWindow = 0;
+
+// True when the running platform exposes the thin g-buffer normal target. Older platforms report
+// WGPUTextureFormat_Undefined, and every authored-normal path stays switched off.
+bool g_authoredAvailable = false;
 
 struct NormalTarget {
     uint32_t width = 0;
@@ -91,11 +108,22 @@ struct NormalTarget {
     WGPUTextureView view = nullptr;
 };
 NormalTarget g_target;
+// Second full-size normal target, allocated only while a comparison debug view is selected: it
+// receives whichever normal did NOT become the service output, so the debug pass can show both.
+NormalTarget g_altTarget;
 struct RetiredTarget {
     NormalTarget target;
     int framesLeft = 0;
 };
 std::vector<RetiredTarget> g_retired;
+
+// 1x1 stand-ins so the compute bind group always matches its layout on platforms (or in modes)
+// where the real resource is absent. The authored one is zero-filled: w = 0 reads as "no authored
+// normal", which is exactly the reconstruct-this-pixel path.
+WGPUTexture g_dummyAuthored = nullptr;
+WGPUTextureView g_dummyAuthoredView = nullptr;
+WGPUTexture g_dummyAlt = nullptr;
+WGPUTextureView g_dummyAltView = nullptr;
 
 bool g_cameraValid = false;
 float g_viewFromProj[16] = {};
@@ -104,20 +132,41 @@ bool g_frameComputed = false;
 WGPUTextureView g_frameView = nullptr;
 uint32_t g_frameWidth = 0;
 uint32_t g_frameHeight = 0;
+// Per-frame state the debug draw needs, decided when the frame's reconstruction was queued.
+WGPUTextureView g_frameAltView = nullptr;  // null unless a comparison view ran this frame
+bool g_frameAltIsAuthored = false;
+bool g_frameUsedAuthored = false;
 
 // Mirror of the WGSL Uniforms struct (keep in sync with res/reconstruct.wgsl).
 struct ReconstructUniforms {
     float view_from_proj[16];
     float world_from_view[16];
     float inv_size[2];
-    float _pad0[2];
+    float use_authored;
+    float debug_compare;
+    float basis_flip[3];
+    float _pad0;
 };
-static_assert(sizeof(ReconstructUniforms) == 144);
+static_assert(sizeof(ReconstructUniforms) == 160);
 static_assert(sizeof(ReconstructUniforms) % 16 == 0);
+// basis_flip is a WGSL vec3f, which aligns to 16 bytes; the C mirror only matches if it lands on
+// a 16-byte boundary of its own accord.
+static_assert(offsetof(ReconstructUniforms, basis_flip) % 16 == 0);
+
+// Mirror of the WGSL Uniforms struct in res/debug.wgsl.
+struct DebugUniforms {
+    uint32_t mode;
+    uint32_t alt_is_authored;
+    uint32_t _pad0[2];
+};
+static_assert(sizeof(DebugUniforms) == 16);
+static_assert(sizeof(DebugUniforms) % 16 == 0);
 
 struct ComputePayload {
     WGPUTextureView sceneDepth;
     WGPUTextureView normalOut;
+    WGPUTextureView authoredNormal;
+    WGPUTextureView altOut;
     uint32_t uniformOffset;
     uint32_t uniformSize;
     uint32_t width;
@@ -128,6 +177,9 @@ static_assert(std::is_trivially_copyable_v<ComputePayload>);
 
 struct DebugDrawPayload {
     WGPUTextureView normal;
+    WGPUTextureView alt;
+    uint32_t uniformOffset;
+    uint32_t uniformSize;
 };
 static_assert(sizeof(DebugDrawPayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
 static_assert(std::is_trivially_copyable_v<DebugDrawPayload>);
@@ -157,29 +209,68 @@ void tick_retired() {
     }
 }
 
-bool ensure_target(uint32_t width, uint32_t height) {
-    if (g_target.width == width && g_target.height == height && g_target.view != nullptr) {
+// A target that is still in flight cannot be destroyed immediately; park it for a few frames.
+void retire_target(NormalTarget& target) {
+    if (target.width != 0) {
+        g_retired.push_back(RetiredTarget{std::exchange(target, NormalTarget{}), 4});
+    }
+}
+
+bool ensure_target(NormalTarget& target, uint32_t width, uint32_t height, const char* label) {
+    if (target.width == width && target.height == height && target.view != nullptr) {
         return true;
     }
-    if (g_target.width != 0) {
-        g_retired.push_back(RetiredTarget{std::exchange(g_target, NormalTarget{}), 4});
-    }
+    retire_target(target);
     WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
-    desc.label = {"depth-to-normal world normal", WGPU_STRLEN};
+    desc.label = {label, WGPU_STRLEN};
     desc.usage = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding;
     desc.size = {width, height, 1};
     desc.format = WGPUTextureFormat_RGBA32Float;
-    g_target.texture = wgpuDeviceCreateTexture(g_deviceInfo.device, &desc);
-    if (g_target.texture != nullptr) {
-        g_target.view = wgpuTextureCreateView(g_target.texture, nullptr);
+    target.texture = wgpuDeviceCreateTexture(g_deviceInfo.device, &desc);
+    if (target.texture != nullptr) {
+        target.view = wgpuTextureCreateView(target.texture, nullptr);
     }
-    if (g_target.view == nullptr) {
-        release_target(g_target);
+    if (target.view == nullptr) {
+        release_target(target);
         return false;
     }
-    g_target.width = width;
-    g_target.height = height;
+    target.width = width;
+    target.height = height;
     return true;
+}
+
+// The 1x1 stand-ins, created once. The authored one is zero-filled so its validity channel reads
+// 0; the alternate one is write-only and never read.
+bool build_dummy_textures() {
+    WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+    desc.label = {"depth-to-normal authored stand-in", WGPU_STRLEN};
+    desc.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+    desc.size = {1, 1, 1};
+    desc.format = WGPUTextureFormat_RGBA8Unorm;
+    g_dummyAuthored = wgpuDeviceCreateTexture(g_deviceInfo.device, &desc);
+    if (g_dummyAuthored == nullptr) {
+        return false;
+    }
+    g_dummyAuthoredView = wgpuTextureCreateView(g_dummyAuthored, nullptr);
+    if (g_dummyAuthoredView == nullptr) {
+        return false;
+    }
+    const uint8_t zero[4] = {0, 0, 0, 0};
+    WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+    dst.texture = g_dummyAuthored;
+    WGPUTexelCopyBufferLayout layout{.offset = 0, .bytesPerRow = 4, .rowsPerImage = 1};
+    WGPUExtent3D extent{1, 1, 1};
+    wgpuQueueWriteTexture(g_deviceInfo.queue, &dst, zero, sizeof(zero), &layout, &extent);
+
+    desc.label = {"depth-to-normal alternate stand-in", WGPU_STRLEN};
+    desc.usage = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding;
+    desc.format = WGPUTextureFormat_RGBA32Float;
+    g_dummyAlt = wgpuDeviceCreateTexture(g_deviceInfo.device, &desc);
+    if (g_dummyAlt == nullptr) {
+        return false;
+    }
+    g_dummyAltView = wgpuTextureCreateView(g_dummyAlt, nullptr);
+    return g_dummyAltView != nullptr;
 }
 
 bool build_pipeline() {
@@ -220,8 +311,21 @@ bool build_debug_pipeline() {
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = module;
     fragment.entryPoint = {"fs_main", WGPU_STRLEN};
-    fragment.targetCount = 1;
-    fragment.targets = &colorTarget;
+    // Thin g-buffer (platform-gbuffer-test and later): when the host writes the game's authored
+    // normals to a SECOND color attachment, every pipeline recorded into the scene pass must
+    // declare a matching second target - WebGPU requires the attachment counts to agree, and a
+    // one-target pipeline is rejected outright. This effect never writes normals, so the target
+    // exists purely to match the pass and its write mask is off. Undefined (buffer disabled, and
+    // every platform before it) leaves this at a single target, unchanged.
+    WGPUColorTargetState colorTargets[2] = {colorTarget, WGPU_COLOR_TARGET_STATE_INIT};
+    uint32_t colorTargetCount = 1;
+    if (gfx_compat::normal_format(g_deviceInfo) != WGPUTextureFormat_Undefined) {
+        colorTargets[1].format = gfx_compat::normal_format(g_deviceInfo);
+        colorTargets[1].writeMask = WGPUColorWriteMask_None;
+        colorTargetCount = 2;
+    }
+    fragment.targetCount = colorTargetCount;
+    fragment.targets = colorTargets;
     WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
     depthStencil.format = g_deviceInfo.depth_format;
     depthStencil.depthWriteEnabled = WGPUOptionalBool_False;
@@ -245,21 +349,36 @@ bool build_debug_pipeline() {
 
 void on_debug_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
+    // Scene-pass attachment guard (thin g-buffer): our pipelines declare the target count the
+    // device reported at init. If the host's normal buffer has been toggled since, that count no
+    // longer matches this pass and recording the draw would be a WebGPU validation error - skip
+    // it instead and let the game thread report it. Reloading the mod rebuilds the pipelines.
+    if (gfx_compat::normal_format(*ctx) != gfx_compat::normal_format(g_deviceInfo)) {
+        g_normalFormatMismatch.store(true, std::memory_order_relaxed);
+        return;
+    }
     if (payloadSize != sizeof(DebugDrawPayload)) {
         return;
     }
     DebugDrawPayload data;
     std::memcpy(&data, payload, sizeof(data));
-    if (data.normal == nullptr || g_debugPipeline == nullptr) {
+    if (data.normal == nullptr || data.alt == nullptr || g_debugPipeline == nullptr) {
         return;
     }
-    WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
-    entry.binding = 0;
-    entry.textureView = data.normal;
+    WGPUBindGroupEntry entries[3] = {
+        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    entries[0].binding = 0;
+    entries[0].textureView = data.normal;
+    entries[1].binding = 1;
+    entries[1].textureView = data.alt;
+    entries[2].binding = 2;
+    entries[2].buffer = ctx->uniform_buffer;
+    entries[2].offset = data.uniformOffset;
+    entries[2].size = data.uniformSize;
     WGPUBindGroupDescriptor bgDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bgDesc.layout = g_debugLayout;
-    bgDesc.entryCount = 1;
-    bgDesc.entries = &entry;
+    bgDesc.entryCount = 3;
+    bgDesc.entries = entries;
     WGPUBindGroup group = wgpuDeviceCreateBindGroup(ctx->device, &bgDesc);
     if (group == nullptr) {
         return;
@@ -277,10 +396,12 @@ void on_compute(
     }
     ComputePayload data;
     std::memcpy(&data, payload, sizeof(data));
-    if (data.sceneDepth == nullptr || data.normalOut == nullptr || g_pipeline == nullptr) {
+    if (data.sceneDepth == nullptr || data.normalOut == nullptr ||
+        data.authoredNormal == nullptr || data.altOut == nullptr || g_pipeline == nullptr)
+    {
         return;
     }
-    WGPUBindGroupEntry entries[3] = {
+    WGPUBindGroupEntry entries[5] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
         WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
     entries[0].binding = 0;
     entries[0].textureView = data.sceneDepth;
@@ -290,9 +411,13 @@ void on_compute(
     entries[2].buffer = ctx->uniform_buffer;
     entries[2].offset = data.uniformOffset;
     entries[2].size = data.uniformSize;
+    entries[3].binding = 3;
+    entries[3].textureView = data.authoredNormal;
+    entries[4].binding = 4;
+    entries[4].textureView = data.altOut;
     WGPUBindGroupDescriptor bgDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bgDesc.layout = g_layout;
-    bgDesc.entryCount = 3;
+    bgDesc.entryCount = 5;
     bgDesc.entries = entries;
     WGPUBindGroup group = wgpuDeviceCreateBindGroup(ctx->device, &bgDesc);
     if (group == nullptr) {
@@ -313,6 +438,7 @@ void on_scene_begin(ModContext*, const GfxStageContext* stageCtx, void*) {
     tick_retired();
     g_frameComputed = false;
     g_frameView = nullptr;
+    g_frameAltView = nullptr;
     g_cameraValid = false;
     if (stageCtx == nullptr || stageCtx->struct_size < sizeof(GfxStageContext) ||
         stageCtx->game_view == nullptr)
@@ -328,6 +454,40 @@ void on_scene_begin(ModContext*, const GfxStageContext* stageCtx, void*) {
     g_cameraValid = true;
 }
 
+bool get_bool_option(ConfigVarHandle var, bool fallback) {
+    bool value = fallback;
+    if (var == 0 || svc_config->get_bool(mod_ctx, var, &value) != MOD_OK) {
+        return fallback;
+    }
+    return value;
+}
+
+int64_t get_int_option(ConfigVarHandle var, int64_t fallback) {
+    int64_t value = fallback;
+    if (var == 0 || svc_config->get_int(mod_ctx, var, &value) != MOD_OK) {
+        return fallback;
+    }
+    return value;
+}
+
+// Debug view modes; must match the switch in res/debug.wgsl.
+constexpr int64_t kDebugModeCount = 5;
+
+bool debug_overlay_on() { return get_bool_option(g_cvarNormalsDebug, false); }
+
+// Modes 1-4 compare the two normal sources, which needs the authored buffer; without it there is
+// nothing to compare, so the overlay falls back to showing the service output.
+uint32_t debug_mode() {
+    int64_t mode =
+        std::clamp(get_int_option(g_cvarDebugMode, 0), int64_t{0}, kDebugModeCount - 1);
+    if (!g_authoredAvailable) {
+        mode = 0;
+    }
+    return static_cast<uint32_t>(mode);
+}
+
+bool authored_selected() { return g_authoredAvailable && get_bool_option(g_cvarUseAuthored, true); }
+
 // The exported service entry point (see g_dtnService below).
 ModResult get_frame(ModContext*, DepthToNormalFrame* out) {
     if (out == nullptr || out->struct_size < sizeof(DepthToNormalFrame)) {
@@ -340,23 +500,52 @@ ModResult get_frame(ModContext*, DepthToNormalFrame* out) {
         return MOD_UNAVAILABLE;
     }
     if (!g_frameComputed) {
+        const bool useAuthored = authored_selected();
+        const bool wantCompare = debug_overlay_on() && debug_mode() != 0;
+
         GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
         resolveDesc.color = false;
         resolveDesc.depth = true;
+        // Only pay for the normal snapshot when something will read it: with authored normals
+        // switched off and no comparison view up, this is exactly the old depth-only path, which
+        // is what makes the A/B toggle an honest performance comparison too.
+        gfx_compat::request_normal(resolveDesc, g_authoredAvailable && (useAuthored || wantCompare));
         GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
         if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) != MOD_OK ||
             resolved.depth == nullptr || resolved.width == 0 || resolved.height == 0)
         {
             return MOD_UNAVAILABLE;
         }
-        if (!ensure_target(resolved.width, resolved.height)) {
+        // Depth stays the hard requirement. A missing normal snapshot is never a failure - it
+        // just means every pixel takes the reconstruction path.
+        if (!ensure_target(
+                g_target, resolved.width, resolved.height, "depth-to-normal world normal")) {
             return MOD_UNAVAILABLE;
         }
+        bool comparing = wantCompare &&
+            ensure_target(g_altTarget, resolved.width, resolved.height,
+                "depth-to-normal alternate normal");
+        if (!comparing) {
+            retire_target(g_altTarget);
+        }
+
         ReconstructUniforms uniforms{};
         std::memcpy(uniforms.view_from_proj, g_viewFromProj, sizeof(uniforms.view_from_proj));
         std::memcpy(uniforms.world_from_view, g_worldFromView, sizeof(uniforms.world_from_view));
         uniforms.inv_size[0] = 1.0f / static_cast<float>(resolved.width);
         uniforms.inv_size[1] = 1.0f / static_cast<float>(resolved.height);
+        const bool authoredBound = gfx_compat::resolved_normal(resolved) != nullptr;
+        uniforms.use_authored = (authoredBound && useAuthored) ? 1.0f : 0.0f;
+        uniforms.debug_compare = comparing ? 1.0f : 0.0f;
+        // Basis diagnostic: the authored normal is rotated by GX's model-view matrix while the
+        // reconstruction comes from the camera service's view_from_proj. Those should be the same
+        // view basis; if the Difference view says otherwise, this flips the suspect axes without
+        // a rebuild. 0 = as-is, 1 = flip Y, 2 = flip Z, 3 = flip both.
+        const int64_t basis = std::clamp(get_int_option(g_cvarAuthoredBasis, 0), int64_t{0}, int64_t{3});
+        uniforms.basis_flip[0] = 1.0f;
+        uniforms.basis_flip[1] = (basis == 1 || basis == 3) ? -1.0f : 1.0f;
+        uniforms.basis_flip[2] = (basis == 2 || basis == 3) ? -1.0f : 1.0f;
+
         GfxRange range{0, 0};
         if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &range) != MOD_OK) {
             return MOD_UNAVAILABLE;
@@ -364,6 +553,8 @@ ModResult get_frame(ModContext*, DepthToNormalFrame* out) {
         ComputePayload payload{};
         payload.sceneDepth = resolved.depth;
         payload.normalOut = g_target.view;
+        payload.authoredNormal = authoredBound ? gfx_compat::resolved_normal(resolved) : g_dummyAuthoredView;
+        payload.altOut = comparing ? g_altTarget.view : g_dummyAltView;
         payload.uniformOffset = range.offset;
         payload.uniformSize = range.size;
         payload.width = resolved.width;
@@ -374,6 +565,10 @@ ModResult get_frame(ModContext*, DepthToNormalFrame* out) {
         g_frameView = g_target.view;
         g_frameWidth = resolved.width;
         g_frameHeight = resolved.height;
+        g_frameAltView = comparing ? g_altTarget.view : nullptr;
+        // The alternate holds the authored normal exactly when the output is the reconstruction.
+        g_frameAltIsAuthored = uniforms.use_authored < 0.5f;
+        g_frameUsedAuthored = uniforms.use_authored > 0.5f;
         g_frameComputed = true;
     }
     out->normal = g_frameView;
@@ -383,38 +578,190 @@ ModResult get_frame(ModContext*, DepthToNormalFrame* out) {
 }
 
 void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
-    bool debugOn = false;
-    if (g_cvarNormalsDebug == 0 ||
-        svc_config->get_bool(mod_ctx, g_cvarNormalsDebug, &debugOn) != MOD_OK || !debugOn)
-    {
+    if (!debug_overlay_on()) {
         return;
     }
     DepthToNormalFrame frame = DEPTH_TO_NORMAL_FRAME_INIT;
     if (get_frame(mod_ctx, &frame) != MOD_OK || frame.normal == nullptr) {
         return;
     }
+    // A comparison view needs the alternate buffer. If it did not run this frame (no normal
+    // buffer, or the allocation failed), show the service output rather than garbage.
+    DebugUniforms uniforms{};
+    uniforms.mode = g_frameAltView != nullptr ? debug_mode() : 0u;
+    uniforms.alt_is_authored = g_frameAltIsAuthored ? 1u : 0u;
+    GfxRange range{0, 0};
+    if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &range) != MOD_OK) {
+        return;
+    }
     DebugDrawPayload payload{};
     payload.normal = frame.normal;
+    payload.alt = g_frameAltView != nullptr ? g_frameAltView : g_dummyAltView;
+    payload.uniformOffset = range.offset;
+    payload.uniformSize = range.size;
     svc_gfx->push_draw(mod_ctx, g_debugDrawType, &payload, sizeof(payload));
+}
+
+void add_control(UiElementHandle pane, const UiControlDesc& desc) {
+    svc_ui->pane_add_control(mod_ctx, pane, &desc, nullptr);
+}
+
+bool authored_unavailable(ModContext*, void*) { return !g_authoredAvailable; }
+
+char g_statusText[160] = "Waiting for a scene frame";
+
+// Live readout of which source the provider is actually feeding consumers, plus the MSAA sample
+// count - which belongs here because it directly limits how much of the screen CAN use authored
+// normals: the host resolves the normal target by averaging samples, so every partially covered
+// pixel carries a blended normal that this mod has to reject and reconstruct instead.
+void status_get(ModContext*, void*, UiControlValue* outValue) {
+    const char* source;
+    if (!g_authoredAvailable) {
+        source = "Reconstructed - this game build has no normal buffer";
+    } else if (!get_bool_option(g_cvarUseAuthored, true)) {
+        source = "Reconstructed from depth (authored normals off)";
+    } else if (g_frameUsedAuthored) {
+        source = "Authored, reconstructing where absent";
+    } else {
+        source = "Authored - waiting for a scene frame";
+    }
+    if (g_deviceInfo.sample_count > 1) {
+        std::snprintf(g_statusText, sizeof(g_statusText), "%s [MSAA %ux - silhouettes blend]",
+            source, g_deviceInfo.sample_count);
+    } else {
+        std::snprintf(g_statusText, sizeof(g_statusText), "%s [no MSAA]", source);
+    }
+    outValue->string_value = g_statusText;
+}
+void status_set(ModContext*, void*, const UiControlValue*) {}
+bool status_disabled(ModContext*, void*) { return true; }
+
+void add_authored_toggle(UiElementHandle pane) {
+    UiControlDesc control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_TOGGLE;
+    control.label = "Use Authored Normals";
+    control.help_rml =
+        "Chooses where the surface normal every other mod consumes comes from.<br/>On: the game's "
+        "own authored vertex normals, read from the renderer's thin g-buffer - smooth across "
+        "low-poly surfaces, so AO and shadows show no faceting. Pixels with no authored normal "
+        "(sky, UI, billboards, effects that do not write depth) still reconstruct.<br/>Off: the "
+        "5-tap depth-gradient reconstruction, which is the flat face normal of each triangle. "
+        "<br/>The switch is live and applies to every consumer at once (VBAO, SSILVB, Realtime "
+        "Sun Shadows, SMAA), so it is the A/B for the whole stack. Needs a game build with the "
+        "normal buffer; on older builds it is greyed out and everything reconstructs.";
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = g_cvarUseAuthored;
+    control.is_disabled = authored_unavailable;
+    add_control(pane, control);
+}
+
+void add_status_line(UiElementHandle pane) {
+    UiControlDesc control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_STRING;
+    control.label = "Normal Source";
+    control.help_rml = "Which source fed the normal buffer on the last drawn frame.";
+    control.binding = UI_BINDING_CALLBACKS;
+    control.get = status_get;
+    control.set = status_set;
+    control.is_disabled = status_disabled;
+    add_control(pane, control);
+}
+
+void add_debug_toggle(UiElementHandle pane) {
+    UiControlDesc control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_TOGGLE;
+    control.label = "Show Normals";
+    control.help_rml =
+        "Draws the normal buffer over the whole screen at the very end of the frame (after every "
+        "other effect), as a diagnostic. World normal XYZ maps to RGB; sky / invalid pixels are "
+        "black. Which of the comparison views it draws is picked under Open Normal Controls.";
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = g_cvarNormalsDebug;
+    add_control(pane, control);
+}
+
+ModResult build_controls_tab(
+    ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*, ModError*) {
+    (void)right;
+    add_authored_toggle(left);
+    add_status_line(left);
+    add_debug_toggle(left);
+
+    static const char* kDebugOptions[] = {
+        "Service Output", "Authored", "Reconstructed", "Difference", "Coverage"};
+    UiControlDesc control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_SELECT;
+    control.label = "Debug View";
+    control.help_rml =
+        "What Show Normals draws. Every view but the first renders both sources at once, so they "
+        "can be flipped between without touching the Use Authored Normals switch.<br/>Service "
+        "Output: what consumers get this frame.<br/>Authored: the thin g-buffer normal; black "
+        "where the pixel has none.<br/>Reconstructed: the depth-gradient normal.<br/>Difference: "
+        "the angle between the two, 0-45 degrees as black - blue - green - yellow - red. Faceting "
+        "alone reads dark with bright creases along triangle edges; a whole screen of yellow/red "
+        "means the two disagree systematically, which is a basis mismatch, not a smoothness "
+        "difference - try the Authored Basis control below.<br/>Coverage: green where an authored "
+        "normal exists, red where it falls back to the reconstruction.";
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = g_cvarDebugMode;
+    control.options = kDebugOptions;
+    control.option_count = 5;
+    control.is_disabled = authored_unavailable;
+    add_control(left, control);
+
+    static const char* kBasisOptions[] = {"As-is", "Flip Y", "Flip Z", "Flip Y and Z"};
+    control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_SELECT;
+    control.label = "Authored Basis";
+    control.help_rml =
+        "Diagnostic. The authored normal arrives rotated by the game's model-view matrix, while "
+        "the reconstruction is derived from the camera service's projection - these should be the "
+        "same view basis. If the Difference view shows a systematic disagreement rather than just "
+        "faceting, one of these flips is the fix; leave it on As-is otherwise.";
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = g_cvarAuthoredBasis;
+    control.options = kBasisOptions;
+    control.option_count = 4;
+    control.is_disabled = authored_unavailable;
+    add_control(left, control);
+    return MOD_OK;
+}
+
+void on_controls_window_closed(ModContext*, UiWindowHandle, void*) { g_controlsWindow = 0; }
+
+void on_open_controls(ModContext*, void*) {
+    if (g_controlsWindow != 0) {
+        return;
+    }
+    UiTabDesc tabs[1] = {UI_TAB_DESC_INIT};
+    tabs[0].title = "Depth to Normal";
+    tabs[0].build = build_controls_tab;
+    UiWindowDesc desc = UI_WINDOW_DESC_INIT;
+    desc.tabs = tabs;
+    desc.tab_count = 1;
+    desc.on_closed = on_controls_window_closed;
+    if (svc_ui->window_push(mod_ctx, &desc, &g_controlsWindow) != MOD_OK) {
+        svc_log->error(mod_ctx, "failed to open Depth to Normal controls window");
+    }
 }
 
 // Adds this sub-feature's section to the shared mods panel.
 void build_section(UiElementHandle panel) {
     svc_ui->pane_add_section(mod_ctx, panel, "Depth to Normal");
     svc_ui->pane_add_text(mod_ctx, panel,
-        "Reconstructs a world-space surface normal from the depth buffer each frame and provides "
-        "it to other mods (AO, GI, shadows). Passive: no on/off, just the debug view below.",
+        "Provides a world-space surface normal to other mods (AO, GI, shadows, AA) each frame, "
+        "from the game's authored vertex normals where it can and from the depth buffer where it "
+        "cannot. Passive: no on/off, just the source switch and the debug views.",
         nullptr);
-    UiControlDesc debugToggle = UI_CONTROL_DESC_INIT;
-    debugToggle.kind = UI_CONTROL_TOGGLE;
-    debugToggle.label = "Show Normals";
-    debugToggle.help_rml =
-        "Draws the reconstructed world-space normal buffer over the whole screen at the very end "
-        "of the frame (after every other effect), as a diagnostic. World normal XYZ maps to RGB; "
-        "sky / invalid pixels are black.";
-    debugToggle.binding = UI_BINDING_CONFIG_VAR;
-    debugToggle.config_var = g_cvarNormalsDebug;
-    svc_ui->pane_add_control(mod_ctx, panel, &debugToggle, nullptr);
+    add_authored_toggle(panel);
+    add_status_line(panel);
+    add_debug_toggle(panel);
+
+    UiControlDesc control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_BUTTON;
+    control.label = "Open Normal Controls";
+    control.on_pressed = on_open_controls;
+    add_control(panel, control);
 }
 
 ModResult init(ModError* error) {
@@ -424,6 +771,10 @@ ModResult init(ModError* error) {
     }
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to query device info");
+    }
+    g_authoredAvailable = gfx_compat::normal_format(g_deviceInfo) != WGPUTextureFormat_Undefined;
+    if (!build_dummy_textures()) {
+        return mods::set_error(error, MOD_ERROR, "failed to create stand-in textures");
     }
     if (!build_pipeline()) {
         return mods::set_error(error, MOD_ERROR, "failed to create reconstruct pipeline");
@@ -450,6 +801,30 @@ ModResult init(ModError* error) {
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarNormalsDebug) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register normalsDebug");
     }
+    // DEFAULT: authored normals on where the platform provides them.
+    cvarDesc = CONFIG_VAR_DESC_INIT;
+    cvarDesc.name = "useAuthoredNormals";
+    cvarDesc.type = CONFIG_VAR_BOOL;
+    cvarDesc.default_bool = true;
+    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarUseAuthored) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register useAuthoredNormals");
+    }
+    // DEFAULT: debug view 0 = the service output (what consumers get).
+    cvarDesc = CONFIG_VAR_DESC_INIT;
+    cvarDesc.name = "normalsDebugMode";
+    cvarDesc.type = CONFIG_VAR_INT;
+    cvarDesc.default_int = 0;
+    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarDebugMode) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register normalsDebugMode");
+    }
+    // DEFAULT: authored basis as-is (no axis flips).
+    cvarDesc = CONFIG_VAR_DESC_INIT;
+    cvarDesc.name = "authoredNormalBasis";
+    cvarDesc.type = CONFIG_VAR_INT;
+    cvarDesc.default_int = 0;
+    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarAuthoredBasis) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register authoredNormalBasis");
+    }
     result = svc_resource->load(mod_ctx, "debug.wgsl", &g_debugShaderSource);
     if (result != MOD_OK || g_debugShaderSource.data == nullptr) {
         return mods::set_error(error, result, "failed to load debug.wgsl");
@@ -470,6 +845,10 @@ ModResult init(ModError* error) {
     {
         return mods::set_error(error, MOD_ERROR, "failed to register frame hook");
     }
+    svc_log->info(mod_ctx,
+        g_authoredAvailable
+            ? "depth-to-normal: authored normals available (thin g-buffer)"
+            : "depth-to-normal: no normal buffer on this game build; reconstructing from depth");
     return MOD_OK;
 }
 
@@ -477,10 +856,23 @@ void shutdown() {
     svc_resource->free(mod_ctx, &g_shaderSource);
     svc_resource->free(mod_ctx, &g_debugShaderSource);
     release_target(g_target);
+    release_target(g_altTarget);
     for (auto& retired : g_retired) {
         release_target(retired.target);
     }
     g_retired.clear();
+    const auto releaseTexture = [](WGPUTexture& texture, WGPUTextureView& view) {
+        if (view != nullptr) {
+            wgpuTextureViewRelease(view);
+            view = nullptr;
+        }
+        if (texture != nullptr) {
+            wgpuTextureRelease(texture);
+            texture = nullptr;
+        }
+    };
+    releaseTexture(g_dummyAuthored, g_dummyAuthoredView);
+    releaseTexture(g_dummyAlt, g_dummyAltView);
     if (g_pipeline != nullptr) {
         wgpuComputePipelineRelease(g_pipeline);
         g_pipeline = nullptr;
@@ -501,10 +893,15 @@ void shutdown() {
     g_sceneBeginHook = 0;
     g_debugDrawType = 0;
     g_frameBeforeHudHook = 0;
-    g_cvarNormalsDebug = 0;
+    g_cvarNormalsDebug = g_cvarDebugMode = g_cvarUseAuthored = g_cvarAuthoredBasis = 0;
+    g_controlsWindow = 0;
+    g_authoredAvailable = false;
     g_cameraValid = false;
     g_frameComputed = false;
     g_frameView = nullptr;
+    g_frameAltView = nullptr;
+    g_frameAltIsAuthored = false;
+    g_frameUsedAuthored = false;
 }
 
 }  // namespace hub_dtn
@@ -540,6 +937,11 @@ GfxStageHookHandle g_sceneAfterOpaqueHook = 0;
 GfxStageHookHandle g_frameBeforeHudHook = 0;
 ResourceBuffer g_shaderSource = RESOURCE_BUFFER_INIT;
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
+// Set by the render worker when a draw's pass layout stops matching the pipelines built at init
+// (the host's thin g-buffer was toggled mid-session). Logged once from the game thread; the
+// render worker must not touch the log service.
+std::atomic<bool> g_normalFormatMismatch{false};
+bool g_loggedNormalMismatch = false;
 WGPURenderPipeline g_fogPipeline = nullptr;
 WGPURenderPipeline g_fogDebugPipeline = nullptr;
 WGPURenderPipeline g_mixedPipeline = nullptr;
@@ -854,6 +1256,14 @@ HookAction on_set_fog_pre(ModContext*, void* args, void*, void*) {
 
 void on_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
+    // Scene-pass attachment guard (thin g-buffer): our pipelines declare the target count the
+    // device reported at init. If the host's normal buffer has been toggled since, that count no
+    // longer matches this pass and recording the draw would be a WebGPU validation error - skip
+    // it instead and let the game thread report it. Reloading the mod rebuilds the pipelines.
+    if (gfx_compat::normal_format(*ctx) != gfx_compat::normal_format(g_deviceInfo)) {
+        g_normalFormatMismatch.store(true, std::memory_order_relaxed);
+        return;
+    }
     if (payloadSize != sizeof(DrawPayload)) {
         return;
     }
@@ -1348,8 +1758,21 @@ bool build_fog_pipeline(bool blend, const char* entryPoint, WGPURenderPipeline& 
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = module;
     fragment.entryPoint = {entryPoint, WGPU_STRLEN};
-    fragment.targetCount = 1;
-    fragment.targets = &colorTarget;
+    // Thin g-buffer (platform-gbuffer-test and later): when the host writes the game's authored
+    // normals to a SECOND color attachment, every pipeline recorded into the scene pass must
+    // declare a matching second target - WebGPU requires the attachment counts to agree, and a
+    // one-target pipeline is rejected outright. This effect never writes normals, so the target
+    // exists purely to match the pass and its write mask is off. Undefined (buffer disabled, and
+    // every platform before it) leaves this at a single target, unchanged.
+    WGPUColorTargetState colorTargets[2] = {colorTarget, WGPU_COLOR_TARGET_STATE_INIT};
+    uint32_t colorTargetCount = 1;
+    if (gfx_compat::normal_format(g_deviceInfo) != WGPUTextureFormat_Undefined) {
+        colorTargets[1].format = gfx_compat::normal_format(g_deviceInfo);
+        colorTargets[1].writeMask = WGPUColorWriteMask_None;
+        colorTargetCount = 2;
+    }
+    fragment.targetCount = colorTargetCount;
+    fragment.targets = colorTargets;
     WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
     depthStencil.format = g_deviceInfo.depth_format;
     depthStencil.depthWriteEnabled = WGPUOptionalBool_False;
@@ -1539,6 +1962,18 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 }
 
 MOD_EXPORT ModResult mod_update(ModError*) {
+    if (!hub_dtn::g_loggedNormalMismatch && hub_dtn::g_normalFormatMismatch.load(std::memory_order_relaxed)) {
+        hub_dtn::g_loggedNormalMismatch = true;
+        svc_log->warn(mod_ctx,
+            "scene pass normal-target layout changed since init; composite skipped - "
+            "reload this mod to rebuild its pipelines");
+    }
+    if (!hub_fog::g_loggedNormalMismatch && hub_fog::g_normalFormatMismatch.load(std::memory_order_relaxed)) {
+        hub_fog::g_loggedNormalMismatch = true;
+        svc_log->warn(mod_ctx,
+            "scene pass normal-target layout changed since init; composite skipped - "
+            "reload this mod to rebuild its pipelines");
+    }
     return MOD_OK;
 }
 
