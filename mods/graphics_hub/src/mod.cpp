@@ -606,7 +606,7 @@ struct MixedFogUniforms {
     MixedFogEntry configs[8];
     uint32_t count;
     uint32_t debug_mode;
-    float _pad0;
+    uint32_t fallback_index;  // config for pixels the ID replay didn't cover (see push_fog_quad)
     float _pad1;
 };
 static_assert(sizeof(MixedFogUniforms) % 16 == 0);
@@ -659,6 +659,42 @@ bool config_matches(const FogConfig& reference, const FogConfig& candidate) {
            std::fabs(candidate.endZ - reference.endZ) <= span * 0.02f &&
            std::fabs(candidate.nearZ - reference.nearZ) <= 1.0f &&
            std::fabs(candidate.farZ - reference.farZ) <= reference.farZ * 0.01f + 1.0f;
+}
+
+// The Hyrule Castle "Ganon barrier" (game actor d_a_obj_ganonwall2) is a translucent dome, but it
+// draws in the OPAQUE BG list (its Draw() calls dComIfGd_setListBG()), so it lands inside the
+// suppression scope. Every frame that actor rewrites its material fog to pure BLACK with a huge
+// range (startZ 1000, endZ 250000) so the dome fades to black at distance. If we defer that config,
+// two things break: the config-ID replay rasterizes the (really translucent) dome SOLID and stamps
+// its black fog onto the castle and trees INSIDE it (they turn dark), and the barrier's own
+// fog-then-blend compositing is lost. So we recognise this one distinctive signature and leave the
+// barrier entirely on its vanilla forward fog: its shapes are never suppressed and never registered
+// as a frame config. The frame then stays uniform (the field fog), the geometry inside the barrier
+// keeps the correct field fog, and the dome keeps its own black forward fog. (Residual: the
+// fullscreen quad still adds the field fog over the dome pixels — minor, and far better than the
+// black-stamped geometry it replaces. A perfect result is impossible here: a single fullscreen fog
+// pass cannot reproduce per-fragment fog through a translucent surface.)
+//
+// Signature match is deliberately narrow — fully black color AND a far plane past 100000 — so it
+// cannot catch normal fog or the black twilight fog (which keeps a normal range).
+bool is_barrier_fog(const FogConfig& c) {
+    return c.color.r == 0 && c.color.g == 0 && c.color.b == 0 && c.endZ > 100000.0f;
+}
+
+// Index of the captured config with the widest projection far plane — TP's distant-scenery fog
+// (Death Mountain, the castle). Used as the uncovered-pixel fallback in the fog quad AND as the
+// config-ID replay stamp for the barrier dome, so the far geometry inside/behind the barrier
+// resolves to that gentle long-range fog instead of the aggressive near fog (config 0).
+uint32_t widest_far_index() {
+    uint32_t idx = 0;
+    float widest = g_frameConfigCount > 0 ? g_frameConfigs[0].farZ : 0.0f;
+    for (uint32_t i = 1; i < g_frameConfigCount; ++i) {
+        if (g_frameConfigs[i].farZ > widest) {
+            widest = g_frameConfigs[i].farZ;
+            idx = i;
+        }
+    }
+    return idx;
 }
 
 bool exact_mode() {
@@ -738,7 +774,11 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
             config.nearZ = fog->mNearZ;
             config.farZ = fog->mFarZ;
             config.color = fog->mColor;
-            index = lookup_frame_config(config);
+            // The barrier dome (excluded from the config table) is a translucent surface drawn
+            // solid in the replay; stamping it as the near config 0 would darken the distant castle
+            // behind it. Resolve it to the distant (widest-far) fog instead, which is what that
+            // castle uses.
+            index = is_barrier_fog(config) ? widest_far_index() : lookup_frame_config(config);
         }
         const auto idByte = static_cast<u8>((index + 1) * 24);
         GXSetNumTevStages(1);
@@ -775,6 +815,9 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     config.nearZ = fog->mNearZ;
     config.farZ = fog->mFarZ;
     config.color = fog->mColor;
+    if (is_barrier_fog(config)) {
+        return HOOK_CONTINUE;  // leave the Ganon barrier on its own forward fog (see is_barrier_fog)
+    }
     if (vote_config(config)) {
         GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, GXColor{0, 0, 0, 0});
     }
@@ -800,6 +843,9 @@ HookAction on_set_fog_pre(ModContext*, void* args, void*, void*) {
     config.nearZ = mods::arg<float>(args, 3);
     config.farZ = mods::arg<float>(args, 4);
     config.color = mods::arg<GXColor>(args, 5);
+    if (is_barrier_fog(config)) {
+        return HOOK_CONTINUE;  // leave the Ganon barrier on its own forward fog (see is_barrier_fog)
+    }
     if (vote_config(config)) {
         mods::arg_ref<GXFogType>(args, 0) = GX_FOG_NONE;
     }
@@ -889,6 +935,14 @@ void push_fog_quad() {
         }
         uniforms.count = g_frameConfigCount;
         uniforms.debug_mode = debugMode;
+        // Pixels the config-ID replay did not cover fall back to this config. TP draws distant
+        // scenery (Death Mountain, the castle behind the barrier) with a WIDER projection far plane
+        // and a separate, gentle long-range fog; the single-projection replay clips that far
+        // geometry, so its pixels are uncovered. Falling those back to config 0 (the aggressive
+        // NEAR fog, which reads ~fully fogged at that distance) is what over-fogs / darkens the
+        // distant subjects. Fall back instead to the config with the widest far plane — that IS the
+        // distant-scenery fog — so uncovered far geometry gets its correct light fog.
+        uniforms.fallback_index = widest_far_index();
         GfxRange uniformRange{0, 0};
         if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &uniformRange) !=
             MOD_OK)
@@ -983,6 +1037,50 @@ bool replay_config_ids(uint32_t width, uint32_t height) {
     }
     g_configIdView = resolved.color;
     return true;
+}
+
+// Diagnostic: dump the frame's captured fog-config table on change, so the exact configs at a
+// spot (uniform vs multiple, their ranges/colors) can be read off in-game. Off by default.
+ConfigVarHandle g_cvarFogLog = 0;
+char g_lastFogLogSig[128] = "";
+
+void log_fog_configs() {
+    if (!get_bool_option(g_cvarFogLog, false)) {
+        g_lastFogLogSig[0] = '\0';
+        return;
+    }
+    const bool exact = exact_mode();
+    // Signature over the table so we only log when it changes.
+    char sig[128];
+    int n = std::snprintf(sig, sizeof(sig), "%d|%u|%u|%.0f|%.0f|%d,%d,%d", exact ? 1 : 0,
+        g_frameConfigCount, static_cast<unsigned>(g_reference.type), g_reference.startZ,
+        g_reference.endZ, g_reference.color.r, g_reference.color.g, g_reference.color.b);
+    for (uint32_t i = 0; i < g_frameConfigCount && n < static_cast<int>(sizeof(sig)); ++i) {
+        n += std::snprintf(sig + n, sizeof(sig) - n, ";%.0f/%.0f", g_frameConfigs[i].startZ,
+            g_frameConfigs[i].endZ);
+    }
+    if (std::strcmp(sig, g_lastFogLogSig) == 0) {
+        return;
+    }
+    std::snprintf(g_lastFogLogSig, sizeof(g_lastFogLogSig), "%s", sig);
+
+    char msg[200];
+    std::snprintf(msg, sizeof(msg),
+        "fog: mode=%s configs=%u  REF type=%u rgb(%u,%u,%u) start=%.0f end=%.0f near=%.1f far=%.0f",
+        exact ? "exact" : "vanilla", g_frameConfigCount, static_cast<unsigned>(g_reference.type),
+        static_cast<unsigned>(g_reference.color.r), static_cast<unsigned>(g_reference.color.g),
+        static_cast<unsigned>(g_reference.color.b), g_reference.startZ, g_reference.endZ,
+        g_reference.nearZ, g_reference.farZ);
+    svc_log->info(mod_ctx, msg);
+    for (uint32_t i = 0; i < g_frameConfigCount; ++i) {
+        const FogConfig& c = g_frameConfigs[i];
+        std::snprintf(msg, sizeof(msg),
+            "  cfg %u: type=%u rgb(%u,%u,%u) start=%.0f end=%.0f near=%.1f far=%.0f", i,
+            static_cast<unsigned>(c.type), static_cast<unsigned>(c.color.r),
+            static_cast<unsigned>(c.color.g), static_cast<unsigned>(c.color.b), c.startZ, c.endZ,
+            c.nearZ, c.farZ);
+        svc_log->info(mod_ctx, msg);
+    }
 }
 
 void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
@@ -1082,6 +1180,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
         std::snprintf(g_statusText, sizeof(g_statusText), "Deferring fog (%u draws this frame)",
             g_suppressedCount);
     }
+
+    log_fog_configs();
 }
 
 void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
@@ -1144,13 +1244,15 @@ ModResult build_controls_tab(
     control.kind = UI_CONTROL_SELECT;
     control.label = "Mixed Scenes";
     control.help_rml =
-        "How scenes that draw with several fog configurations are handled.<br/>Vanilla: fall "
-        "back to the game's forward fog (exact, but AO/shadows then darken the fog itself at "
-        "range).<br/>Exact (replay): defer every configuration - the opaque geometry is "
-        "replayed once into a per-pixel config-ID buffer and each pixel gets its own exact fog. "
-        "Costs one extra opaque scene of per-frame geometry streaming on mixed frames; with "
-        "heavy shadow-cascade settings this can crowd the engine's fixed streaming buffers, so "
-        "prefer Vanilla there until the adaptive-buffer engine update lands.";
+        "How scenes that draw with several fog configurations are handled.<br/><b>Vanilla</b> "
+        "(default, recommended): in a multi-config scene, revert that scene to the game's own "
+        "forward fog - exactly vanilla - while still deferring in the common single-config scenes "
+        "(so the AO/shadow benefit is kept where it works). Best for matching vanilla.<br/>"
+        "<b>Exact (replay)</b>: always defer, replaying the opaque geometry into a per-pixel "
+        "config-ID buffer. It cannot faithfully reproduce scenes that mix a near fog with a "
+        "separate long-range fog for distant scenery (e.g. Hyrule Field's Death Mountain / the "
+        "Ganon barrier), where it over-fogs the distant subjects - use Vanilla there. Also costs "
+        "one extra opaque geometry pass on mixed frames.";
     control.binding = UI_BINDING_CONFIG_VAR;
     control.config_var = g_cvarFogMixed;
     control.options = kMixedOptions;
@@ -1169,6 +1271,18 @@ ModResult build_controls_tab(
     control.config_var = g_cvarFogDebug;
     control.options = kDebugOptions;
     control.option_count = 3;
+    add_control(left, control);
+
+    control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_TOGGLE;
+    control.label = "Log Fog Configs";
+    control.help_rml =
+        "Diagnostic: prints the frame's captured fog configuration table to the log whenever it "
+        "changes - the number of distinct fog configs and each one's type, color, and start/end/"
+        "near/far range. Use it to see what fog a spot actually uses (e.g. is a distant subject one "
+        "config or several).";
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = g_cvarFogLog;
     add_control(left, control);
     return MOD_OK;
 }
@@ -1272,11 +1386,13 @@ ModResult init(ModError* error) {
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogEnabled) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
-    // DEFAULT: mixed-scene mode = Exact replay (1). 0 = Vanilla fallback.
+    // DEFAULT: mixed-scene mode = Vanilla revert (0). 1 = Exact replay. Vanilla matches the game's
+    // fog exactly in multi-config scenes (e.g. Hyrule Field's near + distant-scenery fog), which
+    // Exact cannot reproduce; Exact still defers single-config scenes fine but over-fogs those.
     cvarDesc = CONFIG_VAR_DESC_INIT;
     cvarDesc.name = "fogMixedMode";
     cvarDesc.type = CONFIG_VAR_INT;
-    cvarDesc.default_int = 1;
+    cvarDesc.default_int = 0;
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogMixed) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
@@ -1286,6 +1402,14 @@ ModResult init(ModError* error) {
     cvarDesc.type = CONFIG_VAR_INT;
     cvarDesc.default_int = 0;
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogDebug) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register fog option");
+    }
+    // DEFAULT: fog-config diagnostic logging off.
+    cvarDesc = CONFIG_VAR_DESC_INIT;
+    cvarDesc.name = "fogLogConfigs";
+    cvarDesc.type = CONFIG_VAR_BOOL;
+    cvarDesc.default_bool = false;
+    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogLog) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
 
@@ -1365,7 +1489,8 @@ void shutdown() {
     releaseLayout(g_fogDebugLayout);
     releaseLayout(g_mixedLayout);
     releaseLayout(g_mixedDebugLayout);
-    g_cvarFogEnabled = g_cvarFogMixed = g_cvarFogDebug = 0;
+    g_cvarFogEnabled = g_cvarFogMixed = g_cvarFogDebug = g_cvarFogLog = 0;
+    g_lastFogLogSig[0] = '\0';
     g_controlsWindow = 0;
     g_drawType = g_sceneBeginHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;
     g_scopeActive = g_quadArmed = g_suppressAllowed = g_shapeHookOk = g_wasSuppressing = false;

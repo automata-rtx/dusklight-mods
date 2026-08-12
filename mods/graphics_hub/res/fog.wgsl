@@ -47,7 +47,7 @@ struct MixedFogUniforms {
     configs: array<MixedFogEntry, 8>,
     count: u32,
     debug_mode: u32, // 1 = combined fog factor, 2 = config-ID visualization
-    _pad0: f32,
+    fallback_index: u32, // config for pixels the ID replay didn't cover (clipped distant scenery)
     _pad1: f32,
 }
 
@@ -129,19 +129,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
 // ~0 rejects all of that so it falls back to config 0 (the reference config, which is the
 // correct room fog for grass anyway) instead of a per-pixel config that flickers with the
 // lighting. (Pure-red bypassed geometry could still alias, but none occurs in practice.)
+// Returns the fog-config index for a pixel from the ID buffer. Pixels the replay did not cover
+// (background/clipped distant scenery, or non-J3D drawers) decode as invalid and fall back to
+// mixed.fallback_index — the widest-far distant fog — rather than config 0 (the near fog), so
+// distant geometry the single-projection replay clipped is not over-fogged by the near config.
 fn config_index_at(uv: vec2f) -> u32 {
     let size = vec2<i32>(textureDimensions(config_ids));
     let texel = clamp(vec2<i32>(uv * vec2f(size)), vec2<i32>(0i), size - 1i);
     let c = textureLoad(config_ids, texel, 0i);
     if c.g > 0.03 || c.b > 0.03 {
-        return 0u;
+        return mixed.fallback_index;
     }
     let v = i32(round(c.r * 255.0));
     let slot = (v + 12i) / 24i;
     if slot >= 1i && u32(slot) <= mixed.count && abs(v - slot * 24i) <= 4i {
         return u32(slot) - 1u;
     }
-    return 0u;
+    return mixed.fallback_index;
 }
 
 @fragment
