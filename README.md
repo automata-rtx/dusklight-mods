@@ -75,9 +75,3 @@ all seven platforms and merges each into one cross-platform `.dusk` via `tools/m
   provider (now the Depth to Normal feature of Graphics Hub) and how other mods tap its service
 - `docs/mod-api-notes.md` — mod-API pitfalls learned the hard way
 - Upstream mod API reference: <https://github.com/TwilitRealm/dusklight/blob/main/docs/modding.md>
-
-## iOS note
-
-Code mods cannot run on iOS (dlopen restriction). The pre-mod-API standalone build (release
-`standalone-final` on automata-rtx/dusklight-ao) is the only build with these graphics features
-on iPhone.

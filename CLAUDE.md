@@ -357,10 +357,7 @@ Do not resurrect it without a concrete reason — appending fields to SDK struct
     see `docs/authored_normals.md` §9.5).
   - Branch `claude/dusklight-platform-rebuild-rqhsaw` / `platform-v2-test` (`9361fbd9ea`) = the
     superseded pre-g-buffer platform.
-  - Branch `claude/standalone-final` + the `standalone-final` release = the pre-mod-API aurora-fork
-    build; that build is the ONLY way the graphics features run on iOS (code mods cannot run there —
-    dlopen restriction), so never delete it. (`mod-platform` / `platform-v1` are the superseded
-    first-generation platform — historical only.)
-- `automata-rtx/aurora-ao` — our aurora fork. Branch `claude/dusklight-platform-rebuild-rqhsaw` =
-  the platform's aurora (mainline-pinned + enlarged buffers, above). Other branches remain the
-  frozen fork the `standalone-final` build uses.
+  - `mod-platform` / `platform-v1` are the superseded first-generation platform — historical only.
+- `automata-rtx/aurora-ao` — our aurora fork. **No longer part of the build.** Branch
+  `claude/dusklight-platform-rebuild-rqhsaw` = the platform's aurora (mainline-pinned + enlarged
+  buffers, above); other branches are historical.
