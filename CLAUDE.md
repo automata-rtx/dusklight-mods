@@ -255,6 +255,12 @@ The user typically does not build locally. Iteration loop:
   see `docs/normal_buffer_portability.md`.
 - **VBAO stays service-only.** If a feature seems to need game code, it belongs in the shadow
   mod or needs an upstream service extension — don't add game includes to `vbao`.
+- **Never name a config var `enabled`.** That fragment is **reserved by the loader**, which owns the
+  per-mod enable/disable toggle and persists it under the same key; `register_var` rejects it. A mod
+  that registers it first in `mod_initialize` fails to load outright with a message that reads like a
+  registration bug rather than a name collision — this cost Celestial Orbit its entire first
+  in-game outing. Use a qualified name (`orbitEnabled`, `fogEnabled`). See `ConfigVarDesc` in
+  `mods/svc/config.h`, which is the only place the reservation is documented.
 - **The ABI pin**: the platform is pinned by **`DUSKLIGHT_VERSION` in the top-level `CMakeLists.txt`**,
   fetched from `DUSKLIGHT_REPOSITORY` — which is now **upstream `TwilitRealm/dusklight`**, not a fork.
   It currently points at **`0fc05028`** (upstream `main`, 2026-08-09). There is no fork delta left:

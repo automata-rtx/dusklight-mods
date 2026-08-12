@@ -302,7 +302,11 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // DEFAULT: on, with both bodies peaking at 75 degrees (well clear of the 80-degree ceiling)
     // and no yaw. Untick Enabled for bit-exact vanilla.
     ConfigVarDesc enabledDesc = CONFIG_VAR_DESC_INIT;
-    enabledDesc.name = "enabled";
+    // NOT "enabled": that name fragment is reserved by the loader, which owns the per-mod
+    // enable/disable toggle and persists it under the same key. register_var rejects it, and
+    // since this is the first call in mod_initialize the whole mod failed to load with
+    // "failed to register enabled option". See ConfigVarDesc in mods/svc/config.h.
+    enabledDesc.name = "orbitEnabled";
     enabledDesc.type = CONFIG_VAR_BOOL;
     enabledDesc.default_bool = true;
     if (svc_config->register_var(mod_ctx, &enabledDesc, &g_cvarEnabled) != MOD_OK) {
