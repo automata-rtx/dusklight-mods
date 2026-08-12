@@ -80,15 +80,43 @@ CLAUDE.md, "Every render pipeline recorded into the scene pass must declare TWO 
 
 ---
 
-## 3. Doing the re-platform
+## 3. This already happened — and the shim held
 
-1. Bump `DUSKLIGHT_VERSION` (and `DUSKLIGHT_SDK_STUB_URL` if the release tag changes) per CLAUDE.md,
-   "Re-platforming".
+The tree now pins **upstream Dusklight** (`0fc05028`), which has no normal buffer of any kind. The
+move needed **zero source changes**: a wiped-tree `cmake -B build && cmake --build build` against the
+upstream SDK compiled, linked and packaged all seven mods with no errors. `normal_format` does not
+appear anywhere in that SDK, so every accessor above took its absent-field branch.
+
+### The failure this prevented, and the one it didn't
+
+Our old fork appended `GfxDeviceInfo::normal_format` at **offset 40**. Upstream independently
+appended `WGPUInstance instance` at **the same offset**, and grew the struct from 48 to 56 bytes.
+Fork-built `.dusk` files run on an upstream build therefore:
+
+- failed the host's `caller->struct_size < sizeof(host struct)` check (48 < 56), and
+- read a live `WGPUInstance` pointer as a texture format — non-zero, so `!= Undefined`, so every
+  scene-pass composite declared **two** colour targets against a **one**-attachment pass and was
+  rejected outright.
+
+Result: the mods loaded and did nothing. Rebuilding against the upstream SDK fixes both, and the
+shim is what made that a pin bump rather than an edit across five mods.
+
+**What the shim does not cover:** appending a field to an SDK struct is not forward compatible when
+two vendors do it independently. The shim protects against a field *disappearing*; nothing protects
+against two different fields landing at the same offset. That is an argument for upstreaming a
+feature rather than forking the SDK for it — see `docs/authored_normals.md` §9.5.
+
+## 4. Doing the next re-platform
+
+1. Bump `DUSKLIGHT_VERSION` to the upstream commit whose build you run, and reconfigure. The stub URL
+   does not change: upstream's `sdk` release is one fixed, version-independent tag.
 2. Build. It should just work; if it does not, the failure is in the shim, not in the mods.
-3. `DUSKLIGHT_AURORA_VERSION` can be dropped if the new base's `extern/aurora` pin resolves — it is
-   already a no-op against `b96bf5ec01`, which records `3ba95790`.
-4. Expect Graphics Hub to report *"this game build has no normal buffer"* and normals to go back to
-   faceted. That is correct, not a regression.
-5. Re-verify the **game-linked** mods in-game (Realtime Sun Shadows, Deferred Fog, Effect Remover,
-   Celestial Orbit) — they hook specific game functions and a game-code delta can shift what they
-   hook. The service-only mods (VBAO, SSILVB, SMAA) need no re-verification.
+3. Expect Graphics Hub to report *"this game build has no normal buffer"* and normals to be faceted.
+   That is correct.
+4. Re-verify the **game-linked** mods in-game (Realtime Sun Shadows, Deferred Fog, Effect Remover,
+   Celestial Orbit) — they hook specific game functions **by symbol, resolved at load**, so a decomp
+   delta can make one fail to load rather than merely misbehave. The service-only mods (VBAO, SSILVB,
+   SMAA) need no re-verification.
+5. Watch the shadow mod for streaming-buffer overflow: upstream's aurora is smaller than our old fork
+   (Vertex 5 MB / Index 2 MB / Storage 8 MB vs 16 / 4 / 16) and the cascade replays are the heaviest
+   consumer.
