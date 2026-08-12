@@ -1,0 +1,7 @@
+{
+  "id": "dev.automata.celestial_orbit",
+  "name": "Celestial Orbit",
+  "version": "1.0.0",
+  "author": "automata-rtx",
+  "description": "Raises the path the sun and moon travel across the sky. Twilight Princess sweeps both bodies around a tilted circle that peaks at only 59 degrees, so the light is slanted even at noon and shadows never shorten; this mod re-derives that tilt from a peak-elevation knob (up to 80 degrees), giving realtime lighting a proper overhead sun and a real arc through the day. The sweep itself is untouched, so the clock, the palette schedule, and every dawn/dusk/night transition are unchanged, and sunrise/sunset still look the same. Moves the visible sun, moon, lens flare and the game's own light together; an optional orbit yaw also turns where the bodies rise and set. Publishes the modded orbit as a service so Realtime Sun Shadows follows it exactly."
+}
