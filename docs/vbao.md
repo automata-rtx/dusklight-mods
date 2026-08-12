@@ -120,8 +120,8 @@ default candidate) or at high supersampling.
 
 ## History / provenance
 
-Ported from our aurora-fork implementation (frozen at `standalone-final` in
-automata-rtx/dusklight-ao + aurora-ao) onto Encounter's upstream `ao_mod` demo framework: the demo
+Ported from our earlier pre-mod-API implementation in the retired `dusklight-ao` + `aurora-ao`
+forks onto Encounter's upstream `ao_mod` demo framework: the demo
 contributed the MIP depth chain, compute scheduling, and denoiser; ours contributed the
 bitmask estimator, temporal accumulation, depth-aware upscale, thickness/contrast/black
 point, and distance fade. Never reference MXAO in code or comments.

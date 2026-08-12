@@ -19,7 +19,8 @@ Sun Shadows if Depth to Normal is not installed and enabled. Install both togeth
    each snapped to whole texels of its own map (kills crawling); near/far extents scale
    with each radius. The optional **Link cascade** is a small box (`linkCoverage`) snapped
    to the player's position with a deliberately short light distance for maximum depth
-   discrimination.
+   discrimination. When it is enabled, Link's models are **excluded from the world cascades**
+   rather than drawn into both — see `linkCascade` in the settings table for why.
 2. **Caster capture** (`replay_cascade`, once per cascade at `SCENE_AFTER_TERRAIN`): replay
    the game's own opaque draw lists (`dComIfGd_drawOpaList*`) into a `create_pass` offscreen
    pass with `GXSetProjectionFull(lightReplayProjection)` + `j3dSys.setViewMtx` — the game
@@ -142,8 +143,10 @@ Sun Shadows if Depth to Normal is not installed and enabled. Install both togeth
    thickness threshold is a fraction of the pixel's remaining depth range, the term resolves
    contact detail and thin casters at *any* distance — it pairs with a reduced `boxRadius`
    (sharper map texels up close, screen-space detail everywhere).
-5. **Game-shadow suppression**: pre-hooks skip `dDlst_shadowControl_c::imageDraw/draw` and
-   `drawCloudShadow` while the mod is active (typed hooks only — no symbol manifest needed).
+5. **Game-shadow suppression**: pre-hooks skip `dDlst_shadowControl_c::imageDraw/draw` while
+   the mod is active (typed hooks only — no symbol manifest needed). `drawCloudShadow` was
+   skipped here too until it was established that it is the *moya* (靄, mist/haze) packet
+   rather than a shadow routine — see "Known caveats".
 6. **Indoor auto-disable**: `dKy_Indoor_check() != 0` (+ `indoorDisable` on) suppresses the
    shadow MAP render and its composite path (interiors read as fully shadowed under a
    sky-light map), and the suppression hooks go inactive so the game's own shadows return —
@@ -218,7 +221,7 @@ Space Shadows" is inert when SSS is off.
 | Var | Default | Meaning |
 |---|---|---|
 | `effectEnabled` | on | master toggle |
-| `shadowMapEnabled` | on | off = screen-space-only mode: no map render/composite, the game's own real/blob shadows return (the skip hooks go inactive), the Bend SSS term still applies |
+| `shadowMapEnabled` | on | off = screen-space-only mode: no map render/composite, the game's own simple/real shadows return (the skip hooks go inactive), the Bend SSS term still applies |
 | `mapSize` | 2 | EACH world cascade's map: 0=1024 1=2048 2=4096 3=8192 |
 | `boxRadius` | 25000 | full coverage radius in world units (1000–30000) = the FAR cascade |
 | `cascadeCount` | 2 | world cascades minus one (UI select "1/2/3"): 0=single map, 1=two cascades, 2=three (default). See the streaming-budget caveat; the enlarged platform buffers carry 3 in normal play |
@@ -231,7 +234,7 @@ Space Shadows" is inert when SSS is off.
 | `grassShadows` | 0 (All) | which cascades replay the dDlst packet list — the field grass/flower custom drawers (`d_grass.inc`/`d_flower.inc`, the list's only users). They are immediate-mode per-tuft draws no shadow cull can touch, redrawn in FULL by every included cascade — a large flat CPU cost per replay in grassy areas. 1 = near cascade only (crisp close grass shadows kept, distant dapple dropped), 2 = off (SSS still grounds on-screen grass) |
 | `cascadeEdgeFade` | on | fade the widest cascade's shadow out across its outer edge (band = `cascadeBlend`) instead of a hard coverage cutoff |
 | `pcfFarStep` | 1 | extra PCF kernel steps per cascade beyond the near one (0–2) |
-| `linkCascade` | off | the Link cascade: an extra map covering only the player, combined with max() |
+| `linkCascade` | off | the Link cascade: an extra map covering only the player, combined with `max()`. **On = Link is also removed from the world cascades.** The composite takes whichever cascade is darker (`shadow.wgsl`), so drawing him into both lets a coarse wide-area map win that `max` over the crisp one — reintroducing the blocky edges and self-shadow speckle the Link cascade exists to remove. Trade-off: his cast shadow then comes only from this map, so at very low sun angles a long shadow can run past its edge; raise `linkCoverage` if that shows. Excluding him also makes the world cascades' cached copies (`cascadeStagger`) valid for longer, since his movement no longer changes them. |
 | `linkMapSize` | 2 | Link cascade resolution (same scale as `mapSize`), independent of it |
 | `linkCoverage` | 300 | Link cascade box radius in world units (100–2000) |
 | `strength` | 60 | shadow darkening % |
@@ -481,6 +484,65 @@ the two-normal split it was also actively harmful — it flattened the curvature
 carries. Do not reintroduce it: if bias faceting appears, the cause is a bias term reading the
 shading normal instead of `n_geom`.
 
+## TODO — the two open shading problems
+
+Both come from the same root cause and are recorded here so the next session does not re-derive
+it: **this platform has no authored surface normals.** The upstream Dusklight build the mods pin
+exposes no normal buffer of any kind (nothing in the SDK's `gfx.h`, nothing in the pinned aurora),
+so Graphics Hub reconstructs the normal from the depth buffer for every pixel. A depth
+reconstruction returns the *flat facet of a triangle*, not the smooth normal an artist authored —
+that is a property of the method, not a bug in it. Everything below follows from that.
+
+### 1. Harsh faceting on shadowed surfaces — needs a fix, route not yet chosen
+
+The shading normal is faceted, so the light-to-dark terminator on curved geometry steps from
+triangle to triangle instead of curving. There used to be a `normalSmooth` blur pass that hid
+this; it was deleted while the retired thin-g-buffer platform supplied smooth authored normals
+and made it redundant. That platform is gone; the blur is still gone.
+
+Three possible routes, none started:
+
+1. **A bespoke cheap smoothing pass.** Closest to what was deleted, but it must be narrower than
+   the old one: `docs/authored_normals.md` §8.6 established that a smoothed normal must **never**
+   reach the bias — the bias needs the true geometric face normal or acne returns. So smooth only
+   the *shading* normal `n` and leave `n_geom` untouched. That distinction is why this is not a
+   straight revert of the old pass, which fed both.
+2. **Curvature-aware reconstruction in the provider.** Improve Depth to Normal itself (wider or
+   adaptive tap pattern) so every consumer benefits rather than each mod smoothing its own copy.
+   More invasive, better placed.
+3. **Upstream Dusklight adds a thin g-buffer.** The real fix. Authored normals are already
+   implemented end-to-end in the *retired* fork (see `docs/authored_normals.md`), so the design is
+   proven and could be offered upstream rather than re-invented. Until upstream exposes it, no mod
+   can reach it — this is not something a mod-side change can substitute for, only approximate.
+
+Pick deliberately. Route 1 is the cheap stopgap, route 3 is the correct answer, route 2 is the
+middle. Do not re-add the old pass unmodified.
+
+### 2. Broken shading on Link's front when he faces away from the sun/moon
+
+**Known, unresolved, and reproducible:** when Link is back-lit, the surfaces facing *toward* the
+camera — most visibly his face — show a fractured, patchy shading pattern rather than a smooth
+falloff. This is the artifact the earlier authored-normals work was chasing when the platform
+changed underneath it; the last recorded user report still showed it on his boots, torso and
+lower tunic.
+
+What is known:
+
+- It is the **attached (`n·L`) term**, not a missing occluder — those two have identical symptoms
+  and Debug View 15 (**Shadow Terms**) is the view that separates them. Red = the shadow map,
+  green = attached `n·L`, yellow = both, black = reported fully lit. Do not diagnose from Shadow
+  Factor (view 2) alone; it cannot tell them apart.
+- Faceted normals (problem 1) are the prime suspect: `n·L` near a grazing angle is exactly where a
+  facet-vs-smooth normal difference is largest, which is why it concentrates on a curved,
+  detailed, back-lit surface like a face.
+- Four changes landed that each plausibly address it (geometric-vs-shading normal split,
+  `sin`-scaled normal offset, terminator-band fade, receiver-plane fractional-bias cap) and
+  **none has been verified in game since** — they were developed while authored normals were live.
+
+Next step is a measurement, not a code change: Shadow Factor and Shadow Terms on back-lit Link in
+the same frame, then the bias retune. Fixing problem 1 first may resolve this outright, so treat
+them as one investigation.
+
 ## Known caveats
 
 - **2D-menu crash (fixed in 1.6.3)**: with the mod enabled but the shadow map off, the
@@ -491,17 +553,36 @@ shading normal instead of `n_geom`.
   the game-state calls or the offscreen pass there. Same readiness gate the replay already
   used, so real scenes are unaffected.
 - **Distortion particles vanish with the map on** (heat-haze / steam / wind in Kakariko
-  Village, Goron Springs) — *open*. Only the shadow **map** triggers it; screen-space-only
-  mode (Shadow Map off) shows the particles normally, so that's the current workaround.
-  An `earlyShadowPass` experiment that moved the offscreen replay from `SCENE_AFTER_TERRAIN`
-  to `SCENE_BEGIN` made *no* difference in-game, which rules out the replay's *timing*
-  relative to the framebuffer capture (`GXCopyTex` → `getFrameBufferTex`) as the cause — it's
-  something the replay *does* (a GX/PE or texture-cache state it leaves dirty), not when it
-  runs. Next step is to widen the GX-state save/restore around the replay. That toggle was
-  removed since it did nothing.
-- **Midna**: the game's projected blob shadow (which the mod hooks out) is where Midna
+  Village, Goron Springs) — **RESOLVED. The mod was deleting them itself.**
+
+  The cause was not dirty GX state and not the replay. Alongside the game's two real shadow
+  routines, the mod also pre-hooked `drawCloudShadow` and skipped it unconditionally whenever
+  the shadow map was active. `drawCloudShadow` is **not a shadow routine** — the name is
+  romanized-Japanese shorthand, and it draws the whole *moya* (靄, mist/haze) packet: the
+  drifting haze, mist and steam, and at `mMoyaMode >= 50` the framebuffer heat-shimmer and
+  wolf-senses distortion (`d_kankyo_rain.cpp:4549` splits the two branches). The handler had no
+  mode check, so turning on the shadow map deleted all of it.
+
+  That explains every symptom that was recorded here, including the one that misled the
+  investigation: the `earlyShadowPass` experiment changed nothing because the effects were
+  never being drawn at all, so *when* the map rendered was always irrelevant. The previous
+  conclusion in this entry — "it's something the replay does, a GX/PE or texture-cache state it
+  leaves dirty" — was wrong, and it is what sent sessions after a phantom bug in innocent code.
+
+  **Fix:** the `drawCloudShadow` hook was removed from this mod entirely. Nothing it drew was a
+  projected shadow this mod replaces, and Effect Remover's **Haze Removal** already owns moya
+  with per-mode toggles that deliberately spare the `>= 50` modes. A side effect of the old
+  hook was that it silently overrode those toggles whenever both mods were installed; that is
+  fixed too. **Expected change in game:** with the shadow map on, drifting haze/steam and the
+  heat-shimmer now appear where they previously did not. If you want them gone, that is Haze
+  Removal's job — per mode, which is the control the old behaviour bypassed.
+- **Midna**: the game's projected shadow (which the mod hooks out) is where Midna
   "lives" during her summon/emergence animation. A retain path (re-enable the game shadow
   for Link only, or anchor her to our sun ground-projection) is a known follow-up.
+  Naming note: the game's own classes are `dDlst_shadowSimple_c` and `dDlst_shadowReal_c`
+  (`d_drawlist.h:202`, `:254`), and `d_bg_s.cpp` calls the projected geometry kind
+  リアル影 ("real *kage*"). **"Blob shadow" is this project's coinage, not the game's word** —
+  it is fine when describing the look to a player, but do not grep the game for it.
 - **The per-frame streaming budget (the v1.6.0/1.6.1 startup crash)**: aurora streams ALL
   GX geometry into fixed-size per-frame buffers — 5 MB vertex, **1 MB index**, 8 MB
   storage, 24 MB uniform (`extern/aurora/lib/gfx/common.hpp:176`) — and these are mapped,

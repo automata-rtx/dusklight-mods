@@ -24,16 +24,17 @@ Linux x64/arm64, Android arm64) produced by CI.
 
 ## Installing
 
-1. Install the matching game build once: the **`platform-v2-test`** release of
-   [automata-rtx/dusklight-ao](https://github.com/automata-rtx/dusklight-ao/releases) (pick the zip
-   for your OS/arch; on Windows unzip `dusklight-*-win32-msvc-x86_64.zip` and run `dusklight.exe`).
-   The `.dusk` files must match the game build they were built against.
-2. Download the latest `mods-combined` artifact from this repo's Actions page.
-3. Copy the `.dusk` files into the game's mods folder:
+1. Download the latest `mods-combined` artifact from this repo's Actions page.
+2. Copy the `.dusk` files into the game's mods folder:
    - Windows: `%APPDATA%\TwilitRealm\Dusklight\mods`
    - Linux: `~/.local/share/TwilitRealm/Dusklight/mods`
    - macOS: `~/Library/Application Support/TwilitRealm/Dusklight/mods`
-4. In game: Mods menu → enable them. Settings live in each mod's detail pane.
+3. In game: Mods menu → enable them. Settings live in each mod's detail pane.
+
+The game-linked mods resolve their hook targets by symbol at load, so a `.dusk` and the game build
+it was compiled against are a matched pair. These are built against upstream Dusklight at the
+commit pinned as `DUSKLIGHT_VERSION` in `CMakeLists.txt`; if a mod fails to load or loads and does
+nothing, that pin and your game build have diverged.
 
 After replacing a `.dusk` with a newer build, the in-game **Reload** button picks it up without
 restarting.
@@ -51,10 +52,10 @@ cmake -B build          # fetches the SDK + link stub on first run
 cmake --build build     # -> build/mods/*.dusk
 ```
 
-That's it, on any platform — including Windows (plain MSVC) — because the base game is the template's
-own base (`76b56cd8`). The only fork-specific configuration is two cache variables in `CMakeLists.txt`
-that point the template at our platform: `DUSKLIGHT_REPOSITORY` (our `dusklight-ao` fork, for the
-enlarged aurora buffers) and `DUSKLIGHT_SDK_STUB_URL` (our public `platform-v2-test` release).
+That's it, on any platform — including Windows (plain MSVC). There is **no fork-specific
+configuration**: `DUSKLIGHT_REPOSITORY`, `DUSKLIGHT_SDK_STUB_URL` and `DUSKLIGHT_AURORA_VERSION` are
+all left unset, so the source comes from upstream `TwilitRealm/dusklight` at `DUSKLIGHT_VERSION` and
+the link stubs come from upstream's public, version-independent `sdk` release.
 
 CI (`.github/workflows/build.yml`) is the template's build + combine pipeline: it builds every mod on
 all seven platforms and merges each into one cross-platform `.dusk` via `tools/merge_mod.py`
@@ -74,9 +75,3 @@ all seven platforms and merges each into one cross-platform `.dusk` via `tools/m
   provider (now the Depth to Normal feature of Graphics Hub) and how other mods tap its service
 - `docs/mod-api-notes.md` — mod-API pitfalls learned the hard way
 - Upstream mod API reference: <https://github.com/TwilitRealm/dusklight/blob/main/docs/modding.md>
-
-## iOS note
-
-Code mods cannot run on iOS (dlopen restriction). The pre-mod-API standalone build (release
-`standalone-final` on automata-rtx/dusklight-ao) is the only build with these graphics features
-on iPhone.

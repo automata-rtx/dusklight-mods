@@ -14,7 +14,12 @@ is present and SKIPS - loudly, exit 0 - when it is not. A skip is the normal
 state of a fresh clone; failing there would just train people to ignore it.
 
     python3 tools/check_japanese_naming.py
-    DUSKLIGHT_DIR=/path/to/dusklight-ao python3 tools/check_japanese_naming.py
+    DUSKLIGHT_DIR=/path/to/dusklight python3 tools/check_japanese_naming.py
+
+The tree comes from upstream TwilitRealm/dusklight at DUSKLIGHT_VERSION - NOT from the
+retired automata-rtx/dusklight-ao fork. Pointing DUSKLIGHT_DIR at a fork checkout would
+check the glossary against source the mods are not built against, which is worse than
+skipping. docs/japanese-naming.md 2.1 has the exact clone commands.
 """
 
 from __future__ import annotations

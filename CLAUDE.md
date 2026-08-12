@@ -13,11 +13,21 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   optional Link-only cascade) with PCF, receiver-plane + slope bias, sin-scaled normal-offset
   receiver, two-sided casters, Bend-style screen-space shadows, and indoor auto-disable.
   **Game-linked**: it includes game headers and hooks game functions, so it is coupled to the
-  pinned game build. **Two normals, never interchangeable**: the *shading* normal (the provider's
+  pinned game build. It does **not** hook `drawCloudShadow` — that is the moya haze packet, not a
+  shadow, and suppressing it was the cause of the long-standing "distortion particles vanish"
+  bug; moya belongs to Effect Remover's Haze Removal. **Two normals, never interchangeable**: the *shading* normal (the provider's
   authored one) drives `n·L` / attached shadows / normal offset, the *geometric* face normal drives
   the bias — see `docs/realtime_sun_shadows.md` "Shadow term assembly" and
-  `docs/authored_normals.md` §8.6. The `normalSmooth` blur pass was **deleted**; do not
-  reintroduce it. Debug View 15 ("Shadow Terms") is the view that diagnoses wrongly-lit pixels.
+  `docs/authored_normals.md` §8.6. The `normalSmooth` blur pass was **deleted** — do not
+  reintroduce it *as it was*, because it smoothed the bias normal too; see the TODO section of
+  `docs/realtime_sun_shadows.md` for the two open shading problems (harsh faceting, and the broken
+  shading on back-lit Link's face) and the three candidate routes. Both trace to this platform
+  having **no authored normals at all**, so every normal is a depth reconstruction and therefore
+  faceted by construction. Debug View 15 ("Shadow Terms") is the view that separates a missing
+  occluder from a misread `n·L` — they look identical otherwise.
+  **`linkCascade` on also removes Link from the world cascades** rather than drawing him into
+  both: the composite takes `max()` of the cascades, so a coarse map would otherwise override the
+  crisp one.
   Derives its light direction from the time of day rather than reading `sun_pos`, so it imports
   the **Celestial Orbit** service (soft dependency) to follow a retilted sun/moon path.
 - **`mods/celestial_orbit/`** — "Celestial Orbit": raises the sun/moon travel path. TP sweeps both
@@ -100,11 +110,17 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   fake-shading so it doesn't fight the realtime stack. It merges three former standalone mods, each
   in its own namespace inside `src/mod.cpp` (`er_psr` / `er_tsr` / `er_vu`) with its own UI section
   and independent config:
-  - **Projected Shadow Removal** (`er_psr`): pre-hooks `drawCloudShadow` (TP's "moya"
-    projected-ground-shade draw — the kankyo cloud packet) and cancels it **per `mMoyaMode`**
-    (per-area, set by `kytag` actors). Per-mode toggles; default removes only mode 5 (the slow-sway
-    canopy candidate) and keeps the wind-driven cloud shadows (modes 4/11). `mMoyaMode >= 50`
-    (heat-shimmer / senses) always preserved. Live mode logger.
+  - **Haze Removal** (`er_psr` — internal name and `psr*` config keys kept so saved settings
+    survive the rename): pre-hooks `drawCloudShadow` and cancels it **per
+    `mMoyaMode`**. **Despite the feature's name, moya (靄, mist/haze) is not a projected ground
+    shade**: it is camera-facing haze billboards drawn with the depth test disabled
+    (`d_kankyo_rain.cpp:4594`), and five of its twelve modes blend additively so they can only
+    brighten (`:4587`). The dappled forest floor is a *different* system — the terrain TEV stage
+    `er_tsr` targets. Mode assignment is in **code**, not map data: mode 4 comes only from
+    `d_a_kytag02`, and **Hyrule Field's haze is mode 7** (`d_kankyo_wether.cpp:1111`), so the UI's
+    "keep mode 4 for Hyrule Field's shadows" advice is wrong on both halves. Default removes only
+    mode 5. `mMoyaMode >= 50` (heat-shimmer / senses) always preserved. Live mode logger.
+    See `docs/fake_shading_systems.md` §1.
   - **Terrain Shadow Removal** (`er_tsr`): the *other* fake shadow — a drifting dapple **overlay
     baked as a second TEV texture stage inside the terrain material** (not moya — moya count reads 0
     there). `dKy_cloudshadow_scroll` scrolls **texmtx 1** of `MA00`/`MA01`/`MA16` by the `vrkumo`
@@ -114,17 +130,21 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
     strength control (`docs/japanese-naming.md` §4.1). That red measures as a *wash-out* control
     (in-game test: 0 = **darker**, max = washed out), so `er_tsr` **post-hooks `dKy_bg_MAxx_proc`**
     and pins KColor 1's red to **255** — white into the shadow stage, base ground (stage 0)
-    untouched, so it **does not hole the floor**. The polarity is **known-effective, not yet
-    known-faithful**: the label predicts the opposite sign and the TEV equation is baked in the
-    `.bmd`. **`MA04` is the confirmed Faron forest-floor shade.** Per-code toggles + logger. Off by
-    default (global terrain change).
+    untouched, so it **does not hole the floor**. The polarity is **corroborated by the engine's
+    own usage**: the game forces `mFogDensity = -1` (read as 255) in the wolf's enhanced-senses
+    state (`d_kankyo.cpp:2427`), where it deliberately flattens the look — so 255 is the engine's
+    own "no cloud shadow" value. The TEV equation in the `.bmd` is still unread but cannot change
+    what 255 does. **`MA04` is the confirmed Faron forest-floor shade.** Note the hook fires on
+    **seven** actors, not just room terrain (two of them water) — see `docs/fake_shading_systems.md`
+    §2. Per-code toggles + logger. Off by default (global terrain change).
   - **Unbaked Vertex Lighting** (`er_vu`): post-hooks the J3D model loader
     (`J3DModelLoaderDataBase::load`/`loadBinaryDisplayList`) and rewrites each model's CLR0/CLR1
     vertex-color arrays in place — `rgb' = mix(white, rgb, vertexLight/100)` — 100 = vanilla, 0 =
     flat; alpha untouched; all six GX color formats; applies as models load (re-enter the area).
 
-  **Game-linked**. EXPERIMENTAL. See `docs/fake_shading_systems.md` for the three systems + code
-  names.
+  **Game-linked**. EXPERIMENTAL. See `docs/fake_shading_systems.md` for the three systems Effect
+  Remover targets, the **four more** the same `dKy_bg_MAxx_proc` sets up that we do not (§4), and
+  the code names.
 
   **Working mode (user's explicit standing instruction): the technical direction of SSILVB rests
   with Claude.** The user is an amateur on SSAO/SSGI internals and cannot provide technical
@@ -337,10 +357,7 @@ Do not resurrect it without a concrete reason — appending fields to SDK struct
     see `docs/authored_normals.md` §9.5).
   - Branch `claude/dusklight-platform-rebuild-rqhsaw` / `platform-v2-test` (`9361fbd9ea`) = the
     superseded pre-g-buffer platform.
-  - Branch `claude/standalone-final` + the `standalone-final` release = the pre-mod-API aurora-fork
-    build; that build is the ONLY way the graphics features run on iOS (code mods cannot run there —
-    dlopen restriction), so never delete it. (`mod-platform` / `platform-v1` are the superseded
-    first-generation platform — historical only.)
-- `automata-rtx/aurora-ao` — our aurora fork. Branch `claude/dusklight-platform-rebuild-rqhsaw` =
-  the platform's aurora (mainline-pinned + enlarged buffers, above). Other branches remain the
-  frozen fork the `standalone-final` build uses.
+  - `mod-platform` / `platform-v1` are the superseded first-generation platform — historical only.
+- `automata-rtx/aurora-ao` — our aurora fork. **No longer part of the build.** Branch
+  `claude/dusklight-platform-rebuild-rqhsaw` = the platform's aurora (mainline-pinned + enlarged
+  buffers, above); other branches are historical.
