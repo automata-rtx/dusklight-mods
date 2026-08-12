@@ -261,6 +261,14 @@ bool g_frameFrustumBypass = false;
 bool g_replayingSceneLists = false;
 bool g_replayTwoSided = false;   // twoSidedCasters, latched for the current replay
 bool g_replayLinkOnly = false;   // Link cascade replay: only models anchored near the player draw
+// World-cascade replay: the exact inverse of g_replayLinkOnly. When the Link cascade is active
+// this frame it already carries Link (and whatever is anchored at him) at its own high
+// resolution, and the composite max-combines the two (shadow.wgsl:598). Leaving him in the
+// world cascades too lets a coarse wide-box map WIN that max over the crisp one, which is a
+// pure downgrade: blocky edges and self-shadow acne on his own body from a map whose texels
+// and bias were sized for the whole scene. So the world cascades skip him instead of
+// overlapping. Requires g_linkFilterCenter/RadiusSq to be live BEFORE the world loop runs.
+bool g_replayExcludeLinkModels = false;
 float g_linkFilterCenter[3] = {};  // player position, world space
 float g_linkFilterRadiusSq = 0.0f;
 
@@ -1471,14 +1479,16 @@ bool main_view_culls_sphere(const WorldSphere& s) {
 HookAction on_mat_packet_draw_pre(ModContext*, void* args, void*, void*) {
     bool replayLinkCull = false;
     bool replayWorldCull = false;
+    bool replayExcludeLink = false;
     bool mainViewCull = false;
     if (g_replayingSceneLists) {
         replayLinkCull = g_replayLinkOnly;
         replayWorldCull = g_replayCullActive && !g_replayLinkOnly;
+        replayExcludeLink = g_replayExcludeLinkModels && !g_replayLinkOnly;
     } else {
         mainViewCull = g_mainViewCullActive;
     }
-    if (!replayLinkCull && !replayWorldCull && !mainViewCull) {
+    if (!replayLinkCull && !replayWorldCull && !replayExcludeLink && !mainViewCull) {
         return HOOK_CONTINUE;
     }
     if (mainViewCull) {
@@ -1503,11 +1513,23 @@ HookAction on_mat_packet_draw_pre(ModContext*, void* args, void*, void*) {
             }
             continue;
         }
+        // Link exclusion: this shape belongs to the Link cascade, so on its own it is not a
+        // reason to draw the packet. If every shape in the packet is his, the loop runs to the
+        // end and the whole packet is skipped before its geometry streams; if any shape is not,
+        // the packet draws and the per-shape hook drops his individually.
+        if (replayExcludeLink && model != nullptr && link_filter_keeps(model)) {
+            continue;
+        }
         WorldSphere sphere;
         if (!shape_world_sphere(model, packet->getShape(), sphere)) {
             return HOOK_CONTINUE;
         }
-        if (replayWorldCull ? !replay_culls_sphere(sphere) : !main_view_culls_sphere(sphere)) {
+        if (replayWorldCull || mainViewCull) {
+            if (replayWorldCull ? !replay_culls_sphere(sphere) : !main_view_culls_sphere(sphere)) {
+                return HOOK_CONTINUE;
+            }
+        } else {
+            // Exclusion-only pass (no lateral cull armed): anything not Link's must draw.
             return HOOK_CONTINUE;
         }
     }
@@ -1564,6 +1586,14 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     // its whole geometry stream. Conservative on unknowns: no model (a non-packet draw) or
     // degenerate bounds -> draw. Whole packets of culled shapes are already skipped in
     // on_mat_packet_draw_pre; this catches the culled shapes of mixed packets.
+    // Link exclusion: the Link cascade owns him this frame, so keep him out of the world maps.
+    // Unknown model -> draw, matching every other cull here (conservative on unknowns).
+    if (g_replayExcludeLinkModels && !g_replayLinkOnly) {
+        J3DModel* model = j3dSys.getModel();
+        if (model != nullptr && link_filter_keeps(model)) {
+            return HOOK_SKIP_ORIGINAL;
+        }
+    }
     if (g_replayCullActive && !g_replayLinkOnly) {
         J3DModel* model = j3dSys.getModel();
         J3DShape* shape = const_cast<J3DShape*>(mods::arg<const J3DShape*>(args, 0));
@@ -2104,6 +2134,38 @@ void render_shadow_map(
                4.0f * innerTexel;
     };
 
+    // Link cascade, part 1 of 2: decide here whether it runs this frame and where its filter
+    // sits, because the WORLD cascades below need those values in order to exclude him. The
+    // cascade itself is rendered after them (part 2), but g_linkFilterCenter/RadiusSq must be
+    // live first - reading them later would leave the world loop culling against last frame's
+    // player position, or against uninitialised values on the first frame of a scene.
+    bool linkCascadeActive = false;
+    float linkRadius = 0.0f;
+    uint32_t linkMapSize = 0;
+    cXyz linkCenter;
+    if (!cameraReplayDebug && get_bool_option(g_cvarLinkCascade, false)) {
+        daPy_py_c* player = dComIfGp_getLinkPlayer();
+        // Guard the position too: on the first frames of a scene the actor can exist before
+        // its placement is meaningful.
+        if (player != nullptr && std::isfinite(player->current.pos.x) &&
+            std::isfinite(player->current.pos.y) && std::isfinite(player->current.pos.z))
+        {
+            linkRadius = static_cast<float>(
+                std::clamp<int64_t>(get_int_option(g_cvarLinkCoverage, 300), 100, 2000));
+            linkMapSize = 1024u << std::clamp<int64_t>(get_int_option(g_cvarLinkMapSize, 2), 0, 3);
+            linkCenter = player->current.pos;
+            linkCenter.y += linkRadius * 0.35f;
+            g_linkFilterCenter[0] = player->current.pos.x;
+            g_linkFilterCenter[1] = player->current.pos.y;
+            g_linkFilterCenter[2] = player->current.pos.z;
+            const float filterRadius = linkRadius * 2.0f;
+            g_linkFilterRadiusSq = filterRadius * filterRadius;
+            linkCascadeActive = true;
+        }
+    }
+    // Armed only for the world loop; part 2 clears it before the Link replay itself.
+    g_replayExcludeLinkModels = linkCascadeActive;
+
     for (int i = 0; i < count; ++i) {
         CascadeCacheEntry& cache = g_cascadeCache[i];
         const bool exclusionEligible = cull && !cameraReplayDebug && debugMode == 0 &&
@@ -2155,6 +2217,7 @@ void render_shadow_map(
                 g_mapPass.cascades[i]))
         {
             g_replayPerfSlot = -1;
+            g_replayExcludeLinkModels = false;
             g_mapPass = {};
             return;
         }
@@ -2178,43 +2241,30 @@ void render_shadow_map(
 
     // Link cascade: a small high-resolution box snapped to the player. Purely additive in the
     // composite (it contains no world geometry), so a failed render just drops the extra detail.
-    if (!cameraReplayDebug && get_bool_option(g_cvarLinkCascade, true)) {
-        daPy_py_c* player = dComIfGp_getLinkPlayer();
-        // Guard the position too: on the first frames of a scene the actor can exist before
-        // its placement is meaningful.
-        if (player != nullptr && std::isfinite(player->current.pos.x) &&
-            std::isfinite(player->current.pos.y) && std::isfinite(player->current.pos.z))
+    // Link cascade, part 2 of 2: render it, using the values part 1 already resolved. The
+    // exclusion flag is cleared first so this replay itself is never filtered by it (the
+    // !g_replayLinkOnly guards make that redundant, but explicit beats implicit here).
+    g_replayExcludeLinkModels = false;
+    if (linkCascadeActive) {
+        cXyz center = linkCenter;
+        LightCamera lightCamera{};
+        // A short light distance keeps the ortho depth range tight around the player for
+        // maximum depth discrimination on self-shadowing.
+        const auto linkStart = std::chrono::steady_clock::now();
+        g_replayPerfSlot = kLinkCascade;
+        if (build_light_camera_core(
+                center, linkMapSize, linkRadius, linkRadius * 4.0f + 2000.0f, lightCamera) &&
+            replay_cascade(lightCamera, replayViewMtx, replayProjection, false, linkMapSize,
+                linkRadius, true, false, false, nullptr, 0.0f,
+                g_mapPass.cascades[kLinkCascade]))
         {
-            const float linkRadius = static_cast<float>(
-                std::clamp<int64_t>(get_int_option(g_cvarLinkCoverage, 300), 100, 2000));
-            const uint32_t linkMapSize =
-                1024u << std::clamp<int64_t>(get_int_option(g_cvarLinkMapSize, 2), 0, 3);
-            cXyz center = player->current.pos;
-            center.y += linkRadius * 0.35f;
-            g_linkFilterCenter[0] = player->current.pos.x;
-            g_linkFilterCenter[1] = player->current.pos.y;
-            g_linkFilterCenter[2] = player->current.pos.z;
-            const float filterRadius = linkRadius * 2.0f;
-            g_linkFilterRadiusSq = filterRadius * filterRadius;
-            LightCamera lightCamera{};
-            // A short light distance keeps the ortho depth range tight around the player for
-            // maximum depth discrimination on self-shadowing.
-            const auto linkStart = std::chrono::steady_clock::now();
-            g_replayPerfSlot = kLinkCascade;
-            if (build_light_camera_core(
-                    center, linkMapSize, linkRadius, linkRadius * 4.0f + 2000.0f, lightCamera) &&
-                replay_cascade(lightCamera, replayViewMtx, replayProjection, false, linkMapSize,
-                    linkRadius, true, false, false, nullptr, 0.0f,
-                    g_mapPass.cascades[kLinkCascade]))
-            {
-                g_mapPass.linkReady = true;
-            }
-            g_replayPerfSlot = -1;
-            g_perf.replayMs[kLinkCascade] +=
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                    linkStart).count();
-            ++g_perf.replayCount[kLinkCascade];
+            g_mapPass.linkReady = true;
         }
+        g_replayPerfSlot = -1;
+        g_perf.replayMs[kLinkCascade] +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                linkStart).count();
+        ++g_perf.replayCount[kLinkCascade];
     }
 }
 
@@ -2803,7 +2853,13 @@ ModResult build_controls_tab(
         "A dedicated extra shadow map covering just Link (and anything right next to him) at "
         "very high effective resolution - crisp self-shadowing on his model regardless of the "
         "Coverage setting. Adds one more scene replay per frame, but it only draws the player's "
-        "models. Combines on top of the regular cascades; requires the shadow map to be on.");
+        "models. When this is on, Link is <i>removed</i> from the regular cascades instead of "
+        "appearing in both: the two are combined by taking whichever is darker, so leaving him "
+        "in a coarse wide-area map lets that map override this one and reintroduce the blocky "
+        "edges and self-shadow speckle this option exists to fix. One consequence to know: his "
+        "cast shadow now comes only from this map, so at very low sun angles a long shadow can "
+        "run past the edge of it - raise Link Coverage if you see it cut off. Requires the "
+        "shadow map to be on.");
     static const char* kLinkMapSizes[] = {"1024", "2048", "4096", "8192"};
     add_select(left, "Link Map Size", g_cvarLinkMapSize, kLinkMapSizes, 4,
         "Resolution of the Link cascade, independent of the main Map Size. 4096 over a "

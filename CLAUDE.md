@@ -18,8 +18,16 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   bug; moya belongs to Effect Remover's Haze Removal. **Two normals, never interchangeable**: the *shading* normal (the provider's
   authored one) drives `n·L` / attached shadows / normal offset, the *geometric* face normal drives
   the bias — see `docs/realtime_sun_shadows.md` "Shadow term assembly" and
-  `docs/authored_normals.md` §8.6. The `normalSmooth` blur pass was **deleted**; do not
-  reintroduce it. Debug View 15 ("Shadow Terms") is the view that diagnoses wrongly-lit pixels.
+  `docs/authored_normals.md` §8.6. The `normalSmooth` blur pass was **deleted** — do not
+  reintroduce it *as it was*, because it smoothed the bias normal too; see the TODO section of
+  `docs/realtime_sun_shadows.md` for the two open shading problems (harsh faceting, and the broken
+  shading on back-lit Link's face) and the three candidate routes. Both trace to this platform
+  having **no authored normals at all**, so every normal is a depth reconstruction and therefore
+  faceted by construction. Debug View 15 ("Shadow Terms") is the view that separates a missing
+  occluder from a misread `n·L` — they look identical otherwise.
+  **`linkCascade` on also removes Link from the world cascades** rather than drawing him into
+  both: the composite takes `max()` of the cascades, so a coarse map would otherwise override the
+  crisp one.
   Derives its light direction from the time of day rather than reading `sun_pos`, so it imports
   the **Celestial Orbit** service (soft dependency) to follow a retilted sun/moon path.
 - **`mods/celestial_orbit/`** — "Celestial Orbit": raises the sun/moon travel path. TP sweeps both
