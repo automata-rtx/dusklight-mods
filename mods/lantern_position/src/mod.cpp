@@ -174,6 +174,13 @@ bool stowed_placement_runs(daAlink_c* link, const BeltState& state) {
     if (link->checkWolf()) {
         return false;
     }
+    // The whole item-model block — the lantern's included — sits inside a
+    // !checkNoResetFlg2(FLG2_STATUS_WINDOW_DRAW) guard, so on frames where Link is being drawn for
+    // the status window none of it runs and the matrices stand from the previous frame. Rewriting
+    // the lantern there would move it in a pose vanilla leaves alone.
+    if (link->checkNoResetFlg2(daPy_py_c::FLG2_STATUS_WINDOW_DRAW)) {
+        return false;
+    }
     if (!link->checkNoResetFlg2(daPy_py_c::FLG2_UNK_1)) {
         return false;
     }
