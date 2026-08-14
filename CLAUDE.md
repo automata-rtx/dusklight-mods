@@ -106,6 +106,20 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   The service returns the **true surface direction**, not a camera-facing one. Consumers wanting
   camera-facing normals apply their own guard *with a margin* (VBAO and SSILVB already do, at 0.15);
   a hard zero threshold corrupts smooth normals near every silhouette.
+- **`mods/lantern_position/`** — "Lantern Position": moves where Link's lit lantern hangs on his
+  belt while something else is in his hands. The lantern is **not parented to a bone** — there is no
+  attachment table to edit: `daAlink_c::setItemMatrix` rebuilds `mpKanteraModel`'s base matrix every
+  frame from one of Link's animated joint matrices, choosing between *in hand* (joint
+  `mLeftItemJntNo` = 10) and *on the belt* (joint `0x10` = 16, `trans(-1, 4.5, 9)`,
+  `rot(-75, 62, 89)`) purely on `mEquipItem`. The mod pre/post-hooks that function and rewrites the
+  **stowed** placement only, from live config (joint, offset, rotation, scale). Everything
+  downstream follows the matrix for free — the flame, the glow, the light and shadow mode, the
+  real-shadow entry, the insect actors — because all of them read `mKandelaarFlamePos`, which the
+  lantern model's joint-1 callback derives from wherever the model landed. **The pre-hook exists for
+  one reason**: that flame position is a damped spring with per-frame state
+  (`field_0x3618/3624/3630`) advanced *inside* the callback `modelCalc()` runs, so re-calculating in
+  the post-hook without rewinding it would step the spring twice a frame. Defaults are the vanilla
+  numbers, so an untouched install looks stock. **Game-linked**. Docs: `docs/lantern_position.md`.
 - **`mods/effect_remover/`** — "Effect Remover": a **combination mod** that cuts down TP's built-in
   fake-shading so it doesn't fight the realtime stack. It merges three former standalone mods, each
   in its own namespace inside `src/mod.cpp` (`er_psr` / `er_tsr` / `er_vu`) with its own UI section

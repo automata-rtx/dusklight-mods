@@ -9,6 +9,7 @@ PC/mobile port), built on the official [Dusklight mod template](https://github.c
 | Realtime Sun Shadows | `realtime_sun_shadows.dusk` | Real-geometry sun/moon cascaded shadow maps with PCF, slope-scaled bias, contact (screen-space) shadows, and indoor auto-disable |
 | SSILVB | `ssilvb.dusk` | Screen-space indirect lighting with visibility bitmask (Therrien et al. 2023): one-bounce colored light gathered through the same 32-sector bitmask VBAO uses; with the bounce disabled it acts as a standalone directional AO. Requires Graphics Hub |
 | [WIP] Graphics Hub | `graphics_hub.dusk` | Hosts the screen-space infrastructure other graphics mods build on, so effects layer correctly with the game's original rendering instead of over-applying. Two independently-toggleable features: **Depth to Normal** (reconstructs a world-space surface normal buffer that AO/GI/shadow mods consume — no settings, keep enabled for SSILVB & Realtime Sun Shadows) and **Deferred Fog** (re-applies the game's fog after screen-space effects so they darken the world under the fog, not the fog itself). Experimental |
+| Lantern Position | `lantern_position.dusk` | Moves where Link's lit lantern hangs on his belt while something else is in his hands. Live controls for attach joint, position, rotation and scale; defaults are the game's own placement |
 | Effect Remover | `effect_remover.dusk` | Cuts down TP's built-in fake-shading so it doesn't fight new realtime effects. Three independently-toggleable removers: **Projected Shadow Removal** (the "moya" fake ground shade — swaying canopy dapple vs. rolling cloud shadows are per-mode toggles), **Terrain Shadow Removal** (the animated shadow overlay baked into terrain materials, per material code), and **Unbaked Vertex Lighting** (fades the lighting painted into vertex colors, 0 = flat, 100 = vanilla). Experimental |
 
 VBAO and SSILVB are **service-only** (mod-API services only, no game code, so they survive game
@@ -73,5 +74,7 @@ all seven platforms and merges each into one cross-platform `.dusk` via `tools/m
   Fog feature of Graphics Hub)
 - `docs/depth_to_normal_plan.md`, `docs/depth_to_normal_consumers.md` — the normal-reconstruction
   provider (now the Depth to Normal feature of Graphics Hub) and how other mods tap its service
+- `docs/lantern_position.md` — how the game attaches Link's lantern (it rebuilds the matrix from a
+  joint every frame, nothing is parented in the model) and what the mod rewrites
 - `docs/mod-api-notes.md` — mod-API pitfalls learned the hard way
 - Upstream mod API reference: <https://github.com/TwilitRealm/dusklight/blob/main/docs/modding.md>

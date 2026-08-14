@@ -1,0 +1,7 @@
+{
+  "id": "dev.automata.lantern_position",
+  "name": "Lantern Position",
+  "version": "1.0.0",
+  "author": "automata-rtx",
+  "description": "Moves where Link's lantern hangs on his belt while it is lit but not in his hands. Twilight Princess rebuilds the lantern's matrix every frame from a hip joint plus a fixed offset and rotation; this mod rewrites that placement from live controls - attach joint, position, rotation and scale - so the stowed lantern can sit anywhere on him. The in-hand placement is untouched, and the flame, its glow, the light it casts and its shadow all follow the model, because the game measures them from the same matrix. Defaults are the game's own numbers, so nothing changes until you move a slider."
+}
