@@ -236,6 +236,37 @@ fn load_sample_position(uv: vec2<f32>, sample_mip_level: f32) -> vec4<f32> {
     return vec4<f32>(reconstruct_view_space_position(depth, uv), depth);
 }
 
+// GEOMETRIC (face) normal of the depth surface at the centre pixel, view space. Four MIP-0 taps and
+// a cross product of the screen-space position deltas, side-selected on the smaller depth step.
+//
+// MUST STAY CHARACTER-IDENTICAL TO ssilvb.wgsl's copy. It is only the sample-rejection plane, not
+// the shading normal, and the two mods diverging here is a real visual difference with no setting
+// to equalise it: at mid distance a thin feature is 1-2 chain pixels wide, so a reconstruction that
+// tapped +/-2 pixels (as reconstruct_normal below does) lands both far taps on the BACKGROUND and
+// returns the background's plane. The rejection then discards samples that legitimately occlude the
+// thin feature and its occlusion breaks up, while a +/-1 tap still has a chance of straddling it.
+// reconstruct_normal remains the right tool for the normal FALLBACK - it is silhouette-robust for
+// shading - but not for this.
+//
+// `fallback` must be the shading normal, never a zero vector: the rejection is
+// `dot(delta, geo_n) > 0`, so a zero geo_n rejects every sample and switches AO off entirely.
+fn geometric_normal_view(uv: vec2<f32>, centre: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
+    let px = uniforms.inv_size;
+    let r = load_sample_position(uv + vec2<f32>(px.x, 0.0), 0.0).xyz;
+    let l = load_sample_position(uv - vec2<f32>(px.x, 0.0), 0.0).xyz;
+    let d = load_sample_position(uv + vec2<f32>(0.0, px.y), 0.0).xyz;
+    let u = load_sample_position(uv - vec2<f32>(0.0, px.y), 0.0).xyz;
+    let ddx = select(centre - l, r - centre, abs(r.z - centre.z) < abs(l.z - centre.z));
+    let ddy = select(centre - u, d - centre, abs(d.z - centre.z) < abs(u.z - centre.z));
+    let g = cross(ddy, ddx);
+    let len = length(g);
+    if !(len > 1.0e-12) { // also catches NaN from a degenerate cross product
+        return fallback;
+    }
+    let gn = g / len;
+    return select(gn, -gn, dot(gn, centre) > 0.0);
+}
+
 @compute
 @workgroup_size(8, 8, 1)
 fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -271,15 +302,14 @@ fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let world_n = textureLoad(d2n_normal, n_texel, 0i).xyz;
         let r = uniforms.view_from_world;
         pixel_normal = normalize(r[0].xyz * world_n.x + r[1].xyz * world_n.y + r[2].xyz * world_n.z);
-        let g = reconstruct_normal(pixel_coordinates, pixel_position, raw_depth);
-        // reconstruct_normal normalizes an unguarded cross product, so a degenerate patch yields
-        // NaN. Left alone that would make `dot(delta, geo_n) > 0` false for every sample and switch
-        // AO off on those pixels; fall back to the shading normal, which reduces the rejection to
-        // the old behaviour.
-        geo_n = select(pixel_normal, g, dot(g, g) > 0.5);
+        geo_n = geometric_normal_view(uv, pixel_position, pixel_normal);
     } else {
         pixel_normal = reconstruct_normal(pixel_coordinates, pixel_position, raw_depth);
-        geo_n = pixel_normal;
+        // Still the 4-tap plane, NOT pixel_normal: reconstruct_normal taps +/-2 pixels, so on a
+        // thin mid-distance feature it returns the background's plane and the rejection then eats
+        // that feature's occlusion. Keeping this identical to the provider branch also keeps the
+        // "Use Authored Normals" A/B honest - only the shading normal changes across that switch.
+        geo_n = geometric_normal_view(uv, pixel_position, pixel_normal);
     }
     pixel_position *= 1.0 - uniforms.depth_bias; // bias toward the camera suppresses self-occlusion
     let view_vec = normalize(-pixel_position);
