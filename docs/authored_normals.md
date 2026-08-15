@@ -677,18 +677,53 @@ occludes:
 if sp.w > 0.0 && dot(sp.xyz - pixel_position, geo_n) > 0.0 { ... }
 ```
 
-`geo_n` is the face normal from depth (VBAO reuses its own `reconstruct_normal`; SSILVB gained a
-4-tap `geometric_normal_view`). It is a **no-op on the reconstruction path** — there `geo_n` *is*
-the shading normal, so nothing changes and the A/B stays honest.
+`geo_n` is the face normal from depth: a **4-tap `geometric_normal_view`, character-identical in
+both mods** — `vbao.wgsl:253` and `ssilvb.wgsl`. Keep it that way; see 8.11a for why the two copies
+diverging is not a cosmetic difference. It stays **near-inert on the reconstruction path**, where
+the shading normal is already a plane from depth and only the tap pattern differs, so the A/B across
+*Use Authored Normals* changes the shading normal and essentially nothing else.
 
-Two traps in that one line, both hit while writing it:
+Three traps, all hit while writing that one line:
 
 - `geo_n` must fall back to the **shading normal** when the cross product is degenerate, never to a
   zero vector. `dot(delta, 0) > 0` is false, so a zero `geo_n` rejects every sample and switches AO
   off entirely on those pixels — the opposite of "pass everything".
-- VBAO's `reconstruct_normal` normalizes an unguarded cross product, so a degenerate patch yields
-  **NaN**, and every comparison against NaN is false — the same silent AO-off. Guarded with
-  `dot(g, g) > 0.5`, which NaN also fails, selecting the fallback.
+- The same applies to **NaN** from a degenerate normalize: every comparison against NaN is false, so
+  it is the same silent AO-off. The guard is written `if !(len > 1.0e-12)`, negated so that NaN
+  takes the fallback rather than sailing through.
+- `geo_n` must be built from the **unbiased** centre position. SSILVB applied
+  `pixel_position *= 1.0 - depth_bias` *before* calling `geometric_normal_view`, whose four taps are
+  unbiased — leaving a spurious `depth_bias · P` offset along the view ray of 0.0040·z against a
+  true one-pixel gradient of 0.0011·z. **3.7× the signal**, so the cross product measured the bias,
+  not the surface. Build `geo_n` first, bias after.
+
+### 8.11a The rejection plane must be the ±1 tap, not atyuwen's 5-tap
+
+**Symptom:** with both mods at half res and slices, steps, black point and every other visible
+setting matched 1:1, SSILVB held extremely thin mid-distance coverage that VBAO broke up — an area
+reading solid in SSILVB looked *"almost half-res"* in VBAO, despite both being in half-res mode.
+
+Everything else in the AO path is shared and was ruled out by direct comparison: MIP selection
+during the march (`clamp(log2(max(dist, 1.0)) - 3.3, 0.0, 4.0)`), `load_sample_position`,
+`calculate_neighboring_depth_differences` and its edge packing, `preprocess_depth.wgsl`, the
+noise/jitter, the sector math, the denoise kernel, the composite shaping. Byte-identical or
+algebraically identical.
+
+The one real difference was the rejection plane introduced by 8.11: VBAO used `reconstruct_normal`
+(atyuwen's 5-tap, taps at ±1 **and ±2** pixels) where SSILVB used the new 4-tap (±1 only).
+
+**Why the tap radius matters here and not for shading.** At mid distance a thin feature is 1–2 chain
+pixels wide, and the chain is half-res, so coarser again. A ±2 tap lands **both** far taps on the
+background; atyuwen's side test then picks whichever side extrapolates most smoothly, which is the
+background. `geo_n` becomes the *background's* plane, `dot(delta, geo_n) > 0` discards samples that
+legitimately occlude the thin feature, and its occlusion breaks up per pixel — which through the
+half-res upscale reads as lower resolution. A ±1 tap at least has a chance of straddling the
+feature.
+
+`reconstruct_normal` is not wrong; it is being asked the wrong question. Its wide taps are exactly
+what make it **silhouette-robust for shading** — it is picking a stable plane across a
+discontinuity. A per-pixel rejection plane wants the opposite: the plane of *this* pixel, however
+small the feature it belongs to. It stays as VBAO's normal fallback, and nowhere else.
 
 **Rule:** the service returns a *shading* normal wherever the game supplied one. Anything asking
 "is this direction above the surface" — an AO hemisphere, a shadow-map bias — must build its own
