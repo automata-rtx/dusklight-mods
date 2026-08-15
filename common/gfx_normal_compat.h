@@ -1,7 +1,14 @@
-// Compile-time shim for the thin g-buffer fields the mod SDK gained in `platform-gbuffer-test`:
+// Compile-time shim for the scene-normal-buffer fields the mod SDK gained in GfxService 1.2
+// (`platform-normals-test`; an earlier, incompatible spelling shipped in `platform-gbuffer-test`):
 //
 //     GfxDeviceInfo::normal_format      GfxResolveDesc::normal
-//     GfxDrawContext::normal_format     GfxResolvedTargets::normal
+//     GfxResolvedTargets::normal
+//
+// Note there is deliberately no `GfxDrawContext::normal_format` accessor. The retired fork had that
+// field and the draw callbacks compared it against the device's to detect a pass that had changed
+// shape. On an SDK without it the shim answers `Undefined` while the device answers a real format,
+// so the comparison was true on every draw and silently disabled every composite. **These
+// accessors are safe for reading a value, not for comparing one against a live one.**
 //
 // **An SDK without those fields is a supported configuration, not an error.** Upstream Dusklight
 // has no normal buffer of any kind, so re-platforming onto it (or onto any base that predates the

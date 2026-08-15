@@ -101,7 +101,7 @@ exact function, source file and line are always available:
 ```sh
 # 1. The Windows build for the pinned platform, from DUSKLIGHT_SDK_STUB_URL's release.
 curl -sSL -o dusk.zip \
-  "https://github.com/automata-rtx/dusklight-ao/releases/download/platform-gbuffer-test/dusklight-UNKNOWN-VERSION-win32-msvc-x86_64.zip"
+  "https://github.com/automata-rtx/dusklight-ao/releases/download/platform-normals-test/dusklight-UNKNOWN-VERSION-win32-msvc-x86_64.zip"
 unzip -q dusk.zip -d dusk
 
 # 2. debug.7z inside it holds dusklight.pdb (~246 MB). No 7z binary here; py7zr works.

@@ -216,22 +216,28 @@ should be seamless, not a visible seam.
 
 ## 4. Verification order
 
-1. **Prereq.** Install the `platform-gbuffer-test` game build **and** fresh `.dusk` files as a
-   matched pair, with **Use Authored Normals off**. Everything must look exactly as it did before
-   and the log must be clean. Any missing or corrupted composite here means a mod pipeline is still
-   declaring one color target (see §5).
-2. **Basis.** Turn the toggle on, Show Normals on, Debug View = Difference. Expect dark with bright
+1. **Prereq.** Install the `platform-normals-test` game build **and** fresh `.dusk` files as a
+   matched pair. Start with **Video → Rendering → Scene Normal Buffer OFF** — the shipping default.
+   Everything must look exactly as it did before and the log must be clean; Graphics Hub's status
+   line should tell you to turn the buffer on. This step alone confirms the re-platform, since the
+   symptom it replaces was mods failing to load outright.
+2. **Buffer on.** Turn on the Video setting, **restart**, and confirm "Use Authored Normals" is no
+   longer greyed out. Leave it **off** for one more pass: everything must still look unchanged. Any
+   missing or corrupted composite *here* — with the pass now carrying two attachments — means a mod
+   pipeline is not following `get_pass_targets` (see §5). This is the step that catches it.
+3. **Basis.** Turn the toggle on, Show Normals on, Debug View = Difference. Expect dark with bright
    creases; see §2 if not.
-3. **Coverage.** Debug View = Coverage. Confirm the fallback regions are the expected ones.
-4. **The payoff.** Overlay off, VBAO/SSILVB on a low-poly rock face or a character: the faceting
+4. **Coverage.** Debug View = Coverage. Confirm the fallback regions are the expected ones.
+5. **The payoff.** Overlay off, VBAO/SSILVB on a low-poly rock face or a character: the faceting
    the reconstruction produced should be gone, with no blur pass involved.
-5. **Shadows.** Set Normal Smoothing to **0** (see §4a — that is what binds the authored normal
-   unblurred) and check the Receiver Normal debug view, then compare shadow quality against the
-   old default of 4.
-6. **Everything at once.** VBAO/SSILVB + Realtime Sun Shadows + Deferred Fog + SMAA together — each
+6. **Shadows.** Check the Receiver Normal debug view, then compare shadow quality against the
+   buffer-off run.
+7. **Everything at once.** VBAO/SSILVB + Realtime Sun Shadows + Deferred Fog + SMAA together — each
    pushes a draw into the scene pass, so this is where a missed pipeline surfaces.
-7. **Perf.** Frame time against the `platform-v2-test` baseline. Expect slightly more in the scene
-   pass (one extra RGBA8 target), and considerably less once the normal-smoothing pass goes.
+8. **Perf.** Frame time with the buffer off vs on — the same install, so it is a clean A/B. Expect
+   slightly more in the scene pass (one extra RGB10A2 target and a write per covered fragment), and
+   less in the provider, which drops eight depth taps and two unprojections per pixel wherever an
+   authored normal covers it.
 
 ## 4a. Realtime Sun Shadows had a second normal path
 
