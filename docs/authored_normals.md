@@ -1,7 +1,7 @@
-# Authored normals (thin g-buffer) — consuming them, and how to A/B them
+# Authored normals (scene normal buffer) — consuming them, and how to A/B them
 
 **Status:** landed in the mods. Partly verified in-game — see §0. The platform side is done,
-merged and published (`platform-gbuffer-test`).
+merged and published (`platform-normals-test`).
 
 > **Cold-start readers:** read §0 first. It is the state of play — what is done, what is confirmed
 > in-game, what is still open, and which debug views answer which question. §8 is the list of
@@ -11,12 +11,19 @@ merged and published (`platform-gbuffer-test`).
 > one route that genuinely would work, why it is still the wrong build, and the upstream-drift
 > notes (an `GfxDeviceInfo` ABI collision) that matter on the next re-platform.
 
-The game's forward renderer now writes its own **authored, interpolated vertex normals** into a
-second RGBA8 color attachment on the scene (EFB) pass, and the mod API exposes a per-frame snapshot
-of it. **Graphics Hub / Depth to Normal** consumes that snapshot instead of reconstructing normals
-from the depth buffer, and because every other mod reads normals through the
+The game's forward renderer can write its own **authored, interpolated vertex normals** into a
+second RGB10A2 color attachment on the scene (EFB) pass, and the mod API exposes a per-frame
+snapshot of it. **Graphics Hub / Depth to Normal** consumes that snapshot instead of reconstructing
+normals from the depth buffer, and because every other mod reads normals through the
 `dev.automata.depth_to_normal` service, all of them (VBAO, SSILVB, Realtime Sun Shadows, SMAA)
 inherit it with **zero changes of their own**.
+
+**It is off by default.** The game ships the buffer switched off — **Video → Rendering → Scene
+Normal Buffer**, applied on the next launch — because it costs a render target and a write per
+covered fragment and nothing reads it unless a mod does. Until it is on, every mod here behaves
+exactly as it did before: the provider reconstructs from depth for every pixel and says so in its
+status line. It is also unavailable in compatibility mode (the D3D11 and OpenGL ES fallbacks),
+where the renderer disables it whatever the setting says.
 
 Why it matters: a depth-gradient normal is a cross product of screen-space position deltas, i.e.
 the flat face normal of each rasterized triangle — faceting is inherent to the method. Authored
@@ -27,10 +34,15 @@ it away afterwards. See `dusklight-ao/docs/thin-gbuffer-normals.md` for the rend
 
 ## 0. State of play (read first)
 
-**Branch:** `claude/authored-normal-buffer-testing-6sxm4m` in `automata-rtx/dusklight-mods`.
-**Platform:** `DUSKLIGHT_VERSION = b96bf5ec01`, `DUSKLIGHT_SDK_STUB_URL` → `platform-gbuffer-test`.
-The user must run the `win32-msvc-x86_64` build from that release; game build and `.dusk` files are
-always a matched pair, in both directions (see §6 for rollback).
+**Platform:** `DUSKLIGHT_VERSION = 0474043c`, `DUSKLIGHT_REPOSITORY` → `automata-rtx/dusklight-ao`,
+`DUSKLIGHT_SDK_STUB_URL` → `platform-normals-test`. The user must run the `win32-msvc-x86_64` build
+from that release; game build and `.dusk` files are always a matched pair, in both directions (see
+§6 for rollback). **Then turn on Video → Rendering → Scene Normal Buffer and restart** — nothing in
+this document is observable until that is done.
+
+That pin is upstream `008a18c1` plus the GfxService 1.2 additions, which matters for a second
+reason: `008a18c1` bumped the **game service major version**, so mods built against the older
+`0fc05028` SDK are refused outright by this host. Every mod but SMAA failed to load on it.
 
 ### What landed, in order
 
@@ -50,6 +62,8 @@ always a matched pair, in both directions (see §6 for rollback).
 | `317111b` | Map comparison faded across the terminator band (§8.7). |
 | `aa2c723` | **Receiver-plane fractional-sampling bias capped** (§8.8). |
 | `38386e4` | Normal Smoothing pass deleted outright (§8.9). |
+| `e50a1a9` | Re-platformed onto upstream `0fc05028`, which has no normal buffer — authored normals off across the board, provider reconstructing every pixel. |
+| *(this change)* | Re-platformed onto `platform-normals-test`, restoring authored normals; all six scene-pass pipelines moved to `get_pass_targets`, and the `GfxDrawContext::normal_format` guard deleted (§5). |
 
 ### Confirmed in-game by the user
 
@@ -79,8 +93,18 @@ of flat bias against a ~150-unit-tall character.
    acne control since Normal Smoothing is gone. Needs a screenshot-driven pass, not guessed values.
 2. If flat sunlit ground shows acne, `rpdb_max` (currently `0.02`) is the knob; the fractional cap
    `kMaxFractionalBias` (`0.001`) is deliberately tight.
-3. Renderer-side follow-ups, both in `aurora-ao`, neither blocking: normal-target precision
-   (`RGB10A2Unorm` if RGBA8 banding shows), and MSAA handling if MSAA is ever enabled (§8.5).
+3. MSAA handling if MSAA is ever enabled (§8.5). *(Normal-target precision is done — the buffer is
+   `RGB10A2Unorm`, ten bits per axis, so the RGBA8 banding this item was raised against cannot
+   occur.)*
+4. **Everything in §0 "Confirmed in-game" was confirmed on the retired `platform-gbuffer-test`
+   platform**, whose buffer was RGBA8 and whose renderer was a different fork. The findings should
+   carry — the encoding, coverage rule and basis are the same — but the first run on
+   `platform-normals-test` is a re-confirmation, not a regression check. Start with Coverage (is it
+   still green everywhere?) and Difference (§2), in that order.
+5. **SMAA's `Normal Threshold` default (10%) was tuned against faceted normals**, where a low value
+   lights up every facet boundary on curved low-poly geometry. With authored normals those interior
+   steps are gone, so lower values should now be usable and catch real creases this default misses.
+   Worth a screenshot pass; the control is live, so no rebuild is needed to explore it.
 
 ### Debug views — which question each answers
 
@@ -300,58 +324,83 @@ provider's own — which is the point.
 ## 5. The prerequisite that touches every mod
 
 **A WebGPU render pass with two color attachments requires every pipeline drawing into it to
-declare two color targets.** With the normal buffer on, the scene pass has two — so every pipeline
-handed to `push_draw` declares a second target in `g_deviceInfo.normal_format` with
-`writeMask = None`, or Dawn rejects the draw on attachment count. Every stage that pushes draws
-(`SCENE_BEGIN`, `SCENE_AFTER_TERRAIN`, `SCENE_AFTER_OPAQUE`, `FRAME_BEFORE_HUD`,
-`FRAME_AFTER_HUD`) lands inside that pass; there is no exempt stage.
+declare two color targets.** With the normal buffer on, the scene pass has two, or Dawn rejects the
+draw on attachment count. Every stage that pushes draws (`SCENE_BEGIN`, `SCENE_AFTER_TERRAIN`,
+`SCENE_AFTER_OPAQUE`, `FRAME_BEFORE_HUD`, `FRAME_AFTER_HUD`) lands inside that pass; there is no
+exempt stage.
 
-Done at all six sites: VBAO and SSILVB composites (blend + debug), SMAA neighborhood blend,
-Graphics Hub's normal debug overlay and deferred fog fullscreen, Realtime Sun Shadows composite.
-The WGSL is unchanged — a fragment shader returning a single `@location(0)` value is valid against
-a pipeline whose second target is masked.
+**Ask the service for the layout; do not rebuild it.** `get_pass_targets(GFX_PASS_SCENE, …)` returns
+the pass's attachments ready to point `WGPUFragmentState` at, with every renderer-owned target
+already write-masked off. All six sites go through `gfx_compat::scene_pass_layout` (see
+`docs/normal_buffer_portability.md` §3): VBAO and SSILVB composites (blend + debug), SMAA
+neighborhood blend, Graphics Hub's normal debug overlay and deferred fog fullscreen, Realtime Sun
+Shadows composite. The WGSL is unchanged — a fragment shader returning a single `@location(0)` value
+is valid against a pipeline whose second target is masked.
+
+The earlier version of this section told you to assemble the layout by hand from
+`g_deviceInfo.normal_format`. That works, but it is a copy of the renderer's own logic and it is
+wrong the moment the pass changes shape again. It also came paired with a per-draw guard comparing
+`GfxDrawContext::normal_format` against the device's — a field the current SDK does not have, which
+made the guard fire unconditionally and silently disable every composite. Both are gone; see
+`docs/normal_buffer_portability.md` §2.
 
 Offscreen passes from `create_pass` (shadow-map replays, the fog config-ID replay) stay
 single-target: they render with the game's own pipelines, which the renderer builds from the
 current pass.
 
-**Any new mod pipeline recorded into the scene pass must do the same.** Keep the
-`!= WGPUTextureFormat_Undefined` guard rather than hardcoding two targets — that is what lets the
-same binary run on both platforms.
+**Any new mod pipeline recorded into the scene pass must call `scene_pass_layout` too.**
 
 ## 6. Platform pin and rollback
 
-`CMakeLists.txt` pins `DUSKLIGHT_VERSION = b96bf5ec01…` (tip of
-`claude/thin-gbuffer-authored-normals-wgqupt` in `dusklight-ao`) and `DUSKLIGHT_SDK_STUB_URL` at the
-`platform-gbuffer-test` release. The base game code is identical to `platform-v2-test` (both are
-pristine upstream Dusklight `76b56cd8`); only the renderer change and the SDK header additions
-differ, so the game-linked mods hook the same functions.
+`CMakeLists.txt` pins `DUSKLIGHT_VERSION = 0474043c…` (tip of
+`claude/dusklight-thin-gbuffer-normals-l4l9dc` in `dusklight-ao`), `DUSKLIGHT_REPOSITORY` at that
+fork and `DUSKLIGHT_SDK_STUB_URL` at the `platform-normals-test` release. The base game code is
+upstream Dusklight `008a18c1`; the renderer change and the SDK header additions sit on top of it.
 
-To roll back: set both knobs back to `9361fbd9ea…` / `platform-v2-test`, let CI rebuild, and
-install those `.dusk` files together with that game build. The stable release is untouched and
-still published. **No source change is needed** — every authored-normal path is guarded on
-`GfxDeviceInfo::normal_format`, which that platform reports as `Undefined`, so the provider simply
-reconstructs exactly as before and the second color target is never declared. The game build and
-the `.dusk` files are always a matched pair, in either direction.
+**Rolling back to upstream is not free any more.** `008a18c1` carries an upstream **game-service
+major-version bump**, so a mod built against the older `0fc05028` SDK is refused by this host and a
+mod built against this SDK is refused by that one. Rollback therefore means moving the pin *and*
+rebuilding *and* installing the matching game build — the same matched-pair rule as always, but with
+no overlap window where one set of `.dusk` files works on both. No **source** change is needed
+either way: every authored-normal path is guarded on `GfxDeviceInfo::normal_format`, which a base
+without the buffer reports as `Undefined`.
+
+Note also that turning the buffer off in Video settings is a much cheaper A/B than rolling the
+platform back, and it is the one to reach for first when deciding whether authored normals are the
+cause of something.
 
 ## 7. API surface used
 
 All fields are appended to existing structs and `struct_size`-guarded.
 
 ```c
-GfxDeviceInfo::normal_format      /* RGBA8Unorm, or Undefined when the buffer is off */
+GfxDeviceInfo::normal_format      /* RGB10A2Unorm, or Undefined when the buffer is off */
 GfxResolveDesc::normal            /* request the per-frame normal snapshot */
 GfxResolvedTargets::normal        /* single-sample snapshot, frame-valid, may be NULL */
 GfxResolvedTargets::normal_format
-GfxDrawContext::normal_format     /* 2nd target format of the pass a draw lands in */
+GfxService::get_pass_targets      /* the scene pass's attachment layout, for pipelines */
 ```
 
+`GfxResolveDesc::normal` is the one field `struct_size` cannot police: it landed in the struct's
+existing tail padding, so the host honours it only for callers that also pass a 1.2-sized
+`GfxResolvedTargets` to receive the view in. Initialising both from their `GFX_*_INIT` macros, as
+the provider does, satisfies that automatically.
+
+There is deliberately **no** `GfxDrawContext::normal_format` — the retired fork had one and the
+per-draw guard built on it is what silently disabled every composite on the way back to a base with
+a normal buffer. See `docs/normal_buffer_portability.md` §2.
+
 Snapshot contents: `rgb` = `normalize(mv_nrm) * 0.5 + 0.5`, the **view-space** authored normal;
-`a` = 1.0 when the draw supplied a normal attribute, 0.0 otherwise. Decode with
-`normalize(texel.xyz * 2.0 - 1.0)` — **always renormalize**, since interpolation, 8-bit
-quantization and any MSAA resolve all denormalize it. The attachment is cleared to `(0,0,0,0)` on
-the frame's first EFB pass and loaded on resumed segments, so a snapshot taken at
-`SCENE_AFTER_OPAQUE` holds every opaque draw so far.
+`a` = 1.0 when the draw supplied a normal attribute, 0.0 otherwise. Ten bits per axis, which is what
+keeps low-curvature surfaces from banding; the two alpha bits only ever carry the flag. Decode with
+`normalize(texel.xyz * 2.0 - 1.0)` — **always renormalize**, since interpolation, quantization and
+any MSAA resolve all denormalize it. The attachment is cleared to `(0,0,0,0)` on the frame's first
+EFB pass and loaded on resumed segments, so a snapshot taken at `SCENE_AFTER_OPAQUE` holds every
+opaque draw so far.
+
+Coverage is exactly the depth buffer's: a draw writes a normal if and only if it writes depth. So a
+normal snapshot and a depth snapshot always describe the same surface, and effects that only blend
+over the scene (particle billboards, the game's projected shadow quads) cannot contaminate it.
 
 ### MSAA silhouettes — resolved by rejecting blended texels
 

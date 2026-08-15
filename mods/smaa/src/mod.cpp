@@ -23,6 +23,7 @@
 #include "mods/svc/gfx.h"
 
 #include "gfx_normal_compat.h"
+#include "gfx_scene_pass.h"
 #include "mods/svc/log.h"
 #include "mods/svc/resource.h"
 #include "mods/svc/ui.h"
@@ -43,9 +44,9 @@ IMPORT_SERVICE(ConfigService, svc_config);
 IMPORT_SERVICE(ResourceService, svc_resource);
 IMPORT_SERVICE(UiService, svc_ui);
 IMPORT_SERVICE(GfxService, svc_gfx);
-// Optional: when the Depth to Normal provider (Graphics Hub) is present, its reconstructed world
-// normal + depth drive geometric edge detection. Optional so SMAA still loads and does luma-only
-// edge detection when the provider is absent.
+// Optional: when the Depth to Normal provider (Graphics Hub) is present, its world normal + depth
+// drive geometric edge detection. Optional so SMAA still loads and does luma-only edge detection
+// when the provider is absent.
 IMPORT_OPTIONAL_SERVICE(DepthToNormalService, svc_n2d);
 
 namespace {
@@ -70,11 +71,6 @@ ResourceBuffer g_blendSource = RESOURCE_BUFFER_INIT;
 ResourceBuffer g_neighborhoodSource = RESOURCE_BUFFER_INIT;
 
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
-// Set by the render worker when a draw's pass layout stops matching the pipelines built at init
-// (the host's thin g-buffer was toggled mid-session). Logged once from the game thread; the
-// render worker must not touch the log service.
-std::atomic<bool> g_normalFormatMismatch{false};
-bool g_loggedNormalMismatch = false;
 WGPUComputePipeline g_edgePipeline = nullptr;
 WGPUComputePipeline g_blendPipeline = nullptr;
 WGPUBindGroupLayout g_edgeLayout = nullptr;
@@ -199,29 +195,28 @@ bool build_neighborhood_pipeline() {
     if (module == nullptr) {
         return false;
     }
-    WGPUColorTargetState colorTarget = WGPU_COLOR_TARGET_STATE_INIT;
-    colorTarget.format = g_deviceInfo.color_format; // opaque replace; non-edge pixels discard
+    // The pipeline has to describe the scene pass's attachments, whatever they currently are: with
+    // the host's scene normal buffer on, the pass carries a second, renderer-owned colour target,
+    // and a one-target pipeline is rejected outright. Asking the service beats rebuilding the
+    // layout from GfxDeviceInfo, which is a copy of the renderer's logic that goes silently wrong
+    // whenever the pass gains an attachment. The extra target comes back write-masked off, so the
+    // blend leaves the game's authored normals untouched - which matters here beyond validity:
+    // SMAA rewrites edge pixels' colour, and stamping a blended normal over them would corrupt the
+    // very silhouettes every other consumer relies on. (Target 0 stays an opaque replace; non-edge
+    // pixels discard.)
+    gfx_compat::ScenePassLayout layout;
+    if (!gfx_compat::scene_pass_layout(mod_ctx, svc_gfx, g_deviceInfo, layout)) {
+        wgpuShaderModuleRelease(module);
+        return false;
+    }
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = module;
     fragment.entryPoint = {"fs_main", WGPU_STRLEN};
-    // Thin g-buffer (platform-gbuffer-test and later): when the host writes the game's authored
-    // normals to a SECOND color attachment, every pipeline recorded into the scene pass must
-    // declare a matching second target - WebGPU requires the attachment counts to agree, and a
-    // one-target pipeline is rejected outright. This effect never writes normals, so the target
-    // exists purely to match the pass and its write mask is off. Undefined (buffer disabled, and
-    // every platform before it) leaves this at a single target, unchanged.
-    WGPUColorTargetState colorTargets[2] = {colorTarget, WGPU_COLOR_TARGET_STATE_INIT};
-    uint32_t colorTargetCount = 1;
-    if (gfx_compat::normal_format(g_deviceInfo) != WGPUTextureFormat_Undefined) {
-        colorTargets[1].format = gfx_compat::normal_format(g_deviceInfo);
-        colorTargets[1].writeMask = WGPUColorWriteMask_None;
-        colorTargetCount = 2;
-    }
-    fragment.targetCount = colorTargetCount;
-    fragment.targets = colorTargets;
+    fragment.targetCount = layout.color_target_count;
+    fragment.targets = layout.color_targets;
     // Depth state must match the scene pass despite never testing/writing depth.
     WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
-    depthStencil.format = g_deviceInfo.depth_format;
+    depthStencil.format = layout.depth_format;
     depthStencil.depthWriteEnabled = WGPUOptionalBool_False;
     depthStencil.depthCompare = WGPUCompareFunction_Always;
 
@@ -231,7 +226,7 @@ bool build_neighborhood_pipeline() {
     pipelineDesc.vertex.entryPoint = {"vs_main", WGPU_STRLEN};
     pipelineDesc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
     pipelineDesc.depthStencil = &depthStencil;
-    pipelineDesc.multisample.count = g_deviceInfo.sample_count;
+    pipelineDesc.multisample.count = layout.sample_count;
     pipelineDesc.fragment = &fragment;
     g_neighborhoodPipeline = wgpuDeviceCreateRenderPipeline(g_deviceInfo.device, &pipelineDesc);
     wgpuShaderModuleRelease(module);
@@ -389,14 +384,6 @@ void on_compute(
 // Render worker: composite the antialiased edges into the live scene target.
 void on_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
-    // Scene-pass attachment guard (thin g-buffer): our pipelines declare the target count the
-    // device reported at init. If the host's normal buffer has been toggled since, that count no
-    // longer matches this pass and recording the draw would be a WebGPU validation error - skip
-    // it instead and let the game thread report it. Reloading the mod rebuilds the pipelines.
-    if (gfx_compat::normal_format(*ctx) != gfx_compat::normal_format(g_deviceInfo)) {
-        g_normalFormatMismatch.store(true, std::memory_order_relaxed);
-        return;
-    }
     if (payloadSize != sizeof(DrawPayload)) {
         return;
     }
@@ -581,12 +568,18 @@ ModResult build_controls_tab(
         "edges inside high-contrast texture). 200% is the SMAA default.",
         100, 400, 10, "%");
     add_toggle(left, "Geometric Edges", g_cvarUseNormalEdges,
-        "Also detect edges from the reconstructed surface normal and depth (Depth to Normal "
-        "service). Catches silhouettes and creases where two flat-shaded surfaces have similar "
-        "brightness. No effect if the provider is absent.");
+        "Also detect edges from the surface normal and depth (Depth to Normal service). Catches "
+        "silhouettes and creases where two flat-shaded surfaces have similar brightness. No effect "
+        "if the provider is absent.");
     add_number(left, "Normal Threshold", g_cvarNormalThreshold,
         "How sharp a normal difference counts as a geometric edge (angular; 10% is a shallow "
-        "crease). Lower catches subtler creases; higher only steep angles.",
+        "crease). Lower catches subtler creases; higher only steep angles.<br/>What counts as "
+        "'subtler' depends on which normal the provider is serving. A depth-reconstructed normal is "
+        "flat per triangle, so every facet boundary on a curved low-poly surface is a normal step "
+        "and a low threshold lights up geometry that is not really an edge - the default is set to "
+        "clear that noise. With <b>authored normals</b> on, those interior steps are gone and only "
+        "real creases and silhouettes remain, so lower values become usable and catch edges this "
+        "default misses.",
         2, 50, 1, "%");
     add_number(left, "Depth Threshold", g_cvarDepthThreshold,
         "Relative depth discontinuity that counts as a geometric edge (silhouettes). Lower catches "
@@ -762,12 +755,6 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 }
 
 MOD_EXPORT ModResult mod_update(ModError*) {
-    if (!g_loggedNormalMismatch && g_normalFormatMismatch.load(std::memory_order_relaxed)) {
-        g_loggedNormalMismatch = true;
-        svc_log->warn(mod_ctx,
-            "scene pass normal-target layout changed since init; composite skipped - "
-            "reload this mod to rebuild its pipelines");
-    }
     if (!g_loggedChain && g_chainExecuted.load(std::memory_order_acquire)) {
         g_loggedChain = true;
         svc_log->info(mod_ctx, "SMAA chain executed OK");

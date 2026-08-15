@@ -4,9 +4,10 @@
 // (ambient occlusion, GI, shadows, antialiasing), once per frame. There are two sources:
 //
 //   * AUTHORED (preferred): the game's own interpolated vertex normal, written by the renderer
-//     into the thin g-buffer's second color attachment and handed to us as a snapshot
-//     (RGBA8Unorm: xyz = view-space normal * 0.5 + 0.5, w = 1 when that draw supplied a normal
-//     attribute). Smooth by construction - no faceting, so no smoothing pass is needed.
+//     into the scene pass's second color attachment and handed to us as a snapshot (RGB10A2Unorm:
+//     xyz = view-space normal * 0.5 + 0.5, w = 1 when that draw supplied a normal attribute).
+//     Smooth by construction - no faceting, so no smoothing pass is needed. Ten bits per axis is
+//     what keeps low-curvature surfaces from banding; the two alpha bits only ever carry a flag.
 //   * RECONSTRUCTED (fallback): atyuwen's accurate 5-tap depth-gradient method, adapted UNCHANGED
 //     from Encounter's ao_mod demo (which ports it from Bevy Engine's SSAO; see res/licenses/).
 //     A cross product of screen-space position deltas is the flat face normal of the rasterized
@@ -130,8 +131,8 @@ fn reconstruct(@builtin(global_invocation_id) gid: vec3u) {
     }
     let pos = reconstruct_view_space_position(depth, uv);
 
-    // Decode the authored normal. Renormalize always: vertex interpolation, 8-bit quantization
-    // and any MSAA resolve all denormalize the stored vector.
+    // Decode the authored normal. Renormalize always: vertex interpolation, quantization and any
+    // MSAA resolve all denormalize the stored vector.
     let a_size = vec2<i32>(textureDimensions(authored_normal));
     let a = textureLoad(authored_normal, clamp(coord, vec2<i32>(0i), a_size - 1i), 0i);
     var authored_valid = a.w > 0.5;
@@ -139,7 +140,7 @@ fn reconstruct(@builtin(global_invocation_id) gid: vec3u) {
     if authored_valid {
         let raw = (a.xyz * 2.0 - 1.0) * uniforms.basis_flip;
         // Length is the confidence signal. A texel written by ONE surface decodes to a unit
-        // vector - 8-bit quantization moves it by well under 0.01. Anything materially shorter
+        // vector - 10-bit quantization moves it by well under 0.01. Anything materially shorter
         // is a HARDWARE MSAA RESOLVE AVERAGE, and its direction is a blend that corresponds to
         // no real surface:
         //

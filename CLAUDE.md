@@ -66,12 +66,13 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
     SSILVB/Realtime Sun Shadows/VBAO/SMAA resolve it as before — they include
     `../graphics_hub/include`). Two sources: the game's **authored vertex normals** from a renderer
     thin g-buffer (smooth — no faceting), falling back per pixel to the **depth reconstruction**
-    (atyuwen's 5-tap method) wherever there is no authored normal. **On the current upstream platform
-    there is no normal buffer at all**, so every pixel takes the reconstruction, "Use Authored
-    Normals" greys out, and the status line reads *"this game build has no normal buffer"* — correct,
-    not a regression. The authored path and its A/B debug views remain in the code for a base that
-    provides one. Passive provider: no on/off. Docs: `docs/authored_normals.md`,
-    `docs/normal_buffer_portability.md`.
+    (atyuwen's 5-tap method) wherever there is no authored normal. The current platform **does**
+    provide the buffer, but **it ships switched off**: the user must turn on the game's own
+    **Video → Rendering → Scene Normal Buffer** and restart. Until then every pixel takes the
+    reconstruction, "Use Authored Normals" greys out, and the status line names the setting to turn
+    on — correct, not a regression. Same fallback on a base without the buffer, and in compatibility
+    mode (D3D11 / OpenGL ES), where the renderer refuses it whatever the setting says. Passive
+    provider: no on/off. Docs: `docs/authored_normals.md`, `docs/normal_buffer_portability.md`.
   - **Deferred Fog** (`hub_fog`): suppresses the game's per-draw fog during the opaque world lists
     and re-applies it (bit-exact aurora fog math) as a fullscreen pass after every mod's
     `SCENE_AFTER_OPAQUE` composites, so AO/shadows darken surfaces under the fog instead of the fog
@@ -182,11 +183,12 @@ This repo **is** the official Dusklight mod template
 `add_mod` usage, `.gitattributes`, and `build.yml` (build + combine, plain `cl`, no link-target
 plumbing), just laid out as a monorepo (one `mods/<name>/` per mod). The pinned game/SDK source is
 **fetched** by `FetchDusklight` into `dusklight/` (git-ignored), keyed by `DUSKLIGHT_VERSION`; a plain
-`git clone` + `cmake -B build` fetches it and the per-arch link stub automatically. **There are no
-fork-specific bits any more**: `DUSKLIGHT_REPOSITORY`, `DUSKLIGHT_SDK_STUB_URL` and
-`DUSKLIGHT_AURORA_VERSION` are all left unset, so the source comes from upstream
-`TwilitRealm/dusklight` and the stubs from upstream's public, version-independent `sdk` release.
-The tree is the stock template plus our `mods/`, so template updates apply cleanly.
+`git clone` + `cmake -B build` fetches it and the per-arch link stub automatically. Two knobs point
+the stock template at our platform fork: `DUSKLIGHT_REPOSITORY` (`automata-rtx/dusklight-ao`, for
+the scene normal buffer and the enlarged aurora streaming buffers) and `DUSKLIGHT_SDK_STUB_URL`
+(that fork's `platform-normals-test` release, which publishes the per-arch link stubs as top-level
+assets). `DUSKLIGHT_AURORA_VERSION` stays unset — the recorded `extern/aurora` pin resolves on its
+own. Everything else is the template unchanged, so template updates apply cleanly.
 
 ## What a change does and does not require
 
@@ -206,9 +208,10 @@ The user typically does not build locally. Iteration loop:
 
 - **Which repos to attach to the session:** **only `automata-rtx/dusklight-mods`** — for any mod
   work *and* for re-platforming. The game SDK is **fetched over the network** by
-  `cmake/FetchDusklight.cmake` from upstream `TwilitRealm/dusklight` at the pinned
-  `DUSKLIGHT_VERSION`, and the SDK **auto-downloads** its per-arch link stub from upstream's public
-  `sdk` release. The old `dusklight-ao` / `aurora-ao` forks are no longer part of the build at all.
+  `cmake/FetchDusklight.cmake` from `DUSKLIGHT_REPOSITORY` at the pinned `DUSKLIGHT_VERSION`, and
+  the SDK **auto-downloads** its per-arch link stub from `DUSKLIGHT_SDK_STUB_URL`. Attach
+  `dusklight-ao` / `aurora-ao` only when changing the platform *itself* (a renderer or SDK change),
+  not to build or modify mods.
 - **Default to service-only.** A new screen-space effect (e.g. SSDO, 1-bounce SSGI, SSR,
   outlines) should follow the VBAO / SSILVB pattern: consume depth + the world-space
   normal from the **Depth to Normal service** (`mods/graphics_hub/include/depth_to_normal_service.h`,
@@ -237,29 +240,43 @@ The user typically does not build locally. Iteration loop:
 - **All WGPU handles from the gfx service are borrowed**; resolved views are valid for the
   current frame only. Objects the mod creates are released in `mod_shutdown`.
 - **Reversed-Z everywhere** (1 = near). Sky pixels have raw depth 0.
-- **Every render pipeline recorded into the scene pass must declare TWO color targets** when
-  `gfx_compat::normal_format(g_deviceInfo) != WGPUTextureFormat_Undefined` — target 1 in that format
-  with `writeMask = None`. A host normal buffer adds a second attachment to the EFB pass, and WebGPU
-  rejects any pipeline whose target count does not match the pass. Every stage that pushes draws
-  lands in that pass; there is no exempt stage. **Upstream has no normal buffer, so today every
-  composite takes the single-target path** — keep the `!= Undefined` guard anyway: it is what makes
-  one binary correct on both kinds of base, and getting it wrong is precisely what silently killed
-  every composite when a fork-built mod misread `WGPUInstance` as a format (see The ABI pin).
-  Offscreen `create_pass` targets stay single-target. See `docs/authored_normals.md` §5.
+- **Every render pipeline recorded into the scene pass must take its attachment layout from
+  `gfx_compat::scene_pass_layout` (`common/gfx_scene_pass.h`)**, never from `GfxDeviceInfo`. A host
+  normal buffer adds a second attachment to the EFB pass, and WebGPU rejects any pipeline whose
+  target count does not match the pass. The helper wraps GfxService 1.2's `get_pass_targets`, which
+  returns the pass's real targets with renderer-owned ones already write-masked off, and falls back
+  to the hand-assembled layout on an SDK too old to have the query. Every stage that pushes draws
+  lands in that pass; there is no exempt stage. Offscreen `create_pass` targets stay single-target.
+  See `docs/authored_normals.md` §5.
 - **Never touch an SDK normal-buffer field directly** — `GfxDeviceInfo::normal_format`,
-  `GfxDrawContext::normal_format`, `GfxResolveDesc::normal`, `GfxResolvedTargets::normal`. Go through
-  `common/gfx_normal_compat.h` (`gfx_compat::normal_format` / `request_normal` / `resolved_normal`),
-  which detects each field at compile time and degrades to "no normal buffer" when it is absent.
-  Those fields are **fork-local** — upstream Dusklight has none — so a direct access compiles today
-  and breaks the whole tree on the next re-platform. Verified by building against a stripped SDK;
-  see `docs/normal_buffer_portability.md`.
+  `GfxResolveDesc::normal`, `GfxResolvedTargets::normal`. Go through `common/gfx_normal_compat.h`
+  (`gfx_compat::normal_format` / `request_normal` / `resolved_normal`), which detects each field at
+  compile time and degrades to "no normal buffer" when it is absent. Those fields are **fork-local**
+  — upstream Dusklight has none — so a direct access compiles today and breaks the whole tree on the
+  next re-platform. Verified by building against a stripped SDK; see
+  `docs/normal_buffer_portability.md`.
+- **Degrade-to-absent is safe for a READ, not for a COMPARISON.** The draw callbacks used to guard
+  on `gfx_compat::normal_format(*ctx) != gfx_compat::normal_format(g_deviceInfo)`. `GfxDrawContext`
+  has no `normal_format` in this SDK, so that shim call is a constant `Undefined` while the device
+  reports a real format — the guard fired on every draw and silently disabled all six composites the
+  moment the user enabled the buffer. It is deleted. Do not reintroduce a guard that compares a
+  compile-time-detected field against a live value.
 - **VBAO stays service-only.** If a feature seems to need game code, it belongs in the shadow
   mod or needs an upstream service extension — don't add game includes to `vbao`.
 - **The ABI pin**: the platform is pinned by **`DUSKLIGHT_VERSION` in the top-level `CMakeLists.txt`**,
-  fetched from `DUSKLIGHT_REPOSITORY` — which is now **upstream `TwilitRealm/dusklight`**, not a fork.
-  It currently points at **`0fc05028`** (upstream `main`, 2026-08-09). There is no fork delta left:
-  `DUSKLIGHT_REPOSITORY`, `DUSKLIGHT_SDK_STUB_URL` and `DUSKLIGHT_AURORA_VERSION` are all unset so the
-  template's own defaults apply. **`DUSKLIGHT_VERSION` must match the game build actually being run.**
+  fetched from `DUSKLIGHT_REPOSITORY`. It currently points at **`0474043c`** in
+  **`automata-rtx/dusklight-ao`** (branch `claude/dusklight-thin-gbuffer-normals-l4l9dc`, published
+  as the **`platform-normals-test`** prerelease) — upstream Dusklight `008a18c1` plus the GfxService
+  1.2 scene-normal-buffer additions, over an aurora with the optional normal target and the enlarged
+  streaming buffers. `DUSKLIGHT_SDK_STUB_URL` tracks it to that same release;
+  `DUSKLIGHT_AURORA_VERSION` stays unset. **`DUSKLIGHT_VERSION` must match the game build actually
+  being run.**
+  - **Why a fork again, and why this one is safe.** Two reasons: upstream `008a18c1` bumped the
+    **game service major version**, so mods built against the older `0fc05028` SDK are refused
+    outright by that host (every mod but SMAA failed to load); and GfxService 1.2 is what hands mods
+    the authored normals. The offset collision that sank the *previous* fork is not repeated here —
+    `normal_format` is appended **after** upstream's own `instance`/`adapter`, on top of upstream
+    rather than beside it, so no slot is claimed twice.
   - **Match the pin to the running build.** Game-linked mods resolve hook targets **by symbol at load**,
     so a mod built against a different base can fail to load outright rather than merely misbehave.
   - **Struct-size ABI is one-directional.** The host rejects callers whose
@@ -273,68 +290,75 @@ The user typically does not build locally. Iteration loop:
     format, concluded the thin g-buffer existed, declared a second colour target against a
     one-attachment scene pass, and had **every composite rejected** — the mods loaded and did
     nothing. Two vendors appending to the same struct is not forward compatibility.
-  - **Two color attachments.** When a host normal buffer exists the scene pass has two color targets,
-    and *every* pipeline recorded into it must declare two or WebGPU rejects the draw. All five
-    scene-pass composites (ssilvb, vbao, realtime_sun_shadows, graphics_hub's deferred fog, smaa)
-    declare a write-masked second target when the format is set, and skip the draw if the draw
-    context ever disagrees at record time. **Upstream has no normal buffer, so on this platform they
-    all take the single-target path** — but any new scene-pass mod must still follow the rule.
-  - **Authored normals are gone on this platform.** Upstream has no normal buffer of any kind, so
-    Graphics Hub reconstructs from depth for every pixel and reports *"this game build has no normal
-    buffer"*. That is correct, not a regression. `common/gfx_normal_compat.h` makes it a compile-time
-    non-event; see `docs/normal_buffer_portability.md`.
-  - **Link stubs come from upstream and are version-independent.** The SDK downloads them from
-    `encounter/dusklight` `releases/download/sdk` — one fixed tag, public, generated by symgen, and
-    carrying every asset our CI matrix needs (`windows-amd64.lib`, `windows-arm64.lib`,
-    `stub-macos-arm64`, `stub-macos-x86_64`, `stub-android-aarch64.so`). Linux needs no stub at all.
-    Bump `DUSKLIGHT_VERSION` **only** when deliberately re-platforming, never as a side effect of a
-    mod change.
-  - **Aurora's streaming buffers are upstream-sized again**, and that is the one real regression risk:
-    upstream pins Vertex 5 MB / Index 2 MB / Storage 8 MB where our old fork used 16 / 4 / 16. The
-    shadow mod replays the game's draw lists into up to four extra cascade passes, so heavy cascade
-    settings can now overflow. If Realtime Sun Shadows aborts or drops geometry, reduce cascade count,
+  - **Two color attachments.** When the host normal buffer is on the scene pass has two color targets,
+    and *every* pipeline recorded into it must declare two or WebGPU rejects the draw. All six
+    scene-pass pipelines (ssilvb, vbao, realtime_sun_shadows, smaa, and graphics_hub's deferred fog +
+    normal overlay) take their layout from `gfx_compat::scene_pass_layout`, so they follow the pass
+    whichever shape it has. Any new scene-pass mod must do the same.
+  - **Authored normals are back — but off until the user switches them on.** The platform provides
+    the buffer; the game ships it disabled (**Video → Rendering → Scene Normal Buffer**, applies on
+    the next launch) and cannot provide it at all in compatibility mode. Until then Graphics Hub
+    reconstructs from depth for every pixel and its status line says which setting to turn on. That
+    is correct, not a regression. `common/gfx_normal_compat.h` makes a base *without* the buffer a
+    compile-time non-event; see `docs/normal_buffer_portability.md`.
+  - **Link stubs come from the same release as the game build.** `DUSKLIGHT_SDK_STUB_URL` points at
+    `automata-rtx/dusklight-ao` `releases/download/platform-normals-test`, which publishes every
+    asset our CI matrix needs (`windows-amd64.lib`, `windows-arm64.lib`, `stub-macos-arm64`,
+    `stub-macos-x86_64`, `stub-android-aarch64.so`) as top-level assets. Linux needs no stub at all.
+    Unlike upstream's version-independent `sdk` tag, **a fork release's stubs are per-build** — move
+    `DUSKLIGHT_SDK_STUB_URL` whenever you move `DUSKLIGHT_VERSION`. Bump either **only** when
+    deliberately re-platforming, never as a side effect of a mod change.
+  - **Aurora's streaming buffers are the enlarged ones again** (Vertex 16 MB / Index 4 MB / Storage
+    16 MB, vs upstream's 5 / 2 / 8). That removes the overflow risk the upstream pin carried for
+    Realtime Sun Shadows' cascade replays — but it is also a reason a mod tuned here can overrun a
+    stock-upstream base later. If the shadow mod aborts or drops geometry, reduce cascade count,
     shadow resolution or draw distance first — see `docs/realtime_sun_shadows.md`.
 
 ## Re-platforming (moving to a newer base game)
 
-Now a **one-line change**, because we track upstream directly and no fork is involved:
-
-1. Bump **`DUSKLIGHT_VERSION`** to the upstream commit whose build the user runs, and reconfigure.
-   The stub URL never changes — upstream's `sdk` release is a single fixed tag and is
-   version-independent, so it keeps serving every platform.
+1. Bump **`DUSKLIGHT_VERSION`**, and **`DUSKLIGHT_REPOSITORY` / `DUSKLIGHT_SDK_STUB_URL` with it** if
+   the new base lives in a different repo or release. The stubs must come from the same build as the
+   game: upstream's `sdk` tag is version-independent, a fork release's stubs are not.
 2. Install the matching game build and fresh `.dusk` files **as a pair**. The pin and the running
    build must agree: game-linked mods resolve hook targets by symbol at load, so a mismatch can make
    a mod fail to load outright (this is exactly how Celestial Orbit failed when fork-built `.dusk`
-   files were run on an upstream build).
+   files were run on an upstream build). The **game service major version** is a second, blunter
+   version of the same trap — a bump there refuses every mod built against the older SDK regardless
+   of hooks.
 3. **Re-verify the game-linked mods in-game** — Realtime Sun Shadows, Graphics Hub's Deferred Fog,
    Effect Remover, Celestial Orbit. They hook specific game functions and a decomp delta can move or
    rename what they hook. The service-only mods (VBAO, SSILVB, SMAA) need no re-verification.
-4. Watch for **streaming-buffer overflow** in the shadow mod: upstream's aurora is smaller than the
-   old fork's (Vertex 5 MB / Index 2 MB / Storage 8 MB vs 16 / 4 / 16), and the cascade replays are
-   the heaviest consumer.
+4. Watch for **streaming-buffer overflow** in the shadow mod if the new base uses upstream's aurora
+   sizes (Vertex 5 MB / Index 2 MB / Storage 8 MB vs the fork's 16 / 4 / 16) — the cascade replays
+   are the heaviest consumer.
+5. If the new base has no scene normal buffer, expect Graphics Hub to say so and normals to be
+   faceted. That is correct, and needs no source change.
 
-The old two-repo fork process (`dusklight-ao` + `aurora-ao`, each pristine-upstream-plus-a-delta,
-with a grafted release job to publish stubs) is **retired**. It existed to carry the enlarged aurora
-buffers and the thin g-buffer; upstream now serves public stubs and we no longer use the g-buffer.
-Do not resurrect it without a concrete reason — appending fields to SDK structs is what caused the
-`normal_format` / `WGPUInstance` offset collision documented under The ABI pin.
+**Forking the SDK is not free.** Appending fields to SDK structs is what caused the
+`normal_format` / `WGPUInstance` offset collision documented under The ABI pin, and the current pin
+avoids it only by appending *after* upstream's own fields. Prefer upstreaming a platform feature
+over carrying a delta — see `docs/authored_normals.md` §9.5.
 
-## Related repos (context only — not needed for day-to-day mod work)
+## Related repos
 
-- `TwilitRealm/dusklight` — **upstream, and now our actual platform.** `DUSKLIGHT_VERSION` pins a
-  commit here directly. Its `sdk` release on `encounter/dusklight` serves the link stubs.
-- `automata-rtx/dusklight-ao` — our former Dusklight fork. **No longer part of the build.** Kept for
-  history and for the one thing that still matters:
+- `automata-rtx/dusklight-ao` — **our Dusklight fork, and the current platform.**
+  `DUSKLIGHT_VERSION` pins a commit here and `DUSKLIGHT_SDK_STUB_URL` a release here.
+  - Branch `claude/dusklight-thin-gbuffer-normals-l4l9dc` / `platform-normals-test` (`0474043c`) =
+    **the live platform**: upstream `008a18c1` + GfxService 1.2's scene normal buffer.
+    `dusklight-ao/docs/thin-gbuffer-normals.md` is the renderer-side design. The three
+    `TEST SCAFFOLDING` commits on the tip (aurora submodule pin, release job, an unrelated debug
+    toggle removal) are meant to be dropped before any upstream PR — dropping them would move the
+    pin, so re-pin if that happens.
   - Branch `claude/thin-gbuffer-authored-normals-wgqupt` / `platform-gbuffer-test` (`b96bf5ec01`) =
-    the retired thin-g-buffer platform; `dusklight-ao/docs/thin-gbuffer-normals.md` is its
-    renderer-side design, should authored normals ever be revisited (ideally upstreamed instead —
-    see `docs/authored_normals.md` §9.5).
+    the **retired** first g-buffer platform (RGBA8, colliding `GfxDeviceInfo` offset). Historical.
   - Branch `claude/dusklight-platform-rebuild-rqhsaw` / `platform-v2-test` (`9361fbd9ea`) = the
     superseded pre-g-buffer platform.
   - Branch `claude/standalone-final` + the `standalone-final` release = the pre-mod-API aurora-fork
     build; that build is the ONLY way the graphics features run on iOS (code mods cannot run there —
     dlopen restriction), so never delete it. (`mod-platform` / `platform-v1` are the superseded
     first-generation platform — historical only.)
-- `automata-rtx/aurora-ao` — our aurora fork. Branch `claude/dusklight-platform-rebuild-rqhsaw` =
-  the platform's aurora (mainline-pinned + enlarged buffers, above). Other branches remain the
-  frozen fork the `standalone-final` build uses.
+- `automata-rtx/aurora-ao` — our aurora fork, the renderer under the platform above. Branch
+  `claude/dusklight-thin-gbuffer-normals-l4l9dc` (`f8d8c035`) = upstream aurora `59c2b97` + the
+  optional normal target + the enlarged streaming buffers; this is the `extern/aurora` submodule pin
+  `dusklight-ao` records. Other branches remain the frozen fork the `standalone-final` build uses.
+- `TwilitRealm/dusklight` — upstream. Our fork tracks it; a mod session does not need it attached.
