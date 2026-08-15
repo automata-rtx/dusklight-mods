@@ -198,7 +198,18 @@ own. Everything else is the template unchanged, so template updates apply cleanl
 
 Editing a shader or tuning a default touches ONE file here. It does **not** require building
 the game, building aurora, or editing the fetched `dusklight/` tree (a read-only pinned
-reference). CI compiles all mods on every platform and validates every shader in a few minutes.
+reference). CI compiles all mods on every platform in a few minutes.
+
+**CI does NOT validate shaders** — it only packages the `.wgsl` files, so a WGSL error ships and
+first appears in-game as a pipeline that fails to create. Validate locally before pushing a shader
+change; `tools/wgsl_check.cpp` compiles every shader through Dawn's null backend and needs no GPU:
+
+```sh
+cmake -B build && cmake --build build          # fetches the prebuilt Dawn the validator links
+D=build/_deps/dawn_prebuilt-src
+g++ -std=c++20 -I$D/include tools/wgsl_check.cpp $D/lib/libwebgpu_dawn.a -ldl -lpthread -lX11 \
+    -o build/wgsl_check && ./build/wgsl_check mods/*/res/*.wgsl
+```
 
 The user typically does not build locally. Iteration loop:
 1. Edit, commit, push (branch per the session's instructions).

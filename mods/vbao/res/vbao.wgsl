@@ -255,15 +255,31 @@ fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // provider is used in half-res mode, sample it at this chain pixel's (jittered) full-res
     // position - the 4-phase jitter walks full-res normal detail, which temporal accumulation
     // integrates - so half-res AO still gets a full-res normal. Rotate world -> view.
+    // geo_n is the GEOMETRIC (face) normal of the depth surface, and is not what shades the AO -
+    // `normal` below still centres the visibility mask and carries the cosine lobe. Its only job is
+    // to answer "which directions lie below the surface that actually occludes", which is a
+    // property of the GEOMETRY rather than of the artist's smoothed vertex normal. See the
+    // rejection in the march loop.
+    //
+    // When the provider is absent it costs nothing: the inline reconstruction IS the face normal,
+    // so the two are the same vector and the rejection is a no-op.
     var pixel_normal: vec3<f32>;
+    var geo_n: vec3<f32>;
     if (uniforms.flags & 8u) != 0u {
         let n_dims = vec2<f32>(textureDimensions(d2n_normal));
         let n_texel = clamp(vec2<i32>(uv * n_dims), vec2<i32>(0i), vec2<i32>(n_dims) - vec2<i32>(1i));
         let world_n = textureLoad(d2n_normal, n_texel, 0i).xyz;
         let r = uniforms.view_from_world;
         pixel_normal = normalize(r[0].xyz * world_n.x + r[1].xyz * world_n.y + r[2].xyz * world_n.z);
+        let g = reconstruct_normal(pixel_coordinates, pixel_position, raw_depth);
+        // reconstruct_normal normalizes an unguarded cross product, so a degenerate patch yields
+        // NaN. Left alone that would make `dot(delta, geo_n) > 0` false for every sample and switch
+        // AO off on those pixels; fall back to the shading normal, which reduces the rejection to
+        // the old behaviour.
+        geo_n = select(pixel_normal, g, dot(g, g) > 0.5);
     } else {
         pixel_normal = reconstruct_normal(pixel_coordinates, pixel_position, raw_depth);
+        geo_n = pixel_normal;
     }
     pixel_position *= 1.0 - uniforms.depth_bias; // bias toward the camera suppresses self-occlusion
     let view_vec = normalize(-pixel_position);
@@ -334,12 +350,19 @@ fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
             // MIP level from the sample's screen distance in pixels (bandwidth optimization).
             let sample_mip_level = clamp(log2(max(dist, 1.0)) - 3.3, 0.0, 4.0);
 
+            // Geometric rejection: only samples ABOVE the occluding surface's own plane can
+            // occlude it. With a depth-reconstructed normal this is a no-op - that normal IS the
+            // plane, so coplanar samples already land exactly on the horizon and carve nothing.
+            // With an AUTHORED normal it is what stops flat ground from occluding itself: the
+            // artist's smoothed vertex normal tilts off the geometry by design, and a hemisphere
+            // centred on it swallows the very plane the samples lie in, which reads as AO shading
+            // on surfaces that have no occluder anywhere near them.
             let sp = load_sample_position(uv + offset, sample_mip_level);
-            if sp.w > 0.0 {
+            if sp.w > 0.0 && dot(sp.xyz - pixel_position, geo_n) > 0.0 {
                 occ = carve_sample(occ, sp.xyz - pixel_position, view_vec, n, t_base, depth_range, false);
             }
             let sn = load_sample_position(uv - offset, sample_mip_level);
-            if sn.w > 0.0 {
+            if sn.w > 0.0 && dot(sn.xyz - pixel_position, geo_n) > 0.0 {
                 occ = carve_sample(occ, sn.xyz - pixel_position, view_vec, n, t_base, depth_range, true);
             }
         }

@@ -230,6 +230,41 @@ fn load_sample_position(uv: vec2<f32>, sample_mip_level: f32) -> vec4<f32> {
     return vec4<f32>(reconstruct_view_space_position(depth, uv), depth);
 }
 
+// GEOMETRIC (face) normal of the depth surface at the centre pixel, view space. Four MIP-0 taps
+// and a cross product of the screen-space position deltas, side-selected on the smaller depth step
+// so a silhouette does not smear the plane.
+//
+// This is deliberately the FACETED normal, and it is NOT what shades the AO - `normal` (the
+// provider's, authored where available) still centres the visibility mask and carries the cosine
+// lobe. Its only job is to answer "which directions lie below the surface that actually occludes",
+// which is a property of the GEOMETRY and not of the artist's smoothed vertex normal. See the
+// rejection at the march call sites.
+//
+// The camera-facing flip here is correct and required: a cross product's sign is arbitrary. That is
+// the exact case docs/authored_normals.md 2a carves out - it applies to reconstructions, never to
+// authored normals.
+// `fallback` is returned when the taps are degenerate (parallel deltas - a constant-depth patch, or
+// clamped-out edges). It must be the shading normal, NOT a zero vector: the rejection is
+// `dot(delta, geo_n) > 0`, so a zero geo_n rejects every sample and switches AO off entirely
+// instead of passing everything. Falling back to the shading normal reduces the rejection to the
+// old behaviour, which is the right degenerate answer.
+fn geometric_normal_view(uv: vec2<f32>, centre: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
+    let px = uniforms.inv_size;
+    let r = load_sample_position(uv + vec2<f32>(px.x, 0.0), 0.0).xyz;
+    let l = load_sample_position(uv - vec2<f32>(px.x, 0.0), 0.0).xyz;
+    let d = load_sample_position(uv + vec2<f32>(0.0, px.y), 0.0).xyz;
+    let u = load_sample_position(uv - vec2<f32>(0.0, px.y), 0.0).xyz;
+    let ddx = select(centre - l, r - centre, abs(r.z - centre.z) < abs(l.z - centre.z));
+    let ddy = select(centre - u, d - centre, abs(d.z - centre.z) < abs(u.z - centre.z));
+    let g = cross(ddy, ddx);
+    let len = length(g);
+    if !(len > 1.0e-12) { // also catches NaN from a degenerate cross product
+        return fallback;
+    }
+    let gn = g / len;
+    return select(gn, -gn, dot(gn, centre) > 0.0);
+}
+
 // Linear scene radiance at a march sample, from the SAME MIP level as its depth fetch: the
 // pre-averaged level approximates the mean radiance of the surface span a wide sector sees.
 fn load_sample_radiance(uv: vec2<f32>, sample_mip_level: f32) -> vec3<f32> {
@@ -303,6 +338,9 @@ fn ssilvb(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // to clamp instead of flip - a back-facing emitter contributes nothing, which needs no sign
     // change. See docs/authored_normals.md 2a.
     let normal = pixel_normal;
+    // Plane of the geometry that actually occludes. A sample below it is behind the surface and
+    // cannot occlude this point; see the rejection in the march loop and geometric_normal_view.
+    let geo_n = geometric_normal_view(uv, pixel_position, normal);
 
     // Depth-proportional radius with a distance ramp; base thickness grows logarithmically with
     // the view-space radius plus a radius-proportional floor. All inherited from VBAO - see
@@ -401,7 +439,14 @@ fn ssilvb(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let sample_mip_level = clamp(log2(max(dist, 1.0)) - 3.3, 0.0, 4.0);
 
             let sp = load_sample_position(uv + offset, sample_mip_level);
-            if sp.w > 0.0 {
+            // Geometric rejection: only samples ABOVE the occluding surface's own plane can
+            // occlude it. With a depth-reconstructed normal this is a no-op - that normal IS the
+            // plane, so coplanar samples already land exactly on the horizon and carve nothing.
+            // With an AUTHORED normal it is what stops flat ground from occluding itself: the
+            // artist's smoothed vertex normal tilts off the geometry by design, and a hemisphere
+            // centred on it swallows the very plane the samples lie in, which reads as AO shading
+            // on surfaces that have no occluder anywhere near them.
+            if sp.w > 0.0 && dot(sp.xyz - pixel_position, geo_n) > 0.0 {
                 let bits = sample_sector_bits(
                     sp.xyz - pixel_position, view_vec, n, t_base, depth_range, false);
                 let newly = bits & occ;
@@ -412,7 +457,7 @@ fn ssilvb(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 occ &= ~bits;
             }
             let sn = load_sample_position(uv - offset, sample_mip_level);
-            if sn.w > 0.0 {
+            if sn.w > 0.0 && dot(sn.xyz - pixel_position, geo_n) > 0.0 {
                 let bits = sample_sector_bits(
                     sn.xyz - pixel_position, view_vec, n, t_base, depth_range, true);
                 let newly = bits & occ;

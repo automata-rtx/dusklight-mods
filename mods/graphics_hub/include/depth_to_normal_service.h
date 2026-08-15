@@ -1,8 +1,28 @@
 // Depth to Normal - shared service contract.
 //
-// Include this header in any mod that wants the per-pixel world-space surface normal that the
-// Depth to Normal provider mod reconstructs from the scene depth buffer once per frame. See
-// docs/depth_to_normal_plan.md and docs/depth_to_normal_consumers.md.
+// Include this header in any mod that wants the per-pixel world-space surface normal the Depth to
+// Normal provider (Graphics Hub) publishes once per frame. See docs/depth_to_normal_plan.md and
+// docs/depth_to_normal_consumers.md.
+//
+// WHICH NORMAL THIS IS. Two different things get called "the normal", they are not
+// interchangeable, and picking the wrong one is a bug that looks like a tuning problem:
+//
+//   * SHADING normal - the game's authored, interpolated vertex normal. Smooth across a facet by
+//     design, and by design NOT perpendicular to the triangle it sits on. Right for n.L, attached
+//     shadows, normal offset, and cosine weighting.
+//   * GEOMETRIC normal - the face normal of the rasterized triangle, i.e. the plane the depth
+//     samples actually lie in. Right for anything asking "is this direction above or below the
+//     surface": shadow-map bias, and the occlusion hemisphere of an AO march.
+//
+// **This service returns the SHADING normal wherever the game supplied one**, falling back to the
+// depth reconstruction (which is geometric) only where it did not. So the meaning of the vector
+// CHANGES per pixel and with the user's "Use Authored Normals" switch. A consumer that needs the
+// geometric plane must derive it from depth itself and must not assume this vector is it -
+// vbao/ssilvb do exactly that for their sample rejection, and the shadow mod for its bias.
+//
+// Getting this wrong is what made AO appear on flat ground the moment authored normals were turned
+// on: a visibility hemisphere centred on a shading normal that tilts off the geometry swallows the
+// very plane its samples lie in. See docs/authored_normals.md 8.6 and 8.11.
 //
 // Usage (consumer):
 //     #include "depth_to_normal_service.h"
@@ -34,13 +54,21 @@ typedef struct DepthToNormalFrame {
     WGPUTextureView normal; /* rgba32float: xyz = world-space surface normal (unit), w = raw
                              * reversed-Z depth. Frame-valid.
                              *
-                             * Orientation: the TRUE surface direction, not forced camera-facing.
-                             * Only clearly inverted geometry (a two-sided sheet seen from behind)
-                             * is flipped. Near a silhouette a smooth authored normal legitimately
-                             * turns past perpendicular to the view, and forcing it toward the
-                             * camera there corrupts it - which matters to anything using n.L.
-                             * Consumers that want a strictly camera-facing normal (AO) should
-                             * apply their own guard WITH A MARGIN, as vbao/ssilvb do. */
+                             * WORLD SPACE, always - the authored normal arrives from the renderer
+                             * in view space and the provider rotates it out with the camera
+                             * service's world_from_view, so consumers get one canonical basis
+                             * whichever source fed the pixel. Rotate it into your own space if you
+                             * need to (vbao/ssilvb rotate straight back to view, which is a round
+                             * trip through exact inverses - lossless, and the price of the shared
+                             * buffer).
+                             *
+                             * ORIENTATION: the surface direction with the GAME'S OWN SIGN. Do NOT
+                             * flip it toward the camera, at any threshold. dot(n, view_ray) is not
+                             * a property of the surface - the ray sweeps across the screen - so any
+                             * such test negates everything past a line and seams flat ground. This
+                             * was got wrong three times; see docs/authored_normals.md 2a. The only
+                             * legitimate camera-facing flips are on cross products you build
+                             * yourself, whose sign genuinely is arbitrary. */
     uint32_t width;
     uint32_t height;
 } DepthToNormalFrame;

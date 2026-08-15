@@ -643,6 +643,57 @@ the curvature the shading normal carries.
   through the user's testing is not. Prefer shipping the view that answers the question over
   shipping another guess.
 
+### 8.11 A shading normal cannot define an AO hemisphere
+
+**Symptom:** with the normal debug view correct and the seam gone, toggling *Use Authored Normals*
+on still made SSILVB (bounce and probe off, so pure AO) *worse in one specific way* — shading got
+smoother as expected, but **AO appeared on flat ground that has no occluder anywhere near it**.
+
+**It is not a basis problem, and this is worth stating plainly because it looks like one.** The
+provider's output really is world space: the authored normal arrives in view space and is rotated
+out with the camera service's `world_from_view`; VBAO and SSILVB rotate it straight back with the
+same service's `view_from_world`. Those are exact inverses from the same struct in the same frame,
+so the round trip is lossless to ~1e-7 — waste (two 3×3 rotations per pixel), never a visible
+artifact.
+
+**The cause is that the two normals do different jobs**, the same lesson as §8.6 but on the AO side:
+
+- `ssilvb.wgsl:218` (`hh = (fbang + n)/PI + 0.5`) and VBAO's `carve_sample` map each sample's
+  horizon angles into a 32-sector mask **centred on the normal angle `n`**. The normal therefore
+  *defines the hemisphere* — it decides which directions are above the surface at all.
+- A depth-reconstructed normal is perpendicular to the plane its own samples lie in **by
+  construction**. Coplanar ground samples land exactly on the horizon and carve nothing. Flat ground
+  is self-consistently unoccluded, for free.
+- An authored normal is *deliberately not* perpendicular to its triangle — that is the entire point
+  of a smoothed vertex normal. Tilt it by θ and the hemisphere tilts with it, swallowing the very
+  plane the samples lie in. On TP's heavily smoothed low-poly terrain θ is easily 10–30°, which is
+  θ/π of the slice: **3–5 of 32 sectors carved on a perfectly flat surface**.
+
+**Fix:** keep the shading normal for the hemisphere and the cosine lobe — that is what buys the
+smoothness — and reject samples that lie below the *geometric* plane, which is what actually
+occludes:
+
+```wgsl
+if sp.w > 0.0 && dot(sp.xyz - pixel_position, geo_n) > 0.0 { ... }
+```
+
+`geo_n` is the face normal from depth (VBAO reuses its own `reconstruct_normal`; SSILVB gained a
+4-tap `geometric_normal_view`). It is a **no-op on the reconstruction path** — there `geo_n` *is*
+the shading normal, so nothing changes and the A/B stays honest.
+
+Two traps in that one line, both hit while writing it:
+
+- `geo_n` must fall back to the **shading normal** when the cross product is degenerate, never to a
+  zero vector. `dot(delta, 0) > 0` is false, so a zero `geo_n` rejects every sample and switches AO
+  off entirely on those pixels — the opposite of "pass everything".
+- VBAO's `reconstruct_normal` normalizes an unguarded cross product, so a degenerate patch yields
+  **NaN**, and every comparison against NaN is false — the same silent AO-off. Guarded with
+  `dot(g, g) > 0.5`, which NaN also fails, selecting the fallback.
+
+**Rule:** the service returns a *shading* normal wherever the game supplied one. Anything asking
+"is this direction above the surface" — an AO hemisphere, a shadow-map bias — must build its own
+geometric normal from depth. The service header says so now.
+
 ## 9. Could a mod produce this buffer without the aurora change?
 
 Investigated against **upstream `TwilitRealm/dusklight` HEAD `4504e5009`** (28 commits past our base
