@@ -323,6 +323,15 @@ fn ssilvb(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // mode the (jittered) full-res position walks full-res normal detail, which temporal
     // accumulation integrates - same trick as VBAO's provider path.
     let pixel_normal = load_view_normal(uv);
+    // Plane of the geometry that actually occludes. Built from the UNBIASED centre, and the order
+    // here is load-bearing: geometric_normal_view's four taps are unbiased fresh loads, so passing
+    // a centre already scaled by (1 - depth_bias) leaves every delta carrying a spurious
+    // +depth_bias * P offset ALONG THE VIEW RAY. At the default bias that offset is ~3.7x the true
+    // one-pixel gradient, which swamps the cross product and leaves geo_n pointing somewhere near
+    // perpendicular to the view instead of along the surface - and a wrong geo_n rejects the wrong
+    // samples. VBAO gets this right by construction (it reconstructs before biasing); this matches
+    // that ordering. See the rejection in the march loop.
+    let geo_n = geometric_normal_view(uv, pixel_position, pixel_normal);
     pixel_position *= 1.0 - uniforms.depth_bias; // bias toward the camera suppresses self-occlusion
     let view_vec = normalize(-pixel_position);
     // NO camera-facing flip - the provider's normal arrives correctly oriented and must be taken
@@ -338,9 +347,6 @@ fn ssilvb(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // to clamp instead of flip - a back-facing emitter contributes nothing, which needs no sign
     // change. See docs/authored_normals.md 2a.
     let normal = pixel_normal;
-    // Plane of the geometry that actually occludes. A sample below it is behind the surface and
-    // cannot occlude this point; see the rejection in the march loop and geometric_normal_view.
-    let geo_n = geometric_normal_view(uv, pixel_position, normal);
 
     // Depth-proportional radius with a distance ramp; base thickness grows logarithmically with
     // the view-space radius plus a radius-proportional floor. All inherited from VBAO - see
