@@ -267,12 +267,19 @@ fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
     pixel_position *= 1.0 - uniforms.depth_bias; // bias toward the camera suppresses self-occlusion
     let view_vec = normalize(-pixel_position);
-    var normal = pixel_normal;
-    // Face the normal toward the camera only when CLEARLY back-facing (double-sided foliage seen
-    // from behind); the margin keeps grazing surfaces from toggling per pixel.
-    if dot(normal, view_vec) < -0.15 {
-        normal = -normal;
-    }
+    // NO camera-facing flip. Both branches above already arrive correctly oriented, by different
+    // routes: the inline reconstruction orients itself (its cross product has an arbitrary sign),
+    // and the provider's normal is either that same reconstruction or the game's AUTHORED normal,
+    // which carries the sign the game gave it and must not be second-guessed.
+    //
+    // This used to flip at dot(normal, view_vec) < -0.15, nominally for double-sided foliage seen
+    // from behind. It never fired on the reconstruction (already camera-facing), so in practice it
+    // acted only on authored normals - and there it seamed flat ground: the view ray sweeps across
+    // the screen, so on a large surface at a grazing angle the test flips along a line and negates
+    // everything past it. Worse than the provider's own retired 0.5 guard, since -0.15 trips
+    // earlier and so lands the seam nearer the horizon, right where ground planes are widest.
+    // See docs/authored_normals.md 2a.
+    let normal = pixel_normal;
 
     // Depth-proportional radius: constant screen-space search radius. Base thickness grows
     // logarithmically with the view-space radius (keeps close-up foliage from overdarkening),

@@ -34,7 +34,7 @@ it away afterwards. See `dusklight-ao/docs/thin-gbuffer-normals.md` for the rend
 
 ## 0. State of play (read first)
 
-**Platform:** `DUSKLIGHT_VERSION = 0474043c`, `DUSKLIGHT_REPOSITORY` → `automata-rtx/dusklight-ao`,
+**Platform:** `DUSKLIGHT_VERSION = 6297083`, `DUSKLIGHT_REPOSITORY` → `automata-rtx/dusklight-ao`,
 `DUSKLIGHT_SDK_STUB_URL` → `platform-normals-test`. The user must run the `win32-msvc-x86_64` build
 from that release; game build and `.dusk` files are always a matched pair, in both directions (see
 §6 for rollback). **Then turn on Video → Rendering → Scene Normal Buffer and restart** — nothing in
@@ -63,7 +63,8 @@ reason: `008a18c1` bumped the **game service major version**, so mods built agai
 | `aa2c723` | **Receiver-plane fractional-sampling bias capped** (§8.8). |
 | `38386e4` | Normal Smoothing pass deleted outright (§8.9). |
 | `e50a1a9` | Re-platformed onto upstream `0fc05028`, which has no normal buffer — authored normals off across the board, provider reconstructing every pixel. |
-| *(this change)* | Re-platformed onto `platform-normals-test`, restoring authored normals; all six scene-pass pipelines moved to `get_pass_targets`, and the `GfxDrawContext::normal_format` guard deleted (§5). |
+| `dcdaa23` | Re-platformed onto `platform-normals-test`, restoring authored normals; all six scene-pass pipelines moved to `get_pass_targets`, and the `GfxDrawContext::normal_format` guard deleted (§5). |
+| *(this change)* | **Every camera-facing flip on an authored normal deleted** — provider (was 0.5) and VBAO/SSILVB (were −0.15). Re-pinned to the rebased platform, which also drops aurora's enlarged streaming buffers (§2a). |
 
 ### Confirmed in-game by the user
 
@@ -165,42 +166,64 @@ that has never been checked on a GPU.
   it with **Authored Basis** (As-is / Flip Y / Flip Z / Flip Y and Z) and report which one landed;
   the winning flip then gets folded into the shader as the default.
 
-Note a camera-facing guard is applied to the authored normal too (see §2a), so a *global* sign
-error is largely self-correcting on front-facing surfaces — a Y flip or an axis swap is the failure
-mode that would actually show.
+Note that no camera-facing guard is applied to the authored normal (see §2a), so a *global* sign
+error would show up plainly rather than being masked on front-facing surfaces.
 
-## 2a. The camera-facing guard must not use a zero threshold
+## 2a. Never flip an authored normal toward the camera — at any threshold
+
+**This is the single most expensive lesson in this document. It was got wrong three times, each
+time by weakening the test rather than deleting it.**
 
 The reconstruction ends with `if dot(n, pos) > 0 { n = -n }`, forcing the normal toward the camera.
-That is safe for a **face** normal: on a front-facing triangle it never legitimately points away, so
-the test only fires on numerical noise.
+That is *required* there and nowhere else: a cross product of screen-space deltas has an *arbitrary
+sign*. Nothing in the depth buffer says which way the surface faces, so the sign has to be invented,
+and "toward the camera" is the only sane choice.
 
-Applied to an **authored** normal it is wrong, and visibly so. A smooth, interpolated normal field
-crosses `dot(n, view) = 0` *at the visual silhouette by construction*, and on low-poly geometry it
-travels well past perpendicular before the triangle ends — an 8-sided cylinder reaches about 22°,
-`dot ≈ 0.37`. A zero threshold negates every pixel in that band. Symptoms:
+An authored normal is not in that position. It **already has a sign** — the one the artist gave it,
+transformed by the model-view matrix — and the renderer writes it per draw, so a reverse pass over
+two-sided geometry supplies the normals for the side it actually draws. There is no ambiguity left
+for a guard to resolve, so a guard can only ever destroy information.
 
-- a **wrong-coloured band hugging every silhouette** in the normal debug view, which *widens and
-  narrows as the camera moves* — because the size of the region where `dot(n, view) > 0` is itself
-  view-dependent. (That view-dependence is what distinguishes this from an MSAA resolve artifact,
-  which would be a fixed ~1px rim. MSAA is in fact off: Dusklight never assigns `AuroraConfig::msaa`
-  and `aurora.cpp:116` defaults it to 1.)
-- the shadow mod's **attached-shadow term failing on curved back-lit features** — a flipped normal
-  inverts `n·L`, so a surface facing away from the sun reads as facing it and the term switches off.
-  Nose tip, boot and tunic edges, exactly the high-curvature silhouette-adjacent geometry.
+### Why any threshold seams
 
-The threshold is now **0.5** — flip only what is *clearly* inverted, i.e. a two-sided sheet seen
-from behind, whose normal points nearly straight away (0.7–1.0). A silhouette band tops out near
-0.4, so the two cases separate cleanly.
+`dot(n, view_ray)` is **not a property of the surface**. The ray direction sweeps across the screen
+under perspective, so on a large surface seen at a grazing angle the product crosses any fixed
+threshold *along a line*, and every pixel past that line is negated. The result is a **hard seam
+across geometrically flat ground**, worst where ground planes run to the horizon.
 
-This is not a new idea in the repo: **VBAO and SSILVB already guard with a 0.15 margin** and say why
-— *"Face the normal toward the camera only when CLEARLY back-facing… the margin keeps grazing
-surfaces from toggling per pixel."* The provider was the one place using a hard zero. Because those
-mods re-apply their own guard, AO keeps the orientation it wants, while consumers needing the true
-surface direction (the shadow bias and its `n·L` terminator) now get it.
+Moving the threshold moves the seam. It does not remove it.
 
-**Rule for the service:** it returns the true surface direction, not a camera-facing one. Anything
-that wants strictly camera-facing normals applies its own guard *with a margin*.
+### The three attempts
+
+| Threshold | Reasoning at the time | What it actually did |
+|---|---|---|
+| `dot > 0` | "Copy the reconstruction's guard." | Negated the whole silhouette band. A smooth normal field crosses `dot = 0` *at the visual silhouette by construction*, and on low-poly geometry travels well past perpendicular first — an 8-sided cylinder reaches ~22°, `dot ≈ 0.37`. Showed as a wrong-coloured band hugging every silhouette that *widened and narrowed with camera angle*, and as the shadow mod's `n·L` inverting on curved back-lit features (nose tip, boot and tunic edges). |
+| `dot > 0.5` | "Spare the silhouette band; flip only what is *clearly* inverted." | Same bug, seam relocated. Smaller region negated, still bounded by a hard view-dependent line. |
+| *(none)* | An authored normal has no sign ambiguity. | Correct. |
+
+The consumers repeated the mistake independently: **VBAO and SSILVB each re-applied their own guard
+at `dot(n, view_vec) < -0.15`**, nominally for double-sided foliage. That fires *earlier* than the
+provider's own 0.5, so it planted the seam nearer the horizon — precisely where ground planes are
+widest on screen. It also never fired on the reconstruction path (already camera-facing), so despite
+the general-sounding comment it only ever acted on authored normals.
+
+All of them are now deleted. The four surviving flips in the tree are all on cross-product
+reconstructions, which is the one case that needs them:
+`graphics_hub/reconstruct.wgsl` `reconstruct_normal`, `vbao/vbao.wgsl` and `vbao/composite.wgsl`
+`reconstruct_normal`, and `realtime_sun_shadows/shadow.wgsl` `geometric_normal_at`.
+
+### What about genuinely back-facing geometry?
+
+The case the guards were written for largely does not arise: TP draws two-sided geometry as a
+reverse pass, and that pass writes the normals for the side it draws, so a visible back face already
+has a normal facing the viewer. Where single-pass two-sided geometry does leave a normal pointing
+away, AO integrates over a hemisphere facing away from the screen on those pixels. That is the
+accepted trade — it is local and rare, where the seam was global and on the most visible surface in
+the game. SSILVB's *emitter* term shows the right way to handle it without a sign change: it
+`clamp`s `dot(n, -l)` to `[0,1]`, so a back-facing emitter simply contributes nothing.
+
+**Rule for the service:** it returns the surface direction with the game's own sign. Consumers take
+it as given. A consumer that "corrects" it against the view re-creates this bug.
 
 ## 3. Coverage and the fallback
 
@@ -358,7 +381,7 @@ current pass.
 
 ## 6. Platform pin and rollback
 
-`CMakeLists.txt` pins `DUSKLIGHT_VERSION = 0474043c…` (tip of
+`CMakeLists.txt` pins `DUSKLIGHT_VERSION = 6297083…` (tip of
 `claude/dusklight-thin-gbuffer-normals-l4l9dc` in `dusklight-ao`), `DUSKLIGHT_REPOSITORY` at that
 fork and `DUSKLIGHT_SDK_STUB_URL` at the `platform-normals-test` release. The base game code is
 upstream Dusklight `008a18c1`; the renderer change and the SDK header additions sit on top of it.
@@ -425,7 +448,9 @@ The design note in §12 of the renderer doc predicted "slight silhouette error�
 practice it was neither slight nor confined to appearance:
 
 - a **wrong-coloured rim** on every silhouette in the normal debug view (partial-coverage texels
-  get flipped by the camera-facing guard, landing on a roughly camera-facing direction);
+  decode to a direction belonging to no real surface; at the time the camera-facing guard then
+  flipped many of them as well, compounding it — that guard is gone, §2a, but the blend it was
+  reacting to is what this section is about and the length test is what fixes it);
 - the shadow mod's **attached-shadow term failing** on thin back-lit features — a nose tip, boot
   and tunic edges — because `n·L` computed from a blended normal can read as sun-facing, switching
   the term off exactly where it is needed.
@@ -551,9 +576,9 @@ normal, so the two uses coincided and the bug could not show. `normalSmooth` was
 workaround from the same confusion — it traded bias banding at facet edges for bias error inside
 facets, which is why no value of it ever looked right.
 
-**Related:** the camera-facing guard has the same shape of error. A zero threshold is right for a
-face normal and wrong for a smooth one, which legitimately turns past perpendicular near a
-silhouette (§2a).
+**Related:** the camera-facing guard was the same shape of error, twice over — a test that is right
+for a face normal and wrong for an authored one, then "fixed" by retuning its threshold instead of
+removing it. It is gone entirely (§2a).
 
 ### 8.7 Acne and light leaks are the same failure with opposite sign
 
@@ -737,11 +762,16 @@ So the idea is sound, not hand-waving. It is still the wrong thing to build.
 
 ### 9.4 It would not remove the aurora fork
 
-`aurora-ao` carries **two** deltas, and the thin g-buffer is only one of them. The other is the
-enlarged per-frame streaming buffers (Index 4 MB, Vertex 16 MB, Storage 16 MB, Uniform/TextureUpload
-24 MB), which exist because the shadow mod's replays overflow stock aurora's 1 MB index / 5 MB
-vertex. Adding a second full-scene replay would need *more* headroom, not less. The trade buys
-nothing on the axis it was proposed for.
+`aurora-ao` historically carried **two** deltas, and the thin g-buffer was only one of them. The
+other was the enlarged per-frame streaming buffers (Index 4 MB, Vertex 16 MB, Storage 16 MB), which
+existed because the shadow mod's replays overflow stock aurora's sizes. Adding a second full-scene
+replay would need *more* headroom, not less, so the trade bought nothing on the axis it was proposed
+for.
+
+**As of the current pin that second delta is gone** — the rebased branch is upstream aurora plus the
+normal target and nothing else, so the buffers are back to 5 / 2 / 8. That does not revive this
+proposal (it makes the headroom argument worse, not better), but it does mean the shadow mod's
+cascade replays are running on stock sizes again; see CLAUDE.md's ABI pin.
 
 ### 9.5 The actual way to stop carrying the delta
 

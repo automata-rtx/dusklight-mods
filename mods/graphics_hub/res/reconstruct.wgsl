@@ -5,9 +5,10 @@
 //
 //   * AUTHORED (preferred): the game's own interpolated vertex normal, written by the renderer
 //     into the scene pass's second color attachment and handed to us as a snapshot (RGB10A2Unorm:
-//     xyz = view-space normal * 0.5 + 0.5, w = 1 when that draw supplied a normal attribute).
-//     Smooth by construction - no faceting, so no smoothing pass is needed. Ten bits per axis is
-//     what keeps low-curvature surfaces from banding; the two alpha bits only ever carry a flag.
+//     xyz = view-space normal * 0.5 + 0.5, w = 1 when that normal is usable, 0 when the draw had
+//     none or interpolation cancelled it to zero). Smooth by construction - no faceting, so no
+//     smoothing pass is needed. Ten bits per axis is what keeps low-curvature surfaces from
+//     banding; the two alpha bits only ever carry a flag.
 //   * RECONSTRUCTED (fallback): atyuwen's accurate 5-tap depth-gradient method, adapted UNCHANGED
 //     from Encounter's ao_mod demo (which ports it from Bevy Engine's SSAO; see res/licenses/).
 //     A cross product of screen-space position deltas is the flat face normal of the rasterized
@@ -15,13 +16,18 @@
 //     is absent (w = 0: sky, UI, billboards, non-depth-writing effects), and globally when the
 //     user turns authored normals off or the platform has no normal buffer.
 //
-// Both are defined in view space (camera at the origin, so the camera-facing test is just
-// dot(normal, position) > 0) and both are rotated into world space for output, so any consumer
+// Both are defined in view space and both are rotated into world space for output, so any consumer
 // gets a canonical world-space normal and rotates to its own space if needed.
 //
-// Output rgba32float: xyz = world-space normal (unit length, camera-facing), w = raw reversed-Z
-// depth (carried along so consumers get a bilateral/rejection reference without a second fetch).
-// Sky / cleared pixels (raw depth 0) are written as (0,0,1, 0): w = 0 marks them invalid.
+// THE TWO SOURCES ARE NOT ORIENTED THE SAME WAY, and that asymmetry is load-bearing. The
+// reconstruction is forced to face the camera because a cross product's sign is arbitrary. The
+// authored normal is passed through with the sign the game gave it and is NEVER flipped against
+// the view - doing so seams flat ground, at any threshold. See reconstruct() and
+// docs/authored_normals.md 2a; a consumer that "corrects" the output re-creates the bug.
+//
+// Output rgba32float: xyz = world-space unit normal, w = raw reversed-Z depth (carried along so
+// consumers get a bilateral/rejection reference without a second fetch). Sky / cleared pixels
+// (raw depth 0) are written as (0,0,1, 0): w = 0 marks them invalid.
 //
 // When debug_compare is set, the OTHER normal (whichever of the two did not become the output) is
 // also written to alt_out as xyz = world normal, w = authored validity, purely so the debug view
@@ -166,29 +172,27 @@ fn reconstruct(@builtin(global_invocation_id) gid: vec3u) {
             authored_valid = false;
         } else {
             authored_view = raw / len;
-            // Flip ONLY when the surface is clearly inverted - a two-sided sheet (foliage, cloth)
-            // seen from behind, whose normal points almost straight away from the camera.
+            // NO CAMERA-FACING FLIP HERE, at any threshold. This is deliberate and was learned the
+            // hard way twice; see docs/authored_normals.md 2a.
             //
-            // This deliberately does NOT use the reconstruction's zero threshold. That test is
-            // safe for a FACE normal, which on a front-facing triangle never legitimately points
-            // away. It is wrong for an AUTHORED normal: a smooth, interpolated normal field
-            // crosses dot(n, view) = 0 exactly at the visual silhouette by construction, and on
-            // low-poly geometry it goes well past perpendicular before the triangle ends (an
-            // 8-sided cylinder reaches ~22 degrees, dot ~ 0.37). A zero threshold negates every
-            // one of those pixels, which showed up as a wrong-coloured band hugging every
-            // silhouette - widening and narrowing with camera angle, since the size of the region
-            // where dot(n, view) > 0 is itself view-dependent - and, through the service, as the
-            // shadow mod's attached-shadow term failing on curved back-lit features, because a
-            // flipped normal inverts n.L.
+            // reconstruct_normal below must orient its result, because a cross product of
+            // screen-space deltas has an ARBITRARY SIGN - nothing in the depth buffer says which
+            // way the surface faces. An authored normal is not in that position: it already has a
+            // sign, the one the game gave it, and the renderer writes it per draw, so a reverse
+            // pass over two-sided geometry supplies the normals for the side it actually draws.
+            // There is no ambiguity left for a guard to resolve.
             //
-            // 0.5 separates the two cases cleanly: a silhouette band tops out near 0.4, while a
-            // genuinely inverted back-face points nearly straight away (0.7 to 1.0). VBAO and
-            // SSILVB already re-apply their own camera-facing guard with a 0.15 margin for the
-            // same reason, so AO keeps the orientation it wants while consumers that need the
-            // true surface direction (the shadow bias and its n.L terminator) now get it.
-            if dot(authored_view, normalize(pos)) > 0.5 {
-                authored_view = -authored_view;
-            }
+            // Applying one anyway costs a HARD SEAM ACROSS FLAT GROUND. `dot(n, view_ray)` is not
+            // a per-pixel property of the surface: the ray direction sweeps across the screen, so
+            // on any large surface seen at a grazing angle the product crosses the threshold along
+            // a line, and every pixel past that line gets negated. Ground planes running to the
+            // horizon are the worst case and the first place it shows.
+            //
+            // The failed intermediate step is worth recording: this used to flip at
+            // `dot > 0.5`, chosen to spare the silhouette band that a zero threshold destroyed.
+            // That is the same bug with the seam relocated, not fixed - a smaller region negated,
+            // still bounded by a hard line, still view-dependent. The threshold was never the
+            // problem; applying the test at all was.
         }
     }
 

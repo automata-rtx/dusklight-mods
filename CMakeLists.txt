@@ -40,7 +40,7 @@ project(dusklight_mods CXX)
 # Keep the pin matched to the game build actually being run — the game-linked mods resolve hook
 # targets by symbol at load, and a mod built against a different base can fail to load outright.
 if (NOT DUSKLIGHT_VERSION)
-    set(DUSKLIGHT_VERSION "0474043c860cf8108804ae4c17dfb96cbfc5a52a")
+    set(DUSKLIGHT_VERSION "629708397390998b6f30357123a5957f45e79359")
 endif ()
 
 if (NOT DEFINED DUSKLIGHT_REPOSITORY)

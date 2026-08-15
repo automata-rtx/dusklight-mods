@@ -287,15 +287,22 @@ fn ssilvb(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // frame entirely when the provider has no scene yet), rotated world -> view. In half-res
     // mode the (jittered) full-res position walks full-res normal detail, which temporal
     // accumulation integrates - same trick as VBAO's provider path.
-    var pixel_normal = load_view_normal(uv);
+    let pixel_normal = load_view_normal(uv);
     pixel_position *= 1.0 - uniforms.depth_bias; // bias toward the camera suppresses self-occlusion
     let view_vec = normalize(-pixel_position);
-    var normal = pixel_normal;
-    // Face the normal toward the camera only when CLEARLY back-facing (double-sided foliage seen
-    // from behind); the margin keeps grazing surfaces from toggling per pixel.
-    if dot(normal, view_vec) < -0.15 {
-        normal = -normal;
-    }
+    // NO camera-facing flip - the provider's normal arrives correctly oriented and must be taken
+    // as given. Where it is the game's AUTHORED normal it carries the sign the game gave it (the
+    // renderer writes normals per draw, so a reverse pass over two-sided geometry supplies them
+    // for the side it actually draws); where it fell back to the depth reconstruction, that path
+    // already oriented itself.
+    //
+    // This used to flip at dot(normal, view_vec) < -0.15, nominally for double-sided foliage seen
+    // from behind. On authored normals it seamed flat ground: the view ray sweeps across the
+    // screen, so on a large surface at a grazing angle the test flips along a line and negates
+    // everything past it. The emitter term at load_view_normal's other call site was always right
+    // to clamp instead of flip - a back-facing emitter contributes nothing, which needs no sign
+    // change. See docs/authored_normals.md 2a.
+    let normal = pixel_normal;
 
     // Depth-proportional radius with a distance ramp; base thickness grows logarithmically with
     // the view-space radius plus a radius-proportional floor. All inherited from VBAO - see

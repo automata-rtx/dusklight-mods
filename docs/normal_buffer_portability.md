@@ -185,6 +185,6 @@ The current pin does not repeat that mistake: `normal_format` is appended *after
    Celestial Orbit) — they hook specific game functions **by symbol, resolved at load**, so a decomp
    delta can make one fail to load rather than merely misbehave. The service-only mods (VBAO, SSILVB,
    SMAA) need no re-verification.
-5. Watch the shadow mod for streaming-buffer overflow. The current pin's aurora carries the enlarged
-   buffers (Vertex 16 MB / Index 4 MB / Storage 16 MB); a base on upstream's sizes (5 / 2 / 8) is
-   tighter and the cascade replays are the heaviest consumer.
+5. Watch the shadow mod for streaming-buffer overflow. The current pin's aurora uses upstream's
+   sizes (Vertex 5 MB / Index 2 MB / Storage 8 MB) — the enlarged 16 / 4 / 16 buffers the fork once
+   carried are gone — and the cascade replays are the heaviest consumer.
