@@ -729,6 +729,54 @@ small the feature it belongs to. It stays as VBAO's normal fallback, and nowhere
 "is this direction above the surface" — an AO hemisphere, a shadow-map bias — must build its own
 geometric normal from depth. The service header says so now.
 
+### 8.12 `max` is not how you combine two independent visibilities
+
+**Symptom:** in Realtime Sun Shadows, a bright stripe like a **specular glint** running along the
+light/shadow boundary on curved surfaces — reported from Debug View 15 as sitting exactly where the
+red (map) region hands over to the green (`n·L`) region. Not at every shadow edge, which is what
+made it look exotic.
+
+The combine in `shadow.wgsl` was:
+
+```wgsl
+occlusion = max(map_occlusion * light_facing, 1.0 - light_facing);
+```
+
+Write it as `max(m·f, 1 − f)` and evaluate it for a pixel **fully inside a cast shadow**, `m = 1`:
+
+| `f` (light_facing) | 1 | 0.75 | **0.5** | 0.25 | 0 |
+|---|---|---|---|---|---|
+| `max(m·f, 1 − f)` | 1 | 0.75 | **0.5** | 0.75 | 1 |
+
+A **V-shaped dip to half darkness through the middle of the terminator band, inside a shadow**. At
+the default Terminator Softness the band is ±0.1 in `n·L` — a few degrees of surface orientation —
+so on anything curved the dip is a thin bright stripe following the terminator through a dark
+region. It needs a cast shadow to *overlap* the terminator band, which is a much smaller set of
+pixels than "every shadow edge": hence rare-but-common-enough.
+
+**The fix is one line**, because the two terms are independent reasons not to receive sun —
+something is in the way, or the surface is turned away — so the light that arrives is their
+**product** and the darkening is one minus it:
+
+```wgsl
+occlusion = saturate(map_occlusion * light_facing + (1.0 - light_facing));  // = 1 - (1 - m) * f
+```
+
+Same endpoints (`f = 1` → `m`, `f = 0` → 1), no dip, and genuinely monotone in both inputs
+(`∂/∂m = f ≥ 0`, `∂/∂f = m − 1 ≤ 0`) where `max` is not monotone in `f` at all.
+
+**What made this survive so long** is the comment that defended it: *"at light_facing 0.5 the result
+is 0.5 either way, so the fade is invisible."* Both halves of that are true — the terms really do
+both equal 0.5 there, and the handover really is seamless — and the conclusion is still wrong,
+because the *correct* value for a pixel that is both shadowed and facing away is 1.0. Two terms
+agreeing on a number is not evidence that the number is right. The comment also claimed the
+expression was "monotone in both inputs", which is false and checkable in one line of algebra.
+
+**Rule:** when combining independent visibility/occlusion terms, multiply the visibilities. `max`
+of occlusions is only correct when the terms are alternative *estimates of the same quantity*
+(which is why `max` remains right for the Link cascade, and for folding in the Bend SSS term — both
+are other measurements of "is something in the way").
+
 ## 9. Could a mod produce this buffer without the aurora change?
 
 Investigated against **upstream `TwilitRealm/dusklight` HEAD `4504e5009`** (28 commits past our base

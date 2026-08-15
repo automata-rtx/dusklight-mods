@@ -606,24 +606,41 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         // shadowed pixels don't darken further; only the leaking back-faces get corrected.
         var map_occlusion = occlusion;  // before the attached term, for debug view 15
         if uniforms.attached_shadows != 0.0 {
-            // Weight the MAP by how much the surface actually faces the light, then take the
-            // stronger of that and the n.L term.
+            // Weight the MAP by how much the surface actually faces the light, then ADD the n.L
+            // term. These are two INDEPENDENT ways of not receiving sun - something stands in the
+            // way, or the surface is turned away - so the light that arrives is the PRODUCT of the
+            // two visibilities, and the darkening is one minus it:
             //
-            // The map comparison is only trustworthy where the surface faces the light. As it
-            // turns edge-on, one shadow texel spans an ever larger depth range, so the comparison
-            // is dominated by bias error rather than by geometry - that band is where acne and
-            // light leaks both live, and on a back-lit character it is most of the visible
-            // surface. Fading the map out across exactly that band costs nothing, because the n.L
-            // term is already driving those pixels dark: at light_facing 0.5 the result is 0.5
-            // either way, so the fade is invisible but the noise is gone.
+            //   lit       = (1 - map_occlusion) * light_facing
+            //   occlusion = 1 - lit = map_occlusion * light_facing + (1 - light_facing)
+            //
+            // The map fade is why the weighting exists at all: a shadow-map comparison is only
+            // trustworthy where the surface faces the light. As it turns edge-on, one shadow texel
+            // spans an ever larger depth range, so the comparison is dominated by bias error
+            // rather than by geometry - that band is where acne and light leaks both live, and on
+            // a back-lit character it is most of the visible surface. Fading the map out across
+            // exactly that band removes the failure instead of trading it.
             //
             //   light_facing 1 (facing the light) -> occlusion = map_occlusion, cast shadows and
             //                                        their detail are completely unchanged
             //   light_facing 0 (facing away)      -> occlusion = 1, from n.L alone, map ignored
             //
-            // Monotone in both inputs, so no seam appears where the two hand over.
+            // NEVER max() THESE. `max(m*f, 1-f)` has the same two endpoints and looks equivalent,
+            // but for a pixel fully inside a cast shadow (m = 1) it reads 1 at f = 1, 1 at f = 0,
+            // and **0.5 at f = 0.5** - a V-shaped dip to half darkness straight through the middle
+            // of the terminator band, INSIDE a shadow. At the default Terminator Softness that band
+            // is only +/-0.1 in n.L, so on anything curved the dip is a thin bright stripe
+            // following the terminator through a dark region: it reads as a specular glint, and
+            // shows exactly where a cast shadow crosses the terminator (which is why it is not at
+            // every shadow edge). The old comment justified it with "at light_facing 0.5 the result
+            // is 0.5 either way, so the fade is invisible" - true that both terms are 0.5 there,
+            // but the correct answer for a shadowed pixel that also faces away is 1.0, not 0.5.
+            // Two terms agreeing on a number does not make that number right.
+            //
+            // The sum is genuinely monotone in both inputs (d/dm = f >= 0, d/df = m - 1 <= 0),
+            // which max() is not in f, and stays within [0,1] because m <= 1.
             map_occlusion = map_occlusion * light_facing;
-            occlusion = max(map_occlusion, 1.0 - light_facing);
+            occlusion = saturate(map_occlusion + (1.0 - light_facing));
         }
 
         // 15 = which term is doing the shadowing, so a wrong-looking pixel names its own cause
@@ -631,6 +648,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         //   RED   = the shadow MAP comparison (cast shadow / self-shadow acne lives here)
         //   GREEN = the attached n.L term (surfaces turned away from the sun)
         //   YELLOW = both      BLACK = neither, i.e. this pixel is being reported as fully LIT
+        // With the additive combine above the two channels literally SUM to the shadow factor
+        // (red is already the light_facing-weighted map term), so red + green should reach full
+        // brightness anywhere the pixel is fully shadowed. A red->green transition that dips dark
+        // in between is the two terms failing to hand over - that dip is the visible artifact.
         // A bright patch that should be dark is black here, and the channel that SHOULD have been
         // lit tells you which half of the model to fix: black on a back-facing surface means n.L
         // read it as sun-facing; red-free black on a surface behind a caster means the map missed.

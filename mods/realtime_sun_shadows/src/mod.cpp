@@ -2884,7 +2884,9 @@ ModResult build_controls_tab(
         "GREEN = the attached n.L term, YELLOW = both, BLACK = neither (the pixel is being "
         "reported as fully lit). Use this on a wrongly-lit patch: black tells you nothing is "
         "shadowing it, and which channel is missing says whether the map or the surface normal "
-        "is at fault");
+        "is at fault. The two channels add up to the final shadow factor, so a red-to-green "
+        "transition should stay bright all the way across - if it dims in between, that dip is a "
+        "bright artifact in the real frame");
     return MOD_OK;
 }
 
