@@ -34,15 +34,22 @@ it away afterwards. See `dusklight-ao/docs/thin-gbuffer-normals.md` for the rend
 
 ## 0. State of play (read first)
 
-**Platform:** `DUSKLIGHT_VERSION = 6297083`, `DUSKLIGHT_REPOSITORY` → `automata-rtx/dusklight-ao`,
+**Platform:** `DUSKLIGHT_VERSION = 5ded001`, `DUSKLIGHT_REPOSITORY` → `automata-rtx/dusklight-ao`,
 `DUSKLIGHT_SDK_STUB_URL` → `platform-normals-test`. The user must run the `win32-msvc-x86_64` build
 from that release; game build and `.dusk` files are always a matched pair, in both directions (see
 §6 for rollback). **Then turn on Video → Rendering → Scene Normal Buffer and restart** — nothing in
 this document is observable until that is done.
 
-That pin is upstream `008a18c1` plus the GfxService 1.2 additions, which matters for a second
-reason: `008a18c1` bumped the **game service major version**, so mods built against the older
-`0fc05028` SDK are refused outright by this host. Every mod but SMAA failed to load on it.
+That pin is upstream `c880d46f` plus **GfxService 1.3**, over aurora `cf3ffc9` plus the normal
+attachment. Note the release tag `platform-normals-test` is republished on every push to the
+platform branch, so the *URL* is stable while its assets are not.
+
+**The fork delta is now two fields wide.** Upstream shipped its own scene-target-layout API in
+#2305 (GfxService 1.2 — `GfxRenderTargetLayout`, `get_scene_target_layout`,
+`gfx_init_color_target_states`, `GfxDrawContext::layout`, and the `GfxAttachmentSemantic` tags), so
+the hand-rolled `GfxPassTargets` vocabulary our fork used to carry was **deleted rather than
+merged**. What remains fork-local is 1.3's `GfxResolveDesc::normal` → `GfxResolvedTargets::normal`.
+`GfxDeviceInfo::normal_format` is gone entirely — see §7.
 
 ### What landed, in order
 
@@ -64,7 +71,10 @@ reason: `008a18c1` bumped the **game service major version**, so mods built agai
 | `38386e4` | Normal Smoothing pass deleted outright (§8.9). |
 | `e50a1a9` | Re-platformed onto upstream `0fc05028`, which has no normal buffer — authored normals off across the board, provider reconstructing every pixel. |
 | `dcdaa23` | Re-platformed onto `platform-normals-test`, restoring authored normals; all six scene-pass pipelines moved to `get_pass_targets`, and the `GfxDrawContext::normal_format` guard deleted (§5). |
-| *(this change)* | **Every camera-facing flip on an authored normal deleted** — provider (was 0.5) and VBAO/SSILVB (were −0.15). Re-pinned to the rebased platform, which also drops aurora's enlarged streaming buffers (§2a). |
+| `ca6b73a` | **Every camera-facing flip on an authored normal deleted** — provider (was 0.5) and VBAO/SSILVB (were −0.15). Re-pinned to the rebased platform, which also drops aurora's enlarged streaming buffers (§2a). |
+| `3cbab91`–`8cc46b9` | AO occlusion hemisphere built from geometry, not the shading normal; the rejection plane made a 4-tap ±1 in both mods (§8.11, §8.11a). |
+| `b426c4d` | Shadow map and `n·L` terms combined by multiplying visibilities instead of `max` — fixes the terminator glint (§8.12). |
+| *(this change)* | Re-pinned to **GfxService 1.3** on rebased upstream. Our scene-layout fork deleted in favour of upstream's; `normal_format` accessor removed; `has_normal_attachment` is the new "does this build have authored normals" (§5, §7). |
 
 ### Confirmed in-game by the user
 
@@ -358,20 +368,24 @@ draw on attachment count. Every stage that pushes draws (`SCENE_BEGIN`, `SCENE_A
 `SCENE_AFTER_OPAQUE`, `FRAME_BEFORE_HUD`, `FRAME_AFTER_HUD`) lands inside that pass; there is no
 exempt stage.
 
-**Ask the service for the layout; do not rebuild it.** `get_pass_targets(GFX_PASS_SCENE, …)` returns
-the pass's attachments ready to point `WGPUFragmentState` at, with every renderer-owned target
-already write-masked off. All six sites go through `gfx_compat::scene_pass_layout` (see
-`docs/normal_buffer_portability.md` §3): VBAO and SSILVB composites (blend + debug), SMAA
-neighborhood blend, Graphics Hub's normal debug overlay and deferred fog fullscreen, Realtime Sun
-Shadows composite. The WGSL is unchanged — a fragment shader returning a single `@location(0)` value
-is valid against a pipeline whose second target is masked.
+**Ask the service for the layout; do not rebuild it.** `get_scene_target_layout(…)` returns a
+`GfxRenderTargetLayout` — one entry per attachment, each tagged with a `GfxAttachmentSemantic` — and
+the SDK's inline `gfx_init_color_target_states` turns that into a `WGPUColorTargetState[]` with
+every attachment the mod does not own already write-masked off. All six sites go through
+`gfx_compat::scene_pass_layout` (see `docs/normal_buffer_portability.md` §3): VBAO and SSILVB
+composites (blend + debug), SMAA neighborhood blend, Graphics Hub's normal debug overlay and
+deferred fog fullscreen, Realtime Sun Shadows composite. The WGSL is unchanged — a fragment shader
+returning a single `@location(0)` value is valid against a pipeline whose other targets are masked.
 
-The earlier version of this section told you to assemble the layout by hand from
-`g_deviceInfo.normal_format`. That works, but it is a copy of the renderer's own logic and it is
-wrong the moment the pass changes shape again. It also came paired with a per-draw guard comparing
-`GfxDrawContext::normal_format` against the device's — a field the current SDK does not have, which
-made the guard fire unconditionally and silently disable every composite. Both are gone; see
-`docs/normal_buffer_portability.md` §2.
+Two earlier versions of this section are worth remembering, because each shipped a silent failure.
+The first told you to assemble the layout by hand from `g_deviceInfo.normal_format`, which is a copy
+of the renderer's own logic and wrong the moment the pass changes shape; it came paired with a
+per-draw guard comparing `GfxDrawContext::normal_format` against the device's, on a field the SDK
+had stopped carrying, so the guard fired unconditionally and disabled every composite. The second
+named upstream-1.2-era symbols (`get_pass_targets`, `GfxPassTargets`, `GFX_MAX_COLOR_TARGETS`) that
+upstream then **renamed**; the compat header's `#if` went false, the whole tree compiled cleanly,
+and every pipeline reverted to one colour target. Both are `normal_buffer_portability.md` §2 now,
+and the second is why that header fails the build instead of guessing.
 
 Offscreen passes from `create_pass` (shadow-map replays, the fog config-ID replay) stay
 single-target: they render with the game's own pipelines, which the renderer builds from the
@@ -381,18 +395,19 @@ current pass.
 
 ## 6. Platform pin and rollback
 
-`CMakeLists.txt` pins `DUSKLIGHT_VERSION = 6297083…` (tip of
+`CMakeLists.txt` pins `DUSKLIGHT_VERSION = 5ded001…` (tip of
 `claude/dusklight-thin-gbuffer-normals-l4l9dc` in `dusklight-ao`), `DUSKLIGHT_REPOSITORY` at that
 fork and `DUSKLIGHT_SDK_STUB_URL` at the `platform-normals-test` release. The base game code is
-upstream Dusklight `008a18c1`; the renderer change and the SDK header additions sit on top of it.
+upstream Dusklight `c880d46f`; the renderer change and the SDK header additions sit on top of it.
 
-**Rolling back to upstream is not free any more.** `008a18c1` carries an upstream **game-service
+**Rolling back to upstream is not free any more.** The base carries an upstream **game-service
 major-version bump**, so a mod built against the older `0fc05028` SDK is refused by this host and a
 mod built against this SDK is refused by that one. Rollback therefore means moving the pin *and*
 rebuilding *and* installing the matching game build — the same matched-pair rule as always, but with
 no overlap window where one set of `.dusk` files works on both. No **source** change is needed
-either way: every authored-normal path is guarded on `GfxDeviceInfo::normal_format`, which a base
-without the buffer reports as `Undefined`.
+either way: every authored-normal path degrades through `common/gfx_normal_compat.h`, and the
+"is there a normal buffer" question is answered by the scene layout's semantic tags, which simply
+list no `GFX_ATTACHMENT_NORMAL` on a base without one.
 
 Note also that turning the buffer off in Video settings is a much cheaper A/B than rolling the
 platform back, and it is the one to reach for first when deciding whether authored normals are the
@@ -400,24 +415,34 @@ cause of something.
 
 ## 7. API surface used
 
-All fields are appended to existing structs and `struct_size`-guarded.
+Two groups, and the distinction matters when re-platforming: **upstream** (GfxService 1.2, present
+on any current base) and **fork-local** (GfxService 1.3, the entire remaining delta).
 
 ```c
-GfxDeviceInfo::normal_format      /* RGB10A2Unorm, or Undefined when the buffer is off */
-GfxResolveDesc::normal            /* request the per-frame normal snapshot */
-GfxResolvedTargets::normal        /* single-sample snapshot, frame-valid, may be NULL */
-GfxResolvedTargets::normal_format
-GfxService::get_pass_targets      /* the scene pass's attachment layout, for pipelines */
+/* upstream 1.2 — scene pass layout, for building pipelines */
+GfxService::get_scene_target_layout   /* -> GfxRenderTargetLayout */
+GfxRenderTargetLayout::color_attachments[i].semantic   /* GFX_ATTACHMENT_NORMAL lives here */
+gfx_init_color_target_states          /* inline SDK helper; write-masks off what you don't own */
+GfxDrawContext::layout                /* the same layout, inside a draw callback */
+
+/* fork-local 1.3 — the normal snapshot */
+GfxResolveDesc::normal                /* request the per-frame normal snapshot */
+GfxResolvedTargets::normal            /* single-sample snapshot, frame-valid, may be NULL */
 ```
 
-`GfxResolveDesc::normal` is the one field `struct_size` cannot police: it landed in the struct's
-existing tail padding, so the host honours it only for callers that also pass a 1.2-sized
-`GfxResolvedTargets` to receive the view in. Initialising both from their `GFX_*_INIT` macros, as
-the provider does, satisfies that automatically.
+**To ask whether this build has authored normals, scan the layout for a `GFX_ATTACHMENT_NORMAL`
+semantic** — `gfx_compat::ScenePassLayout::has_normal_attachment` does exactly that. There is no
+`normal_format` field on any struct any more. Two platforms had one and each produced a distinct
+silent failure: an offset collision with upstream's `WGPUInstance`, and a per-draw guard that
+compared a compile-time-absent field against a live value and disabled every composite. See
+`docs/normal_buffer_portability.md` §2.1.
 
-There is deliberately **no** `GfxDrawContext::normal_format` — the retired fork had one and the
-per-draw guard built on it is what silently disabled every composite on the way back to a base with
-a normal buffer. See `docs/normal_buffer_portability.md` §2.
+`GfxResolveDesc::normal` is the one field `struct_size` cannot police: it landed in the struct's
+existing tail padding, so `sizeof(GfxResolveDesc)` is **unchanged** between 1.2 and 1.3 and the flag
+is invisible to the usual check. The host therefore honours it only for callers that also pass a
+1.3-sized `GfxResolvedTargets` to receive the view in — so a 1.2 mod's uninitialised padding can
+never request a snapshot it has nowhere to put. Initialising both from their `GFX_*_INIT` macros, as
+the provider does, satisfies that automatically.
 
 Snapshot contents: `rgb` = `normalize(mv_nrm) * 0.5 + 0.5`, the **view-space** authored normal;
 `a` = 1.0 when the draw supplied a normal attribute, 0.0 otherwise. Ten bits per axis, which is what

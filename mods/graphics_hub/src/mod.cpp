@@ -768,7 +768,16 @@ ModResult init(ModError* error) {
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to query device info");
     }
-    g_authoredAvailable = gfx_compat::normal_format(g_deviceInfo) != WGPUTextureFormat_Undefined;
+    // "Does this build carry authored normals" is a question about the SCENE PASS, not about the
+    // device: the attachment exists only when the renderer built the pass with it, which needs
+    // both a core-features backend (D3D12 / Vulkan / Metal — never compatibility mode) and the
+    // game's own Video -> Rendering -> Scene Normal Buffer setting on at launch. The scene layout
+    // tags each attachment with a semantic, so GFX_ATTACHMENT_NORMAL being present is the direct
+    // answer. (This used to read GfxDeviceInfo::normal_format, a field that no longer exists.)
+    gfx_compat::ScenePassLayout sceneLayout;
+    g_authoredAvailable =
+        gfx_compat::scene_pass_layout(mod_ctx, svc_gfx, g_deviceInfo, sceneLayout) &&
+        sceneLayout.has_normal_attachment;
     if (!build_dummy_textures()) {
         return mods::set_error(error, MOD_ERROR, "failed to create stand-in textures");
     }

@@ -1,29 +1,35 @@
-// Compile-time shim for the scene-normal-buffer fields the mod SDK gained in GfxService 1.2
-// (`platform-normals-test`; an earlier, incompatible spelling shipped in `platform-gbuffer-test`):
+// Compile-time shim for the two scene-normal-buffer fields that are fork-local to our platform
+// (GfxService 1.3, `platform-normals-test`):
 //
-//     GfxDeviceInfo::normal_format      GfxResolveDesc::normal
-//     GfxResolvedTargets::normal
+//     GfxResolveDesc::normal      GfxResolvedTargets::normal
 //
-// Note there is deliberately no `GfxDrawContext::normal_format` accessor. The retired fork had that
-// field and the draw callbacks compared it against the device's to detect a pass that had changed
-// shape. On an SDK without it the shim answers `Undefined` while the device answers a real format,
-// so the comparison was true on every draw and silently disabled every composite. **These
-// accessors are safe for reading a value, not for comparing one against a live one.**
+// Set the first to snapshot the game's authored vertex normals alongside depth; read the second to
+// get the resulting view. That pair is the ENTIRE normal-buffer API now, and the entire remaining
+// fork delta — everything else the mods use is upstream GfxService 1.2.
 //
-// **An SDK without those fields is a supported configuration, not an error.** Upstream Dusklight
-// has no normal buffer of any kind, so re-platforming onto it (or onto any base that predates the
-// thin g-buffer) removes them. Every accessor here degrades to "this build has no normal buffer",
-// which is precisely the state the mods already handle at runtime on `platform-v2-test`: Graphics
-// Hub falls back to the 5-tap depth reconstruction per pixel, and the scene-pass composites drop
-// back to a single colour target. The result is that such a re-platform stays a one-line
+// **`GfxDeviceInfo::normal_format` IS GONE — do not reintroduce an accessor for it.** Two earlier
+// platforms had that field and two separate bugs came out of it: the retired fork put it at an
+// offset upstream independently claimed for `WGPUInstance`, and a `GfxDrawContext::normal_format`
+// accessor that degraded to `Undefined` was compared against a live device format, so the guard
+// fired on every draw and silently disabled all six composites. To ask "does this build carry
+// authored normals", use `gfx_compat::ScenePassLayout::has_normal_attachment`
+// (`gfx_scene_pass.h`), which reads the semantic tags on the real scene layout.
+//
+// **An SDK without these two fields is a supported configuration, not an error** — unlike the
+// scene-target-layout query next door, which is an #error precisely because getting it wrong is
+// silent. Upstream Dusklight has no normal snapshot, so re-platforming onto it removes them, and
+// both accessors degrade to "this build has no normal buffer": Graphics Hub falls back to the
+// 5-tap depth reconstruction per pixel, exactly as it already does whenever the user has the
+// game's Scene Normal Buffer setting switched off. That keeps such a move a one-line
 // DUSKLIGHT_VERSION bump instead of a source rescue across five mods.
 //
-// Use these accessors instead of touching the fields directly. A direct `g_deviceInfo.normal_format`
-// compiles today and breaks on the next platform move; `gfx_compat::normal_format(g_deviceInfo)`
-// does not. See CLAUDE.md, "The ABI pin", and `docs/normal_buffer_portability.md`.
+// **These accessors are safe for reading a value, never for comparing one against a live one.** A
+// shim that answers "absent" is indistinguishable from a real "absent" only in a read; in a
+// comparison it manufactures a difference that was never there.
 //
-// Detection is by member name, so the same helper serves both structs that spell a field the same
-// way (GfxDeviceInfo and GfxDrawContext both use `normal_format`).
+// Detection is by member name via SFINAE, which works here because both fields are members of
+// types that exist either way. A missing TYPE or constant cannot be probed this way — see the note
+// in gfx_scene_pass.h on why that one needs the preprocessor.
 
 #pragma once
 
@@ -35,33 +41,9 @@
 namespace gfx_compat {
 
 template <class T, class = void>
-struct has_normal_format : std::false_type {};
-template <class T>
-struct has_normal_format<T, std::void_t<decltype(std::declval<const T&>().normal_format)>>
-    : std::true_type {};
-
-template <class T, class = void>
 struct has_normal : std::false_type {};
 template <class T>
 struct has_normal<T, std::void_t<decltype(std::declval<const T&>().normal)>> : std::true_type {};
-
-/// Format of the host's authored-normal attachment, or `Undefined` when this SDK (or this game
-/// build) has none. Accepts `GfxDeviceInfo` and `GfxDrawContext`.
-///
-/// Undefined is the correct "absent" answer for both callers: a scene-pass pipeline compares it
-/// against Undefined to decide whether to declare the second colour target, and a draw callback
-/// compares the context's value against the device's to detect a mid-session layout change. When
-/// the fields are gone both sides read Undefined, so the comparison still agrees and no draw is
-/// skipped.
-template <class T>
-inline WGPUTextureFormat normal_format(const T& v) {
-    if constexpr (has_normal_format<T>::value) {
-        return v.normal_format;
-    } else {
-        (void)v;
-        return WGPUTextureFormat_Undefined;
-    }
-}
 
 /// Request (or decline) the normal snapshot on a `GfxResolveDesc`. A no-op when the SDK has no
 /// such field — the resolve then simply returns colour/depth, which is what the caller's

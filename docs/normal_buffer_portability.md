@@ -21,16 +21,22 @@ Three different situations land here, and the mod cannot tell them apart: the bu
 Video settings** (the default), the device is in **compatibility mode**, or the game build
 **predates the feature**. All three report the same thing.
 
-The host reports `GfxDeviceInfo::normal_format == WGPUTextureFormat_Undefined`, and everything
-downstream follows from that single fact:
+The question is asked of the **scene pass**, not of the device: the attachment exists only when the
+renderer built the pass with it. `get_scene_target_layout` tags every attachment with a
+`GfxAttachmentSemantic`, so the presence of a `GFX_ATTACHMENT_NORMAL` entry is the direct answer,
+surfaced as `gfx_compat::ScenePassLayout::has_normal_attachment`. Everything downstream follows
+from that single fact:
 
-| Site | Behaviour when Undefined |
+| Site | Behaviour when there is no normal attachment |
 |---|---|
 | Graphics Hub, init | `g_authoredAvailable = false`. |
 | Graphics Hub, per frame | Never sets `GfxResolveDesc::normal`, so no snapshot is requested and no cost is paid. |
 | Graphics Hub, compute | Binds `g_dummyAuthoredView` (a 1×1 texture created at init) so the bind group stays valid, and passes `use_authored = 0` — the shader takes the 5-tap depth reconstruction for **every** pixel. |
 | Graphics Hub, UI | "Use Authored Normals" greys out; the status line names the fix — *"Reconstructed — turn on Video > Rendering > Scene Normal Buffer and restart (unavailable in compatibility mode)"*. |
-| All six scene-pass pipelines | `get_pass_targets` reports one colour target, so they declare one. |
+| All six scene-pass pipelines | The layout reports one colour target, so they declare one. |
+
+This used to read `GfxDeviceInfo::normal_format == WGPUTextureFormat_Undefined`. **That field no
+longer exists in any SDK** — see §2.1.
 
 Consumers (VBAO, SSILVB, SMAA, Realtime Sun Shadows) never see any of this: they read normals
 through the `dev.automata.depth_to_normal` service, which keeps returning a valid world-space
@@ -44,12 +50,15 @@ ABI pin".
 ## 2. Build time — the SDK has no normal-buffer fields
 
 This is the case when you re-platform onto upstream Dusklight, or any base predating the scene
-normal buffer. Three struct fields simply cease to exist:
+normal buffer. **Exactly two struct fields cease to exist** (GfxService 1.3):
 
 ```
-GfxDeviceInfo::normal_format      GfxResolveDesc::normal
-GfxResolvedTargets::normal (and ::normal_format)
+GfxResolveDesc::normal      GfxResolvedTargets::normal
 ```
+
+That pair is the whole normal-buffer API, and the whole remaining fork delta. Everything else the
+mods touch — the scene-target-layout query, the attachment semantics, `GfxDrawContext::layout` — is
+upstream GfxService 1.2.
 
 A direct field access is a hard compile error, and before `common/gfx_normal_compat.h` there were
 ~18 of them across five mods — which would have made a one-line pin bump into a source rescue.
@@ -58,7 +67,6 @@ A direct field access is a hard compile error, and before `common/gfx_normal_com
 name at compile time and degrades to the "no normal buffer" answer when it is absent:
 
 ```cpp
-gfx_compat::normal_format(g_deviceInfo)   // -> Undefined  when the field is gone
 gfx_compat::request_normal(desc, want)    // -> no-op      when the field is gone
 gfx_compat::resolved_normal(resolved)     // -> nullptr    when the field is gone
 ```
@@ -67,33 +75,58 @@ Those are exactly the values §1 already handles, so an SDK without the fields c
 tested runtime fallback path rather than into a new, untested one. No `#ifdef`s, no CMake feature
 detection, no per-mod configuration.
 
-### `GfxDrawContext::normal_format` is gone — and so is the guard that read it
+### 2.1 `normal_format` is gone from every struct — and so are the accessors for it
 
-The retired fork put `normal_format` on `GfxDrawContext` as well, and every scene-pass draw
-callback compared it against the device's to catch a pass that had changed shape mid-session:
+Two platforms carried a `normal_format` field and each produced its own bug. The retired fork put
+it on `GfxDeviceInfo` at an offset upstream independently claimed for `WGPUInstance` (§4). It also
+put one on `GfxDrawContext`, and every scene-pass draw callback compared that against the device's
+to catch a pass that had changed shape mid-session:
 
 ```cpp
 if (gfx_compat::normal_format(*ctx) != gfx_compat::normal_format(g_deviceInfo)) { return; }
 ```
 
-**The current SDK has no such field**, and that turns the guard into a trap rather than a
-safeguard. `normal_format(*ctx)` compiles to a constant `Undefined` while the device reports a real
-format, so the condition is *always true the moment the user switches the buffer on* — every
-composite silently returns without drawing. That is the same "mods load but do nothing" symptom the
-offset collision produced, reached from the opposite direction, and it is precisely the failure the
-compat shim is meant to prevent: degrading to "absent" is only safe for a value being **read**, not
-for one being **compared against a live one**.
+When the field vanished from `GfxDrawContext`, that guard became a trap rather than a safeguard.
+`normal_format(*ctx)` compiled to a constant `Undefined` while the device reported a real format,
+so the condition was *always true the moment the user switched the buffer on* — every composite
+silently returned without drawing. Degrading to "absent" is only safe for a value being **read**,
+never for one **compared against a live one**.
 
-The guard is deleted. It defended against a mid-session toggle that cannot happen — the buffer is
-an initialization-time setting requiring a restart — and the layout question it was asking is now
-answered properly at pipeline build time by `get_pass_targets`.
+Both the guard and the accessor are deleted. The current SDK has no `normal_format` anywhere; ask
+`ScenePassLayout::has_normal_attachment` instead, which reads the real pass's semantic tags.
+
+### 2.2 A renamed API is not an absent one — and this bit us
+
+**This is the trap to internalise, because it is silent and the tree looked healthy.**
+
+`gfx_scene_pass.h` used to guard on `#if defined(GFX_MAX_COLOR_TARGETS)` and fall back to a
+hand-assembled single-target layout when that was absent. Upstream then shipped its own version of
+the same feature under different names — `get_pass_targets` → `get_scene_target_layout`,
+`GfxPassTargets` → `GfxRenderTargetLayout`, `GFX_MAX_COLOR_TARGETS` → `GFX_MAX_COLOR_ATTACHMENTS`.
+
+On the pin bump, the guard went false. **All seven mods compiled, linked and packaged with zero
+errors and zero warnings**, and every scene-pass pipeline quietly reverted to declaring one colour
+target — which WebGPU rejects against a two-attachment pass. Six composites would have drawn
+nothing, in-game, with no build-time signal at all. Identical symptom to the offset collision,
+reached from a third direction.
+
+The lesson generalises past this one header: **"degrade to absent" cannot distinguish a feature
+that is gone from a feature that was renamed**, and it silently picks the wrong answer for the
+second. So the two shims now differ deliberately, by how bad being wrong is:
+
+| Shim | Missing vocabulary means | Why |
+|---|---|---|
+| `gfx_normal_compat.h` | quietly take the reconstruction path | Genuinely optional. Being wrong costs smoothness, and §1 handles it every session already. |
+| `gfx_scene_pass.h` | **`#error`, with the fix named** | Being wrong makes six mods draw nothing with no other symptom. The legacy path still exists, behind `GFX_COMPAT_ALLOW_LEGACY_SCENE_LAYOUT`, so a genuine pre-1.2 base is one define away. |
+
+The rule: reach for degrade-to-absent when the feature is optional and its absence is *observable
+at runtime*. When silently guessing wrong produces no diagnostic, fail the build instead.
 
 ## 3. Pipelines — `common/gfx_scene_pass.h`
 
 A pipeline recorded into the scene pass must declare that pass's attachments exactly. Mods used to
-assemble that layout by hand from `GfxDeviceInfo` plus a second write-masked target when
-`normal_format` was set. GfxService 1.2 answers it directly, and
-`gfx_compat::scene_pass_layout(...)` is the one call site for it:
+assemble that layout by hand from `GfxDeviceInfo`. GfxService 1.2 answers it directly with
+`get_scene_target_layout`, and `gfx_compat::scene_pass_layout(...)` is the one call site for it:
 
 ```cpp
 gfx_compat::ScenePassLayout layout;
@@ -107,33 +140,38 @@ depthStencil.format = layout.depth_format;
 pipelineDesc.multisample.count = layout.sample_count;
 ```
 
-It prefers `get_pass_targets` and falls back to the hand-assembled layout on an SDK that predates
-it, detected the same way as the struct fields — so the six sites (vbao, ssilvb, smaa,
-realtime_sun_shadows, and both of graphics_hub's) stay correct on a base with the buffer, without
-it, and on an SDK that has never heard of the query. Offscreen `create_pass` targets are
-single-target and do not use this.
+Internally it calls `get_scene_target_layout` and hands the result to the SDK's own inline
+`gfx_init_color_target_states`, which write-masks off every attachment the mod does not own — so
+the six sites (vbao, ssilvb, smaa, realtime_sun_shadows, and both of graphics_hub's) stay correct
+whether the pass has one attachment or several, and a composite that only reads the scene can never
+clobber the game's authored normals. `color_targets[0]` is the scene colour and the only entry the
+caller may modify. Offscreen `create_pass` targets are single-target and do not use this.
 
-### Verified, not assumed — and it caught a real bug
+### Verified, not assumed — and it has caught two real bugs
 
-This is checked end to end by reducing the fetched SDK header to a 1.1-era one — deleting the field
-declarations, `GfxPassTargets`, `GfxPass`, `GFX_MAX_COLOR_TARGETS` and `get_pass_targets`, and
-trimming the positional `GFX_*_INIT` macros to match — then configuring and building the whole tree
-from scratch. All seven mods compile, link and package. Re-run it if you change either shim.
+This is checked end to end by reducing the fetched SDK header to the previous era — deleting the
+field declarations and trimming the positional `GFX_*_INIT` macros to match — then forcing a full
+recompile of the whole tree. All seven mods compile, link and package; the probe additionally
+asserts that the layout query stays engaged while `has_normal<GfxResolveDesc>` and
+`has_normal<GfxResolvedTargets>` both go false. Re-run it if you change either shim, and **check
+that objects actually rebuilt** — a cached "Built target" proves nothing.
 
-It is not a formality. `scene_pass_layout` was first written with `if constexpr` on a
-member-detection trait, mirroring `gfx_normal_compat.h`, and this build rejected it outright: **a
-discarded `if constexpr` branch is still parsed and name-looked-up**, so naming `GfxPassTargets` in
-it is a hard error on an SDK that lacks the type. Member detection works for a *member of an
-existing type*; it cannot help when the type itself is absent. Hence the `#if` — only the
-preprocessor removes code from the translation unit. Had the experiment been skipped, the tree would
-have compiled fine today and broken the next re-platform, which is precisely what these shims exist
-to prevent.
+It is not a formality; it has now caught two bugs that would each have shipped.
+
+1. `scene_pass_layout` was first written with `if constexpr` on a member-detection trait, mirroring
+   `gfx_normal_compat.h`, and the stripped build rejected it outright: **a discarded `if constexpr`
+   branch is still parsed and name-looked-up**, so naming a type the SDK lacks is a hard error, not
+   a quietly unused branch. Member detection works for a *member of an existing type*; it cannot
+   help when the type itself is absent. Hence the `#if`.
+2. The rename in §2.2 — which the *build* could not catch by construction, because compiling
+   cleanly was the symptom. What caught it was reading the new SDK header before trusting the
+   green build.
 
 ### The one rule for new code
 
-> **Never write `.normal_format` or `.normal` on an SDK struct directly. Call the `gfx_compat`
-> accessor. Never hand-assemble a scene-pass pipeline's colour targets — call
-> `gfx_compat::scene_pass_layout`.**
+> **Never write `.normal` on an SDK struct directly. Call the `gfx_compat` accessor. Never
+> hand-assemble a scene-pass pipeline's colour targets — call `gfx_compat::scene_pass_layout`.
+> And never ask `GfxDeviceInfo` whether the normal buffer exists; ask the scene layout.**
 
 ---
 
@@ -169,8 +207,21 @@ two vendors do it independently. The shim protects against a field *disappearing
 against two different fields landing at the same offset. That is an argument for upstreaming a
 feature rather than forking the SDK for it — see `docs/authored_normals.md` §9.5.
 
-The current pin does not repeat that mistake: `normal_format` is appended *after* upstream's own
-`instance`/`adapter`, on top of upstream rather than beside it, so no slot is claimed twice.
+The current pin cannot repeat that mistake, because `normal_format` is **gone entirely** rather
+than relocated. The surviving fork delta is two fields, and 1.3 places them carefully:
+`GfxResolveDesc::normal` lands in the struct's existing **tail padding**, so `sizeof` is unchanged
+and `struct_size` cannot distinguish a 1.2 caller from a 1.3 one. The host therefore reads it only
+when `GfxResolvedTargets` is large enough to carry the result back — a 1.2 mod's uninitialised
+padding can never accidentally request a snapshot it has nowhere to receive. That is the pattern to
+copy if the fork ever has to grow a third field.
+
+### Upstreaming shrank the delta, exactly as predicted
+
+The previous pin's fork carried the whole scene-layout mechanism. Upstream shipped its own (#2305),
+and our hand-rolled version — five types, a service entry point, and the compat branch that chose
+between them — was **deleted rather than merged**. The delta went from "a layout API plus a device
+field plus two resolve fields" to "two resolve fields". Every re-platform since has been cheaper
+for it. The §9.5 argument is not theoretical.
 
 ## 5. Doing the next re-platform
 
