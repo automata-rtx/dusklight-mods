@@ -141,7 +141,7 @@ the previous transformed output, the transform would have to be a no-op on that 
 
 | Option | Default | Notes |
 | :-- | :-- | :-- |
-| `enabled` | on | Off = the positions are never touched, bit-exact vanilla (and the shadow mod falls back to the vanilla orbit). This is the only way to get the *exact* 59.036 vanilla tilt back, since the knob steps in whole degrees. |
+| `orbitEnabled` | on | Off = the positions are never touched, bit-exact vanilla (and the shadow mod falls back to the vanilla orbit). This is the only way to get the *exact* 59.036 vanilla tilt back, since the knob steps in whole degrees. **Not named `enabled`** — that key is reserved by the host for the mod manager's own per-mod checkbox, and using it made this mod fail to load entirely; see `docs/mod-api-notes.md` "Config/UI". The two differ in kind: the manager's checkbox unloads the mod, this one keeps it loaded and exporting its service while reporting the vanilla orbit. |
 | `sunElevation` | 75 | Peak sun elevation, 15–80 degrees. |
 | `moonElevation` | 75 | Peak moon elevation — the light that casts night shadows. |
 | `orbitYaw` | 0 | Rotates the whole path about world Y, ±180 degrees. The painted sky and cloud art do not rotate with it, so large values can put the sun somewhere the backdrop does not expect. |

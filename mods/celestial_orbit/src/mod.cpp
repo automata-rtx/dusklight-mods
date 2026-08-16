@@ -301,12 +301,21 @@ extern "C" {
 MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // DEFAULT: on, with both bodies peaking at 75 degrees (well clear of the 80-degree ceiling)
     // and no yaw. Untick Enabled for bit-exact vanilla.
+    //
+    // The config key is "orbitEnabled", NOT "enabled". **"enabled" is RESERVED BY THE HOST** for
+    // every mod: the loader gives each discovered mod a `mod.<escaped id>.enabled` bool for the mod
+    // manager's own on/off checkbox (`mod_enabled_cvar_name`, loader.cpp), created at discovery,
+    // before any mod initializes. A mod var named "enabled" formats to the identical key, so
+    // register_var returns MOD_CONFLICT and the mod dies at its first registration. That is what
+    // kept this mod from loading at all. Ours is a different question anyway - the manager's
+    // checkbox unloads the mod outright, while this one keeps it loaded (and its service exported,
+    // reporting vanilla to Realtime Sun Shadows) and only stops it writing.
     ConfigVarDesc enabledDesc = CONFIG_VAR_DESC_INIT;
-    enabledDesc.name = "enabled";
+    enabledDesc.name = "orbitEnabled";
     enabledDesc.type = CONFIG_VAR_BOOL;
     enabledDesc.default_bool = true;
     if (svc_config->register_var(mod_ctx, &enabledDesc, &g_cvarEnabled) != MOD_OK) {
-        return mods::set_error(error, MOD_ERROR, "failed to register enabled option");
+        return mods::set_error(error, MOD_ERROR, "failed to register orbitEnabled option");
     }
 
     ModResult result = register_int("sunElevation", kDefaultElevation, g_cvarSunElevation, error);

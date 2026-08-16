@@ -291,6 +291,13 @@ The user typically does not build locally. Iteration loop:
   `gfx_normal_compat.h` still degrades quietly. The rule: degrade silently only when the feature is
   optional *and* its absence is observable at runtime; when guessing wrong produces no diagnostic,
   fail the build. **After any pin bump, read the new SDK header — a green build proves nothing.**
+- **Never name a config var `enabled`** — the host reserves `mod.<escaped id>.enabled` for the mod
+  manager's own per-mod checkbox, created at discovery before any mod initializes, so
+  `register_var("enabled")` returns `MOD_CONFLICT` and the mod fails to load. This is silent: the
+  tree builds, the mod packages, and the only symptom is a runtime line naming the mod's own option.
+  It kept Celestial Orbit from loading at all. Prefix it (`orbitEnabled`); the UI label can still
+  say "Enabled". `python3 tools/check_reserved_config_names.py` scans every mod and re-derives the
+  reserved list from the fetched game tree. See `docs/mod-api-notes.md` "Config/UI".
 - **VBAO stays service-only.** If a feature seems to need game code, it belongs in the shadow
   mod or needs an upstream service extension — don't add game includes to `vbao`.
 - **The ABI pin**: the platform is pinned by **`DUSKLIGHT_VERSION` in the top-level `CMakeLists.txt`**,

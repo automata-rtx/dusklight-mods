@@ -1,7 +1,8 @@
 # Authored normals (scene normal buffer) — consuming them, and how to A/B them
 
-**Status:** landed in the mods. Partly verified in-game — see §0. The platform side is done,
-merged and published (`platform-normals-test`).
+**Status:** landed in the mods and **verified in-game** — the back-lit-character artefacts that
+drove most of §8 are confirmed resolved (see §0). The platform side is done, merged and published
+(`platform-normals-test`).
 
 > **Cold-start readers:** read §0 first. It is the state of play — what is done, what is confirmed
 > in-game, what is still open, and which debug views answer which question. §8 is the list of
@@ -89,19 +90,15 @@ merged**. What remains fork-local is 1.3's `GfxResolveDesc::normal` → `GfxReso
 - **The terminator glint is fixed** (`b426c4d`, §8.12) — reported from Debug View 15 as a
   specular-looking stripe where the red map term handed over to the green `n·L` term, and confirmed
   gone. That one was found *from the debug view alone*, which is the workflow §8.12 documents.
+- **The wrongly-lit patches on back-lit Link are gone.** This was the long-running open question —
+  patches on the boots, torso and lower tunic when back-lit. It closed across the run of changes
+  from `5300789` onward: the two-normal split (§8.6), the `sin`-scaled normal offset (§8.7), the
+  **fractional-bias cap** (`aa2c723`, §8.8 — the strongest single candidate, and the one that was
+  arithmetic rather than inference: the term was contributing several hundred world units of flat
+  bias against a ~150-unit-tall character), and the additive term combine (§8.12).
 
-### NOT yet verified — the open question
-
-The back-lit-character work from `5300789` onward is still **unverified in-game**. The last user
-report on it showed wrongly-lit patches on Link's boots, torso and lower tunic when back-lit. Since
-then several changes landed that each plausibly address it, the strongest being the
-**fractional-bias cap** (`aa2c723`, §8.8) — that one is arithmetic, not inference: the term was
-contributing several hundred world units of flat bias against a ~150-unit-tall character. Note the
-glint fix above is a *different* defect that happened to live in the same handover; it does not
-close this item.
-
-**Next step:** Shadow Factor + Shadow Terms on back-lit Link, same frame. Then the bias retune
-(below).
+  No single one of those is attributable as *the* fix, because they were verified together. If the
+  symptom ever returns, §8.8 is the first place to look.
 
 ### Open items
 
