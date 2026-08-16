@@ -236,6 +236,8 @@ for it. The §9.5 argument is not theoretical.
    Celestial Orbit) — they hook specific game functions **by symbol, resolved at load**, so a decomp
    delta can make one fail to load rather than merely misbehave. The service-only mods (VBAO, SSILVB,
    SMAA) need no re-verification.
-5. Watch the shadow mod for streaming-buffer overflow. The current pin's aurora uses upstream's
-   sizes (Vertex 5 MB / Index 2 MB / Storage 8 MB) — the enlarged 16 / 4 / 16 buffers the fork once
-   carried are gone — and the cascade replays are the heaviest consumer.
+5. The shadow mod's cascade replays are the heaviest consumer of aurora's per-frame streaming
+   buffers, so check them if a new base ever *shrinks* those. The current pin uses upstream's sizes
+   (Vertex 5 MB / Index 2 MB / Storage 8 MB); the enlarged 16 / 4 / 16 buffers the fork once
+   carried are gone and are not needed, because upstream raised both the vertex and index buffers
+   itself. See `docs/realtime_sun_shadows.md` for the dates.

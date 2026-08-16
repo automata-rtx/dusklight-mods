@@ -71,7 +71,7 @@ merged**. What remains fork-local is 1.3's `GfxResolveDesc::normal` → `GfxReso
 | `38386e4` | Normal Smoothing pass deleted outright (§8.9). |
 | `e50a1a9` | Re-platformed onto upstream `0fc05028`, which has no normal buffer — authored normals off across the board, provider reconstructing every pixel. |
 | `dcdaa23` | Re-platformed onto `platform-normals-test`, restoring authored normals; all six scene-pass pipelines moved to `get_pass_targets`, and the `GfxDrawContext::normal_format` guard deleted (§5). |
-| `ca6b73a` | **Every camera-facing flip on an authored normal deleted** — provider (was 0.5) and VBAO/SSILVB (were −0.15). Re-pinned to the rebased platform, which also drops aurora's enlarged streaming buffers (§2a). |
+| `ca6b73a` | **Every camera-facing flip on an authored normal deleted** — provider (was 0.5) and VBAO/SSILVB (were −0.15). Re-pinned to the rebased platform, which also drops aurora's enlarged streaming buffers — harmless, upstream had already raised its own (§2a). |
 | `3cbab91`–`8cc46b9` | AO occlusion hemisphere built from geometry, not the shading normal; the rejection plane made a 4-tap ±1 in both mods (§8.11, §8.11a). |
 | `b426c4d` | Shadow map and `n·L` terms combined by multiplying visibilities instead of `max` — fixes the terminator glint (§8.12). |
 | *(this change)* | Re-pinned to **GfxService 1.3** on rebased upstream. Our scene-layout fork deleted in favour of upstream's; `normal_format` accessor removed; `has_normal_attachment` is the new "does this build have authored normals" (§5, §7). |
@@ -85,14 +85,20 @@ merged**. What remains fork-local is 1.3's `GfxResolveDesc::normal` → `GfxReso
 - The normal buffer itself is **smooth** — confirmed against a faceted Shadow Factor in the same
   frame, which is what proved the faceting was downstream of the normal (§8.6).
 - The startup crash is gone (later builds run).
+- The **normal debug view is correct** after the camera-facing flips came out (`ca6b73a`, §2a).
+- **The terminator glint is fixed** (`b426c4d`, §8.12) — reported from Debug View 15 as a
+  specular-looking stripe where the red map term handed over to the green `n·L` term, and confirmed
+  gone. That one was found *from the debug view alone*, which is the workflow §8.12 documents.
 
 ### NOT yet verified — the open question
 
-Everything from `5300789` onward is **unverified in-game**. The last user report still showed
-wrongly-lit patches on Link's boots, torso and lower tunic when back-lit. Since then, four changes
-landed that each plausibly address it, the strongest being the **fractional-bias cap** (`aa2c723`,
-§8.8) — that one is arithmetic, not inference: the term was contributing several hundred world units
-of flat bias against a ~150-unit-tall character.
+The back-lit-character work from `5300789` onward is still **unverified in-game**. The last user
+report on it showed wrongly-lit patches on Link's boots, torso and lower tunic when back-lit. Since
+then several changes landed that each plausibly address it, the strongest being the
+**fractional-bias cap** (`aa2c723`, §8.8) — that one is arithmetic, not inference: the term was
+contributing several hundred world units of flat bias against a ~150-unit-tall character. Note the
+glint fix above is a *different* defect that happened to live in the same handover; it does not
+close this item.
 
 **Next step:** Shadow Factor + Shadow Terms on back-lit Link, same frame. Then the bias retune
 (below).
@@ -756,6 +762,8 @@ geometric normal from depth. The service header says so now.
 
 ### 8.12 `max` is not how you combine two independent visibilities
 
+**Confirmed fixed in-game.**
+
 **Symptom:** in Realtime Sun Shadows, a bright stripe like a **specular glint** running along the
 light/shadow boundary on curved surfaces — reported from Debug View 15 as sitting exactly where the
 red (map) region hands over to the green (`n·L`) region. Not at every shadow edge, which is what
@@ -923,7 +931,8 @@ So the idea is sound, not hand-waving. It is still the wrong thing to build.
 
 `aurora-ao` historically carried **two** deltas, and the thin g-buffer was only one of them. The
 other was the enlarged per-frame streaming buffers (Index 4 MB, Vertex 16 MB, Storage 16 MB), which
-existed because the shadow mod's replays overflow stock aurora's sizes. Adding a second full-scene
+existed because the shadow mod's replays overflowed the aurora sizes **of the time** (Vertex 3 MB,
+Index 1 MB); upstream has since raised both itself, so that delta is retired. Adding a second full-scene
 replay would need *more* headroom, not less, so the trade bought nothing on the axis it was proposed
 for.
 

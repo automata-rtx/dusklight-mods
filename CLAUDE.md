@@ -345,12 +345,16 @@ The user typically does not build locally. Iteration loop:
     Unlike upstream's version-independent `sdk` tag, **a fork release's stubs are per-build** — move
     `DUSKLIGHT_SDK_STUB_URL` whenever you move `DUSKLIGHT_VERSION`. Bump either **only** when
     deliberately re-platforming, never as a side effect of a mod change.
-  - **Aurora's streaming buffers are UPSTREAM-SIZED** (Vertex 5 MB / Index 2 MB / Storage 8 MB).
-    The fork used to carry enlarged ones (16 / 4 / 16) specifically for Realtime Sun Shadows' cascade
-    replays; **that commit was dropped when the branch was rebased for the authored-normal sign fix**,
-    and the current aurora pin is upstream `cf3ffc9` plus the normal attachment and nothing else. So the
-    overflow risk is live again and is the one real regression on this pin. If the shadow mod aborts
-    or drops geometry, reduce cascade count, shadow resolution or draw distance first — see
+  - **Aurora's streaming buffers are UPSTREAM-SIZED** (Vertex 5 MB / Index 2 MB / Storage 8 MB), and
+    that is **fine — the old overflow risk is closed, not merely tolerated.** The fork once carried
+    enlarged 16/4/16 buffers for Realtime Sun Shadows' cascade replays, sized against aurora's
+    *then* 3 MB/1 MB. Upstream has since raised both itself — Vertex 3→5 MB (`b979ff6`,
+    2026-07-07) and Index 1→2 MB (`1b484d4` "Bump IndexBufferSize", 2026-07-19) — so the index
+    budget is double what the v1.6.0/1.6.1 crash happened on, and the mod separately gained three
+    mitigations that did not exist then (`cascadeCull`, `casterMinTexels`, a 2-cascade default).
+    Dropping the fork's buffers is therefore not a regression. **Earlier revisions of this file and
+    three docs called it "the one real regression on this pin"; that was wrong and is corrected.**
+    Cascade count and coverage are framerate choices now, not stability ones — see
     `docs/realtime_sun_shadows.md`.
 
 ## Re-platforming (moving to a newer base game)
@@ -367,9 +371,10 @@ The user typically does not build locally. Iteration loop:
 3. **Re-verify the game-linked mods in-game** — Realtime Sun Shadows, Graphics Hub's Deferred Fog,
    Effect Remover, Celestial Orbit. They hook specific game functions and a decomp delta can move or
    rename what they hook. The service-only mods (VBAO, SSILVB, SMAA) need no re-verification.
-4. Watch for **streaming-buffer overflow** in the shadow mod. The current pin already uses
-   upstream's aurora sizes (Vertex 5 MB / Index 2 MB / Storage 8 MB), and the cascade replays are
-   the heaviest consumer.
+4. The shadow mod's cascade replays are still the heaviest consumer of aurora's per-frame
+   streaming buffers, so they are the thing to watch if a *new* base ever shrinks them. At the
+   current upstream sizes (Vertex 5 MB / Index 2 MB / Storage 8 MB) this is a framerate
+   consideration, not a crash risk.
 5. If the new base has no scene normal buffer, expect Graphics Hub to say so and normals to be
    faceted. That is correct, and needs no source change.
 

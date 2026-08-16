@@ -221,7 +221,7 @@ Space Shadows" is inert when SSS is off.
 | `shadowMapEnabled` | on | off = screen-space-only mode: no map render/composite, the game's own real/blob shadows return (the skip hooks go inactive), the Bend SSS term still applies |
 | `mapSize` | 2 | EACH world cascade's map: 0=1024 1=2048 2=4096 3=8192 |
 | `boxRadius` | 25000 | full coverage radius in world units (1000–30000) = the FAR cascade |
-| `cascadeCount` | 2 | world cascades minus one (UI select "1/2/3"): 0=single map, 1=two cascades, 2=three (default). See the streaming-budget caveat — the platform's aurora is back to upstream's streaming-buffer sizes, so 3 cascades has less headroom than it did |
+| `cascadeCount` | 2 | world cascades minus one (UI select "1/2/3"): 0=single map, 1=two cascades, 2=three (default). 3 costs a third replay, so it is a framerate decision, not a stability one — see the streaming-budget note, which is historical |
 | `cascadeNearPct` / `cascadeMidPct` | 5 / 40 | near / mid cascade radii as % of Coverage (log-uniform for 3 cascades) |
 | `cascadeBlend` | 20 | cross-fade band width at each cascade boundary, % of the cascade extent |
 | `cascadeCull` | on | light-column culling of replay geometry per cascade (keeps the passes inside the engine's per-frame streaming budget - leave on) |
@@ -516,15 +516,33 @@ shading normal instead of `n_geom`.
 - **Midna**: the game's projected blob shadow (which the mod hooks out) is where Midna
   "lives" during her summon/emergence animation. A retain path (re-enable the game shadow
   for Link only, or anchor her to our sun ground-projection) is a known follow-up.
-- **The per-frame streaming budget (the v1.6.0/1.6.1 startup crash)**: aurora streams ALL
-  GX geometry into fixed-size per-frame buffers — 5 MB vertex, **1 MB index**, 8 MB
-  storage, 24 MB uniform (`extern/aurora/lib/gfx/common.hpp:176`) — and these are mapped,
-  non-growable ranges whose overflow is an unconditional `abort()`
-  (`ByteBuffer::resize`, `common.hpp:155`). The game's own draw plus EVERY cascade replay
-  share the same buffers, so uncalled 3-cascade replays (~4× scene geometry, worse with
-  `noFrustumClipping`) blew the index buffer on dense scenes — instantly closing the game
-  on the first frames after loading a save, exactly when geometry volume peaks. Two
-  mitigations ship in 1.6.2: per-cascade **light-column culling** (`cascadeCull`, skips
+- **The per-frame streaming budget (the v1.6.0/1.6.1 startup crash) — HISTORICAL; not a live
+  risk.** Both halves of what caused it have since been fixed, on both sides. Kept here
+  because the tuning levers below are still the right ones for framerate, and because the
+  mechanism explains what the culling settings are *for*.
+
+  Aurora streams ALL GX geometry into fixed-size per-frame buffers, mapped non-growable
+  ranges whose overflow is an unconditional `abort()` (`ByteBuffer::resize`). The game's own
+  draw plus EVERY cascade replay share them, so unculled 3-cascade replays (~4× scene
+  geometry, worse with `noFrustumClipping`) blew the **index** buffer on dense scenes —
+  instantly closing the game on the first frames after loading a save, exactly when geometry
+  volume peaks.
+
+  At the time that buffer was **1 MB**. Upstream aurora has since raised both of the ones
+  that mattered, independently of us:
+
+  | date | upstream commit | change |
+  |---|---|---|
+  | 2026-07-07 | `b979ff6` | Vertex 3 MB → **5 MB** |
+  | 2026-07-19 | `1b484d4` "Bump IndexBufferSize" | Index 1 MB → **2 MB** |
+
+  Current sizes are Vertex 5 MB / Index 2 MB / Storage 8 MB / Uniform 24 MB
+  (`extern/aurora/lib/gfx/resources.hpp:8`). So the index budget is **double** what the
+  crash happened on, and the mod meanwhile gained three mitigations that did not exist then
+  (below). The fork's enlarged 16/4/16 buffers were sized against the *old* numbers and are
+  no longer carried; that is not a regression, and this doc previously called it one in
+  error. The two
+  mitigations that shipped in 1.6.2: per-cascade **light-column culling** (`cascadeCull`, skips
   shapes laterally outside a cascade's light box before their geometry streams; the axis
   toward the light is kept, so tall distant casters still shadow into near boxes) and a
   default of **2 cascades** (~the proven 1.5.x envelope). 1.6.4 adds **small-caster
@@ -535,7 +553,8 @@ shading normal instead of `n_geom`.
   budget is actually spent. It is the main mod-side lever for staying in budget; raise it to
   4-8 to run 3 cascades / high coverage in dense areas.
 
-  **Staying in the per-frame budget without a platform change** — the streaming cost is
+  **Keeping the streaming cost down** — worth doing for framerate; no longer a crash-avoidance
+  exercise. The streaming cost is
   vertex/index bytes from the *replays*, so it scales with how much geometry each replay
   streams, NOT with map resolution (Map Size is free). `cascadeStagger` (default on) already
   halves the worst frame: at 3 cascades only two replays share any one frame's buffers.
@@ -545,10 +564,10 @@ shading normal instead of `n_geom`.
   off-screen casters pop in as you turn; note `mainViewCull` already removes its main-view
   cost, so turning it off only buys replay streaming); (3) fewer cascades (2, or 1); (4)
   smaller `boxRadius` (a smaller far box holds less geometry) paired with `cascadeEdgeFade`
-  + Deferred Fog to hide the nearer cutoff. The definitive fix for
-  unconstrained 3-cascade/high-radius is larger platform buffers (adaptive grow-on-overflow
-  is the intended aurora change; a static bump is a re-platform per CLAUDE.md). The Link
-  cascade is nearly free vertex-wise: its filter skips at drawFast BEFORE geometry streams.
+  + Deferred Fog to hide the nearer cutoff. Adaptive grow-on-overflow remains the *right*
+  aurora change in principle, but with the index buffer doubled and the three culling levers
+  in place there is no longer a case to make for it from this mod. The Link cascade is nearly
+  free vertex-wise: its filter skips at drawFast BEFORE geometry streams.
 - The Link cascade's position filter is by model anchor, so a character standing within
   2× Link Coverage of Link is included (harmless — more detail) and a huge world model
   whose origin happens to sit nearby would be too (its geometry mostly clips out of the
