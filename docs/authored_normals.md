@@ -821,7 +821,7 @@ buffer we currently get from the renderer, so the aurora/SDK delta could be drop
 | Does the mod API expose per-draw authored normals, MRT, or the game's geometry? | **No.** Nothing in GfxService 1.0 or 1.1 reaches a draw's vertex attributes or adds an attachment to a pass. |
 | Is there *any* mod-only route to true authored normals? | **Yes, exactly one** — hijack GX's per-vertex lighting so the game's own shaders rasterize the normal as colour, into a replayed offscreen pass (§9.2). |
 | Should we do it? | **No.** It is strictly worse on every axis that matters here (§9.3) and it does not remove the aurora fork (§9.4). |
-| Is there a way to stop carrying the delta? | **Yes — upstream it** (§9.5). That is the real answer to the question behind the question. |
+| Is there a way to stop carrying the delta? | **Yes, and it is the plan — upstream it, then move the pin** (§9.5). Until then the fork is deliberate, and moving later costs one line. |
 
 ### 9.1 What the mod API actually offers
 
@@ -938,16 +938,27 @@ normal target and nothing else, so the buffers are back to 5 / 2 / 8. That does 
 proposal (it makes the headroom argument worse, not better), but it does mean the shadow mod's
 cascade replays are running on stock sizes again; see CLAUDE.md's ABI pin.
 
-### 9.5 The actual way to stop carrying the delta
+### 9.5 The plan: upstream the delta, then move the pin
 
-Upstream it. The change is small, additive, off by default, and useful to any aurora consumer:
+**This is the intended endgame, not a hypothetical.** We run our own fork today because it is the
+only build that provides authored normals; the plan is to offer the change upstream and, once a
+compatible equivalent lands there, move `DUSKLIGHT_VERSION` to upstream and stop carrying a fork at
+all. (This document is ours and is not part of that PR — what gets offered upstream is the platform
+change, not these notes.)
+
+**Moving costs one line when it happens.** `common/gfx_normal_compat.h` detects the resolve fields
+by member name and `common/gfx_scene_pass.h` reads the real scene layout, so no mod source changes
+whichever base supplies them — that is exactly what those two shims are for, and it has already been
+exercised in both directions (`docs/normal_buffer_portability.md` §4).
+
+The change is small, additive, off by default, and useful to any aurora consumer:
 
 - **aurora** (`encounter/aurora`): `AuroraConfig::enableNormalBuffer` → optional second colour target
   + the `@location(1)` write. Documented end to end in `dusklight/docs/thin-gbuffer-normals.md`.
 - **Dusklight** (`TwilitRealm/dusklight`): the appended `struct_size`-guarded SDK fields (now just
   two, at GfxService 1.3 — upstream already shipped the scene-target-layout half itself), which
-  is exactly the shape of change GfxService 1.1 already made for present targets — it would land as
-  GfxService **1.2**.
+  is exactly the shape of change GfxService 1.1 already made for present targets. We carry it as
+  GfxService **1.3**; upstream would assign whatever minor is next for them.
 
 That removes the fork properly and leaves every consumer mod unchanged, whereas §9.2 removes nothing
 and makes the provider fragile.

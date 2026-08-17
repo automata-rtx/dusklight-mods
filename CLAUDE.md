@@ -406,13 +406,36 @@ The user typically does not build locally. Iteration loop:
 5. If the new base has no scene normal buffer, expect Graphics Hub to say so and normals to be
    faceted. That is correct, and needs no source change.
 
-**Forking the SDK is not free.** Appending fields to SDK structs is what caused the
-`normal_format` / `WGPUInstance` offset collision documented under The ABI pin. Prefer upstreaming a
-platform feature over carrying a delta — see `docs/authored_normals.md` §9.5. **That argument has
-now been paid off in practice:** upstream shipped its own scene-target-layout API, our hand-rolled
-equivalent was deleted rather than merged, and the fork shrank from "a layout API + a device field +
-two resolve fields" to just the two resolve fields. The one that stayed is the one placed most
-carefully — in existing tail padding, gated on the *reply* struct's size.
+## Where the platform is going (state this plainly — it is not a secret)
+
+**Today we run our own fork, deliberately.** `automata-rtx/dusklight-ao` is the platform because it
+is the only build that hands mods the game's authored vertex normals, and everything in this repo
+that reads a normal depends on that. This is a considered position, not an accident or a stopgap we
+are embarrassed about.
+
+**The intended endgame is to upstream the delta and then move the pin to upstream.** The delta is
+now two fields (`GfxResolveDesc::normal` → `GfxResolvedTargets::normal`, GfxService 1.3) plus
+aurora's optional normal attachment — small, additive, off by default, and useful to any aurora
+consumer. `docs/authored_normals.md` §9.5 is the concrete PR shape. Once upstream carries a
+compatible equivalent, moving is a **pin bump and nothing else**: `common/gfx_normal_compat.h`
+detects the fields by member name and `common/gfx_scene_pass.h` reads the real scene layout, so no
+mod source changes whichever base provides them. That is the whole reason those two shims exist.
+
+Until that lands, expect the fork. Do not "clean up" the fork knobs in `CMakeLists.txt`, and do not
+write documentation that describes upstream as the current platform — main did exactly that during
+a temporary retreat and it took a full merge to unpick.
+
+> **Note on scope:** this repo's documentation is ours and is *not* part of any upstream PR, so it
+> says all of the above directly. What would be offered upstream is the platform change itself, not
+> these notes.
+
+**Forking the SDK is still not free.** Appending fields to SDK structs is what caused the
+`normal_format` / `WGPUInstance` offset collision documented under The ABI pin — which is precisely
+why upstreaming is the goal rather than growing the delta. **That argument has already been paid off
+once in practice:** upstream shipped its own scene-target-layout API, our hand-rolled equivalent was
+deleted rather than merged, and the fork shrank from "a layout API + a device field + two resolve
+fields" to just the two resolve fields. The one that stayed is the one placed most carefully — in
+existing tail padding, gated on the *reply* struct's size.
 
 ## Related repos
 
