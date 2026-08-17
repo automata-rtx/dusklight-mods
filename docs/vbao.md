@@ -120,7 +120,7 @@ default candidate) or at high supersampling.
 
 ## History / provenance
 
-Ported from our earlier pre-mod-API implementation in the retired `dusklight-ao` + `aurora-ao`
+Ported from our earlier pre-mod-API implementation in the `dusklight-ao` + `aurora-ao`
 forks onto Encounter's upstream `ao_mod` demo framework: the demo
 contributed the MIP depth chain, compute scheduling, and denoiser; ours contributed the
 bitmask estimator, temporal accumulation, depth-aware upscale, thickness/contrast/black

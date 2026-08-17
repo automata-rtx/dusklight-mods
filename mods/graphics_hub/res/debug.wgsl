@@ -8,7 +8,7 @@
 // between the two textures both normals are always available:
 //
 //   0 Service Output - what consumers actually get this frame.
-//   1 Authored       - the thin g-buffer normal; black where the pixel has none.
+//   1 Authored       - the scene normal buffer's normal; black where the pixel has none.
 //   2 Reconstructed  - the 5-tap depth-gradient normal, always available.
 //   3 Difference     - angle between the two, 0..45 deg as black -> blue -> green -> yellow -> red.
 //                      Faceting alone reads dark with bright creases at triangle edges; a whole

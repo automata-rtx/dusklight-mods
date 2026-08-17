@@ -24,17 +24,26 @@ Linux x64/arm64, Android arm64) produced by CI.
 
 ## Installing
 
-1. Download the latest `mods-combined` artifact from this repo's Actions page.
-2. Copy the `.dusk` files into the game's mods folder:
+1. Install the matching game build: the `win32-msvc-x86_64` archive from the
+   **`platform-normals-test`** release of [`automata-rtx/dusklight-ao`](https://github.com/automata-rtx/dusklight-ao/releases/tag/platform-normals-test).
+   The mods are built against that build, not stock upstream Dusklight — see the matched-pair note
+   below.
+2. Download the latest `mods-combined` artifact from this repo's Actions page.
+3. Copy the `.dusk` files into the game's mods folder:
    - Windows: `%APPDATA%\TwilitRealm\Dusklight\mods`
    - Linux: `~/.local/share/TwilitRealm/Dusklight/mods`
    - macOS: `~/Library/Application Support/TwilitRealm/Dusklight/mods`
-3. In game: Mods menu → enable them. Settings live in each mod's detail pane.
+4. In game: Mods menu → enable them. Settings live in each mod's detail pane.
+5. Optional, for smooth (authored) surface normals: turn on **Video → Rendering → Scene
+   Normal Buffer** and restart. It ships off, and is unavailable in compatibility mode
+   (D3D11 / OpenGL ES). Without it every mod reconstructs normals from depth — correct,
+   just faceted.
 
 The game-linked mods resolve their hook targets by symbol at load, so a `.dusk` and the game build
-it was compiled against are a matched pair. These are built against upstream Dusklight at the
-commit pinned as `DUSKLIGHT_VERSION` in `CMakeLists.txt`; if a mod fails to load or loads and does
-nothing, that pin and your game build have diverged.
+it was compiled against are a matched pair. These are built against `automata-rtx/dusklight-ao` at
+the commit pinned as `DUSKLIGHT_VERSION` in `CMakeLists.txt` — the scene-normal-buffer platform, not
+stock upstream; if a mod fails to load or loads and does nothing, that pin and your game build have
+diverged.
 
 After replacing a `.dusk` with a newer build, the in-game **Reload** button picks it up without
 restarting.
@@ -52,10 +61,12 @@ cmake -B build          # fetches the SDK + link stub on first run
 cmake --build build     # -> build/mods/*.dusk
 ```
 
-That's it, on any platform — including Windows (plain MSVC). There is **no fork-specific
-configuration**: `DUSKLIGHT_REPOSITORY`, `DUSKLIGHT_SDK_STUB_URL` and `DUSKLIGHT_AURORA_VERSION` are
-all left unset, so the source comes from upstream `TwilitRealm/dusklight` at `DUSKLIGHT_VERSION` and
-the link stubs come from upstream's public, version-independent `sdk` release.
+That's it, on any platform — including Windows (plain MSVC). Two knobs point the stock template at
+our platform: `DUSKLIGHT_REPOSITORY` (`automata-rtx/dusklight-ao`, which carries the scene normal
+buffer) and `DUSKLIGHT_SDK_STUB_URL` (that fork's `platform-normals-test` release, which publishes
+the per-arch link stubs). `DUSKLIGHT_AURORA_VERSION` stays unset — the recorded `extern/aurora` pin
+resolves on its own. Note a fork release's stubs are **per-build**, unlike upstream's
+version-independent `sdk` tag, so the stub URL moves whenever `DUSKLIGHT_VERSION` does.
 
 CI (`.github/workflows/build.yml`) is the template's build + combine pipeline: it builds every mod on
 all seven platforms and merges each into one cross-platform `.dusk` via `tools/merge_mod.py`

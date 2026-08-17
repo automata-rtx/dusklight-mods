@@ -1,7 +1,8 @@
-# Authored normals (thin g-buffer) — consuming them, and how to A/B them
+# Authored normals (scene normal buffer) — consuming them, and how to A/B them
 
-**Status:** landed in the mods. Partly verified in-game — see §0. The platform side is done,
-merged and published (`platform-gbuffer-test`).
+**Status:** landed in the mods and **verified in-game** — the back-lit-character artefacts that
+drove most of §8 are confirmed resolved (see §0). The platform side is done, merged and published
+(`platform-normals-test`).
 
 > **Cold-start readers:** read §0 first. It is the state of play — what is done, what is confirmed
 > in-game, what is still open, and which debug views answer which question. §8 is the list of
@@ -11,12 +12,19 @@ merged and published (`platform-gbuffer-test`).
 > one route that genuinely would work, why it is still the wrong build, and the upstream-drift
 > notes (an `GfxDeviceInfo` ABI collision) that matter on the next re-platform.
 
-The game's forward renderer now writes its own **authored, interpolated vertex normals** into a
-second RGBA8 color attachment on the scene (EFB) pass, and the mod API exposes a per-frame snapshot
-of it. **Graphics Hub / Depth to Normal** consumes that snapshot instead of reconstructing normals
-from the depth buffer, and because every other mod reads normals through the
+The game's forward renderer can write its own **authored, interpolated vertex normals** into a
+second RGB10A2 color attachment on the scene (EFB) pass, and the mod API exposes a per-frame
+snapshot of it. **Graphics Hub / Depth to Normal** consumes that snapshot instead of reconstructing
+normals from the depth buffer, and because every other mod reads normals through the
 `dev.automata.depth_to_normal` service, all of them (VBAO, SSILVB, Realtime Sun Shadows, SMAA)
 inherit it with **zero changes of their own**.
+
+**It is off by default.** The game ships the buffer switched off — **Video → Rendering → Scene
+Normal Buffer**, applied on the next launch — because it costs a render target and a write per
+covered fragment and nothing reads it unless a mod does. Until it is on, every mod here behaves
+exactly as it did before: the provider reconstructs from depth for every pixel and says so in its
+status line. It is also unavailable in compatibility mode (the D3D11 and OpenGL ES fallbacks),
+where the renderer disables it whatever the setting says.
 
 Why it matters: a depth-gradient normal is a cross product of screen-space position deltas, i.e.
 the flat face normal of each rasterized triangle — faceting is inherent to the method. Authored
@@ -27,10 +35,22 @@ it away afterwards. See `dusklight-ao/docs/thin-gbuffer-normals.md` for the rend
 
 ## 0. State of play (read first)
 
-**Branch:** `claude/authored-normal-buffer-testing-6sxm4m` in `automata-rtx/dusklight-mods`.
-**Platform:** `DUSKLIGHT_VERSION = b96bf5ec01`, `DUSKLIGHT_SDK_STUB_URL` → `platform-gbuffer-test`.
-The user must run the `win32-msvc-x86_64` build from that release; game build and `.dusk` files are
-always a matched pair, in both directions (see §6 for rollback).
+**Platform:** `DUSKLIGHT_VERSION = 5ded001`, `DUSKLIGHT_REPOSITORY` → `automata-rtx/dusklight-ao`,
+`DUSKLIGHT_SDK_STUB_URL` → `platform-normals-test`. The user must run the `win32-msvc-x86_64` build
+from that release; game build and `.dusk` files are always a matched pair, in both directions (see
+§6 for rollback). **Then turn on Video → Rendering → Scene Normal Buffer and restart** — nothing in
+this document is observable until that is done.
+
+That pin is upstream `c880d46f` plus **GfxService 1.3**, over aurora `cf3ffc9` plus the normal
+attachment. Note the release tag `platform-normals-test` is republished on every push to the
+platform branch, so the *URL* is stable while its assets are not.
+
+**The fork delta is now two fields wide.** Upstream shipped its own scene-target-layout API in
+#2305 (GfxService 1.2 — `GfxRenderTargetLayout`, `get_scene_target_layout`,
+`gfx_init_color_target_states`, `GfxDrawContext::layout`, and the `GfxAttachmentSemantic` tags), so
+the hand-rolled `GfxPassTargets` vocabulary our fork used to carry was **deleted rather than
+merged**. What remains fork-local is 1.3's `GfxResolveDesc::normal` → `GfxResolvedTargets::normal`.
+`GfxDeviceInfo::normal_format` is gone entirely — see §7.
 
 ### What landed, in order
 
@@ -50,6 +70,12 @@ always a matched pair, in both directions (see §6 for rollback).
 | `317111b` | Map comparison faded across the terminator band (§8.7). |
 | `aa2c723` | **Receiver-plane fractional-sampling bias capped** (§8.8). |
 | `38386e4` | Normal Smoothing pass deleted outright (§8.9). |
+| `e50a1a9` | Re-platformed onto upstream `0fc05028`, which has no normal buffer — authored normals off across the board, provider reconstructing every pixel. **`main` independently landed the same retreat as `8695508`**, which is why the two branches conflicted on every platform paragraph. |
+| `dcdaa23` | Re-platformed onto `platform-normals-test`, restoring authored normals; all six scene-pass pipelines moved to the scene-layout query, and the `GfxDrawContext::normal_format` guard deleted (§5). |
+| `ca6b73a` | **Every camera-facing flip on an authored normal deleted** — provider (was 0.5) and VBAO/SSILVB (were −0.15). Re-pinned to the rebased platform, which also drops aurora's enlarged streaming buffers — harmless, upstream had already raised its own (§2a). |
+| `3cbab91`–`8cc46b9` | AO occlusion hemisphere built from geometry, not the shading normal; the rejection plane made a 4-tap ±1 in both mods (§8.11, §8.11a). |
+| `b426c4d` | Shadow map and `n·L` terms combined by multiplying visibilities instead of `max` — fixes the terminator glint (§8.12). |
+| *(this change)* | Re-pinned to **GfxService 1.3** on rebased upstream. Our scene-layout fork deleted in favour of upstream's; `normal_format` accessor removed; `has_normal_attachment` is the new "does this build have authored normals" (§5, §7). |
 
 ### Confirmed in-game by the user
 
@@ -60,17 +86,19 @@ always a matched pair, in both directions (see §6 for rollback).
 - The normal buffer itself is **smooth** — confirmed against a faceted Shadow Factor in the same
   frame, which is what proved the faceting was downstream of the normal (§8.6).
 - The startup crash is gone (later builds run).
+- The **normal debug view is correct** after the camera-facing flips came out (`ca6b73a`, §2a).
+- **The terminator glint is fixed** (`b426c4d`, §8.12) — reported from Debug View 15 as a
+  specular-looking stripe where the red map term handed over to the green `n·L` term, and confirmed
+  gone. That one was found *from the debug view alone*, which is the workflow §8.12 documents.
+- **The wrongly-lit patches on back-lit Link are gone.** This was the long-running open question —
+  patches on the boots, torso and lower tunic when back-lit. It closed across the run of changes
+  from `5300789` onward: the two-normal split (§8.6), the `sin`-scaled normal offset (§8.7), the
+  **fractional-bias cap** (`aa2c723`, §8.8 — the strongest single candidate, and the one that was
+  arithmetic rather than inference: the term was contributing several hundred world units of flat
+  bias against a ~150-unit-tall character), and the additive term combine (§8.12).
 
-### NOT yet verified — the open question
-
-Everything from `5300789` onward is **unverified in-game**. The last user report still showed
-wrongly-lit patches on Link's boots, torso and lower tunic when back-lit. Since then, four changes
-landed that each plausibly address it, the strongest being the **fractional-bias cap** (`aa2c723`,
-§8.8) — that one is arithmetic, not inference: the term was contributing several hundred world units
-of flat bias against a ~150-unit-tall character.
-
-**Next step:** Shadow Factor + Shadow Terms on back-lit Link, same frame. Then the bias retune
-(below).
+  No single one of those is attributable as *the* fix, because they were verified together. If the
+  symptom ever returns, §8.8 is the first place to look.
 
 ### Open items
 
@@ -79,8 +107,18 @@ of flat bias against a ~150-unit-tall character.
    acne control since Normal Smoothing is gone. Needs a screenshot-driven pass, not guessed values.
 2. If flat sunlit ground shows acne, `rpdb_max` (currently `0.02`) is the knob; the fractional cap
    `kMaxFractionalBias` (`0.001`) is deliberately tight.
-3. Renderer-side follow-ups, both in `aurora-ao`, neither blocking: normal-target precision
-   (`RGB10A2Unorm` if RGBA8 banding shows), and MSAA handling if MSAA is ever enabled (§8.5).
+3. MSAA handling if MSAA is ever enabled (§8.5). *(Normal-target precision is done — the buffer is
+   `RGB10A2Unorm`, ten bits per axis, so the RGBA8 banding this item was raised against cannot
+   occur.)*
+4. **Everything in §0 "Confirmed in-game" was confirmed on the retired `platform-gbuffer-test`
+   platform**, whose buffer was RGBA8 and whose renderer was a different fork. The findings should
+   carry — the encoding, coverage rule and basis are the same — but the first run on
+   `platform-normals-test` is a re-confirmation, not a regression check. Start with Coverage (is it
+   still green everywhere?) and Difference (§2), in that order.
+5. **SMAA's `Normal Threshold` default (10%) was tuned against faceted normals**, where a low value
+   lights up every facet boundary on curved low-poly geometry. With authored normals those interior
+   steps are gone, so lower values should now be usable and catch real creases this default misses.
+   Worth a screenshot pass; the control is live, so no rebuild is needed to explore it.
 
 ### Debug views — which question each answers
 
@@ -141,42 +179,64 @@ that has never been checked on a GPU.
   it with **Authored Basis** (As-is / Flip Y / Flip Z / Flip Y and Z) and report which one landed;
   the winning flip then gets folded into the shader as the default.
 
-Note a camera-facing guard is applied to the authored normal too (see §2a), so a *global* sign
-error is largely self-correcting on front-facing surfaces — a Y flip or an axis swap is the failure
-mode that would actually show.
+Note that no camera-facing guard is applied to the authored normal (see §2a), so a *global* sign
+error would show up plainly rather than being masked on front-facing surfaces.
 
-## 2a. The camera-facing guard must not use a zero threshold
+## 2a. Never flip an authored normal toward the camera — at any threshold
+
+**This is the single most expensive lesson in this document. It was got wrong three times, each
+time by weakening the test rather than deleting it.**
 
 The reconstruction ends with `if dot(n, pos) > 0 { n = -n }`, forcing the normal toward the camera.
-That is safe for a **face** normal: on a front-facing triangle it never legitimately points away, so
-the test only fires on numerical noise.
+That is *required* there and nowhere else: a cross product of screen-space deltas has an *arbitrary
+sign*. Nothing in the depth buffer says which way the surface faces, so the sign has to be invented,
+and "toward the camera" is the only sane choice.
 
-Applied to an **authored** normal it is wrong, and visibly so. A smooth, interpolated normal field
-crosses `dot(n, view) = 0` *at the visual silhouette by construction*, and on low-poly geometry it
-travels well past perpendicular before the triangle ends — an 8-sided cylinder reaches about 22°,
-`dot ≈ 0.37`. A zero threshold negates every pixel in that band. Symptoms:
+An authored normal is not in that position. It **already has a sign** — the one the artist gave it,
+transformed by the model-view matrix — and the renderer writes it per draw, so a reverse pass over
+two-sided geometry supplies the normals for the side it actually draws. There is no ambiguity left
+for a guard to resolve, so a guard can only ever destroy information.
 
-- a **wrong-coloured band hugging every silhouette** in the normal debug view, which *widens and
-  narrows as the camera moves* — because the size of the region where `dot(n, view) > 0` is itself
-  view-dependent. (That view-dependence is what distinguishes this from an MSAA resolve artifact,
-  which would be a fixed ~1px rim. MSAA is in fact off: Dusklight never assigns `AuroraConfig::msaa`
-  and `aurora.cpp:116` defaults it to 1.)
-- the shadow mod's **attached-shadow term failing on curved back-lit features** — a flipped normal
-  inverts `n·L`, so a surface facing away from the sun reads as facing it and the term switches off.
-  Nose tip, boot and tunic edges, exactly the high-curvature silhouette-adjacent geometry.
+### Why any threshold seams
 
-The threshold is now **0.5** — flip only what is *clearly* inverted, i.e. a two-sided sheet seen
-from behind, whose normal points nearly straight away (0.7–1.0). A silhouette band tops out near
-0.4, so the two cases separate cleanly.
+`dot(n, view_ray)` is **not a property of the surface**. The ray direction sweeps across the screen
+under perspective, so on a large surface seen at a grazing angle the product crosses any fixed
+threshold *along a line*, and every pixel past that line is negated. The result is a **hard seam
+across geometrically flat ground**, worst where ground planes run to the horizon.
 
-This is not a new idea in the repo: **VBAO and SSILVB already guard with a 0.15 margin** and say why
-— *"Face the normal toward the camera only when CLEARLY back-facing… the margin keeps grazing
-surfaces from toggling per pixel."* The provider was the one place using a hard zero. Because those
-mods re-apply their own guard, AO keeps the orientation it wants, while consumers needing the true
-surface direction (the shadow bias and its `n·L` terminator) now get it.
+Moving the threshold moves the seam. It does not remove it.
 
-**Rule for the service:** it returns the true surface direction, not a camera-facing one. Anything
-that wants strictly camera-facing normals applies its own guard *with a margin*.
+### The three attempts
+
+| Threshold | Reasoning at the time | What it actually did |
+|---|---|---|
+| `dot > 0` | "Copy the reconstruction's guard." | Negated the whole silhouette band. A smooth normal field crosses `dot = 0` *at the visual silhouette by construction*, and on low-poly geometry travels well past perpendicular first — an 8-sided cylinder reaches ~22°, `dot ≈ 0.37`. Showed as a wrong-coloured band hugging every silhouette that *widened and narrowed with camera angle*, and as the shadow mod's `n·L` inverting on curved back-lit features (nose tip, boot and tunic edges). |
+| `dot > 0.5` | "Spare the silhouette band; flip only what is *clearly* inverted." | Same bug, seam relocated. Smaller region negated, still bounded by a hard view-dependent line. |
+| *(none)* | An authored normal has no sign ambiguity. | Correct. |
+
+The consumers repeated the mistake independently: **VBAO and SSILVB each re-applied their own guard
+at `dot(n, view_vec) < -0.15`**, nominally for double-sided foliage. That fires *earlier* than the
+provider's own 0.5, so it planted the seam nearer the horizon — precisely where ground planes are
+widest on screen. It also never fired on the reconstruction path (already camera-facing), so despite
+the general-sounding comment it only ever acted on authored normals.
+
+All of them are now deleted. The four surviving flips in the tree are all on cross-product
+reconstructions, which is the one case that needs them:
+`graphics_hub/reconstruct.wgsl` `reconstruct_normal`, `vbao/vbao.wgsl` and `vbao/composite.wgsl`
+`reconstruct_normal`, and `realtime_sun_shadows/shadow.wgsl` `geometric_normal_at`.
+
+### What about genuinely back-facing geometry?
+
+The case the guards were written for largely does not arise: TP draws two-sided geometry as a
+reverse pass, and that pass writes the normals for the side it draws, so a visible back face already
+has a normal facing the viewer. Where single-pass two-sided geometry does leave a normal pointing
+away, AO integrates over a hemisphere facing away from the screen on those pixels. That is the
+accepted trade — it is local and rare, where the seam was global and on the most visible surface in
+the game. SSILVB's *emitter* term shows the right way to handle it without a sign change: it
+`clamp`s `dot(n, -l)` to `[0,1]`, so a back-facing emitter simply contributes nothing.
+
+**Rule for the service:** it returns the surface direction with the game's own sign. Consumers take
+it as given. A consumer that "corrects" it against the view re-creates this bug.
 
 ## 3. Coverage and the fallback
 
@@ -192,22 +252,28 @@ should be seamless, not a visible seam.
 
 ## 4. Verification order
 
-1. **Prereq.** Install the `platform-gbuffer-test` game build **and** fresh `.dusk` files as a
-   matched pair, with **Use Authored Normals off**. Everything must look exactly as it did before
-   and the log must be clean. Any missing or corrupted composite here means a mod pipeline is still
-   declaring one color target (see §5).
-2. **Basis.** Turn the toggle on, Show Normals on, Debug View = Difference. Expect dark with bright
+1. **Prereq.** Install the `platform-normals-test` game build **and** fresh `.dusk` files as a
+   matched pair. Start with **Video → Rendering → Scene Normal Buffer OFF** — the shipping default.
+   Everything must look exactly as it did before and the log must be clean; Graphics Hub's status
+   line should tell you to turn the buffer on. This step alone confirms the re-platform, since the
+   symptom it replaces was mods failing to load outright.
+2. **Buffer on.** Turn on the Video setting, **restart**, and confirm "Use Authored Normals" is no
+   longer greyed out. Leave it **off** for one more pass: everything must still look unchanged. Any
+   missing or corrupted composite *here* — with the pass now carrying two attachments — means a mod
+   pipeline is not following `gfx_compat::scene_pass_layout` (see §5). This is the step that catches it.
+3. **Basis.** Turn the toggle on, Show Normals on, Debug View = Difference. Expect dark with bright
    creases; see §2 if not.
-3. **Coverage.** Debug View = Coverage. Confirm the fallback regions are the expected ones.
-4. **The payoff.** Overlay off, VBAO/SSILVB on a low-poly rock face or a character: the faceting
+4. **Coverage.** Debug View = Coverage. Confirm the fallback regions are the expected ones.
+5. **The payoff.** Overlay off, VBAO/SSILVB on a low-poly rock face or a character: the faceting
    the reconstruction produced should be gone, with no blur pass involved.
-5. **Shadows.** Set Normal Smoothing to **0** (see §4a — that is what binds the authored normal
-   unblurred) and check the Receiver Normal debug view, then compare shadow quality against the
-   old default of 4.
-6. **Everything at once.** VBAO/SSILVB + Realtime Sun Shadows + Deferred Fog + SMAA together — each
+6. **Shadows.** Check the Receiver Normal debug view, then compare shadow quality against the
+   buffer-off run.
+7. **Everything at once.** VBAO/SSILVB + Realtime Sun Shadows + Deferred Fog + SMAA together — each
    pushes a draw into the scene pass, so this is where a missed pipeline surfaces.
-7. **Perf.** Frame time against the `platform-v2-test` baseline. Expect slightly more in the scene
-   pass (one extra RGBA8 target), and considerably less once the normal-smoothing pass goes.
+8. **Perf.** Frame time with the buffer off vs on — the same install, so it is a clean A/B. Expect
+   slightly more in the scene pass (one extra RGB10A2 target and a write per covered fragment), and
+   less in the provider, which drops eight depth taps and two unprojections per pixel wherever an
+   authored normal covers it.
 
 ## 4a. Realtime Sun Shadows had a second normal path
 
@@ -300,58 +366,98 @@ provider's own — which is the point.
 ## 5. The prerequisite that touches every mod
 
 **A WebGPU render pass with two color attachments requires every pipeline drawing into it to
-declare two color targets.** With the normal buffer on, the scene pass has two — so every pipeline
-handed to `push_draw` declares a second target in `g_deviceInfo.normal_format` with
-`writeMask = None`, or Dawn rejects the draw on attachment count. Every stage that pushes draws
-(`SCENE_BEGIN`, `SCENE_AFTER_TERRAIN`, `SCENE_AFTER_OPAQUE`, `FRAME_BEFORE_HUD`,
-`FRAME_AFTER_HUD`) lands inside that pass; there is no exempt stage.
+declare two color targets.** With the normal buffer on, the scene pass has two, or Dawn rejects the
+draw on attachment count. Every stage that pushes draws (`SCENE_BEGIN`, `SCENE_AFTER_TERRAIN`,
+`SCENE_AFTER_OPAQUE`, `FRAME_BEFORE_HUD`, `FRAME_AFTER_HUD`) lands inside that pass; there is no
+exempt stage.
 
-Done at all six sites: VBAO and SSILVB composites (blend + debug), SMAA neighborhood blend,
-Graphics Hub's normal debug overlay and deferred fog fullscreen, Realtime Sun Shadows composite.
-The WGSL is unchanged — a fragment shader returning a single `@location(0)` value is valid against
-a pipeline whose second target is masked.
+**Ask the service for the layout; do not rebuild it.** `get_scene_target_layout(…)` returns a
+`GfxRenderTargetLayout` — one entry per attachment, each tagged with a `GfxAttachmentSemantic` — and
+the SDK's inline `gfx_init_color_target_states` turns that into a `WGPUColorTargetState[]` with
+every attachment the mod does not own already write-masked off. All six sites go through
+`gfx_compat::scene_pass_layout` (see `docs/normal_buffer_portability.md` §3): VBAO and SSILVB
+composites (blend + debug), SMAA neighborhood blend, Graphics Hub's normal debug overlay and
+deferred fog fullscreen, Realtime Sun Shadows composite. The WGSL is unchanged — a fragment shader
+returning a single `@location(0)` value is valid against a pipeline whose other targets are masked.
+
+Two earlier versions of this section are worth remembering, because each shipped a silent failure.
+The first told you to assemble the layout by hand from `g_deviceInfo.normal_format`, which is a copy
+of the renderer's own logic and wrong the moment the pass changes shape; it came paired with a
+per-draw guard comparing `GfxDrawContext::normal_format` against the device's, on a field the SDK
+had stopped carrying, so the guard fired unconditionally and disabled every composite. The second
+named upstream-1.2-era symbols (`get_pass_targets`, `GfxPassTargets`, `GFX_MAX_COLOR_TARGETS`) that
+upstream then **renamed**; the compat header's `#if` went false, the whole tree compiled cleanly,
+and every pipeline reverted to one colour target. Both are `normal_buffer_portability.md` §2 now,
+and the second is why that header fails the build instead of guessing.
 
 Offscreen passes from `create_pass` (shadow-map replays, the fog config-ID replay) stay
 single-target: they render with the game's own pipelines, which the renderer builds from the
 current pass.
 
-**Any new mod pipeline recorded into the scene pass must do the same.** Keep the
-`!= WGPUTextureFormat_Undefined` guard rather than hardcoding two targets — that is what lets the
-same binary run on both platforms.
+**Any new mod pipeline recorded into the scene pass must call `scene_pass_layout` too.**
 
 ## 6. Platform pin and rollback
 
-`CMakeLists.txt` pins `DUSKLIGHT_VERSION = b96bf5ec01…` (tip of
-`claude/thin-gbuffer-authored-normals-wgqupt` in `dusklight-ao`) and `DUSKLIGHT_SDK_STUB_URL` at the
-`platform-gbuffer-test` release. The base game code is identical to `platform-v2-test` (both are
-pristine upstream Dusklight `76b56cd8`); only the renderer change and the SDK header additions
-differ, so the game-linked mods hook the same functions.
+`CMakeLists.txt` pins `DUSKLIGHT_VERSION = 5ded001…` (tip of
+`claude/dusklight-thin-gbuffer-normals-l4l9dc` in `dusklight-ao`), `DUSKLIGHT_REPOSITORY` at that
+fork and `DUSKLIGHT_SDK_STUB_URL` at the `platform-normals-test` release. The base game code is
+upstream Dusklight `c880d46f`; the renderer change and the SDK header additions sit on top of it.
 
-To roll back: set both knobs back to `9361fbd9ea…` / `platform-v2-test`, let CI rebuild, and
-install those `.dusk` files together with that game build. The stable release is untouched and
-still published. **No source change is needed** — every authored-normal path is guarded on
-`GfxDeviceInfo::normal_format`, which that platform reports as `Undefined`, so the provider simply
-reconstructs exactly as before and the second color target is never declared. The game build and
-the `.dusk` files are always a matched pair, in either direction.
+**Rolling back to upstream is not free any more.** The base carries an upstream **game-service
+major-version bump**, so a mod built against the older `0fc05028` SDK is refused by this host and a
+mod built against this SDK is refused by that one. Rollback therefore means moving the pin *and*
+rebuilding *and* installing the matching game build — the same matched-pair rule as always, but with
+no overlap window where one set of `.dusk` files works on both. No **source** change is needed
+either way: every authored-normal path degrades through `common/gfx_normal_compat.h`, and the
+"is there a normal buffer" question is answered by the scene layout's semantic tags, which simply
+list no `GFX_ATTACHMENT_NORMAL` on a base without one.
+
+Note also that turning the buffer off in Video settings is a much cheaper A/B than rolling the
+platform back, and it is the one to reach for first when deciding whether authored normals are the
+cause of something.
 
 ## 7. API surface used
 
-All fields are appended to existing structs and `struct_size`-guarded.
+Two groups, and the distinction matters when re-platforming: **upstream** (GfxService 1.2, present
+on any current base) and **fork-local** (GfxService 1.3, the entire remaining delta).
 
 ```c
-GfxDeviceInfo::normal_format      /* RGBA8Unorm, or Undefined when the buffer is off */
-GfxResolveDesc::normal            /* request the per-frame normal snapshot */
-GfxResolvedTargets::normal        /* single-sample snapshot, frame-valid, may be NULL */
-GfxResolvedTargets::normal_format
-GfxDrawContext::normal_format     /* 2nd target format of the pass a draw lands in */
+/* upstream 1.2 — scene pass layout, for building pipelines */
+GfxService::get_scene_target_layout   /* -> GfxRenderTargetLayout */
+GfxRenderTargetLayout::color_attachments[i].semantic   /* GFX_ATTACHMENT_NORMAL lives here */
+gfx_init_color_target_states          /* inline SDK helper; write-masks off what you don't own */
+GfxDrawContext::layout                /* the same layout, inside a draw callback */
+
+/* fork-local 1.3 — the normal snapshot */
+GfxResolveDesc::normal                /* request the per-frame normal snapshot */
+GfxResolvedTargets::normal            /* single-sample snapshot, frame-valid, may be NULL */
 ```
 
+**To ask whether this build has authored normals, scan the layout for a `GFX_ATTACHMENT_NORMAL`
+semantic** — `gfx_compat::ScenePassLayout::has_normal_attachment` does exactly that. There is no
+`normal_format` field on any struct any more. Two platforms had one and each produced a distinct
+silent failure: an offset collision with upstream's `WGPUInstance`, and a per-draw guard that
+compared a compile-time-absent field against a live value and disabled every composite. See
+`docs/normal_buffer_portability.md` §2.1.
+
+`GfxResolveDesc::normal` is the one field `struct_size` cannot police: it landed in the struct's
+existing tail padding, so `sizeof(GfxResolveDesc)` is **unchanged** between 1.2 and 1.3 and the flag
+is invisible to the usual check. The host therefore honours it only for callers that also pass a
+1.3-sized `GfxResolvedTargets` to receive the view in — so a 1.2 mod's uninitialised padding can
+never request a snapshot it has nowhere to put. Initialising both from their `GFX_*_INIT` macros, as
+the provider does, satisfies that automatically.
+
 Snapshot contents: `rgb` = `normalize(mv_nrm) * 0.5 + 0.5`, the **view-space** authored normal;
-`a` = 1.0 when the draw supplied a normal attribute, 0.0 otherwise. Decode with
-`normalize(texel.xyz * 2.0 - 1.0)` — **always renormalize**, since interpolation, 8-bit
-quantization and any MSAA resolve all denormalize it. The attachment is cleared to `(0,0,0,0)` on
-the frame's first EFB pass and loaded on resumed segments, so a snapshot taken at
-`SCENE_AFTER_OPAQUE` holds every opaque draw so far.
+`a` = 1.0 when the draw supplied a normal attribute, 0.0 otherwise. Ten bits per axis, which is what
+keeps low-curvature surfaces from banding; the two alpha bits only ever carry the flag. Decode with
+`normalize(texel.xyz * 2.0 - 1.0)` — **always renormalize**, since interpolation, quantization and
+any MSAA resolve all denormalize it. The attachment is cleared to `(0,0,0,0)` on the frame's first
+EFB pass and loaded on resumed segments, so a snapshot taken at `SCENE_AFTER_OPAQUE` holds every
+opaque draw so far.
+
+Coverage is exactly the depth buffer's: a draw writes a normal if and only if it writes depth. So a
+normal snapshot and a depth snapshot always describe the same surface, and effects that only blend
+over the scene (particle billboards, the game's projected shadow quads) cannot contaminate it.
 
 ### MSAA silhouettes — resolved by rejecting blended texels
 
@@ -370,7 +476,9 @@ The design note in §12 of the renderer doc predicted "slight silhouette error�
 practice it was neither slight nor confined to appearance:
 
 - a **wrong-coloured rim** on every silhouette in the normal debug view (partial-coverage texels
-  get flipped by the camera-facing guard, landing on a roughly camera-facing direction);
+  decode to a direction belonging to no real surface; at the time the camera-facing guard then
+  flipped many of them as well, compounding it — that guard is gone, §2a, but the blend it was
+  reacting to is what this section is about and the length test is what fixes it);
 - the shadow mod's **attached-shadow term failing** on thin back-lit features — a nose tip, boot
   and tunic edges — because `n·L` computed from a blended normal can read as sun-facing, switching
   the term off exactly where it is needed.
@@ -380,7 +488,7 @@ still reads valid, and a two-surface pixel reads a fully confident `1.0`. That i
 showed green across the whole screen while the normals were wrong.
 
 `reconstruct.wgsl` now uses the **decoded length as a confidence signal**: a texel written by one
-surface decodes to unit length (8-bit quantization moves it under 0.01), so anything below **0.92**
+surface decodes to unit length (10-bit quantization moves it well under 0.01), so anything below **0.92**
 is a resolve average and is handed to the depth reconstruction instead, which is built for
 silhouettes. Genuine curvature is untouched — adjacent samples a few degrees apart still measure
 ~0.999. With MSAA off every covered texel measures 1.0, so the check is inert.
@@ -393,9 +501,9 @@ If the remaining reconstructed rim is objectionable, the renderer-side fix is to
 resolve for normals and take a single sample (or the sample whose depth matches the resolved
 depth) instead of averaging. That is an `aurora-ao` change.
 
-**Precision** remains untested: if RGBA8 banding shows on smooth surfaces under strong AO, the fix
-is `NormalBufferFormat` → `RGB10A2Unorm`, which keeps the validity channel — also an `aurora-ao`
-change, so report it rather than working around it here.
+**Precision is settled, not open.** `NormalBufferFormat` is already `RGB10A2Unorm`
+(`aurora-ao lib/webgpu/gpu.hpp`), ten bits per axis, so the RGBA8 banding this paragraph used to
+warn about cannot occur. §0 records it closed.
 
 ---
 
@@ -496,9 +604,9 @@ normal, so the two uses coincided and the bug could not show. `normalSmooth` was
 workaround from the same confusion — it traded bias banding at facet edges for bias error inside
 facets, which is why no value of it ever looked right.
 
-**Related:** the camera-facing guard has the same shape of error. A zero threshold is right for a
-face normal and wrong for a smooth one, which legitimately turns past perpendicular near a
-silhouette (§2a).
+**Related:** the camera-facing guard was the same shape of error, twice over — a test that is right
+for a face normal and wrong for an authored one, then "fixed" by retuning its threshold instead of
+removing it. It is gone entirely (§2a).
 
 ### 8.7 Acne and light leaks are the same failure with opposite sign
 
@@ -563,6 +671,142 @@ the curvature the shading normal carries.
   through the user's testing is not. Prefer shipping the view that answers the question over
   shipping another guess.
 
+### 8.11 A shading normal cannot define an AO hemisphere
+
+**Symptom:** with the normal debug view correct and the seam gone, toggling *Use Authored Normals*
+on still made SSILVB (bounce and probe off, so pure AO) *worse in one specific way* — shading got
+smoother as expected, but **AO appeared on flat ground that has no occluder anywhere near it**.
+
+**It is not a basis problem, and this is worth stating plainly because it looks like one.** The
+provider's output really is world space: the authored normal arrives in view space and is rotated
+out with the camera service's `world_from_view`; VBAO and SSILVB rotate it straight back with the
+same service's `view_from_world`. Those are exact inverses from the same struct in the same frame,
+so the round trip is lossless to ~1e-7 — waste (two 3×3 rotations per pixel), never a visible
+artifact.
+
+**The cause is that the two normals do different jobs**, the same lesson as §8.6 but on the AO side:
+
+- `ssilvb.wgsl:218` (`hh = (fbang + n)/PI + 0.5`) and VBAO's `carve_sample` map each sample's
+  horizon angles into a 32-sector mask **centred on the normal angle `n`**. The normal therefore
+  *defines the hemisphere* — it decides which directions are above the surface at all.
+- A depth-reconstructed normal is perpendicular to the plane its own samples lie in **by
+  construction**. Coplanar ground samples land exactly on the horizon and carve nothing. Flat ground
+  is self-consistently unoccluded, for free.
+- An authored normal is *deliberately not* perpendicular to its triangle — that is the entire point
+  of a smoothed vertex normal. Tilt it by θ and the hemisphere tilts with it, swallowing the very
+  plane the samples lie in. On TP's heavily smoothed low-poly terrain θ is easily 10–30°, which is
+  θ/π of the slice: **3–5 of 32 sectors carved on a perfectly flat surface**.
+
+**Fix:** keep the shading normal for the hemisphere and the cosine lobe — that is what buys the
+smoothness — and reject samples that lie below the *geometric* plane, which is what actually
+occludes:
+
+```wgsl
+if sp.w > 0.0 && dot(sp.xyz - pixel_position, geo_n) > 0.0 { ... }
+```
+
+`geo_n` is the face normal from depth: a **4-tap `geometric_normal_view`, character-identical in
+both mods** — `vbao.wgsl:253` and `ssilvb.wgsl`. Keep it that way; see 8.11a for why the two copies
+diverging is not a cosmetic difference. It stays **near-inert on the reconstruction path**, where
+the shading normal is already a plane from depth and only the tap pattern differs, so the A/B across
+*Use Authored Normals* changes the shading normal and essentially nothing else.
+
+Three traps, all hit while writing that one line:
+
+- `geo_n` must fall back to the **shading normal** when the cross product is degenerate, never to a
+  zero vector. `dot(delta, 0) > 0` is false, so a zero `geo_n` rejects every sample and switches AO
+  off entirely on those pixels — the opposite of "pass everything".
+- The same applies to **NaN** from a degenerate normalize: every comparison against NaN is false, so
+  it is the same silent AO-off. The guard is written `if !(len > 1.0e-12)`, negated so that NaN
+  takes the fallback rather than sailing through.
+- `geo_n` must be built from the **unbiased** centre position. SSILVB applied
+  `pixel_position *= 1.0 - depth_bias` *before* calling `geometric_normal_view`, whose four taps are
+  unbiased — leaving a spurious `depth_bias · P` offset along the view ray of 0.0040·z against a
+  true one-pixel gradient of 0.0011·z. **3.7× the signal**, so the cross product measured the bias,
+  not the surface. Build `geo_n` first, bias after.
+
+### 8.11a The rejection plane must be the ±1 tap, not atyuwen's 5-tap
+
+**Symptom:** with both mods at half res and slices, steps, black point and every other visible
+setting matched 1:1, SSILVB held extremely thin mid-distance coverage that VBAO broke up — an area
+reading solid in SSILVB looked *"almost half-res"* in VBAO, despite both being in half-res mode.
+
+Everything else in the AO path is shared and was ruled out by direct comparison: MIP selection
+during the march (`clamp(log2(max(dist, 1.0)) - 3.3, 0.0, 4.0)`), `load_sample_position`,
+`calculate_neighboring_depth_differences` and its edge packing, `preprocess_depth.wgsl`, the
+noise/jitter, the sector math, the denoise kernel, the composite shaping. Byte-identical or
+algebraically identical.
+
+The one real difference was the rejection plane introduced by 8.11: VBAO used `reconstruct_normal`
+(atyuwen's 5-tap, taps at ±1 **and ±2** pixels) where SSILVB used the new 4-tap (±1 only).
+
+**Why the tap radius matters here and not for shading.** At mid distance a thin feature is 1–2 chain
+pixels wide, and the chain is half-res, so coarser again. A ±2 tap lands **both** far taps on the
+background; atyuwen's side test then picks whichever side extrapolates most smoothly, which is the
+background. `geo_n` becomes the *background's* plane, `dot(delta, geo_n) > 0` discards samples that
+legitimately occlude the thin feature, and its occlusion breaks up per pixel — which through the
+half-res upscale reads as lower resolution. A ±1 tap at least has a chance of straddling the
+feature.
+
+`reconstruct_normal` is not wrong; it is being asked the wrong question. Its wide taps are exactly
+what make it **silhouette-robust for shading** — it is picking a stable plane across a
+discontinuity. A per-pixel rejection plane wants the opposite: the plane of *this* pixel, however
+small the feature it belongs to. It stays as VBAO's normal fallback, and nowhere else.
+
+**Rule:** the service returns a *shading* normal wherever the game supplied one. Anything asking
+"is this direction above the surface" — an AO hemisphere, a shadow-map bias — must build its own
+geometric normal from depth. The service header says so now.
+
+### 8.12 `max` is not how you combine two independent visibilities
+
+**Confirmed fixed in-game.**
+
+**Symptom:** in Realtime Sun Shadows, a bright stripe like a **specular glint** running along the
+light/shadow boundary on curved surfaces — reported from Debug View 15 as sitting exactly where the
+red (map) region hands over to the green (`n·L`) region. Not at every shadow edge, which is what
+made it look exotic.
+
+The combine in `shadow.wgsl` was:
+
+```wgsl
+occlusion = max(map_occlusion * light_facing, 1.0 - light_facing);
+```
+
+Write it as `max(m·f, 1 − f)` and evaluate it for a pixel **fully inside a cast shadow**, `m = 1`:
+
+| `f` (light_facing) | 1 | 0.75 | **0.5** | 0.25 | 0 |
+|---|---|---|---|---|---|
+| `max(m·f, 1 − f)` | 1 | 0.75 | **0.5** | 0.75 | 1 |
+
+A **V-shaped dip to half darkness through the middle of the terminator band, inside a shadow**. At
+the default Terminator Softness the band is ±0.1 in `n·L` — a few degrees of surface orientation —
+so on anything curved the dip is a thin bright stripe following the terminator through a dark
+region. It needs a cast shadow to *overlap* the terminator band, which is a much smaller set of
+pixels than "every shadow edge": hence rare-but-common-enough.
+
+**The fix is one line**, because the two terms are independent reasons not to receive sun —
+something is in the way, or the surface is turned away — so the light that arrives is their
+**product** and the darkening is one minus it:
+
+```wgsl
+occlusion = saturate(map_occlusion * light_facing + (1.0 - light_facing));  // = 1 - (1 - m) * f
+```
+
+Same endpoints (`f = 1` → `m`, `f = 0` → 1), no dip, and genuinely monotone in both inputs
+(`∂/∂m = f ≥ 0`, `∂/∂f = m − 1 ≤ 0`) where `max` is not monotone in `f` at all.
+
+**What made this survive so long** is the comment that defended it: *"at light_facing 0.5 the result
+is 0.5 either way, so the fade is invisible."* Both halves of that are true — the terms really do
+both equal 0.5 there, and the handover really is seamless — and the conclusion is still wrong,
+because the *correct* value for a pixel that is both shadowed and facing away is 1.0. Two terms
+agreeing on a number is not evidence that the number is right. The comment also claimed the
+expression was "monotone in both inputs", which is false and checkable in one line of algebra.
+
+**Rule:** when combining independent visibility/occlusion terms, multiply the visibilities. `max`
+of occlusions is only correct when the terms are alternative *estimates of the same quantity*
+(which is why `max` remains right for the Link cascade, and for folding in the Bend SSS term — both
+are other measurements of "is something in the way").
+
 ## 9. Could a mod produce this buffer without the aurora change?
 
 Investigated against **upstream `TwilitRealm/dusklight` HEAD `4504e5009`** (28 commits past our base
@@ -577,7 +821,7 @@ buffer we currently get from the renderer, so the aurora/SDK delta could be drop
 | Does the mod API expose per-draw authored normals, MRT, or the game's geometry? | **No.** Nothing in GfxService 1.0 or 1.1 reaches a draw's vertex attributes or adds an attachment to a pass. |
 | Is there *any* mod-only route to true authored normals? | **Yes, exactly one** — hijack GX's per-vertex lighting so the game's own shaders rasterize the normal as colour, into a replayed offscreen pass (§9.2). |
 | Should we do it? | **No.** It is strictly worse on every axis that matters here (§9.3) and it does not remove the aurora fork (§9.4). |
-| Is there a way to stop carrying the delta? | **Yes — upstream it** (§9.5). That is the real answer to the question behind the question. |
+| Is there a way to stop carrying the delta? | **Yes, and it is the plan — upstream it, then move the pin** (§9.5). Until then the fork is deliberate, and moving later costs one line. |
 
 ### 9.1 What the mod API actually offers
 
@@ -682,21 +926,39 @@ So the idea is sound, not hand-waving. It is still the wrong thing to build.
 
 ### 9.4 It would not remove the aurora fork
 
-`aurora-ao` carries **two** deltas, and the thin g-buffer is only one of them. The other is the
-enlarged per-frame streaming buffers (Index 4 MB, Vertex 16 MB, Storage 16 MB, Uniform/TextureUpload
-24 MB), which exist because the shadow mod's replays overflow stock aurora's 1 MB index / 5 MB
-vertex. Adding a second full-scene replay would need *more* headroom, not less. The trade buys
-nothing on the axis it was proposed for.
+`aurora-ao` historically carried **two** deltas, and the thin g-buffer was only one of them. The
+other was the enlarged per-frame streaming buffers (Index 4 MB, Vertex 16 MB, Storage 16 MB), which
+existed because the shadow mod's replays overflowed the aurora sizes **of the time** (Vertex 3 MB,
+Index 1 MB); upstream has since raised both itself, so that delta is retired. Adding a second full-scene
+replay would need *more* headroom, not less, so the trade bought nothing on the axis it was proposed
+for.
 
-### 9.5 The actual way to stop carrying the delta
+**As of the current pin that second delta is gone** — the rebased branch is upstream aurora plus the
+normal target and nothing else, so the buffers are back to 5 / 2 / 8. That does not revive this
+proposal (it makes the headroom argument worse, not better), but it does mean the shadow mod's
+cascade replays are running on stock sizes again; see CLAUDE.md's ABI pin.
 
-Upstream it. The change is small, additive, off by default, and useful to any aurora consumer:
+### 9.5 The plan: upstream the delta, then move the pin
+
+**This is the intended endgame, not a hypothetical.** We run our own fork today because it is the
+only build that provides authored normals; the plan is to offer the change upstream and, once a
+compatible equivalent lands there, move `DUSKLIGHT_VERSION` to upstream and stop carrying a fork at
+all. (This document is ours and is not part of that PR — what gets offered upstream is the platform
+change, not these notes.)
+
+**Moving costs one line when it happens.** `common/gfx_normal_compat.h` detects the resolve fields
+by member name and `common/gfx_scene_pass.h` reads the real scene layout, so no mod source changes
+whichever base supplies them — that is exactly what those two shims are for, and it has already been
+exercised in both directions (`docs/normal_buffer_portability.md` §4).
+
+The change is small, additive, off by default, and useful to any aurora consumer:
 
 - **aurora** (`encounter/aurora`): `AuroraConfig::enableNormalBuffer` → optional second colour target
   + the `@location(1)` write. Documented end to end in `dusklight/docs/thin-gbuffer-normals.md`.
-- **Dusklight** (`TwilitRealm/dusklight`): the five appended `struct_size`-guarded SDK fields, which
-  is exactly the shape of change GfxService 1.1 already made for present targets — it would land as
-  GfxService **1.2**.
+- **Dusklight** (`TwilitRealm/dusklight`): the appended `struct_size`-guarded SDK fields (now just
+  two, at GfxService 1.3 — upstream already shipped the scene-target-layout half itself), which
+  is exactly the shape of change GfxService 1.1 already made for present targets. We carry it as
+  GfxService **1.3**; upstream would assign whatever minor is next for them.
 
 That removes the fork properly and leaves every consumer mod unchanged, whereas §9.2 removes nothing
 and makes the provider fragile.
@@ -705,13 +967,23 @@ and makes the provider fragile.
 
 Checked while investigating; relevant whenever we re-platform.
 
-- `76b56cd8` (our base) is an ancestor of upstream HEAD `4504e5009` — **28 commits**, so a rebase is
-  clean in principle.
-- **ABI collision to watch.** Upstream appended `WGPUInstance instance; WGPUAdapter adapter;` to
-  `GfxDeviceInfo` — the same slot where our fork appended `WGPUTextureFormat normal_format;`. On a
-  rebase, ours must be re-appended **after** theirs and the service minor bumped to 1.2. Re-applying
-  our diff blindly would silently mis-map the struct. `GfxResolveDesc` / `GfxResolvedTargets` are
-  untouched upstream, so those merge cleanly.
+*(Hashes in the two bullets below are from the ORIGINAL investigation, against base `76b56cd8` and
+upstream HEAD `4504e5009`. They are kept because the lessons are live; the platform has since moved
+to `5ded001` — upstream `c880d46f` plus GfxService 1.3 — so do not treat them as current pins.)*
+
+- **The ABI collision that ended the first fork — and what NOT to do about it now.** Upstream
+  appended `WGPUInstance instance; WGPUAdapter adapter;` to `GfxDeviceInfo`, in the same slot where
+  our first fork appended `WGPUTextureFormat normal_format;`. That is what made fork-built mods read
+  a live pointer as a texture format and silently draw nothing.
+
+  **Do NOT resolve this by re-appending `normal_format` after upstream's fields.** An earlier
+  revision of this section said exactly that, and it is the wrong lesson: the field is now **gone in
+  every form**, and nothing should bring it back. Presence of the buffer is detected by finding a
+  `GFX_ATTACHMENT_NORMAL` semantic in `get_scene_target_layout` — see §7. The one surviving
+  fork-local pair (`GfxResolveDesc::normal` → `GfxResolvedTargets::normal`) is safe because `normal`
+  occupies `GfxResolveDesc`'s existing **tail padding**, so `sizeof` is unchanged, and the host
+  honours it only when `GfxResolvedTargets` is large enough to carry the result back. Copy *that*
+  pattern if the fork ever needs a third field; do not append to `GfxDeviceInfo`.
 - **SDK source renames that touch our three game-linked mods** (`7305ef09b`):
   `mods/hook.hpp` → `mods/svc/hook.hpp`, and `mods::hook_add_pre/add_post/replace(svc_hook, fn)` →
   `mods::hook::add_pre/add_post/replace(fn)` (the service argument is now an optional overload).

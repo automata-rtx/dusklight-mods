@@ -224,7 +224,7 @@ Space Shadows" is inert when SSS is off.
 | `shadowMapEnabled` | on | off = screen-space-only mode: no map render/composite, the game's own simple/real shadows return (the skip hooks go inactive), the Bend SSS term still applies |
 | `mapSize` | 2 | EACH world cascade's map: 0=1024 1=2048 2=4096 3=8192 |
 | `boxRadius` | 25000 | full coverage radius in world units (1000–30000) = the FAR cascade |
-| `cascadeCount` | 2 | world cascades minus one (UI select "1/2/3"): 0=single map, 1=two cascades, 2=three (default). See the streaming-budget caveat; the enlarged platform buffers carry 3 in normal play |
+| `cascadeCount` | 2 | world cascades minus one (UI select "1/2/3"): 0=single map, 1=two cascades, 2=three (default). 3 costs a third replay, so it is a framerate decision, not a stability one — see the streaming-budget note, which is historical |
 | `cascadeNearPct` / `cascadeMidPct` | 5 / 40 | near / mid cascade radii as % of Coverage (log-uniform for 3 cascades) |
 | `cascadeBlend` | 20 | cross-fade band width at each cascade boundary, % of the cascade extent |
 | `cascadeCull` | on | light-column culling of replay geometry per cascade (keeps the passes inside the engine's per-frame streaming budget - leave on) |
@@ -242,7 +242,7 @@ Space Shadows" is inert when SSS is off.
 | `receiverPlaneBias` | on | receiver-plane depth bias: derive the exact per-tap bias from the receiver surface's light-space depth gradient (built from the **geometric face normal**, not the shading normal — see the two-normals note), so acne clears with almost no flat margin and shadows stay attached to their casters (Isidoro 2006). When on it **replaces** `slopeBias` (the gradient is the exact slope term) and adds a fractional-sampling term for the centre texel, taken over half a texel and **hard-capped at 0.1% of the cascade depth range** (uncapped it inherited the clamped gradient and contributed up to 4% — hundreds of world units, more than a character is tall, which leaked self-shadowing straight through); `bias` still applies. The whole slope/plane term is scaled by the **light-facing gate** (`smoothstep(-band, band, n·L)`, `band` from `terminatorSoftness`) so surfaces turned away from the light get ~none of it — they're darkened by the two-sided map's front-most face, not self-shadow, and biasing them there leaks thin geometry (fingers, facial features) back into light. Off = the old constant + `slopeBias` margins (also light-facing-gated). Cap `rpdb_max = 0.02` (max 2% of a cascade's depth range per texel). Both methods |
 | `bias` | 2 | constant depth bias (normalized against light range), applied every tap. With `receiverPlaneBias` on, keep small; raise only if flat light-facing ground still shows acne |
 | `slopeBias` | 2 | bias added ∝ surface slope vs light. **Ignored when `receiverPlaneBias` is on** (that derives the slope term exactly); manual fallback only |
-| `attachedShadows` | on | also shadow surfaces facing **away** from the sun (the `n·L` term), which a cast-only shadow map cannot reach when they are unoccluded (a back-lit nose, protruding tunic/boot facets). Folds `1 - smoothstep(-band, band, n·L)` in via `max()`, so already-cast-shadowed pixels never darken further — only the leaking back-faces get corrected. Off = map-only (those back-faces read as fully lit) |
+| `attachedShadows` | on | also shadow surfaces facing **away** from the sun (the `n·L` term), which a cast-only shadow map cannot reach when they are unoccluded (a back-lit nose, protruding tunic/boot facets). Combines as two independent visibilities — `occlusion = map·f + (1 − f)` where `f = smoothstep(-band, band, n·L)` — so the map fades out exactly across the band where its comparison stops being trustworthy and the `n·L` term takes over. **Not `max()`**: that form reads half-lit in the middle of a cast shadow at the terminator and showed as a specular-looking stripe (`docs/authored_normals.md` §8.12). Off = map-only (those back-faces read as fully lit) |
 | `terminatorSoftness` | 20 | half-width of the light→shadow transition (`band = terminatorSoftness/100 × 0.5`, in `n·L`; floored at 0.02 in-shader). Low = crisp/hard sun-shadow boundary on curved surfaces; high = soft, gradual falloff. Drives both `attachedShadows` and the slope-bias light-facing gate |
 | `normalOffset` | 50 | receiver offset, % of one shadow texel's world size (default = 0.5 texel; already conservative — this is a percentage, not a texel count) |
 | `pcf` | 2 | PCF kernel: 0=1×1 1=3×3 2=5×5 3=7×7 |
@@ -450,8 +450,8 @@ bias_uv    = clamp(bias_uv, -cap, cap)                     // cap = rpdb_max * m
 fractional = (|bias_uv.x| + |bias_uv.y|) * inv_map_size * 0.5
 base_bias  = bias[map] + min(fractional, kMaxFractionalBias)   // 0.001 — see 8.8
 
-// 5. Combine: the map only counts where the surface faces the light
-occlusion = max(map_occlusion * light_facing, 1 - light_facing)
+// 5. Combine: two INDEPENDENT visibilities, so the light that arrives is their product
+occlusion = map_occlusion * light_facing + (1 - light_facing)   // = 1 - (1 - m) * f
 ```
 
 **Step 5 is the one to understand before touching any bias knob.** A shadow-map comparison is only
@@ -461,6 +461,14 @@ failure with opposite sign*, and no bias setting fixes one without causing the o
 across that band removes the failure rather than trading it. `light_facing = 1` leaves cast shadows
 completely untouched.
 
+**Step 5 must be a sum, never a `max`.** It shipped as `max(m·f, 1 − f)` for a long time. Same two
+endpoints, same intent, and wrong in between: for a pixel *fully inside a cast shadow* (`m = 1`) it
+reads 1 at `f = 1`, 1 at `f = 0`, and **0.5 at `f = 0.5`** — a V-shaped dip to half darkness through
+the middle of the terminator band, inside a shadow. At the default Terminator Softness that band is
+±0.1 in `n·L`, so on curved geometry the dip is a thin bright stripe following the terminator: it
+reads as a **specular glint**, and appears only where a cast shadow *crosses* the terminator, which
+is why it is not at every shadow edge. See 8.12.
+
 **Step 4's cap is not optional.** Uncapped, that term inherits the clamped gradient and contributes
 up to `2 × rpdb_max` = 4% of the cascade depth range as a *flat* margin — hundreds of world units on
 a wide cascade, more than a character is tall, which leaks self-shadowing straight through. It is
@@ -468,12 +476,18 @@ gated by `light_facing`, so it only ever showed on sunlit-facing surfaces of a b
 
 ### Debug View 15 — "Shadow Terms"
 
-Renders which term is shadowing each pixel: **red** = the map comparison, **green** = the attached
-`n·L` term, **yellow** = both, **black** = neither, i.e. the pixel is reported fully lit.
+Renders which term is shadowing each pixel: **red** = the map comparison (already weighted by
+`light_facing`), **green** = the attached `n·L` term, **yellow** = both, **black** = neither, i.e.
+the pixel is reported fully lit.
 
-Use it on any wrongly-lit pixel. The Shadow Factor view shows only `max(...)` of the two, so it
-cannot tell "the map missed an occluder" from "`n·L` misread the surface" — two bugs with identical
+Use it on any wrongly-lit pixel. The Shadow Factor view shows only the combined result, so it cannot
+tell "the map missed an occluder" from "`n·L` misread the surface" — two bugs with identical
 symptoms and opposite fixes. Diagnose from view 15, not from Shadow Factor.
+
+Since step 5 is additive, **the two channels sum to the shadow factor**, which makes one failure
+mode readable directly: follow a red region into a green one, and the transition should stay at full
+brightness throughout. Anywhere it *dims* in between, the two terms are failing to hand over and
+that dip is a visible bright artifact in the real frame. That is exactly how 8.12 was found.
 
 ### Normal Smoothing: removed
 
@@ -484,64 +498,39 @@ the two-normal split it was also actively harmful — it flattened the curvature
 carries. Do not reintroduce it: if bias faceting appears, the cause is a bias term reading the
 shading normal instead of `n_geom`.
 
-## TODO — the two open shading problems
+## Shading history — both problems are closed
 
-Both come from the same root cause and are recorded here so the next session does not re-derive
-it: **this platform has no authored surface normals.** The upstream Dusklight build the mods pin
-exposes no normal buffer of any kind (nothing in the SDK's `gfx.h`, nothing in the pinned aurora),
-so Graphics Hub reconstructs the normal from the depth buffer for every pixel. A depth
-reconstruction returns the *flat facet of a triangle*, not the smooth normal an artist authored —
-that is a property of the method, not a bug in it. Everything below follows from that.
+This section used to be a TODO listing two open shading problems. Both are resolved; it is kept as
+history because the reasoning is what a future regression should be diagnosed against, and because
+its old advice was actively wrong once the platform changed.
 
-### 1. Harsh faceting on shadowed surfaces — needs a fix, route not yet chosen
+**1. Faceted normals — conditional, not inherent.** The old text said "this platform has no
+authored surface normals". That was true of the upstream base the tree briefly retreated to, and is
+**not** true now: the platform is `automata-rtx/dusklight-ao` with GfxService 1.3, and Graphics Hub
+consumes the game's own authored vertex normals. Faceting therefore only appears on the
+**reconstruction fallback** — when the user has not turned on *Video → Rendering → Scene Normal
+Buffer*, in compatibility mode (D3D11 / OpenGL ES), or per pixel where a draw supplied no normal.
+That is expected there, not a defect.
 
-The shading normal is faceted, so the light-to-dark terminator on curved geometry steps from
-triangle to triangle instead of curving. There used to be a `normalSmooth` blur pass that hid
-this; it was deleted while the retired thin-g-buffer platform supplied smooth authored normals
-and made it redundant. That platform is gone; the blur is still gone.
+> **Do not "fix" it by reintroducing `normalSmooth`.** The old route 1 suggested exactly that, with
+> a caveat about smoothing only `n` and not `n_geom`. The pass is deleted and stays deleted: it
+> existed to hide reconstruction faceting, which authored normals remove at the source, and it
+> flattened real curvature the shading normal carries. See `docs/authored_normals.md` §8.9.
 
-Three possible routes, none started:
+**2. Broken shading on back-lit Link — fixed and confirmed in-game.** The patchy shading on his
+boots, torso, lower tunic and face when back-lit closed across `5300789`..`b426c4d`, and the user
+has confirmed it resolved. No single commit is attributable, because they were verified together:
 
-1. **A bespoke cheap smoothing pass.** Closest to what was deleted, but it must be narrower than
-   the old one: `docs/authored_normals.md` §8.6 established that a smoothed normal must **never**
-   reach the bias — the bias needs the true geometric face normal or acne returns. So smooth only
-   the *shading* normal `n` and leave `n_geom` untouched. That distinction is why this is not a
-   straight revert of the old pass, which fed both.
-2. **Curvature-aware reconstruction in the provider.** Improve Depth to Normal itself (wider or
-   adaptive tap pattern) so every consumer benefits rather than each mod smoothing its own copy.
-   More invasive, better placed.
-3. **Upstream Dusklight adds a thin g-buffer.** The real fix. Authored normals are already
-   implemented end-to-end in the *retired* fork (see `docs/authored_normals.md`), so the design is
-   proven and could be offered upstream rather than re-invented. Until upstream exposes it, no mod
-   can reach it — this is not something a mod-side change can substitute for, only approximate.
+| change | what it did |
+|---|---|
+| `5300789` | the two-normal split — bias reads the geometric face normal, `n·L` the shading normal (`docs/authored_normals.md` §8.6) |
+| `9af4701` | `sin`-scaled normal offset, Holbert's complete form (§8.7) |
+| `aa2c723` | **receiver-plane fractional-bias cap** (§8.8) — the strongest single candidate and the only one that was arithmetic rather than inference: the term was contributing several hundred world units of flat bias against a ~150-unit-tall character |
+| `b426c4d` | the additive term combine (§8.12) — also fixed a separate terminator glint |
 
-Pick deliberately. Route 1 is the cheap stopgap, route 3 is the correct answer, route 2 is the
-middle. Do not re-add the old pass unmodified.
-
-### 2. Broken shading on Link's front when he faces away from the sun/moon
-
-**Known, unresolved, and reproducible:** when Link is back-lit, the surfaces facing *toward* the
-camera — most visibly his face — show a fractured, patchy shading pattern rather than a smooth
-falloff. This is the artifact the earlier authored-normals work was chasing when the platform
-changed underneath it; the last recorded user report still showed it on his boots, torso and
-lower tunic.
-
-What is known:
-
-- It is the **attached (`n·L`) term**, not a missing occluder — those two have identical symptoms
-  and Debug View 15 (**Shadow Terms**) is the view that separates them. Red = the shadow map,
-  green = attached `n·L`, yellow = both, black = reported fully lit. Do not diagnose from Shadow
-  Factor (view 2) alone; it cannot tell them apart.
-- Faceted normals (problem 1) are the prime suspect: `n·L` near a grazing angle is exactly where a
-  facet-vs-smooth normal difference is largest, which is why it concentrates on a curved,
-  detailed, back-lit surface like a face.
-- Four changes landed that each plausibly address it (geometric-vs-shading normal split,
-  `sin`-scaled normal offset, terminator-band fade, receiver-plane fractional-bias cap) and
-  **none has been verified in game since** — they were developed while authored normals were live.
-
-Next step is a measurement, not a code change: Shadow Factor and Shadow Terms on back-lit Link in
-the same frame, then the bias retune. Fixing problem 1 first may resolve this outright, so treat
-them as one investigation.
+**If it ever regresses, §8.8 is the first place to look**, and Debug View 15 (**Shadow Terms**) is
+still the view that separates a missing occluder from a misread `n·L` — they have identical
+symptoms otherwise, and Shadow Factor alone cannot tell them apart.
 
 ## Known caveats
 
@@ -583,15 +572,33 @@ them as one investigation.
   (`d_drawlist.h:202`, `:254`), and `d_bg_s.cpp` calls the projected geometry kind
   リアル影 ("real *kage*"). **"Blob shadow" is this project's coinage, not the game's word** —
   it is fine when describing the look to a player, but do not grep the game for it.
-- **The per-frame streaming budget (the v1.6.0/1.6.1 startup crash)**: aurora streams ALL
-  GX geometry into fixed-size per-frame buffers — 5 MB vertex, **1 MB index**, 8 MB
-  storage, 24 MB uniform (`extern/aurora/lib/gfx/common.hpp:176`) — and these are mapped,
-  non-growable ranges whose overflow is an unconditional `abort()`
-  (`ByteBuffer::resize`, `common.hpp:155`). The game's own draw plus EVERY cascade replay
-  share the same buffers, so uncalled 3-cascade replays (~4× scene geometry, worse with
-  `noFrustumClipping`) blew the index buffer on dense scenes — instantly closing the game
-  on the first frames after loading a save, exactly when geometry volume peaks. Two
-  mitigations ship in 1.6.2: per-cascade **light-column culling** (`cascadeCull`, skips
+- **The per-frame streaming budget (the v1.6.0/1.6.1 startup crash) — HISTORICAL; not a live
+  risk.** Both halves of what caused it have since been fixed, on both sides. Kept here
+  because the tuning levers below are still the right ones for framerate, and because the
+  mechanism explains what the culling settings are *for*.
+
+  Aurora streams ALL GX geometry into fixed-size per-frame buffers, mapped non-growable
+  ranges whose overflow is an unconditional `abort()` (`ByteBuffer::resize`). The game's own
+  draw plus EVERY cascade replay share them, so unculled 3-cascade replays (~4× scene
+  geometry, worse with `noFrustumClipping`) blew the **index** buffer on dense scenes —
+  instantly closing the game on the first frames after loading a save, exactly when geometry
+  volume peaks.
+
+  At the time that buffer was **1 MB**. Upstream aurora has since raised both of the ones
+  that mattered, independently of us:
+
+  | date | upstream commit | change |
+  |---|---|---|
+  | 2026-07-07 | `b979ff6` | Vertex 3 MB → **5 MB** |
+  | 2026-07-19 | `1b484d4` "Bump IndexBufferSize" | Index 1 MB → **2 MB** |
+
+  Current sizes are Vertex 5 MB / Index 2 MB / Storage 8 MB / Uniform 24 MB
+  (`extern/aurora/lib/gfx/resources.hpp:8`). So the index budget is **double** what the
+  crash happened on, and the mod meanwhile gained three mitigations that did not exist then
+  (below). The fork's enlarged 16/4/16 buffers were sized against the *old* numbers and are
+  no longer carried; that is not a regression, and this doc previously called it one in
+  error. The two
+  mitigations that shipped in 1.6.2: per-cascade **light-column culling** (`cascadeCull`, skips
   shapes laterally outside a cascade's light box before their geometry streams; the axis
   toward the light is kept, so tall distant casters still shadow into near boxes) and a
   default of **2 cascades** (~the proven 1.5.x envelope). 1.6.4 adds **small-caster
@@ -602,7 +609,8 @@ them as one investigation.
   budget is actually spent. It is the main mod-side lever for staying in budget; raise it to
   4-8 to run 3 cascades / high coverage in dense areas.
 
-  **Staying in the per-frame budget without a platform change** — the streaming cost is
+  **Keeping the streaming cost down** — worth doing for framerate; no longer a crash-avoidance
+  exercise. The streaming cost is
   vertex/index bytes from the *replays*, so it scales with how much geometry each replay
   streams, NOT with map resolution (Map Size is free). `cascadeStagger` (default on) already
   halves the worst frame: at 3 cascades only two replays share any one frame's buffers.
@@ -612,10 +620,10 @@ them as one investigation.
   off-screen casters pop in as you turn; note `mainViewCull` already removes its main-view
   cost, so turning it off only buys replay streaming); (3) fewer cascades (2, or 1); (4)
   smaller `boxRadius` (a smaller far box holds less geometry) paired with `cascadeEdgeFade`
-  + Deferred Fog to hide the nearer cutoff. The definitive fix for
-  unconstrained 3-cascade/high-radius is larger platform buffers (adaptive grow-on-overflow
-  is the intended aurora change; a static bump is a re-platform per CLAUDE.md). The Link
-  cascade is nearly free vertex-wise: its filter skips at drawFast BEFORE geometry streams.
+  + Deferred Fog to hide the nearer cutoff. Adaptive grow-on-overflow remains the *right*
+  aurora change in principle, but with the index buffer doubled and the three culling levers
+  in place there is no longer a case to make for it from this mod. The Link cascade is nearly
+  free vertex-wise: its filter skips at drawFast BEFORE geometry streams.
 - The Link cascade's position filter is by model anchor, so a character standing within
   2× Link Coverage of Link is included (harmless — more detail) and a huge world model
   whose origin happens to sit nearby would be too (its geometry mostly clips out of the

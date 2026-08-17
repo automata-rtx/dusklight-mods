@@ -230,6 +230,41 @@ fn load_sample_position(uv: vec2<f32>, sample_mip_level: f32) -> vec4<f32> {
     return vec4<f32>(reconstruct_view_space_position(depth, uv), depth);
 }
 
+// GEOMETRIC (face) normal of the depth surface at the centre pixel, view space. Four MIP-0 taps
+// and a cross product of the screen-space position deltas, side-selected on the smaller depth step
+// so a silhouette does not smear the plane.
+//
+// This is deliberately the FACETED normal, and it is NOT what shades the AO - `normal` (the
+// provider's, authored where available) still centres the visibility mask and carries the cosine
+// lobe. Its only job is to answer "which directions lie below the surface that actually occludes",
+// which is a property of the GEOMETRY and not of the artist's smoothed vertex normal. See the
+// rejection at the march call sites.
+//
+// The camera-facing flip here is correct and required: a cross product's sign is arbitrary. That is
+// the exact case docs/authored_normals.md 2a carves out - it applies to reconstructions, never to
+// authored normals.
+// `fallback` is returned when the taps are degenerate (parallel deltas - a constant-depth patch, or
+// clamped-out edges). It must be the shading normal, NOT a zero vector: the rejection is
+// `dot(delta, geo_n) > 0`, so a zero geo_n rejects every sample and switches AO off entirely
+// instead of passing everything. Falling back to the shading normal reduces the rejection to the
+// old behaviour, which is the right degenerate answer.
+fn geometric_normal_view(uv: vec2<f32>, centre: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
+    let px = uniforms.inv_size;
+    let r = load_sample_position(uv + vec2<f32>(px.x, 0.0), 0.0).xyz;
+    let l = load_sample_position(uv - vec2<f32>(px.x, 0.0), 0.0).xyz;
+    let d = load_sample_position(uv + vec2<f32>(0.0, px.y), 0.0).xyz;
+    let u = load_sample_position(uv - vec2<f32>(0.0, px.y), 0.0).xyz;
+    let ddx = select(centre - l, r - centre, abs(r.z - centre.z) < abs(l.z - centre.z));
+    let ddy = select(centre - u, d - centre, abs(d.z - centre.z) < abs(u.z - centre.z));
+    let g = cross(ddy, ddx);
+    let len = length(g);
+    if !(len > 1.0e-12) { // also catches NaN from a degenerate cross product
+        return fallback;
+    }
+    let gn = g / len;
+    return select(gn, -gn, dot(gn, centre) > 0.0);
+}
+
 // Linear scene radiance at a march sample, from the SAME MIP level as its depth fetch: the
 // pre-averaged level approximates the mean radiance of the surface span a wide sector sees.
 fn load_sample_radiance(uv: vec2<f32>, sample_mip_level: f32) -> vec3<f32> {
@@ -287,15 +322,31 @@ fn ssilvb(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // frame entirely when the provider has no scene yet), rotated world -> view. In half-res
     // mode the (jittered) full-res position walks full-res normal detail, which temporal
     // accumulation integrates - same trick as VBAO's provider path.
-    var pixel_normal = load_view_normal(uv);
+    let pixel_normal = load_view_normal(uv);
+    // Plane of the geometry that actually occludes. Built from the UNBIASED centre, and the order
+    // here is load-bearing: geometric_normal_view's four taps are unbiased fresh loads, so passing
+    // a centre already scaled by (1 - depth_bias) leaves every delta carrying a spurious
+    // +depth_bias * P offset ALONG THE VIEW RAY. At the default bias that offset is ~3.7x the true
+    // one-pixel gradient, which swamps the cross product and leaves geo_n pointing somewhere near
+    // perpendicular to the view instead of along the surface - and a wrong geo_n rejects the wrong
+    // samples. VBAO gets this right by construction (it reconstructs before biasing); this matches
+    // that ordering. See the rejection in the march loop.
+    let geo_n = geometric_normal_view(uv, pixel_position, pixel_normal);
     pixel_position *= 1.0 - uniforms.depth_bias; // bias toward the camera suppresses self-occlusion
     let view_vec = normalize(-pixel_position);
-    var normal = pixel_normal;
-    // Face the normal toward the camera only when CLEARLY back-facing (double-sided foliage seen
-    // from behind); the margin keeps grazing surfaces from toggling per pixel.
-    if dot(normal, view_vec) < -0.15 {
-        normal = -normal;
-    }
+    // NO camera-facing flip - the provider's normal arrives correctly oriented and must be taken
+    // as given. Where it is the game's AUTHORED normal it carries the sign the game gave it (the
+    // renderer writes normals per draw, so a reverse pass over two-sided geometry supplies them
+    // for the side it actually draws); where it fell back to the depth reconstruction, that path
+    // already oriented itself.
+    //
+    // This used to flip at dot(normal, view_vec) < -0.15, nominally for double-sided foliage seen
+    // from behind. On authored normals it seamed flat ground: the view ray sweeps across the
+    // screen, so on a large surface at a grazing angle the test flips along a line and negates
+    // everything past it. The emitter term at load_view_normal's other call site was always right
+    // to clamp instead of flip - a back-facing emitter contributes nothing, which needs no sign
+    // change. See docs/authored_normals.md 2a.
+    let normal = pixel_normal;
 
     // Depth-proportional radius with a distance ramp; base thickness grows logarithmically with
     // the view-space radius plus a radius-proportional floor. All inherited from VBAO - see
@@ -394,7 +445,14 @@ fn ssilvb(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let sample_mip_level = clamp(log2(max(dist, 1.0)) - 3.3, 0.0, 4.0);
 
             let sp = load_sample_position(uv + offset, sample_mip_level);
-            if sp.w > 0.0 {
+            // Geometric rejection: only samples ABOVE the occluding surface's own plane can
+            // occlude it. With a depth-reconstructed normal this is a no-op - that normal IS the
+            // plane, so coplanar samples already land exactly on the horizon and carve nothing.
+            // With an AUTHORED normal it is what stops flat ground from occluding itself: the
+            // artist's smoothed vertex normal tilts off the geometry by design, and a hemisphere
+            // centred on it swallows the very plane the samples lie in, which reads as AO shading
+            // on surfaces that have no occluder anywhere near them.
+            if sp.w > 0.0 && dot(sp.xyz - pixel_position, geo_n) > 0.0 {
                 let bits = sample_sector_bits(
                     sp.xyz - pixel_position, view_vec, n, t_base, depth_range, false);
                 let newly = bits & occ;
@@ -405,7 +463,7 @@ fn ssilvb(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 occ &= ~bits;
             }
             let sn = load_sample_position(uv - offset, sample_mip_level);
-            if sn.w > 0.0 {
+            if sn.w > 0.0 && dot(sn.xyz - pixel_position, geo_n) > 0.0 {
                 let bits = sample_sector_bits(
                     sn.xyz - pixel_position, view_vec, n, t_base, depth_range, true);
                 let newly = bits & occ;

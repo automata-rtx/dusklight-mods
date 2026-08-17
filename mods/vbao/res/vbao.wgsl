@@ -236,6 +236,37 @@ fn load_sample_position(uv: vec2<f32>, sample_mip_level: f32) -> vec4<f32> {
     return vec4<f32>(reconstruct_view_space_position(depth, uv), depth);
 }
 
+// GEOMETRIC (face) normal of the depth surface at the centre pixel, view space. Four MIP-0 taps and
+// a cross product of the screen-space position deltas, side-selected on the smaller depth step.
+//
+// MUST STAY CHARACTER-IDENTICAL TO ssilvb.wgsl's copy. It is only the sample-rejection plane, not
+// the shading normal, and the two mods diverging here is a real visual difference with no setting
+// to equalise it: at mid distance a thin feature is 1-2 chain pixels wide, so a reconstruction that
+// tapped +/-2 pixels (as reconstruct_normal below does) lands both far taps on the BACKGROUND and
+// returns the background's plane. The rejection then discards samples that legitimately occlude the
+// thin feature and its occlusion breaks up, while a +/-1 tap still has a chance of straddling it.
+// reconstruct_normal remains the right tool for the normal FALLBACK - it is silhouette-robust for
+// shading - but not for this.
+//
+// `fallback` must be the shading normal, never a zero vector: the rejection is
+// `dot(delta, geo_n) > 0`, so a zero geo_n rejects every sample and switches AO off entirely.
+fn geometric_normal_view(uv: vec2<f32>, centre: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
+    let px = uniforms.inv_size;
+    let r = load_sample_position(uv + vec2<f32>(px.x, 0.0), 0.0).xyz;
+    let l = load_sample_position(uv - vec2<f32>(px.x, 0.0), 0.0).xyz;
+    let d = load_sample_position(uv + vec2<f32>(0.0, px.y), 0.0).xyz;
+    let u = load_sample_position(uv - vec2<f32>(0.0, px.y), 0.0).xyz;
+    let ddx = select(centre - l, r - centre, abs(r.z - centre.z) < abs(l.z - centre.z));
+    let ddy = select(centre - u, d - centre, abs(d.z - centre.z) < abs(u.z - centre.z));
+    let g = cross(ddy, ddx);
+    let len = length(g);
+    if !(len > 1.0e-12) { // also catches NaN from a degenerate cross product
+        return fallback;
+    }
+    let gn = g / len;
+    return select(gn, -gn, dot(gn, centre) > 0.0);
+}
+
 @compute
 @workgroup_size(8, 8, 1)
 fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -255,24 +286,46 @@ fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // provider is used in half-res mode, sample it at this chain pixel's (jittered) full-res
     // position - the 4-phase jitter walks full-res normal detail, which temporal accumulation
     // integrates - so half-res AO still gets a full-res normal. Rotate world -> view.
+    // geo_n is the GEOMETRIC (face) normal of the depth surface, and is not what shades the AO -
+    // `normal` below still centres the visibility mask and carries the cosine lobe. Its only job is
+    // to answer "which directions lie below the surface that actually occludes", which is a
+    // property of the GEOMETRY rather than of the artist's smoothed vertex normal. See the
+    // rejection in the march loop.
+    //
+    // When the provider is absent it costs nothing: the inline reconstruction IS the face normal,
+    // so the two are the same vector and the rejection is a no-op.
     var pixel_normal: vec3<f32>;
+    var geo_n: vec3<f32>;
     if (uniforms.flags & 8u) != 0u {
         let n_dims = vec2<f32>(textureDimensions(d2n_normal));
         let n_texel = clamp(vec2<i32>(uv * n_dims), vec2<i32>(0i), vec2<i32>(n_dims) - vec2<i32>(1i));
         let world_n = textureLoad(d2n_normal, n_texel, 0i).xyz;
         let r = uniforms.view_from_world;
         pixel_normal = normalize(r[0].xyz * world_n.x + r[1].xyz * world_n.y + r[2].xyz * world_n.z);
+        geo_n = geometric_normal_view(uv, pixel_position, pixel_normal);
     } else {
         pixel_normal = reconstruct_normal(pixel_coordinates, pixel_position, raw_depth);
+        // Still the 4-tap plane, NOT pixel_normal: reconstruct_normal taps +/-2 pixels, so on a
+        // thin mid-distance feature it returns the background's plane and the rejection then eats
+        // that feature's occlusion. Keeping this identical to the provider branch also keeps the
+        // "Use Authored Normals" A/B honest - only the shading normal changes across that switch.
+        geo_n = geometric_normal_view(uv, pixel_position, pixel_normal);
     }
     pixel_position *= 1.0 - uniforms.depth_bias; // bias toward the camera suppresses self-occlusion
     let view_vec = normalize(-pixel_position);
-    var normal = pixel_normal;
-    // Face the normal toward the camera only when CLEARLY back-facing (double-sided foliage seen
-    // from behind); the margin keeps grazing surfaces from toggling per pixel.
-    if dot(normal, view_vec) < -0.15 {
-        normal = -normal;
-    }
+    // NO camera-facing flip. Both branches above already arrive correctly oriented, by different
+    // routes: the inline reconstruction orients itself (its cross product has an arbitrary sign),
+    // and the provider's normal is either that same reconstruction or the game's AUTHORED normal,
+    // which carries the sign the game gave it and must not be second-guessed.
+    //
+    // This used to flip at dot(normal, view_vec) < -0.15, nominally for double-sided foliage seen
+    // from behind. It never fired on the reconstruction (already camera-facing), so in practice it
+    // acted only on authored normals - and there it seamed flat ground: the view ray sweeps across
+    // the screen, so on a large surface at a grazing angle the test flips along a line and negates
+    // everything past it. Worse than the provider's own retired 0.5 guard, since -0.15 trips
+    // earlier and so lands the seam nearer the horizon, right where ground planes are widest.
+    // See docs/authored_normals.md 2a.
+    let normal = pixel_normal;
 
     // Depth-proportional radius: constant screen-space search radius. Base thickness grows
     // logarithmically with the view-space radius (keeps close-up foliage from overdarkening),
@@ -327,12 +380,19 @@ fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
             // MIP level from the sample's screen distance in pixels (bandwidth optimization).
             let sample_mip_level = clamp(log2(max(dist, 1.0)) - 3.3, 0.0, 4.0);
 
+            // Geometric rejection: only samples ABOVE the occluding surface's own plane can
+            // occlude it. With a depth-reconstructed normal this is a no-op - that normal IS the
+            // plane, so coplanar samples already land exactly on the horizon and carve nothing.
+            // With an AUTHORED normal it is what stops flat ground from occluding itself: the
+            // artist's smoothed vertex normal tilts off the geometry by design, and a hemisphere
+            // centred on it swallows the very plane the samples lie in, which reads as AO shading
+            // on surfaces that have no occluder anywhere near them.
             let sp = load_sample_position(uv + offset, sample_mip_level);
-            if sp.w > 0.0 {
+            if sp.w > 0.0 && dot(sp.xyz - pixel_position, geo_n) > 0.0 {
                 occ = carve_sample(occ, sp.xyz - pixel_position, view_vec, n, t_base, depth_range, false);
             }
             let sn = load_sample_position(uv - offset, sample_mip_level);
-            if sn.w > 0.0 {
+            if sn.w > 0.0 && dot(sn.xyz - pixel_position, geo_n) > 0.0 {
                 occ = carve_sample(occ, sn.xyz - pixel_position, view_vec, n, t_base, depth_range, true);
             }
         }

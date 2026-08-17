@@ -197,7 +197,7 @@ it. See `docs/japanese-naming.md` §5.
 
 ## Related game-source landmarks (in the fetched, read-only `dusklight/` tree)
 
-Line numbers below were re-verified against the pinned tree (upstream `TwilitRealm/dusklight` at
+Line numbers below were re-verified against the fetched tree (upstream game code, carried by `automata-rtx/dusklight-ao` at
 `DUSKLIGHT_VERSION`); re-check them after any re-platform.
 
 - `src/d/d_kankyo_rain.cpp` — `drawCloudShadow` (4514), `cloud_shadow_move` (1585),

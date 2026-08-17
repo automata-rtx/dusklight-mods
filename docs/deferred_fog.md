@@ -66,9 +66,10 @@ special-fog materials), and the two modes handle that differently (`mixedMode`):
   sparse-encoded index color (`(index+1)·24` in red; the material display list has already
   run, so a per-shape TEV/channel override sets it). The resolved buffer selects each
   pixel's exact fog configuration in `fs_mixed`. Caveats:
-  - One extra opaque scene of vertex/index streaming per mixed frame. With heavy shadow
-    cascade settings this can crowd aurora's fixed per-frame streaming buffers (see the
-    shadow doc's budget section) — use Vanilla mode there until adaptive buffers land.
+  - One extra opaque scene of vertex/index streaming per mixed frame, which shares aurora's
+    fixed per-frame buffers with the shadow cascade replays. At upstream's current sizes this
+    is a framerate cost rather than the overflow risk it once was — see the shadow doc's
+    budget section, which is now historical.
   - Alpha-tested cutouts (foliage holes) replay solid, so a hole resolves to its tree's
     config; pixels not covered by the shape override (rare non-J3D direct drawers) decode
     as invalid and fall back to config 0 (the frame's reference) — exactly what the

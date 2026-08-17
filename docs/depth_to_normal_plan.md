@@ -234,3 +234,61 @@ The ecosystem angle: because it's a mod-exported service, none of these need to 
 reconstruction — any community modder gets a correct, consistent world-space normal for three
 lines of glue, which is the difference between "an SSR mod is a research project" and "an SSR mod
 is a weekend."
+
+---
+
+## Is the provider still needed, now that GfxService hands out authored normals?
+
+**Yes — keep it.** The question is fair, because on a pixel with an authored normal the provider
+looks like a pass-through: it snapshots a normal the consumer could snapshot itself. Three
+measurements say otherwise.
+
+### 1. `resolve_pass` is a pass break, and it does not dedupe
+
+`aurora/lib/gfx/recording.cpp:921` — every call drains the GX FIFO, **seals the current EFB render
+pass and resumes a new one that loads the previous contents**, and takes a *fresh* pool entry
+(`acquire_pass_snapshot`: `pool.entries[pool.used++]`). There is no per-frame caching: N callers
+asking for the normal is N snapshot textures and N full-target copies, not one shared.
+
+Today Graphics Hub makes that call **once** and four mods read the result. Removing it means VBAO,
+SSILVB, Realtime Sun Shadows and SMAA each request `GfxResolveDesc::normal` — four full-res
+RGB10A2 copies where there is now one. On a tiler, extra pass breaks are the expensive kind of
+expensive.
+
+### 2. The fallback is the real work, and it is 4× in the default configuration
+
+The buffer ships **off** (Video → Rendering → Scene Normal Buffer). In that state *every* pixel
+takes the 5-tap reconstruction: 8 depth taps plus 2 unprojections. The provider pays that once for
+four consumers. Without it, four mods pay it independently, every pixel, in the configuration most
+users are in on first launch. Even with the buffer on, the same applies to every uncovered pixel
+(sky, billboards, non-depth-writing effects, degenerate normals).
+
+### 3. What the shared buffer costs, honestly
+
+It is not free, and this is the one argument on the other side. The provider writes `rgba32float`
+(16 B/px) where the raw g-buffer is RGB10A2 (4 B/px), so each consumer's read is 4× wider than
+reading the g-buffer directly, plus the provider's own dispatch. Against that: `.w` carries the raw
+depth, so consumers get normal *and* depth in one fetch — SMAA's depth-discontinuity term and the
+shadow mod's bilateral taps would both need a second sampler and a second fetch without it.
+
+### The non-perf reasons, which are the stronger ones
+
+- **One decode, one policy.** The validity test, the MSAA-resolve blend rejection (length < 0.92)
+  and the view→world rotation exist in exactly one place. Four copies of that is four chances to
+  reintroduce a camera-facing flip (§2a) — which is precisely how the −0.15 guards got in.
+- **The A/B switch.** *Use Authored Normals* flips every consumer at once, live. That is the tool
+  that found both the flat-ground seam and the AO-hemisphere bug (§8.11). Per-mod snapshots would
+  mean per-mod toggles, or none.
+- **Portability.** On a base with no normal buffer, consumers do not change at all — the provider
+  absorbs it. See `docs/normal_buffer_portability.md`.
+
+### Where the criticism does land
+
+The **world-space round trip is real waste**: authored normals are natively view space, the
+provider rotates them to world, and both AO mods rotate them straight back. It is lossless (exact
+inverse matrices from one `CameraInfo`) so it is not a correctness issue, but it is two 3×3
+rotations per pixel per consumer for nothing. The shadow mod genuinely wants world space and SMAA
+is basis-agnostic, so world is still the right *canonical* choice for a shared service; a future
+`DepthToNormalFrame` could add a view-space view alongside it (the struct is `struct_size`-guarded,
+so that is additive) if the AO mods ever show up hot in a profile. Not worth an ABI change on
+suspicion.

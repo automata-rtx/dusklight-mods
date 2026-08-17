@@ -64,10 +64,38 @@ Upstream reference: the fetched `dusklight/docs/modding.md` and `dusklight/sdk/i
 
 ## Config/UI
 
+- **NEVER name a config var `enabled` — the host reserves it for EVERY mod.** The loader gives
+  each discovered mod a bool at `mod.<escaped id>.enabled` for the mod manager's own on/off
+  checkbox (`mod_enabled_cvar_name`, `loader.cpp`), created at discovery, *before* any mod
+  initializes. `register_var` formats a mod's own var into the same namespace as
+  `mod.<escaped id>.<name>`, so `"enabled"` produces the identical key, `GetConfigVar` finds the
+  manager's var, and registration returns **`MOD_CONFLICT`**. If that is the mod's first
+  registration — the natural place to put an on/off toggle — the mod fails init and never loads.
+
+  It is silent in every way that matters: the tree builds, the mod packages, the manifest is
+  correct, and the only symptom is a runtime line naming *whatever the mod called its own option*,
+  which reads like a mod bug rather than a name collision. Celestial Orbit shipped that way and
+  simply never loaded; its own `set_error` string (`"failed to register enabled option"`) and its
+  own generic `MOD_ERROR` code masked the host's `MOD_CONFLICT` completely. Prefix the name instead
+  (`orbitEnabled`); the UI label can still read "Enabled".
+
+  Note the two toggles are not the same question anyway. The manager's checkbox *unloads* the mod;
+  a mod's own toggle keeps it loaded, keeps any service it exports resolvable, and only stops it
+  acting — which is what Celestial Orbit needs, since Realtime Sun Shadows imports its service and
+  must still be told "vanilla orbit" rather than have the import vanish.
+
+  `python3 tools/check_reserved_config_names.py` scans every mod for this. It re-derives the
+  reserved list from the fetched game tree rather than trusting a constant, so a host that reserves
+  a *second* name is reported instead of silently missed; it skips cleanly with no tree. Run it
+  after adding a config var.
 - `UI_BINDING_CONFIG_VAR` requires matching types: TOGGLE=bool, NUMBER/SELECT=int. Floats
   aren't bindable — register ints and scale (×0.01 convention throughout these mods).
 - Values from config.json apply at `register_var` without firing change callbacks — read
   the value after registration for the starting state.
+- **A mod's own error string can hide the host's reason.** `mods::set_error(error, MOD_ERROR, …)`
+  replaces the service's `ModResult` with a generic `MOD_ERROR` (1), and `fail_mod` prints *that*
+  code next to *your* message. When a service call fails unexpectedly, read the host's
+  implementation for its real return values — or log the actual `ModResult` — before theorising.
 
 ## Build system
 
@@ -101,7 +129,7 @@ exact function, source file and line are always available:
 ```sh
 # 1. The Windows build for the pinned platform, from DUSKLIGHT_SDK_STUB_URL's release.
 curl -sSL -o dusk.zip \
-  "https://github.com/automata-rtx/dusklight-ao/releases/download/platform-gbuffer-test/dusklight-UNKNOWN-VERSION-win32-msvc-x86_64.zip"
+  "https://github.com/automata-rtx/dusklight-ao/releases/download/platform-normals-test/dusklight-UNKNOWN-VERSION-win32-msvc-x86_64.zip"
 unzip -q dusk.zip -d dusk
 
 # 2. debug.7z inside it holds dusklight.pdb (~246 MB). No 7z binary here; py7zr works.

@@ -50,6 +50,7 @@
 #include "mods/svc/gfx.h"
 
 #include "gfx_normal_compat.h"
+#include "gfx_scene_pass.h"
 #include "mods/svc/hook.h"
 #include "mods/svc/log.h"
 #include "mods/svc/resource.h"
@@ -146,11 +147,6 @@ ResourceBuffer g_shaderSource = RESOURCE_BUFFER_INIT;
 ResourceBuffer g_sssShaderSource = RESOURCE_BUFFER_INIT;
 ResourceBuffer g_cascadeCopyShaderSource = RESOURCE_BUFFER_INIT;
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
-// Set by the render worker when a draw's pass layout stops matching the pipelines built at init
-// (the host's thin g-buffer was toggled mid-session). Logged once from the game thread; the
-// render worker must not touch the log service.
-std::atomic<bool> g_normalFormatMismatch{false};
-bool g_loggedNormalMismatch = false;
 WGPURenderPipeline g_compositePipeline = nullptr;       // multiply blend
 WGPURenderPipeline g_compositeDebugPipeline = nullptr;  // no blend (debug views)
 WGPUBindGroupLayout g_compositeLayout = nullptr;
@@ -718,31 +714,27 @@ bool build_composite_pipeline(
             .srcFactor = WGPUBlendFactor_Zero,
             .dstFactor = WGPUBlendFactor_One},
     };
-    WGPUColorTargetState colorTarget = WGPU_COLOR_TARGET_STATE_INIT;
-    colorTarget.format = g_deviceInfo.color_format;
+    // The pipeline has to describe the scene pass's attachments, whatever they currently are: with
+    // the host's scene normal buffer on, the pass carries a second, renderer-owned colour target,
+    // and a one-target pipeline is rejected outright. Asking the service beats rebuilding the
+    // layout from GfxDeviceInfo, which is a copy of the renderer's logic that goes silently wrong
+    // whenever the pass gains an attachment. The extra target comes back write-masked off, so this
+    // composite leaves the game's authored normals untouched.
+    gfx_compat::ScenePassLayout layout;
+    if (!gfx_compat::scene_pass_layout(mod_ctx, svc_gfx, g_deviceInfo, layout)) {
+        wgpuShaderModuleRelease(module);
+        return false;
+    }
     if (blend) {
-        colorTarget.blend = &blendState;
+        layout.color_targets[0].blend = &blendState;
     }
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = module;
     fragment.entryPoint = {"fs_main", WGPU_STRLEN};
-    // Thin g-buffer (platform-gbuffer-test and later): when the host writes the game's authored
-    // normals to a SECOND color attachment, every pipeline recorded into the scene pass must
-    // declare a matching second target - WebGPU requires the attachment counts to agree, and a
-    // one-target pipeline is rejected outright. This effect never writes normals, so the target
-    // exists purely to match the pass and its write mask is off. Undefined (buffer disabled, and
-    // every platform before it) leaves this at a single target, unchanged.
-    WGPUColorTargetState colorTargets[2] = {colorTarget, WGPU_COLOR_TARGET_STATE_INIT};
-    uint32_t colorTargetCount = 1;
-    if (gfx_compat::normal_format(g_deviceInfo) != WGPUTextureFormat_Undefined) {
-        colorTargets[1].format = gfx_compat::normal_format(g_deviceInfo);
-        colorTargets[1].writeMask = WGPUColorWriteMask_None;
-        colorTargetCount = 2;
-    }
-    fragment.targetCount = colorTargetCount;
-    fragment.targets = colorTargets;
+    fragment.targetCount = layout.color_target_count;
+    fragment.targets = layout.color_targets;
     WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
-    depthStencil.format = g_deviceInfo.depth_format;
+    depthStencil.format = layout.depth_format;
     depthStencil.depthWriteEnabled = WGPUOptionalBool_False;
     depthStencil.depthCompare = WGPUCompareFunction_Always;
 
@@ -752,7 +744,7 @@ bool build_composite_pipeline(
     pipelineDesc.vertex.entryPoint = {"vs_main", WGPU_STRLEN};
     pipelineDesc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
     pipelineDesc.depthStencil = &depthStencil;
-    pipelineDesc.multisample.count = g_deviceInfo.sample_count;
+    pipelineDesc.multisample.count = layout.sample_count;
     pipelineDesc.fragment = &fragment;
     outPipeline = wgpuDeviceCreateRenderPipeline(g_deviceInfo.device, &pipelineDesc);
     wgpuShaderModuleRelease(module);
@@ -1007,14 +999,6 @@ void on_sss_compute(
 // Render worker thread: fullscreen deferred-shadow composite.
 void on_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
-    // Scene-pass attachment guard (thin g-buffer): our pipelines declare the target count the
-    // device reported at init. If the host's normal buffer has been toggled since, that count no
-    // longer matches this pass and recording the draw would be a WebGPU validation error - skip
-    // it instead and let the game thread report it. Reloading the mod rebuilds the pipelines.
-    if (gfx_compat::normal_format(*ctx) != gfx_compat::normal_format(g_deviceInfo)) {
-        g_normalFormatMismatch.store(true, std::memory_order_relaxed);
-        return;
-    }
     if (payloadSize != sizeof(DrawPayload)) {
         return;
     }
@@ -1580,12 +1564,6 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
             return HOOK_SKIP_ORIGINAL;
         }
     }
-    // World-cascade replay: light-column culling. The shape's model-space bounds go to world
-    // via the model's base transform, then laterally into the cascade's light space; a shape
-    // entirely outside the column cannot cast into the cascade's box, so skipping it saves
-    // its whole geometry stream. Conservative on unknowns: no model (a non-packet draw) or
-    // degenerate bounds -> draw. Whole packets of culled shapes are already skipped in
-    // on_mat_packet_draw_pre; this catches the culled shapes of mixed packets.
     // Link exclusion: the Link cascade owns him this frame, so keep him out of the world maps.
     // Unknown model -> draw, matching every other cull here (conservative on unknowns).
     if (g_replayExcludeLinkModels && !g_replayLinkOnly) {
@@ -1594,6 +1572,12 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
             return HOOK_SKIP_ORIGINAL;
         }
     }
+    // World-cascade replay: light-column culling. The shape's model-space bounds go to world
+    // via the model's base transform, then laterally into the cascade's light space; a shape
+    // entirely outside the column cannot cast into the cascade's box, so skipping it saves
+    // its whole geometry stream. Conservative on unknowns: no model (a non-packet draw) or
+    // degenerate bounds -> draw. Whole packets of culled shapes are already skipped in
+    // on_mat_packet_draw_pre; this catches the culled shapes of mixed packets.
     if (g_replayCullActive && !g_replayLinkOnly) {
         J3DModel* model = j3dSys.getModel();
         J3DShape* shape = const_cast<J3DShape*>(mods::arg<const J3DShape*>(args, 0));
@@ -2239,8 +2223,10 @@ void render_shadow_map(
     g_mapPass.cascadeCount = count;
     g_mapPass.ready = true;
 
-    // Link cascade: a small high-resolution box snapped to the player. Purely additive in the
-    // composite (it contains no world geometry), so a failed render just drops the extra detail.
+    // Link cascade: a small high-resolution box snapped to the player. It contains no world
+    // geometry, so in the composite it can only ADD occlusion. But it is no longer merely extra
+    // detail: with it on, Link is EXCLUDED from the world cascades (see part 1), so a failed
+    // render here means he casts no shadow at all this frame rather than a coarser one.
     // Link cascade, part 2 of 2: render it, using the values part 1 already resolved. The
     // exclusion flag is cleared first so this replay itself is never filtered by it (the
     // !g_replayLinkOnly guards make that redundant, but explicit beats implicit here).
@@ -2956,7 +2942,9 @@ ModResult build_controls_tab(
         "GREEN = the attached n.L term, YELLOW = both, BLACK = neither (the pixel is being "
         "reported as fully lit). Use this on a wrongly-lit patch: black tells you nothing is "
         "shadowing it, and which channel is missing says whether the map or the surface normal "
-        "is at fault");
+        "is at fault. The two channels add up to the final shadow factor, so a red-to-green "
+        "transition should stay bright all the way across - if it dims in between, that dip is a "
+        "bright artifact in the real frame");
     return MOD_OK;
 }
 
@@ -3361,15 +3349,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     return MOD_OK;
 }
 
-MOD_EXPORT ModResult mod_update(ModError*) {
-    if (!g_loggedNormalMismatch && g_normalFormatMismatch.load(std::memory_order_relaxed)) {
-        g_loggedNormalMismatch = true;
-        svc_log->warn(mod_ctx,
-            "scene pass normal-target layout changed since init; composite skipped - "
-            "reload this mod to rebuild its pipelines");
-    }
-    return MOD_OK;
-}
+MOD_EXPORT ModResult mod_update(ModError*) { return MOD_OK; }
 
 MOD_EXPORT ModResult mod_shutdown(ModError*) {
     restore_actual_light_debug();

@@ -14,7 +14,7 @@ sentence into our own documentation (§4.1).
 
 This document is **self-contained on purpose**: a mod session attaches only
 `dusklight-mods`, so it cannot assume the game tree is already present. §2.1 says how to
-fetch it. **This file is the reference** — longer versions exist in the retired
+fetch it. **This file is the reference** — longer versions exist in the older fork
 `dusklight-ao` / `aurora-ao` forks, but those repos are no longer the platform and are
 historical only.
 
@@ -75,7 +75,7 @@ there and is greppable. If you only want to read it — no build — clone it di
 ```sh
 DUSKLIGHT_VERSION=$(sed -n 's/.*set(DUSKLIGHT_VERSION "\([0-9a-f]*\)").*/\1/p' CMakeLists.txt)
 mkdir -p dusklight && git -C dusklight init --quiet
-git -C dusklight remote add origin https://github.com/TwilitRealm/dusklight.git
+git -C dusklight remote add origin https://github.com/automata-rtx/dusklight-ao.git
 git -C dusklight fetch --depth=1 origin "$DUSKLIGHT_VERSION"
 git -C dusklight checkout --quiet FETCH_HEAD
 ```
@@ -84,10 +84,13 @@ That is the same repository and the same commit `cmake/FetchDusklight.cmake` use
 plain `cmake -B build` produces an equivalent tree. `DUSKLIGHT_DIR` can also point at an
 existing checkout.
 
-> **The game comes from upstream `TwilitRealm/dusklight`, not from a fork.** The
-> `automata-rtx/dusklight-ao` and `aurora-ao` forks are retired and are *not* the platform
-> — a clone of either gives you source the mods are not built against. Anything in this
-> document citing those repos is historical.
+> **The fetched tree is `automata-rtx/dusklight-ao` at `DUSKLIGHT_VERSION`** — the
+> scene-normal-buffer platform, not stock upstream, so the SHA above will not resolve
+> against `TwilitRealm/dusklight` and fetching from there hard-fails. Its **game code is
+> stock upstream**, though — the fork delta is renderer + SDK only — so every line citation
+> in §4 stands unchanged and anything you grep here matches upstream. (CLAUDE.md's "The ABI
+> pin" names the exact upstream base; it is deliberately not repeated here, so there is one
+> place to update.)
 
 ### 2.2 Searching it — use ripgrep, not `grep -P`
 
@@ -500,7 +503,7 @@ after a configure, or point `DUSKLIGHT_DIR` at a checkout.
 - `docs/fake_shading_systems.md` — the three fake-shading systems Effect Remover targets,
   plus (§4) four more the same game function sets up that we do not
 - `docs/celestial_orbit.md` — the sun/moon vocabulary in §3, in use
-- **Historical only, in the retired forks:** `dusklight-ao/docs/japanese-naming.md` and
+- **Historical only, in the older fork branches:** `dusklight-ao/docs/japanese-naming.md` and
   `aurora-ao/docs/japanese-naming.md`. Neither repo is the platform any more. The aurora
   one describes reading a baked TEV meaning out of a generated shader — still the right
   method for the one thing §4.1 leaves unread, but aurora is now vendored inside the

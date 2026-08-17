@@ -24,7 +24,9 @@ IMPORT_OPTIONAL_SERVICE(DepthToNormalService, svc_n2d);   // optional so your mo
 DepthToNormalFrame f = DEPTH_TO_NORMAL_FRAME_INIT;
 if (svc_n2d != nullptr && svc_n2d->get_frame(mod_ctx, &f) == MOD_OK) {
     // f.normal : rgba32float texture view, f.width x f.height
-    //   .xyz = unit world-space normal (camera-facing), .w = raw reversed-Z depth
+    //   .xyz = unit world-space normal, .w = raw reversed-Z depth
+    //   The normal carries the game's own sign where it is authored. Do NOT flip it toward the
+    //   camera - that seams flat ground. See docs/authored_normals.md 2a.
     // bind it into your pipeline; the reconstruction is already queued ahead of your pass.
 }
 ```

@@ -43,6 +43,7 @@
 #include "mods/svc/gfx.h"
 
 #include "gfx_normal_compat.h"
+#include "gfx_scene_pass.h"
 #include "mods/svc/hook.h"
 #include "mods/svc/log.h"
 #include "mods/svc/resource.h"
@@ -76,11 +77,6 @@ namespace hub_dtn {
 
 ResourceBuffer g_shaderSource = RESOURCE_BUFFER_INIT;
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
-// Set by the render worker when a draw's pass layout stops matching the pipelines built at init
-// (the host's thin g-buffer was toggled mid-session). Logged once from the game thread; the
-// render worker must not touch the log service.
-std::atomic<bool> g_normalFormatMismatch{false};
-bool g_loggedNormalMismatch = false;
 WGPUComputePipeline g_pipeline = nullptr;
 WGPUBindGroupLayout g_layout = nullptr;
 GfxComputeTypeHandle g_computeType = 0;
@@ -97,8 +93,14 @@ ConfigVarHandle g_cvarUseAuthored = 0;    // DEFAULT below in init()
 ConfigVarHandle g_cvarAuthoredBasis = 0;  // DEFAULT below in init()
 UiWindowHandle g_controlsWindow = 0;
 
-// True when the running platform exposes the thin g-buffer normal target. Older platforms report
-// WGPUTextureFormat_Undefined, and every authored-normal path stays switched off.
+// True when the host is actually writing the scene normal buffer this session. It reports
+// WGPUTextureFormat_Undefined otherwise, and every authored-normal path stays switched off.
+//
+// Undefined has three causes and the mod cannot tell them apart, which is why the UI names all
+// three rather than guessing: the buffer is OFF in Video -> Rendering -> Scene Normal Buffer (it is
+// off by default and applies on the next launch), the device is in compatibility mode (the D3D11
+// and OpenGL ES fallbacks, where the renderer disables it whatever the setting says), or the game
+// build predates the feature entirely.
 bool g_authoredAvailable = false;
 
 struct NormalTarget {
@@ -306,28 +308,24 @@ bool build_debug_pipeline() {
     if (module == nullptr) {
         return false;
     }
-    WGPUColorTargetState colorTarget = WGPU_COLOR_TARGET_STATE_INIT;
-    colorTarget.format = g_deviceInfo.color_format;
+    // The pipeline has to describe the scene pass's attachments, whatever they currently are: with
+    // the host's scene normal buffer on, the pass carries a second, renderer-owned colour target,
+    // and a one-target pipeline is rejected outright. Asking the service beats rebuilding the
+    // layout from GfxDeviceInfo, which is a copy of the renderer's logic that goes silently wrong
+    // whenever the pass gains an attachment. The extra target comes back write-masked off, so this
+    // overlay leaves the game's authored normals untouched.
+    gfx_compat::ScenePassLayout layout;
+    if (!gfx_compat::scene_pass_layout(mod_ctx, svc_gfx, g_deviceInfo, layout)) {
+        wgpuShaderModuleRelease(module);
+        return false;
+    }
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = module;
     fragment.entryPoint = {"fs_main", WGPU_STRLEN};
-    // Thin g-buffer (platform-gbuffer-test and later): when the host writes the game's authored
-    // normals to a SECOND color attachment, every pipeline recorded into the scene pass must
-    // declare a matching second target - WebGPU requires the attachment counts to agree, and a
-    // one-target pipeline is rejected outright. This effect never writes normals, so the target
-    // exists purely to match the pass and its write mask is off. Undefined (buffer disabled, and
-    // every platform before it) leaves this at a single target, unchanged.
-    WGPUColorTargetState colorTargets[2] = {colorTarget, WGPU_COLOR_TARGET_STATE_INIT};
-    uint32_t colorTargetCount = 1;
-    if (gfx_compat::normal_format(g_deviceInfo) != WGPUTextureFormat_Undefined) {
-        colorTargets[1].format = gfx_compat::normal_format(g_deviceInfo);
-        colorTargets[1].writeMask = WGPUColorWriteMask_None;
-        colorTargetCount = 2;
-    }
-    fragment.targetCount = colorTargetCount;
-    fragment.targets = colorTargets;
+    fragment.targetCount = layout.color_target_count;
+    fragment.targets = layout.color_targets;
     WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
-    depthStencil.format = g_deviceInfo.depth_format;
+    depthStencil.format = layout.depth_format;
     depthStencil.depthWriteEnabled = WGPUOptionalBool_False;
     depthStencil.depthCompare = WGPUCompareFunction_Always;
     WGPURenderPipelineDescriptor pipelineDesc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
@@ -336,7 +334,7 @@ bool build_debug_pipeline() {
     pipelineDesc.vertex.entryPoint = {"vs_main", WGPU_STRLEN};
     pipelineDesc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
     pipelineDesc.depthStencil = &depthStencil;
-    pipelineDesc.multisample.count = g_deviceInfo.sample_count;
+    pipelineDesc.multisample.count = layout.sample_count;
     pipelineDesc.fragment = &fragment;
     g_debugPipeline = wgpuDeviceCreateRenderPipeline(g_deviceInfo.device, &pipelineDesc);
     wgpuShaderModuleRelease(module);
@@ -349,14 +347,6 @@ bool build_debug_pipeline() {
 
 void on_debug_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
-    // Scene-pass attachment guard (thin g-buffer): our pipelines declare the target count the
-    // device reported at init. If the host's normal buffer has been toggled since, that count no
-    // longer matches this pass and recording the draw would be a WebGPU validation error - skip
-    // it instead and let the game thread report it. Reloading the mod rebuilds the pipelines.
-    if (gfx_compat::normal_format(*ctx) != gfx_compat::normal_format(g_deviceInfo)) {
-        g_normalFormatMismatch.store(true, std::memory_order_relaxed);
-        return;
-    }
     if (payloadSize != sizeof(DebugDrawPayload)) {
         return;
     }
@@ -608,7 +598,7 @@ void add_control(UiElementHandle pane, const UiControlDesc& desc) {
 
 bool authored_unavailable(ModContext*, void*) { return !g_authoredAvailable; }
 
-char g_statusText[160] = "Waiting for a scene frame";
+char g_statusText[224] = "Waiting for a scene frame";
 
 // Live readout of which source the provider is actually feeding consumers, plus the MSAA sample
 // count - which belongs here because it directly limits how much of the screen CAN use authored
@@ -617,7 +607,11 @@ char g_statusText[160] = "Waiting for a scene frame";
 void status_get(ModContext*, void*, UiControlValue* outValue) {
     const char* source;
     if (!g_authoredAvailable) {
-        source = "Reconstructed - this game build has no normal buffer";
+        // The actionable case by far: the buffer ships off and needs a restart, so a user who
+        // installed these mods to get authored normals sees nothing change until they switch it
+        // on. Say where the switch is rather than only that the feature is missing.
+        source = "Reconstructed - turn on Video > Rendering > Scene Normal Buffer and restart "
+                 "(unavailable in compatibility mode)";
     } else if (!get_bool_option(g_cvarUseAuthored, true)) {
         source = "Reconstructed from depth (authored normals off)";
     } else if (g_frameUsedAuthored) {
@@ -642,13 +636,15 @@ void add_authored_toggle(UiElementHandle pane) {
     control.label = "Use Authored Normals";
     control.help_rml =
         "Chooses where the surface normal every other mod consumes comes from.<br/>On: the game's "
-        "own authored vertex normals, read from the renderer's thin g-buffer - smooth across "
+        "own authored vertex normals, read from the renderer's scene normal buffer - smooth across "
         "low-poly surfaces, so AO and shadows show no faceting. Pixels with no authored normal "
         "(sky, UI, billboards, effects that do not write depth) still reconstruct.<br/>Off: the "
         "5-tap depth-gradient reconstruction, which is the flat face normal of each triangle. "
         "<br/>The switch is live and applies to every consumer at once (VBAO, SSILVB, Realtime "
-        "Sun Shadows, SMAA), so it is the A/B for the whole stack. Needs a game build with the "
-        "normal buffer; on older builds it is greyed out and everything reconstructs.";
+        "Sun Shadows, SMAA), so it is the A/B for the whole stack.<br/><b>Needs the game's own "
+        "Video &gt; Rendering &gt; Scene Normal Buffer setting turned on</b>, which is off by "
+        "default and takes effect on the next launch. Greyed out until then - and on devices in "
+        "compatibility mode, where the renderer cannot provide it at all.";
     control.binding = UI_BINDING_CONFIG_VAR;
     control.config_var = g_cvarUseAuthored;
     control.is_disabled = authored_unavailable;
@@ -695,7 +691,7 @@ ModResult build_controls_tab(
     control.help_rml =
         "What Show Normals draws. Every view but the first renders both sources at once, so they "
         "can be flipped between without touching the Use Authored Normals switch.<br/>Service "
-        "Output: what consumers get this frame.<br/>Authored: the thin g-buffer normal; black "
+        "Output: what consumers get this frame.<br/>Authored: the scene normal buffer's normal; black "
         "where the pixel has none.<br/>Reconstructed: the depth-gradient normal.<br/>Difference: "
         "the angle between the two, 0-45 degrees as black - blue - green - yellow - red. Faceting "
         "alone reads dark with bright creases along triangle edges; a whole screen of yellow/red "
@@ -772,7 +768,16 @@ ModResult init(ModError* error) {
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to query device info");
     }
-    g_authoredAvailable = gfx_compat::normal_format(g_deviceInfo) != WGPUTextureFormat_Undefined;
+    // "Does this build carry authored normals" is a question about the SCENE PASS, not about the
+    // device: the attachment exists only when the renderer built the pass with it, which needs
+    // both a core-features backend (D3D12 / Vulkan / Metal — never compatibility mode) and the
+    // game's own Video -> Rendering -> Scene Normal Buffer setting on at launch. The scene layout
+    // tags each attachment with a semantic, so GFX_ATTACHMENT_NORMAL being present is the direct
+    // answer. (This used to read GfxDeviceInfo::normal_format, a field that no longer exists.)
+    gfx_compat::ScenePassLayout sceneLayout;
+    g_authoredAvailable =
+        gfx_compat::scene_pass_layout(mod_ctx, svc_gfx, g_deviceInfo, sceneLayout) &&
+        sceneLayout.has_normal_attachment;
     if (!build_dummy_textures()) {
         return mods::set_error(error, MOD_ERROR, "failed to create stand-in textures");
     }
@@ -847,8 +852,9 @@ ModResult init(ModError* error) {
     }
     svc_log->info(mod_ctx,
         g_authoredAvailable
-            ? "depth-to-normal: authored normals available (thin g-buffer)"
-            : "depth-to-normal: no normal buffer on this game build; reconstructing from depth");
+            ? "depth-to-normal: scene normal buffer present; serving authored normals"
+            : "depth-to-normal: no scene normal buffer (off in Video settings, compatibility mode, "
+              "or an older game build); reconstructing from depth");
     return MOD_OK;
 }
 
@@ -937,11 +943,6 @@ GfxStageHookHandle g_sceneAfterOpaqueHook = 0;
 GfxStageHookHandle g_frameBeforeHudHook = 0;
 ResourceBuffer g_shaderSource = RESOURCE_BUFFER_INIT;
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
-// Set by the render worker when a draw's pass layout stops matching the pipelines built at init
-// (the host's thin g-buffer was toggled mid-session). Logged once from the game thread; the
-// render worker must not touch the log service.
-std::atomic<bool> g_normalFormatMismatch{false};
-bool g_loggedNormalMismatch = false;
 WGPURenderPipeline g_fogPipeline = nullptr;
 WGPURenderPipeline g_fogDebugPipeline = nullptr;
 WGPURenderPipeline g_mixedPipeline = nullptr;
@@ -1256,14 +1257,6 @@ HookAction on_set_fog_pre(ModContext*, void* args, void*, void*) {
 
 void on_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
-    // Scene-pass attachment guard (thin g-buffer): our pipelines declare the target count the
-    // device reported at init. If the host's normal buffer has been toggled since, that count no
-    // longer matches this pass and recording the draw would be a WebGPU validation error - skip
-    // it instead and let the game thread report it. Reloading the mod rebuilds the pipelines.
-    if (gfx_compat::normal_format(*ctx) != gfx_compat::normal_format(g_deviceInfo)) {
-        g_normalFormatMismatch.store(true, std::memory_order_relaxed);
-        return;
-    }
     if (payloadSize != sizeof(DrawPayload)) {
         return;
     }
@@ -1750,31 +1743,28 @@ bool build_fog_pipeline(bool blend, const char* entryPoint, WGPURenderPipeline& 
             .srcFactor = WGPUBlendFactor_Zero,
             .dstFactor = WGPUBlendFactor_One},
     };
-    WGPUColorTargetState colorTarget = WGPU_COLOR_TARGET_STATE_INIT;
-    colorTarget.format = g_deviceInfo.color_format;
+    // The pipeline has to describe the scene pass's attachments, whatever they currently are: with
+    // the host's scene normal buffer on, the pass carries a second, renderer-owned colour target,
+    // and a one-target pipeline is rejected outright. Asking the service beats rebuilding the
+    // layout from GfxDeviceInfo, which is a copy of the renderer's logic that goes silently wrong
+    // whenever the pass gains an attachment. The extra target comes back write-masked off, so the
+    // fog leaves the game's authored normals untouched - correct in itself, since fog changes what
+    // a surface looks like and not which way it faces.
+    gfx_compat::ScenePassLayout layout;
+    if (!gfx_compat::scene_pass_layout(mod_ctx, svc_gfx, g_deviceInfo, layout)) {
+        wgpuShaderModuleRelease(module);
+        return false;
+    }
     if (blend) {
-        colorTarget.blend = &blendState;
+        layout.color_targets[0].blend = &blendState;
     }
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = module;
     fragment.entryPoint = {entryPoint, WGPU_STRLEN};
-    // Thin g-buffer (platform-gbuffer-test and later): when the host writes the game's authored
-    // normals to a SECOND color attachment, every pipeline recorded into the scene pass must
-    // declare a matching second target - WebGPU requires the attachment counts to agree, and a
-    // one-target pipeline is rejected outright. This effect never writes normals, so the target
-    // exists purely to match the pass and its write mask is off. Undefined (buffer disabled, and
-    // every platform before it) leaves this at a single target, unchanged.
-    WGPUColorTargetState colorTargets[2] = {colorTarget, WGPU_COLOR_TARGET_STATE_INIT};
-    uint32_t colorTargetCount = 1;
-    if (gfx_compat::normal_format(g_deviceInfo) != WGPUTextureFormat_Undefined) {
-        colorTargets[1].format = gfx_compat::normal_format(g_deviceInfo);
-        colorTargets[1].writeMask = WGPUColorWriteMask_None;
-        colorTargetCount = 2;
-    }
-    fragment.targetCount = colorTargetCount;
-    fragment.targets = colorTargets;
+    fragment.targetCount = layout.color_target_count;
+    fragment.targets = layout.color_targets;
     WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
-    depthStencil.format = g_deviceInfo.depth_format;
+    depthStencil.format = layout.depth_format;
     depthStencil.depthWriteEnabled = WGPUOptionalBool_False;
     depthStencil.depthCompare = WGPUCompareFunction_Always;
 
@@ -1784,7 +1774,7 @@ bool build_fog_pipeline(bool blend, const char* entryPoint, WGPURenderPipeline& 
     pipelineDesc.vertex.entryPoint = {"vs_main", WGPU_STRLEN};
     pipelineDesc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
     pipelineDesc.depthStencil = &depthStencil;
-    pipelineDesc.multisample.count = g_deviceInfo.sample_count;
+    pipelineDesc.multisample.count = layout.sample_count;
     pipelineDesc.fragment = &fragment;
     outPipeline = wgpuDeviceCreateRenderPipeline(g_deviceInfo.device, &pipelineDesc);
     wgpuShaderModuleRelease(module);
@@ -1961,21 +1951,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     return MOD_OK;
 }
 
-MOD_EXPORT ModResult mod_update(ModError*) {
-    if (!hub_dtn::g_loggedNormalMismatch && hub_dtn::g_normalFormatMismatch.load(std::memory_order_relaxed)) {
-        hub_dtn::g_loggedNormalMismatch = true;
-        svc_log->warn(mod_ctx,
-            "scene pass normal-target layout changed since init; composite skipped - "
-            "reload this mod to rebuild its pipelines");
-    }
-    if (!hub_fog::g_loggedNormalMismatch && hub_fog::g_normalFormatMismatch.load(std::memory_order_relaxed)) {
-        hub_fog::g_loggedNormalMismatch = true;
-        svc_log->warn(mod_ctx,
-            "scene pass normal-target layout changed since init; composite skipped - "
-            "reload this mod to rebuild its pipelines");
-    }
-    return MOD_OK;
-}
+MOD_EXPORT ModResult mod_update(ModError*) { return MOD_OK; }
 
 MOD_EXPORT ModResult mod_shutdown(ModError*) {
     hub_fog::shutdown();
