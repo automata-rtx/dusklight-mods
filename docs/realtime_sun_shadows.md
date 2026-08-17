@@ -19,7 +19,8 @@ Sun Shadows if Depth to Normal is not installed and enabled. Install both togeth
    each snapped to whole texels of its own map (kills crawling); near/far extents scale
    with each radius. The optional **Link cascade** is a small box (`linkCoverage`) snapped
    to the player's position with a deliberately short light distance for maximum depth
-   discrimination.
+   discrimination. When it is enabled, Link's models are **excluded from the world cascades**
+   rather than drawn into both — see `linkCascade` in the settings table for why.
 2. **Caster capture** (`replay_cascade`, once per cascade at `SCENE_AFTER_TERRAIN`): replay
    the game's own opaque draw lists (`dComIfGd_drawOpaList*`) into a `create_pass` offscreen
    pass with `GXSetProjectionFull(lightReplayProjection)` + `j3dSys.setViewMtx` — the game
@@ -142,8 +143,10 @@ Sun Shadows if Depth to Normal is not installed and enabled. Install both togeth
    thickness threshold is a fraction of the pixel's remaining depth range, the term resolves
    contact detail and thin casters at *any* distance — it pairs with a reduced `boxRadius`
    (sharper map texels up close, screen-space detail everywhere).
-5. **Game-shadow suppression**: pre-hooks skip `dDlst_shadowControl_c::imageDraw/draw` and
-   `drawCloudShadow` while the mod is active (typed hooks only — no symbol manifest needed).
+5. **Game-shadow suppression**: pre-hooks skip `dDlst_shadowControl_c::imageDraw/draw` while
+   the mod is active (typed hooks only — no symbol manifest needed). `drawCloudShadow` was
+   skipped here too until it was established that it is the *moya* (靄, mist/haze) packet
+   rather than a shadow routine — see "Known caveats".
 6. **Indoor auto-disable**: `dKy_Indoor_check() != 0` (+ `indoorDisable` on) suppresses the
    shadow MAP render and its composite path (interiors read as fully shadowed under a
    sky-light map), and the suppression hooks go inactive so the game's own shadows return —
@@ -218,7 +221,7 @@ Space Shadows" is inert when SSS is off.
 | Var | Default | Meaning |
 |---|---|---|
 | `effectEnabled` | on | master toggle |
-| `shadowMapEnabled` | on | off = screen-space-only mode: no map render/composite, the game's own real/blob shadows return (the skip hooks go inactive), the Bend SSS term still applies |
+| `shadowMapEnabled` | on | off = screen-space-only mode: no map render/composite, the game's own simple/real shadows return (the skip hooks go inactive), the Bend SSS term still applies |
 | `mapSize` | 2 | EACH world cascade's map: 0=1024 1=2048 2=4096 3=8192 |
 | `boxRadius` | 25000 | full coverage radius in world units (1000–30000) = the FAR cascade |
 | `cascadeCount` | 2 | world cascades minus one (UI select "1/2/3"): 0=single map, 1=two cascades, 2=three (default). 3 costs a third replay, so it is a framerate decision, not a stability one — see the streaming-budget note, which is historical |
@@ -231,7 +234,7 @@ Space Shadows" is inert when SSS is off.
 | `grassShadows` | 0 (All) | which cascades replay the dDlst packet list — the field grass/flower custom drawers (`d_grass.inc`/`d_flower.inc`, the list's only users). They are immediate-mode per-tuft draws no shadow cull can touch, redrawn in FULL by every included cascade — a large flat CPU cost per replay in grassy areas. 1 = near cascade only (crisp close grass shadows kept, distant dapple dropped), 2 = off (SSS still grounds on-screen grass) |
 | `cascadeEdgeFade` | on | fade the widest cascade's shadow out across its outer edge (band = `cascadeBlend`) instead of a hard coverage cutoff |
 | `pcfFarStep` | 1 | extra PCF kernel steps per cascade beyond the near one (0–2) |
-| `linkCascade` | off | the Link cascade: an extra map covering only the player, combined with max() |
+| `linkCascade` | off | the Link cascade: an extra map covering only the player, combined with `max()`. **On = Link is also removed from the world cascades.** The composite takes whichever cascade is darker (`shadow.wgsl`), so drawing him into both lets a coarse wide-area map win that `max` over the crisp one — reintroducing the blocky edges and self-shadow speckle the Link cascade exists to remove. Trade-off: his cast shadow then comes only from this map, so at very low sun angles a long shadow can run past its edge; raise `linkCoverage` if that shows. Excluding him also makes the world cascades' cached copies (`cascadeStagger`) valid for longer, since his movement no longer changes them. |
 | `linkMapSize` | 2 | Link cascade resolution (same scale as `mapSize`), independent of it |
 | `linkCoverage` | 300 | Link cascade box radius in world units (100–2000) |
 | `strength` | 60 | shadow darkening % |
@@ -239,7 +242,7 @@ Space Shadows" is inert when SSS is off.
 | `receiverPlaneBias` | on | receiver-plane depth bias: derive the exact per-tap bias from the receiver surface's light-space depth gradient (built from the **geometric face normal**, not the shading normal — see the two-normals note), so acne clears with almost no flat margin and shadows stay attached to their casters (Isidoro 2006). When on it **replaces** `slopeBias` (the gradient is the exact slope term) and adds a fractional-sampling term for the centre texel, taken over half a texel and **hard-capped at 0.1% of the cascade depth range** (uncapped it inherited the clamped gradient and contributed up to 4% — hundreds of world units, more than a character is tall, which leaked self-shadowing straight through); `bias` still applies. The whole slope/plane term is scaled by the **light-facing gate** (`smoothstep(-band, band, n·L)`, `band` from `terminatorSoftness`) so surfaces turned away from the light get ~none of it — they're darkened by the two-sided map's front-most face, not self-shadow, and biasing them there leaks thin geometry (fingers, facial features) back into light. Off = the old constant + `slopeBias` margins (also light-facing-gated). Cap `rpdb_max = 0.02` (max 2% of a cascade's depth range per texel). Both methods |
 | `bias` | 2 | constant depth bias (normalized against light range), applied every tap. With `receiverPlaneBias` on, keep small; raise only if flat light-facing ground still shows acne |
 | `slopeBias` | 2 | bias added ∝ surface slope vs light. **Ignored when `receiverPlaneBias` is on** (that derives the slope term exactly); manual fallback only |
-| `attachedShadows` | on | also shadow surfaces facing **away** from the sun (the `n·L` term), which a cast-only shadow map cannot reach when they are unoccluded (a back-lit nose, protruding tunic/boot facets). Folds `1 - smoothstep(-band, band, n·L)` in via `max()`, so already-cast-shadowed pixels never darken further — only the leaking back-faces get corrected. Off = map-only (those back-faces read as fully lit) |
+| `attachedShadows` | on | also shadow surfaces facing **away** from the sun (the `n·L` term), which a cast-only shadow map cannot reach when they are unoccluded (a back-lit nose, protruding tunic/boot facets). Combines as two independent visibilities — `occlusion = map·f + (1 − f)` where `f = smoothstep(-band, band, n·L)` — so the map fades out exactly across the band where its comparison stops being trustworthy and the `n·L` term takes over. **Not `max()`**: that form reads half-lit in the middle of a cast shadow at the terminator and showed as a specular-looking stripe (`docs/authored_normals.md` §8.12). Off = map-only (those back-faces read as fully lit) |
 | `terminatorSoftness` | 20 | half-width of the light→shadow transition (`band = terminatorSoftness/100 × 0.5`, in `n·L`; floored at 0.02 in-shader). Low = crisp/hard sun-shadow boundary on curved surfaces; high = soft, gradual falloff. Drives both `attachedShadows` and the slope-bias light-facing gate |
 | `normalOffset` | 50 | receiver offset, % of one shadow texel's world size (default = 0.5 texel; already conservative — this is a percentage, not a texel count) |
 | `pcf` | 2 | PCF kernel: 0=1×1 1=3×3 2=5×5 3=7×7 |
@@ -495,6 +498,40 @@ the two-normal split it was also actively harmful — it flattened the curvature
 carries. Do not reintroduce it: if bias faceting appears, the cause is a bias term reading the
 shading normal instead of `n_geom`.
 
+## Shading history — both problems are closed
+
+This section used to be a TODO listing two open shading problems. Both are resolved; it is kept as
+history because the reasoning is what a future regression should be diagnosed against, and because
+its old advice was actively wrong once the platform changed.
+
+**1. Faceted normals — conditional, not inherent.** The old text said "this platform has no
+authored surface normals". That was true of the upstream base the tree briefly retreated to, and is
+**not** true now: the platform is `automata-rtx/dusklight-ao` with GfxService 1.3, and Graphics Hub
+consumes the game's own authored vertex normals. Faceting therefore only appears on the
+**reconstruction fallback** — when the user has not turned on *Video → Rendering → Scene Normal
+Buffer*, in compatibility mode (D3D11 / OpenGL ES), or per pixel where a draw supplied no normal.
+That is expected there, not a defect.
+
+> **Do not "fix" it by reintroducing `normalSmooth`.** The old route 1 suggested exactly that, with
+> a caveat about smoothing only `n` and not `n_geom`. The pass is deleted and stays deleted: it
+> existed to hide reconstruction faceting, which authored normals remove at the source, and it
+> flattened real curvature the shading normal carries. See `docs/authored_normals.md` §8.9.
+
+**2. Broken shading on back-lit Link — fixed and confirmed in-game.** The patchy shading on his
+boots, torso, lower tunic and face when back-lit closed across `5300789`..`b426c4d`, and the user
+has confirmed it resolved. No single commit is attributable, because they were verified together:
+
+| change | what it did |
+|---|---|
+| `5300789` | the two-normal split — bias reads the geometric face normal, `n·L` the shading normal (`docs/authored_normals.md` §8.6) |
+| `9af4701` | `sin`-scaled normal offset, Holbert's complete form (§8.7) |
+| `aa2c723` | **receiver-plane fractional-bias cap** (§8.8) — the strongest single candidate and the only one that was arithmetic rather than inference: the term was contributing several hundred world units of flat bias against a ~150-unit-tall character |
+| `b426c4d` | the additive term combine (§8.12) — also fixed a separate terminator glint |
+
+**If it ever regresses, §8.8 is the first place to look**, and Debug View 15 (**Shadow Terms**) is
+still the view that separates a missing occluder from a misread `n·L` — they have identical
+symptoms otherwise, and Shadow Factor alone cannot tell them apart.
+
 ## Known caveats
 
 - **2D-menu crash (fixed in 1.6.3)**: with the mod enabled but the shadow map off, the
@@ -505,17 +542,36 @@ shading normal instead of `n_geom`.
   the game-state calls or the offscreen pass there. Same readiness gate the replay already
   used, so real scenes are unaffected.
 - **Distortion particles vanish with the map on** (heat-haze / steam / wind in Kakariko
-  Village, Goron Springs) — *open*. Only the shadow **map** triggers it; screen-space-only
-  mode (Shadow Map off) shows the particles normally, so that's the current workaround.
-  An `earlyShadowPass` experiment that moved the offscreen replay from `SCENE_AFTER_TERRAIN`
-  to `SCENE_BEGIN` made *no* difference in-game, which rules out the replay's *timing*
-  relative to the framebuffer capture (`GXCopyTex` → `getFrameBufferTex`) as the cause — it's
-  something the replay *does* (a GX/PE or texture-cache state it leaves dirty), not when it
-  runs. Next step is to widen the GX-state save/restore around the replay. That toggle was
-  removed since it did nothing.
-- **Midna**: the game's projected blob shadow (which the mod hooks out) is where Midna
+  Village, Goron Springs) — **RESOLVED. The mod was deleting them itself.**
+
+  The cause was not dirty GX state and not the replay. Alongside the game's two real shadow
+  routines, the mod also pre-hooked `drawCloudShadow` and skipped it unconditionally whenever
+  the shadow map was active. `drawCloudShadow` is **not a shadow routine** — the name is
+  romanized-Japanese shorthand, and it draws the whole *moya* (靄, mist/haze) packet: the
+  drifting haze, mist and steam, and at `mMoyaMode >= 50` the framebuffer heat-shimmer and
+  wolf-senses distortion (`d_kankyo_rain.cpp:4549` splits the two branches). The handler had no
+  mode check, so turning on the shadow map deleted all of it.
+
+  That explains every symptom that was recorded here, including the one that misled the
+  investigation: the `earlyShadowPass` experiment changed nothing because the effects were
+  never being drawn at all, so *when* the map rendered was always irrelevant. The previous
+  conclusion in this entry — "it's something the replay does, a GX/PE or texture-cache state it
+  leaves dirty" — was wrong, and it is what sent sessions after a phantom bug in innocent code.
+
+  **Fix:** the `drawCloudShadow` hook was removed from this mod entirely. Nothing it drew was a
+  projected shadow this mod replaces, and Effect Remover's **Haze Removal** already owns moya
+  with per-mode toggles that deliberately spare the `>= 50` modes. A side effect of the old
+  hook was that it silently overrode those toggles whenever both mods were installed; that is
+  fixed too. **Expected change in game:** with the shadow map on, drifting haze/steam and the
+  heat-shimmer now appear where they previously did not. If you want them gone, that is Haze
+  Removal's job — per mode, which is the control the old behaviour bypassed.
+- **Midna**: the game's projected shadow (which the mod hooks out) is where Midna
   "lives" during her summon/emergence animation. A retain path (re-enable the game shadow
   for Link only, or anchor her to our sun ground-projection) is a known follow-up.
+  Naming note: the game's own classes are `dDlst_shadowSimple_c` and `dDlst_shadowReal_c`
+  (`d_drawlist.h:202`, `:254`), and `d_bg_s.cpp` calls the projected geometry kind
+  リアル影 ("real *kage*"). **"Blob shadow" is this project's coinage, not the game's word** —
+  it is fine when describing the look to a player, but do not grep the game for it.
 - **The per-frame streaming budget (the v1.6.0/1.6.1 startup crash) — HISTORICAL; not a live
   risk.** Both halves of what caused it have since been fixed, on both sides. Kept here
   because the tuning levers below are still the right ones for framerate, and because the

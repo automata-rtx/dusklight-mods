@@ -10,17 +10,39 @@ the game code**, how we disable it, and which **Effect Remover** feature (and na
 `mods/effect_remover/src/mod.cpp`) owns it. Read this first before touching any of the removal code
 in a future session — the three systems look similar on screen but are completely different in code.
 
-There are **three independent systems**. A shade you see on the ground could be any of them, so the
-identification step (each feature has a logger) matters.
+Effect Remover targets **three** systems. The game has **at least seven** — the single function
+`er_tsr` hooks sets up four more on its own (§4). Do not read this document as an inventory of
+everything TP fakes; it is an inventory of what we currently remove.
+
+A shade you see on the ground could be any of them, so the identification step (each feature has a
+logger) matters.
 
 ---
 
-## 1. "Moya" — projected particle ground shade
+## 1. "Moya" (靄, *mist/haze*) — a camera-facing haze veil, **not** a ground shadow
 
-**What it looks like:** soft, drifting patches of shade projected onto the ground — the slowly
-swaying dappled shadow under a forest canopy (Faron/Ordon), the big rolling cloud shadows drifting
-across Hyrule Field, and drifting mist/dust/steam. It is a *particle field* projected downward, not
-attached to any single surface.
+> **Correction, and it matters for how this feature is described.** This section previously
+> called moya "projected particle ground shade" and the mod's UI still says so. It is not
+> projected onto anything. Verified in the pinned tree:
+>
+> - The quads are built from the **inverse of the view rotation** — `MTXInverse(dComIfGd_getView()
+>   ->viewMtxNoTrans, camMtx)` (`d_kankyo_rain.cpp:4543`, inside `drawCloudShadow` which begins at
+>   `:4514`) — i.e. camera-facing billboards that follow the camera, not geometry on the ground.
+> - They are drawn with the **depth test and depth write both disabled**:
+>   `GXSetZMode(GX_DISABLE, GX_LEQUAL, GX_DISABLE)` (`d_kankyo_rain.cpp:4594`). A surface-projected
+>   shadow cannot be depth-independent; this is an overlay.
+> - **Five of the twelve modes blend additively** — modes 3, 4, 6, 10 and 11 take
+>   `GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_ONE, ...)` (`d_kankyo_rain.cpp:4587`), whose
+>   destination factor is `ONE`. Those modes can only ever *brighten* the frame. They are glare,
+>   dust and storm haze — they are not shadows of any kind.
+>
+> The dappled shade you see on a forest floor is a different system entirely: it is §2, a texture
+> stage baked into the terrain material. `er_tsr`'s own notes record that the moya count reads 0 on
+> that terrain, which is consistent.
+
+**What it looks like:** drifting haze, mist, dust and steam hanging in the air, plus — at
+`mMoyaMode >= 50` — the full-screen heat-shimmer / wolf-senses distortion, which is the same
+function's other branch.
 
 **Code names:**
 - `drawCloudShadow(Mtx, u8**)` in `d/d_kankyo_rain.h` — the draw call for the whole moya packet.
@@ -32,8 +54,14 @@ attached to any single surface.
   here (so if a shade persists with count 0, it is **not** this system — check system 2).
 - `dKy_getEnvlight()` returns `&g_env_light` (linkable) — how we read the two fields above.
 - Behaviour reference: `cloud_shadow_move` in `d_kankyo_rain.cpp` (mode → motion mapping used for
-  the default + UI hints): mode 5 is the only pure non-wind *slow sway* (canopy candidate); modes
-  4/11 are wind-driven drift (the rolling field shadows).
+  the default + UI hints): mode 5 is the only pure non-wind *slow sway*.
+- **Which mode runs where is decided in code, not in map data** — every `mMoyaMode` value is
+  assigned by a `kytag` actor or by the weather code, so the mapping is greppable. Two that the
+  mod's UI currently gets wrong: **mode 4 is set only by `d_a_kytag02` (`:27`, `:121`)**, the
+  scripted wind-gust tag, and **Hyrule Field's ambient haze is mode 7**, set by stage name in
+  `d_kankyo_wether.cpp:1111` (`F_SP121`) alongside `F_SP108` (Faron Woods) and `F_SP127` (the
+  fishing hole). The UI's "leave mode 4 on so Hyrule Field keeps its drifting shadows" is wrong on
+  both halves — mode 4 is not Hyrule Field's, and being additive it is not a shadow.
 
 **How Effect Remover disables it (`er_psr`):** a **pre-hook on `drawCloudShadow`** that returns
 `HOOK_SKIP_ORIGINAL` only when the current `mMoyaMode`'s per-mode toggle is on. Skipping a
@@ -72,11 +100,13 @@ texture (the "two textures interacting" the ground shows).
 Forcing it to **0** makes the shade **darker**; **maximum** washes it out. So removal = **pin it to
 255**, not zero.
 
-**Unresolved, and worth knowing before tuning this.** 濃さ means density/darkness, so the game's own
-label predicts the opposite polarity from what we measured. Both facts are solid; the TEV equation
-that reconciles them is baked into the `.bmd` material and is not in the source tree. It *is*
-readable — aurora generates the WGSL for that draw (`aurora-ao/docs/japanese-naming.md` §3). Until
-someone reads it, pinning 255 is **known-effective, not known-faithful**.
+**Polarity — corroborated by the game itself.** 濃さ means density/darkness, so a naive reading
+predicts 255 = darker, and our in-game test found the opposite. The game settles the direction: in
+the wolf's enhanced-senses state it forces `mFogDensity = -1`, which the terrain pass reads as
+`255` (`d_kankyo.cpp:2427`, consumed at `:11456`) — i.e. the engine drives this value to maximum
+exactly when it wants the cloud shadow gone. **255 is the engine's own "no cloud shadow" value**,
+which is what `er_tsr` pins. The TEV equation in the `.bmd` is still unread and would explain
+*why* 濃さ runs this way, but cannot change what 255 does. See `docs/japanese-naming.md` §4.1.
 
 **How Effect Remover disables it (`er_tsr`):** a **post-hook on `dKy_bg_MAxx_proc`** (runs right
 after the game sets the register, so our value is the one that draws) that, for the enabled material
@@ -85,8 +115,25 @@ stage, so the overlay stops darkening while the **base ground texture (stage 0) 
 holes; an earlier "skip the whole shape" approach holed the floor and was abandoned). Per-code
 toggles (`MA00`/`MA01`/`MA16`/`MA04`) + a logger of which codes a room uses (the Faron spot logs
 ~72 `MA04` materials). **Off by default** — it's a global terrain change; verify per area.
-Waterfalls/water are separate actors (`d_a_obj_waterfall`, `d_a_obj_lv3Water`) with their own
-object-archive BTKs and are never touched.
+**The hook's reach is wider than "room terrain".** `er_tsr` post-hooks `dKy_bg_MAxx_proc`, and
+seven actors call that function, not one — verified in the pinned tree:
+
+| Caller | What it is |
+| :-- | :-- |
+| `d_a_bg.cpp:339` | room terrain (the intended target) |
+| `d_a_obj_groundwater.cpp:268-269` | large ground-water bodies |
+| `d_a_obj_onsen.cpp:92, :96` | 温泉 *onsen*, hot spring |
+| `d_a_bg_obj.cpp:1303` | moving background objects |
+| `d_a_obj_bubblePilar.cpp:192` | bubble pillar |
+| `d_a_obj_gb.cpp:24` | — |
+| `d_a_demo00.cpp:1529` | cutscene object |
+
+So the previous claim here that water "is never touched" was too broad. It is true of the two
+actors it named — `d_a_obj_waterfall` and `d_a_obj_lv3Water` genuinely never call
+`dKy_bg_MAxx_proc` — but two *other* water actors do. Whether the wash actually changes their
+appearance depends on whether their materials carry an `MA00`/`MA01`/`MA04`/`MA16` code, which
+lives in `.bmd` asset data and cannot be settled from source; use the feature's own material
+logger in-game to find out.
 
 ---
 
@@ -116,11 +163,33 @@ tinting on props flattens too.
 
 ---
 
+## 4. Fake shading we do **not** remove (found in the same function `er_tsr` already hooks)
+
+These are listed so nobody reads §1–3 as an inventory of everything TP fakes. All are set up
+inside `dKy_bg_MAxx_proc`, keyed on polygon code, and none is currently exposed by Effect Remover.
+Verified in the pinned tree; none has been evaluated in game.
+
+| Code(s) | What the game does | Where |
+| :-- | :-- | :-- |
+| `MA02`, `MA10` | Builds a **camera-projected texture matrix** (`C_MTXLightPerspective`) and routes the material to the Invisisble list — a screen-locked projected overlay | `d_kankyo.cpp:11424-11450` |
+| `MA11` | In the Twilight (`dKy_darkworld_check`) re-routes to `setListDarkBG` and forces a purple TEV colour — the twilight mist tint | `d_kankyo.cpp:11479-11490` |
+| `MA20` | Forces fog type 7 (black), takes its colour from the `ウソFog` layer, and builds a `cMtx_lookAt` projection anchored to **the player's position** — a mask that follows Link | `d_kankyo.cpp:11582-11620` |
+| `MA13`, `MA14`, `MA16` | Written the authors' own **`ウソFog`** ("fake fog") ambient term as a TEV constant; `MA14` additionally receives the real fog colour | `d_kankyo.cpp:11622-11652` |
+
+The last row matters for Graphics Hub's Deferred Fog: because `ウソFog` is a TEV constant baked
+into the material rather than a `GXSetFog` call, **Deferred Fog can neither suppress nor defer
+it**. On those materials a fog-coloured tint is part of the surface before any mod composites over
+it. See `docs/japanese-naming.md` §5.
+
+---
+
 ## Which system is which? (in-game triage)
 
-1. Turn on **Projected Shadow Removal → Log Active Mode**. Walk to the shade.
+1. Turn on **Haze Removal → Log Active Mode**. Walk to the shade.
    - If the log shows a moya **mode with count > 0**, it's **system 1** — toggle that mode off.
    - If the log shows **count 0**, moya isn't drawing it → go to step 2.
+   - Remember system 1 cannot darken the ground at all, so a *shadow* on the floor is almost
+     certainly system 2 even if a moya mode is also active.
 2. Turn on **Terrain Shadow Removal → Log Overlay Materials** and **Enabled**.
    - If the "seen" count rises (e.g. `seen 72 (MA04)`), it's **system 2** — it'll wash out.
 3. If neither logger reacts and the whole scene just looks flatly pre-shaded (not a discrete
@@ -128,10 +197,21 @@ tinting on props flattens too.
 
 ## Related game-source landmarks (in the fetched, read-only `dusklight/` tree)
 
-- `src/d/d_kankyo_rain.cpp` — `drawCloudShadow` (~4506), `cloud_shadow_move` (~1583), `vrkumo_move`.
-- `src/d/d_kankyo.cpp` — `dKy_cloudshadow_scroll` (~4490), `dKy_bg_MAxx_proc` (~11347),
-  `dKy_murky_set` (~11236).
-- `src/d/actor/d_a_bg.cpp` — room terrain load (`model.btk`/`model.brk`), `dKy_bg_MAxx_proc` call
-  site (~339), the `MA08` special texmtx path (~587).
+Line numbers below were re-verified against the fetched tree (upstream game code, carried by `automata-rtx/dusklight-ao` at
+`DUSKLIGHT_VERSION`); re-check them after any re-platform.
+
+- `src/d/d_kankyo_rain.cpp` — `drawCloudShadow` (4514), `cloud_shadow_move` (1585),
+  `vrkumo_move` (1845); the moya mode branch at 4587 and its depth-off state at 4594.
+- `src/d/d_kankyo.cpp` — `dKy_cloudshadow_scroll` (4491), `dKy_bg_MAxx_proc` (11344),
+  `dKy_murky_set` (11236); `mFogDensity` loaded from the palette at 2423 and forced to `-1` at 2427.
+- `src/d/actor/d_a_bg.cpp` — room terrain load (`model.btk`/`model.brk`); the ordered pair
+  `setLightTevColorType_MAJI` (338) then `dKy_bg_MAxx_proc` (339); the one suffix-matching block,
+  gated to the fishing-hole stages, at 378-383.
+- The moya mode assignments: `d_a_kytag00.cpp`, `d_a_kytag02.cpp:27, :121` (mode 4),
+  `d_a_kytag06.cpp` (modes 10/11), `d_kankyo_wether.cpp:1111` (mode 7).
+
+> A previous revision listed "the `MA08` special texmtx path (~587)" in `d_a_bg.cpp`. **There is no
+> `MA08` anywhere in `src/` or `include/`** — that landmark pointed at code that does not exist and
+> has been removed.
 - `include/d/d_kankyo.h` — `dKy_getEnvlight`, `dKy_bg_MAxx_proc`; `dScnKy_env_light_c` layout
   (`mMoyaMode`, `mMoyaCount`).

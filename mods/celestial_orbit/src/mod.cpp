@@ -309,7 +309,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // register_var returns MOD_CONFLICT and the mod dies at its first registration. That is what
     // kept this mod from loading at all. Ours is a different question anyway - the manager's
     // checkbox unloads the mod outright, while this one keeps it loaded (and its service exported,
-    // reporting vanilla to Realtime Sun Shadows) and only stops it writing.
+    // reporting vanilla to Realtime Sun Shadows) and only stops it writing. The SDK documents
+    // the reservation on ConfigVarDesc::name itself, in mods/svc/config.h.
     ConfigVarDesc enabledDesc = CONFIG_VAR_DESC_INIT;
     enabledDesc.name = "orbitEnabled";
     enabledDesc.type = CONFIG_VAR_BOOL;

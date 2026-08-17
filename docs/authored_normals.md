@@ -70,8 +70,8 @@ merged**. What remains fork-local is 1.3's `GfxResolveDesc::normal` → `GfxReso
 | `317111b` | Map comparison faded across the terminator band (§8.7). |
 | `aa2c723` | **Receiver-plane fractional-sampling bias capped** (§8.8). |
 | `38386e4` | Normal Smoothing pass deleted outright (§8.9). |
-| `e50a1a9` | Re-platformed onto upstream `0fc05028`, which has no normal buffer — authored normals off across the board, provider reconstructing every pixel. |
-| `dcdaa23` | Re-platformed onto `platform-normals-test`, restoring authored normals; all six scene-pass pipelines moved to `get_pass_targets`, and the `GfxDrawContext::normal_format` guard deleted (§5). |
+| `e50a1a9` | Re-platformed onto upstream `0fc05028`, which has no normal buffer — authored normals off across the board, provider reconstructing every pixel. **`main` independently landed the same retreat as `8695508`**, which is why the two branches conflicted on every platform paragraph. |
+| `dcdaa23` | Re-platformed onto `platform-normals-test`, restoring authored normals; all six scene-pass pipelines moved to the scene-layout query, and the `GfxDrawContext::normal_format` guard deleted (§5). |
 | `ca6b73a` | **Every camera-facing flip on an authored normal deleted** — provider (was 0.5) and VBAO/SSILVB (were −0.15). Re-pinned to the rebased platform, which also drops aurora's enlarged streaming buffers — harmless, upstream had already raised its own (§2a). |
 | `3cbab91`–`8cc46b9` | AO occlusion hemisphere built from geometry, not the shading normal; the rejection plane made a 4-tap ±1 in both mods (§8.11, §8.11a). |
 | `b426c4d` | Shadow map and `n·L` terms combined by multiplying visibilities instead of `max` — fixes the terminator glint (§8.12). |
@@ -260,7 +260,7 @@ should be seamless, not a visible seam.
 2. **Buffer on.** Turn on the Video setting, **restart**, and confirm "Use Authored Normals" is no
    longer greyed out. Leave it **off** for one more pass: everything must still look unchanged. Any
    missing or corrupted composite *here* — with the pass now carrying two attachments — means a mod
-   pipeline is not following `get_pass_targets` (see §5). This is the step that catches it.
+   pipeline is not following `gfx_compat::scene_pass_layout` (see §5). This is the step that catches it.
 3. **Basis.** Turn the toggle on, Show Normals on, Debug View = Difference. Expect dark with bright
    creases; see §2 if not.
 4. **Coverage.** Debug View = Coverage. Confirm the fallback regions are the expected ones.
@@ -488,7 +488,7 @@ still reads valid, and a two-surface pixel reads a fully confident `1.0`. That i
 showed green across the whole screen while the normals were wrong.
 
 `reconstruct.wgsl` now uses the **decoded length as a confidence signal**: a texel written by one
-surface decodes to unit length (8-bit quantization moves it under 0.01), so anything below **0.92**
+surface decodes to unit length (10-bit quantization moves it well under 0.01), so anything below **0.92**
 is a resolve average and is handed to the depth reconstruction instead, which is built for
 silhouettes. Genuine curvature is untouched — adjacent samples a few degrees apart still measure
 ~0.999. With MSAA off every covered texel measures 1.0, so the check is inert.
@@ -501,9 +501,9 @@ If the remaining reconstructed rim is objectionable, the renderer-side fix is to
 resolve for normals and take a single sample (or the sample whose depth matches the resolved
 depth) instead of averaging. That is an `aurora-ao` change.
 
-**Precision** remains untested: if RGBA8 banding shows on smooth surfaces under strong AO, the fix
-is `NormalBufferFormat` → `RGB10A2Unorm`, which keeps the validity channel — also an `aurora-ao`
-change, so report it rather than working around it here.
+**Precision is settled, not open.** `NormalBufferFormat` is already `RGB10A2Unorm`
+(`aurora-ao lib/webgpu/gpu.hpp`), ten bits per axis, so the RGBA8 banding this paragraph used to
+warn about cannot occur. §0 records it closed.
 
 ---
 
@@ -944,7 +944,8 @@ Upstream it. The change is small, additive, off by default, and useful to any au
 
 - **aurora** (`encounter/aurora`): `AuroraConfig::enableNormalBuffer` → optional second colour target
   + the `@location(1)` write. Documented end to end in `dusklight/docs/thin-gbuffer-normals.md`.
-- **Dusklight** (`TwilitRealm/dusklight`): the five appended `struct_size`-guarded SDK fields, which
+- **Dusklight** (`TwilitRealm/dusklight`): the appended `struct_size`-guarded SDK fields (now just
+  two, at GfxService 1.3 — upstream already shipped the scene-target-layout half itself), which
   is exactly the shape of change GfxService 1.1 already made for present targets — it would land as
   GfxService **1.2**.
 
@@ -955,13 +956,23 @@ and makes the provider fragile.
 
 Checked while investigating; relevant whenever we re-platform.
 
-- `76b56cd8` (our base) is an ancestor of upstream HEAD `4504e5009` — **28 commits**, so a rebase is
-  clean in principle.
-- **ABI collision to watch.** Upstream appended `WGPUInstance instance; WGPUAdapter adapter;` to
-  `GfxDeviceInfo` — the same slot where our fork appended `WGPUTextureFormat normal_format;`. On a
-  rebase, ours must be re-appended **after** theirs and the service minor bumped to 1.2. Re-applying
-  our diff blindly would silently mis-map the struct. `GfxResolveDesc` / `GfxResolvedTargets` are
-  untouched upstream, so those merge cleanly.
+*(Hashes in the two bullets below are from the ORIGINAL investigation, against base `76b56cd8` and
+upstream HEAD `4504e5009`. They are kept because the lessons are live; the platform has since moved
+to `5ded001` — upstream `c880d46f` plus GfxService 1.3 — so do not treat them as current pins.)*
+
+- **The ABI collision that ended the first fork — and what NOT to do about it now.** Upstream
+  appended `WGPUInstance instance; WGPUAdapter adapter;` to `GfxDeviceInfo`, in the same slot where
+  our first fork appended `WGPUTextureFormat normal_format;`. That is what made fork-built mods read
+  a live pointer as a texture format and silently draw nothing.
+
+  **Do NOT resolve this by re-appending `normal_format` after upstream's fields.** An earlier
+  revision of this section said exactly that, and it is the wrong lesson: the field is now **gone in
+  every form**, and nothing should bring it back. Presence of the buffer is detected by finding a
+  `GFX_ATTACHMENT_NORMAL` semantic in `get_scene_target_layout` — see §7. The one surviving
+  fork-local pair (`GfxResolveDesc::normal` → `GfxResolvedTargets::normal`) is safe because `normal`
+  occupies `GfxResolveDesc`'s existing **tail padding**, so `sizeof` is unchanged, and the host
+  honours it only when `GfxResolvedTargets` is large enough to carry the result back. Copy *that*
+  pattern if the fork ever needs a third field; do not append to `GfxDeviceInfo`.
 - **SDK source renames that touch our three game-linked mods** (`7305ef09b`):
   `mods/hook.hpp` → `mods/svc/hook.hpp`, and `mods::hook_add_pre/add_post/replace(svc_hook, fn)` →
   `mods::hook::add_pre/add_post/replace(fn)` (the service argument is now an optional overload).

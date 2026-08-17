@@ -13,14 +13,21 @@ Hub's Deferred Fog are entirely built out of these names** — `drawCloudShadow`
 sentence into our own documentation (§4.1).
 
 This document is **self-contained on purpose**: a mod session attaches only
-`dusklight-mods`, so it cannot assume the game repo is open. The canonical, longer
-reference is `dusklight-ao/docs/japanese-naming.md`; the parts of it a mod session
-actually needs are restated here.
+`dusklight-mods`, so it cannot assume the game tree is already present. §2.1 says how to
+fetch it. **This file is the reference** — longer versions exist in the older fork
+`dusklight-ao` / `aurora-ao` forks, but those repos are no longer the platform and are
+historical only.
 
-**Status: reference, not an audit.** Everything in §4 was verified against the game
-tree at the pinned `DUSKLIGHT_VERSION`. §5 lists what has *not* been checked. No mod
-code was changed to produce this document — two documentation sentences were, and
-§4.1 says exactly which.
+**Status.** Everything in §4 was verified against the game tree at the pinned
+`DUSKLIGHT_VERSION` — re-verified line by line after the move to upstream Dusklight, so the
+citations match the source the mods are actually built against. §5 says which of the
+questions this document raised are now answered and which are still open.
+
+Findings here have since driven mod changes, not just prose: the `mFogDensity` reading
+corrected Effect Remover's terrain feature, "Projected Shadow Removal" was renamed **Haze
+Removal** because moya is not a projected shadow, and Realtime Sun Shadows' `drawCloudShadow`
+hook was removed once that name was read correctly. Where a section says something is
+unresolved, that is meant literally — do not build on it without checking.
 
 ---
 
@@ -66,12 +73,24 @@ CMake configure, so after any `cmake -B build` the whole game source is sitting
 there and is greppable. If you only want to read it — no build — clone it directly:
 
 ```sh
-git clone --filter=blob:none https://github.com/automata-rtx/dusklight-ao.git dusklight
-git -C dusklight checkout <DUSKLIGHT_VERSION from the top-level CMakeLists.txt>
+DUSKLIGHT_VERSION=$(sed -n 's/.*set(DUSKLIGHT_VERSION "\([0-9a-f]*\)").*/\1/p' CMakeLists.txt)
+mkdir -p dusklight && git -C dusklight init --quiet
+git -C dusklight remote add origin https://github.com/automata-rtx/dusklight-ao.git
+git -C dusklight fetch --depth=1 origin "$DUSKLIGHT_VERSION"
+git -C dusklight checkout --quiet FETCH_HEAD
 ```
 
-`DUSKLIGHT_DIR` can also point at an existing checkout, which is what to do if the
-session already has `dusklight-ao` attached.
+That is the same repository and the same commit `cmake/FetchDusklight.cmake` uses, so a
+plain `cmake -B build` produces an equivalent tree. `DUSKLIGHT_DIR` can also point at an
+existing checkout.
+
+> **The fetched tree is `automata-rtx/dusklight-ao` at `DUSKLIGHT_VERSION`** — the
+> scene-normal-buffer platform, not stock upstream, so the SHA above will not resolve
+> against `TwilitRealm/dusklight` and fetching from there hard-fails. Its **game code is
+> stock upstream**, though — the fork delta is renderer + SDK only — so every line citation
+> in §4 stands unchanged and anything you grep here matches upstream. (CLAUDE.md's "The ABI
+> pin" names the exact upstream base; it is deliberately not repeated here, so there is one
+> place to update.)
 
 ### 2.2 Searching it — use ripgrep, not `grep -P`
 
@@ -98,6 +117,19 @@ correct under either locale, including `\p{…}` classes. If you must shell out 
 
 An empty `grep -P` for Japanese is not evidence of absence, and a non-empty one is
 not evidence of presence.
+
+Two more ways a search comes back empty or wrong, both measured on this tree:
+
+- **`rg -r` is `--replace`, not "recursive".** `rg -rn 'bloom' src` rewrites every match
+  to the letter `n` and prints that, so a real hit reads as nonsense rather than as an
+  error. ripgrep already recurses by default; you never need `-r`. This misfired twice
+  while auditing, once making a class called `bloom_c` look like one called `n_c`.
+- **A polygon code may be compared one character at a time.** The game frequently tests
+  `mat_name[3] == 'M' && mat_name[4] == 'A' && mat_name[5] == '0' && mat_name[6] == '9'`
+  instead of `memcmp(&mat_name[3], "MA09", 4)`. Grepping for the string `MA09` misses
+  every one of those sites. `dKy_cloudshadow_scroll` — the function the terrain-shadow
+  work is built on — is matched this way (`d_kankyo.cpp:4504-4507`). When a code seems
+  unhandled, also search `\[5\] == '` and `\[6\] == '`.
 
 ### 2.3 The method: find where the game labels its own field
 
@@ -140,7 +172,7 @@ Glossed because these are the names in `mods/effect_remover/src/mod.cpp`,
 | Romaji | Japanese | Meaning | Where it reaches our mods |
 | :-- | :-- | :-- | :-- |
 | kankyo | 環境 | environment | everything `dKy_*` |
-| moya | 靄 | mist, haze | `mMoyaMode` / `mMoyaCount` — Effect Remover's Projected Shadow Removal (`er_psr`) switches on exactly this |
+| moya | 靄 | mist, haze | `mMoyaMode` / `mMoyaCount` — Effect Remover's **Haze Removal** (`er_psr`) switches on exactly this |
 | kumo | 雲 | cloud | `drawCloudShadow` is the moya packet; 雲影 *kumokage* = cloud shadow |
 | vrkumo | VR box + 雲 | the drifting skybox cloud packet | `mpVrkumoPacket` — its translation is what scrolls the terrain shadow overlay `er_tsr` removes |
 | kasumi | 霞 | horizon haze band | `vrbox_kasumi_*_col`; **`outer` is the near band, `inner` is the far one** — the opposite of the English |
@@ -149,7 +181,20 @@ Glossed because these are the names in `mods/effect_remover/src/mod.cpp`,
 | nama | 生 | **raw, live** | the game's own label for its placed lights (`d_kankyo.cpp:5165`) |
 | wether | *(English by ear)* | weather | `dKyw_wether_move` — do not "fix" |
 | sibuki / shibuki | 飛沫 | spray, splash | `dKyr_drawSibuki`; the grep-trap example |
-| housi / houshi | 胞子 | spore | `dKyr_housi_init` — drifting motes |
+| housi / houshi | 胞子 | spore | `dKyr_housi_init` — drifting motes; the authors' own panel heading 「胞子の調整パラメータ」 sits directly above its sliders (`d_kankyo.cpp:7753`) |
+| taiyou | 太陽 | sun | 「太陽の調整パラメータ」 (`d_kankyo.cpp:7742`); `setSunpos` writes `sun_pos` |
+| tsuki | 月 | moon | 「月の調整パラメータ」 (`d_kankyo.cpp:7732`); `setSunpos` also writes `moon_pos` |
+| vectle | *(English by ear)* | **vector** | `dKyr_get_vectle_calc` — do not "fix" |
+| Schejule | *(English by ear)* | **schedule** | do not "fix" |
+
+**Celestial Orbit's vocabulary, and one trap in it.** That mod retilts the sun and moon
+path by post-hooking `dScnKy_env_light_c::setSunpos()` (`d_kankyo.cpp:1666`), which writes
+both `sun_pos` and `moon_pos`. The trap: **`dKyr_drawSun` draws the moon as well as the
+sun** — `d_kankyo_wether.cpp:61` calls it with the moon's own texture resource
+(`&mpResMoon`) — so it is the shared celestial-billboard drawer, not a sun-only routine.
+`dKyr_drawStar` is a separate function for the starfield, and `dKyr_draw_rev_moon`
+(`d_kankyo_rain.cpp:2082`) is a third, distinct path that reads `moon_pos` directly.
+Reading `drawSun` as "the sun's drawing code" will send you to the wrong function.
 
 ### Terrain material vocabulary — the `MAnn` codes
 
@@ -214,15 +259,33 @@ game's own cloud-shadow strength control**, the same value the swaying overlay i
 scrolled by. The mod and the game agree about what the system is; only our
 description of it did not.
 
-**What it does not settle, and this matters.** The game's word 濃さ means
-density/darkness, so a naive reading predicts 255 = *darker*. Our in-game test found
-the opposite: 0 darker, 255 washed out, which is why `er_tsr` pins 255. Both facts
-are solid and they are not yet reconciled — the TEV equation that consumes KColor1.r
-lives in the `.bmd` material, not in the source tree. It is readable, and
-`aurora-ao/docs/japanese-naming.md` §3 says where: aurora generates the WGSL for that
-draw. Until someone reads it, "pin to 255" is **known-effective, not known-faithful**,
-and the parenthetical "== max fog density, engine-faithful" in `CLAUDE.md` was
-claiming more than we had.
+**The polarity, and how the game settles it.** 濃さ means density/darkness, so a naive
+reading predicts 255 = *darker*, while our in-game test found the opposite — 0 darker,
+255 washed out — which is why `er_tsr` pins 255. The game's own use of the value decides
+between them:
+
+```
+d_stage.h:150        u8 cloud_shadow_density;      // the palette column mFogDensity loads from
+d_kankyo.cpp:2423    mFogDensity = kankyo_color_ratio_set(..., cloud_shadow_density, ...)
+d_kankyo.cpp:2427    if (daPy_py_c::checkNowWolfPowerUp()) { mFogDensity = -1; }
+```
+
+Two things follow. First, the value is loaded straight out of a palette column the
+decompilation independently named `cloud_shadow_density` — a *second reconstruction*
+agreeing with the authored slider. (It is a member name, so by rule 4 it is corroboration,
+not proof; the authored 雲影の濃さ slider remains the actual evidence.) Second, and more
+useful: in the wolf's enhanced-senses state the game **forces the value to `-1`, which the
+terrain pass reads as `255`** (`sp5C.r = (u8)mFogDensity`, `:11456`) — and it does that in
+the same routine that flattens the rest of the look for that mode. The game drives this
+value to 255 precisely when it wants the cloud shadow gone. That is the same direction our
+in-game test measured, and it means **255 is the engine's own "no cloud shadow" value**, not
+merely a setting that happens to look right.
+
+What is still unread is the TEV equation itself, which lives in the `.bmd` material rather
+than in the source tree. Reading it would explain *why* 濃さ runs this direction; it would
+not change what 255 does. So `er_tsr` pinning 255 is **corroborated by the engine's own
+usage** — a materially stronger position than the "known-effective, not known-faithful"
+this document used to record.
 
 **Corrected: two documentation sentences** (`docs/fake_shading_systems.md` §2 and the
 `er_tsr` bullet in `CLAUDE.md`). **No mod code changed.** `er_tsr` behaves exactly as
@@ -262,17 +325,29 @@ the game's simple shadow class has no Japanese name anywhere in the tree.
 Relevant to any future mod that wants per-draw intent instead of a texture hash:
 
 ```
-J3DModelLoader.cpp:21-28   AssignMaterialNames()  under  #if TARGET_PC
-                           → mat->mMaterialName is populated in EVERY PC build
-J3DPacket.cpp:218-222      GXPushDebugGroup("Mat: %s")  under  #if DEBUG && TARGET_PC
-                           → immediately before callDL(), i.e. the real draw
+J3DModelLoader.cpp:21       AssignMaterialNames(), guarded by  #if TARGET_PC
+J3DModelLoader.cpp:134      called from J3DModelLoader::load()      — the .bmd path ONLY
+J3DModelLoader.cpp:175      J3DModelLoader::loadBinaryDisplayList() — .bdl: never calls it
+J3DPacket.cpp:218, :245     the two readers, both guarded `if (mMaterialName != nullptr)`
 ```
 
 So the game's own semantic label for a draw — `MA00_Gake`, `MA00_Kusa`, and the
-`MA06` water variants — is **available to a game-linked mod at draw time in a
-release build**. Only the debug-group *push* is compiled out. This is a stronger
-per-draw identity channel than anything screen-space, and nothing in this repo uses
-it.
+`MA06` water variants — is available to a game-linked mod at draw time in a release
+build **on the `.bmd` load path**. This is a stronger per-draw identity channel than
+anything screen-space, and nothing in this repo uses it.
+
+> ⚠️ **Do not read `J3DMaterial::mMaterialName` unguarded.** `AssignMaterialNames` is
+> called from `J3DModelLoader::load()` and from nowhere else;
+> `J3DModelLoader::loadBinaryDisplayList()` (the `.bdl` path) never calls it, and
+> `J3DMaterial` never initialises the field, so on that path it is *indeterminate* rather
+> than null. The game's own two readers both null-check it before use, and a mod must do
+> at least the same. An earlier revision of this section claimed the field was "populated
+> in EVERY PC build"; that was wrong and would have led a mod into dereferencing an
+> uninitialised pointer.
+>
+> **The safe route is the model data's name table**, which is what the game itself uses
+> in `dKy_bg_MAxx_proc`: `modelData->getMaterialName()->getName(i)`
+> (`d_kankyo.cpp:11359-11360`). It is populated on both load paths.
 
 (Full material names such as `cc_MA06_NigoriWater_v_x` live in `.bmd` asset data, not
 in the source tree, so the checker in §6 cannot verify them and this document does
@@ -323,48 +398,89 @@ selector is a material name. `hub_fog` reverts to vanilla on "mixed fog configs"
 says the mixed case is not an edge case, it is the game's design for a whole material
 class, and it is identifiable by name rather than by inspecting state.
 
-**Not established:** the per-frame call order between `dKy_bg_MAxx_proc` and
-`setLightTevColorType_MAJI_sub`, i.e. whether the value the translation reads on a given
-frame is the authored one or the one the MAxx pass just wrote. Both write the same field
-on the same materials. That ordering decides whether the sentinel is a static asset
-property or a live per-frame override, and it should be settled before anything is built
-on it.
+**Settled — the sentinel is a live per-frame override, not an asset property.** The call
+order is visible at the room-terrain draw site, two adjacent lines:
+
+```
+d_a_bg.cpp:338   g_env_light.setLightTevColorType_MAJI(bg_model, bgPart->tevstr);  // translates
+d_a_bg.cpp:339   dKy_bg_MAxx_proc(bg_model);                                       // re-stamps
+```
+
+The translation runs **first** and the polygon-code pass runs **second**, so the type the
+translation writes is immediately overwritten. The same order holds at the other call
+sites (e.g. `d_a_obj_groundwater.cpp:265-269`).
+
+Two consequences worth having straight:
+
+- The `7 → 2` rewrite at `d_kankyo.cpp:4467` **never reaches the GPU for these materials**.
+  Its colour side-effect (black) persists, but the type is re-stamped to `7` before the
+  draw, so water is drawn with GX fog type 7 (and `MA09` with 6), not type 2. Any reasoning
+  that starts "type 7 becomes linear fog" is wrong for the terrain water family.
+- Because the codes are re-stamped every frame, the black/white water fog is keyed purely
+  on material name at run time. That is why a view containing water always carries more
+  than one fog configuration — see `docs/deferred_fog.md`.
+
+**Still not established:** whether the same ordering holds for the non-terrain callers of
+`dKy_bg_MAxx_proc` under every actor's own draw sequence. The two checked agree; the
+remaining five were not traced.
 
 ---
 
-## 5. Not checked — this is what the audit is for
+## 5. The questions this document raised, and where each one stands
 
-Stated plainly so nobody reads the above as coverage. **None of these are claims;
-they are the questions the lens raises about our current mods.**
+This section was written as a list of things the naming lens raised but nobody had
+checked. Most have since been checked. Each entry says plainly whether it is **answered**
+or **still open**, so nothing here reads as coverage it does not have.
 
-- **`er_tsr` KColor polarity.** §4.1's unresolved half. Read the generated WGSL for
-  an `MA04` draw and settle whether 255 is the faithful "no cloud shadow" value or
-  merely the one that looks right.
-- **`er_tsr` per-code toggles vs the suffix.** `MA00`/`MA01`/`MA04`/`MA16` is the
-  code granularity; the game authors a descriptive suffix on the same names. Whether
-  the suffix is a better handle is unmeasured. Note the game itself only acts on the
-  suffix in one place (`d_a_bg.cpp:377-390`, gated to one stage), so it is a *weaker*
-  signal in game code even though it is authored everywhere.
-- **`er_psr` mode coverage.** `mMoyaMode` is set per area by `kytag` actors, i.e. the
-  mapping is stage data, not code. Our default (remove mode 5 only) came from
-  `cloud_shadow_move`'s motion table plus in-game observation. Whether the mode↔area
-  mapping is complete is not established from the source tree.
-- **Deferred Fog vs the game's *other* fog.** `hub_fog` defers `GXSetFog`-driven per-
-  draw fog. The environment palette also carries an ambient alpha the authors labelled
-  **`ウソFog`** — "fake fog" (`bg_amb_col[3].a`, `d_kankyo.cpp:5133`), alongside a
-  water-surface alpha (`bg_amb_col[1].a`) and an auxiliary alpha (`bg_amb_col[2].a`).
-  Whether any of that reaches a surface our deferred pass re-fogs is unchecked.
-- **VBAO / SSILVB and the game's four ambient layers.** The game has one actor ambient
-  (`actor_amb_col`) and **four** terrain ambient layers (`bg_amb_col[0..3]`), scaled by
-  `bg_light_influence` (地形ライト影響率) and `mActorLightEffect` (影響率, 0–200). Our
-  AO and GI composite over the finished image, i.e. over a blend of all five. What that
-  means for tuning is unexplored.
-- **Realtime Sun Shadows and light slots 2/3.** §4.2. The game states which slots the
-  sun and moon occupy; our mod derives direction its own way. Whether they agree has
-  not been checked.
-- **Effect-name mining.** `src/d/d_particle_name.cpp` is 3,201 descriptive effect
-  names covering the whole game, frequently romanized opposite to the C code. No
-  session has read them.
+**Answered.**
+
+- **`er_tsr` KColor polarity.** 255 is the engine's own "no cloud shadow" value: the game
+  forces `mFogDensity = -1` (read as `255`) in the wolf's enhanced-senses state, where it
+  flattens the look deliberately. See §4.1. The TEV equation in the `.bmd` is still
+  unread, but it cannot change what 255 *does*.
+- **`er_psr` mode coverage — and this entry's own premise was wrong.** It claimed the
+  mode↔area mapping is stage data and so not derivable from source. It is derivable:
+  every `mMoyaMode` value is assigned in code. Two consequences for the mod's UI, both
+  verified: **mode 4 is set only by `d_a_kytag02` (`:27`, `:121`)**, the scripted
+  wind-gust tag — not by anything ambient — and **Hyrule Field's haze is mode 7**, set by
+  stage name in `d_kankyo_wether.cpp:1111` (`F_SP121`, which the port's own map table
+  names Hyrule Field, `src/dusk/map_loader_definitions.h:68`), alongside `F_SP108` Faron
+  Woods and `F_SP127` the fishing hole. So the mod's advice to leave mode 4 on "so Hyrule
+  Field keeps its drifting shadows" is wrong twice over.
+- **Deferred Fog vs the game's other fog.** `ウソFog` does reach terrain, but **not as
+  fog**: it is written as a TEV constant into `MA13`/`MA14`/`MA16`/`MA20`
+  (`d_kankyo.cpp:11588-11652`). `hub_fog` only intercepts `GXSetFog`/`GFSetFog`, so it can
+  neither suppress nor defer this term — on those materials a fog-coloured tint is baked
+  into the surface before any mod composites over it. `bg_amb_col[1].a` (水面α) and
+  `bg_amb_col[2]` (補佐) are likewise consumed by the water polygon codes in
+  `dKy_bg_MAxx_proc`, not applied globally.
+- **VBAO / SSILVB and the ambient layers — the framing was wrong.** These are not four
+  stacked layers blended over all terrain. `bg_amb_col[0]` is the general BG ambient
+  (`NewAmbColGet`, `d_kankyo.cpp:9969`); `[1]`, `[2]` and `[3]` are special-purpose terms
+  consumed by specific polygon codes, as above. **None of them is an occlusion term**, so
+  our AO is not double-applying one. Interesting, but not currently actionable for tuning.
+- **Realtime Sun Shadows and light slots 2/3.** They agree. Light slot 2's position is
+  `sun_pos` (`d_kankyo.cpp:8574`), and the shadow mod's own derivation mirrors
+  `setSunpos()`. Since Celestial Orbit landed, they agree *by construction*: that mod
+  rewrites `sun_pos`/`moon_pos` and publishes the same orbit as a service, which the
+  shadow mod imports — see `docs/celestial_orbit.md`.
+
+**Still open.**
+
+- **`er_tsr` per-code toggles vs the suffix.** `MA00`/`MA01`/`MA04`/`MA16` is the code
+  granularity; the game authors a descriptive suffix on the same names. Whether the suffix
+  is a better handle is still unmeasured. The game itself acts on a suffix in only one
+  place (`d_a_bg.cpp:378-383`, gated to the fishing-hole stages `F_SP127`/`R_SP127`), so it
+  is a *weaker* signal in game code even though it is authored everywhere.
+- **Effect-name mining.** `src/d/d_particle_name.cpp` carries thousands of descriptive
+  effect names, frequently romanized opposite to the C code. Only spot-read so far — enough
+  to find the `kagerou` (陽炎, heat haze) family including `ZI_S_screenKagerou01`, and to
+  identify `d_a_ep` as the torch stand from its own event strings (`SHOKUDAI`, 燭台), with
+  `ep_hahen_s` = 破片, fragment. A full pass has never been done.
+
+> **This section predates Celestial Orbit**, which was written after it and is built
+> entirely on the game's sun/moon vocabulary. Re-read §5 against all seven current mods
+> rather than assuming it covers them.
 
 ---
 
@@ -384,11 +500,13 @@ after a configure, or point `DUSKLIGHT_DIR` at a checkout.
 
 ## See also
 
-- `dusklight-ao/docs/japanese-naming.md` — the canonical reference and the full
-  glossary
-- `aurora-ao/docs/japanese-naming.md` — what survives into GX, and how to read a
-  baked TEV meaning out of a generated shader (the method §4.1 needs)
-- `docs/fake_shading_systems.md` — the three fake-shading systems Effect Remover
-  targets; §4.1 corrects one sentence of it
+- `docs/fake_shading_systems.md` — the three fake-shading systems Effect Remover targets,
+  plus (§4) four more the same game function sets up that we do not
+- `docs/celestial_orbit.md` — the sun/moon vocabulary in §3, in use
+- **Historical only, in the older fork branches:** `dusklight-ao/docs/japanese-naming.md` and
+  `aurora-ao/docs/japanese-naming.md`. Neither repo is the platform any more. The aurora
+  one describes reading a baked TEV meaning out of a generated shader — still the right
+  method for the one thing §4.1 leaves unread, but aurora is now vendored inside the
+  fetched game tree at `dusklight/extern/aurora`, so go there rather than to the fork.
 - `docs/deferred_fog.md`, `docs/realtime_sun_shadows.md` — the two mods most exposed
   to this vocabulary
