@@ -10,18 +10,23 @@
 //    disocclusion rejection + velocity/content response control ghosting). With accumulation
 //    disabled the spatial denoiser alone remains as the single-frame fallback;
 //  - a depth-aware composite upscale (no AO bleed across silhouettes at half resolution);
-//  - thickness and contrast controls, and a depth-proportional sampling radius.
+//  - thickness and contrast controls, and a depth-proportional sampling radius;
+//  - AUTHORED NORMALS: the shading normal comes from GfxService's per-frame scene normal snapshot
+//    (get_scene_normals), i.e. the vertex normal the artist authored, so the occlusion hemisphere
+//    follows smooth curvature instead of the flat per-triangle facets a depth gradient returns by
+//    construction. No reconstructed SHADING normal remains (the depth-derived geometric plane
+//    that rejects below-surface samples is a different thing and stays). It needs a core-features
+//    device: the D3D11 and OpenGL ES backends cannot carry the attachment, and VBAO disables
+//    itself there with a one-time log line.
 //
 // The framework WGSL in res/ derives from Bevy Engine's SSAO (MIT OR Apache-2.0) and Intel
 // XeGTAO (MIT); see res/licenses/ and the headers of each shader.
 
 #include "mods/service.hpp"
-#include "depth_to_normal_service.h"
 #include "mods/svc/camera.h"
 #include "mods/svc/config.h"
 #include "mods/svc/gfx.h"
 
-#include "gfx_normal_compat.h"
 #include "gfx_scene_pass.h"
 #include "mods/svc/log.h"
 #include "mods/svc/resource.h"
@@ -45,10 +50,6 @@ IMPORT_SERVICE(ResourceService, svc_resource);
 IMPORT_SERVICE(UiService, svc_ui);
 IMPORT_SERVICE(GfxService, svc_gfx);
 IMPORT_SERVICE(CameraService, svc_camera);
-// Optional: when the Depth to Normal provider is present, VBAO sources its receiver normal from
-// it (full-res, shared with other mods) instead of reconstructing its own. Optional so VBAO still
-// loads and runs standalone, falling back to its own reconstruction.
-IMPORT_OPTIONAL_SERVICE(DepthToNormalService, svc_n2d);
 
 namespace {
 
@@ -148,7 +149,7 @@ bool g_historyValid = false;   // the read history holds a valid previous accumu
 bool g_prevCameraValid = false;
 float g_prevProjFromWorld[16] = {};
 
-bool g_warnedNoDepth = false;
+bool g_warnedNoInputs = false;
 bool g_loggedChain = false;
 float g_loggedFarPlane = 1.0f;  // last far plane reported to the log (world-unit calibration)
 std::atomic g_chainExecuted{false};
@@ -158,7 +159,6 @@ struct AoUniforms {
     float projection[16];
     float inverse_projection[16];
     float reproject[16];
-    float view_from_world[16];  // rotates the Depth to Normal provider's world normal into view
     float size[2];
     float inv_size[2];
     float depth_scale[2];
@@ -204,11 +204,11 @@ struct ComputePayload {
     WGPUTextureView aoFinal;
     WGPUTextureView historyIn;
     WGPUTextureView historyOut;
-    WGPUTextureView d2nNormal;  // Depth to Normal provider output (or a stand-in when absent)
+    WGPUTextureView sceneNormal;  // GfxService scene normal snapshot (view space)
     uint32_t uniform_offset;
     uint32_t uniform_size;
     // Resolutions are packed (hi 16 = width, lo 16 = height) to keep the payload within the
-    // 128-byte inline cap after adding d2nNormal. Render resolutions are well under 65535.
+    // 128-byte inline cap after adding sceneNormal. Render resolutions are well under 65535.
     uint32_t chainSize;      // AO chain (half) resolution, packed
     uint32_t fullSize;       // full render resolution, packed
     uint32_t run_temporal;
@@ -219,10 +219,9 @@ static_assert(std::is_trivially_copyable_v<ComputePayload>);
 
 struct CompositePayload {
     WGPUTextureView aoSource;           // accumulated (temporal) or denoised (fallback) AO
-    WGPUTextureView preprocessedDepth;  // debug views reconstruct normals/depth from it
+    WGPUTextureView preprocessedDepth;  // the Depth debug view reads it back
     WGPUTextureView sceneDepth;         // raw snapshot: depth-aware upscale + bypass debug views
-    WGPUTextureView d2nNormal;          // provider normal for the Normals debug view (or a
-                                        // stand-in when absent, as in ComputePayload)
+    WGPUTextureView sceneNormal;        // scene normal snapshot, for the Normals debug view
     uint32_t uniform_offset;
     uint32_t uniform_size;
     uint32_t debug_view;
@@ -346,12 +345,13 @@ bool build_composite_pipeline(
                 .dstFactor = WGPUBlendFactor_One,
             },
     };
-    // The pipeline has to describe the scene pass's attachments, whatever they currently are: with
-    // the host's scene normal buffer on, the pass carries a second, renderer-owned colour target,
-    // and a one-target pipeline is rejected outright. Asking the service beats rebuilding the
-    // layout from GfxDeviceInfo, which is a copy of the renderer's logic that goes silently wrong
-    // whenever the pass gains an attachment. The extra target comes back write-masked off, so this
-    // composite leaves the game's authored normals untouched.
+    // The pipeline has to describe the scene pass's attachments, whatever they currently are. On a
+    // device that carries the scene normals the pass has a SECOND, renderer-owned colour target,
+    // and a one-target pipeline is rejected outright; on the compatibility renderers it has one.
+    // Asking the service beats rebuilding the layout from GfxDeviceInfo, which is a copy of the
+    // renderer's logic that goes silently wrong whenever the pass changes shape. Every target the
+    // mod does not own comes back write-masked off, so this composite writes scene colour only and
+    // leaves the game's normals untouched.
     gfx_compat::ScenePassLayout layout;
     if (!gfx_compat::scene_pass_layout(mod_ctx, svc_gfx, g_deviceInfo, layout)) {
         wgpuShaderModuleRelease(module);
@@ -609,7 +609,7 @@ void on_compute(
         g_vbaoLayout, {textureEntry(0, data.preprocessedDepthAll),
                           textureEntry(1, g_hilbertLutView), textureEntry(2, data.aoNoisy),
                           textureEntry(3, data.depthDifferences), uniformEntry(4),
-                          textureEntry(5, data.d2nNormal)});
+                          textureEntry(5, data.sceneNormal)});
     // Denoise ping-pongs aoNoisy <-> aoFinal; the last-written buffer feeds temporal/composite
     // (the game thread computes the same parity for the composite payload).
     const uint32_t denoisePasses = std::min(data.denoise_passes, 3u);
@@ -704,7 +704,7 @@ void on_draw(
         data.debug_view != 0 ? g_compositeDebugPipeline : g_compositePipeline;
     WGPUBindGroupLayout layout = data.debug_view != 0 ? g_compositeDebugLayout : g_compositeLayout;
     if (data.aoSource == nullptr || data.preprocessedDepth == nullptr ||
-        data.sceneDepth == nullptr || data.d2nNormal == nullptr || pipeline == nullptr)
+        data.sceneDepth == nullptr || data.sceneNormal == nullptr || pipeline == nullptr)
     {
         return;
     }
@@ -722,7 +722,7 @@ void on_draw(
     entries[3].offset = data.uniform_offset;
     entries[3].size = data.uniform_size;
     entries[4].binding = 4;
-    entries[4].textureView = data.d2nNormal;
+    entries[4].textureView = data.sceneNormal;
     WGPUBindGroupDescriptor bindGroupDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bindGroupDesc.layout = layout;
     bindGroupDesc.entryCount = 5;
@@ -761,13 +761,28 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     resolveDesc.color = false;
     resolveDesc.depth = true;
     GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
+    // The scene normals are snapshotted by the HOST, once per frame, immediately after the opaque
+    // lists and before any SCENE_AFTER_OPAQUE hook runs - so by the time this stage callback is
+    // invoked the view is already there, and every mod that asks gets the same texture. Valid for
+    // this frame only. `view` is null on the compatibility renderers (D3D11 / OpenGL ES), which
+    // cannot carry the attachment at all.
+    GfxSceneNormals sceneNormals = GFX_SCENE_NORMALS_INIT;
+    svc_gfx->get_scene_normals(mod_ctx, &sceneNormals);
     if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) != MOD_OK ||
-        resolved.depth == nullptr)
+        resolved.depth == nullptr || sceneNormals.view == nullptr)
     {
-        if (!g_warnedNoDepth) {
-            g_warnedNoDepth = true;
-            svc_log->warn(mod_ctx, "depth snapshots unavailable; AO disabled");
+        if (!g_warnedNoInputs) {
+            g_warnedNoInputs = true;
+            svc_log->warn(mod_ctx,
+                "scene depth or normals unavailable; AO disabled (the D3D11 and OpenGL ES "
+                "compatibility renderers cannot provide scene normals)");
         }
+        // Invalidate the temporal state exactly as the disabled path does. On a device without
+        // scene normals this branch is taken EVERY frame, so leaving a stale history and camera
+        // around would hand the first frame after any recovery a reprojection from whenever the
+        // mod last ran.
+        g_historyValid = false;
+        g_prevCameraValid = false;
         return;
     }
 
@@ -796,9 +811,6 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     } else {
         std::memcpy(uniforms.reproject, camera.proj_from_view, sizeof(uniforms.reproject));
     }
-    // For rotating the Depth to Normal provider's world-space normal into view space.
-    std::memcpy(
-        uniforms.view_from_world, camera.view_from_world, sizeof(uniforms.view_from_world));
     uniforms.size[0] = static_cast<float>(width);
     uniforms.size[1] = static_cast<float>(height);
     uniforms.inv_size[0] = 1.0f / uniforms.size[0];
@@ -875,14 +887,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     // The noise advances per frame only while accumulating; pinned otherwise (the spatial
     // denoiser alone then sees a stable pattern, matching the single-frame fallback).
     uniforms.frame_index = temporal ? g_frameIndex : 0u;
-    // Prefer the Depth to Normal provider's full-res world normal when available (queues its
-    // reconstruction into the command stream ahead of our AO pass). Falls back to VBAO's own
-    // reconstruction (flags bit 3 clear) when the provider is absent or has no scene this frame.
-    DepthToNormalFrame n2dFrame = DEPTH_TO_NORMAL_FRAME_INIT;
-    const bool haveExternalNormal = svc_n2d != nullptr &&
-        svc_n2d->get_frame(mod_ctx, &n2dFrame) == MOD_OK && n2dFrame.normal != nullptr;
-    uniforms.flags = (temporal ? 1u : 0u) | (g_historyValid ? 2u : 0u) |
-        (distanceFade ? 4u : 0u) | (haveExternalNormal ? 8u : 0u);
+    uniforms.flags =
+        (temporal ? 1u : 0u) | (g_historyValid ? 2u : 0u) | (distanceFade ? 4u : 0u);
 
     GfxRange uniformRange{0, 0};
     if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &uniformRange) != MOD_OK) {
@@ -911,9 +917,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     computePayload.fullSize = (resolved.width << 16) | resolved.height;
     computePayload.run_temporal = temporal ? 1u : 0u;
     computePayload.denoise_passes = denoisePasses;
-    // The AO pass samples binding 5 only when flags bit 3 is set; stand in with the depth
-    // snapshot (a texture_2d<f32>) otherwise so the bind group is always complete.
-    computePayload.d2nNormal = haveExternalNormal ? n2dFrame.normal : computePayload.depth;
+    computePayload.sceneNormal = sceneNormals.view;
     if (svc_gfx->push_compute(mod_ctx, g_computeType, &computePayload, sizeof(computePayload)) !=
         MOD_OK)
     {
@@ -926,7 +930,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         : ((denoisePasses % 2u) != 0u ? g_targets.aoFinalView : g_targets.aoNoisyView);
     const CompositePayload drawPayload{
         temporal ? g_targets.historyViews[writeIdx] : denoisedView, g_targets.preprocessedDepthAll,
-        resolved.depth, computePayload.d2nNormal, uniformRange.offset, uniformRange.size,
+        resolved.depth, computePayload.sceneNormal, uniformRange.offset, uniformRange.size,
         debugMode};
     if (debugMode != 0) {
         // Debug views draw at FRAME_BEFORE_HUD so deferred fog, translucency, and bloom
@@ -1126,9 +1130,9 @@ ModResult build_controls_tab(
     static const char* kDebugOptions[] = {"Off", "AO", "Normals", "Depth", "Staircase"};
     add_select(left, "Debug View", g_cvarDebugView,
         "AO: the final shaped occlusion term as grayscale (accumulated when temporal is "
-        "on).<br/>Normals: the view-space normals the occlusion pass consumes - the Depth to "
-        "Normal provider's (authored, when Graphics Hub has them) or the inline depth "
-        "reconstruction, whichever the AO actually used this frame.<br/>Depth: the preprocessed depth as a distance "
+        "on).<br/>Normals: the view-space scene normals the occlusion pass consumes, black "
+        "where the scene has none (sky, billboards) - exactly the pixels the AO leaves "
+        "fully lit.<br/>Depth: the preprocessed depth as a distance "
         "gradient.<br/>Staircase: detects quantized depth - smooth depth is "
         "near-black with thin triangle edges, quantized depth lights up across "
         "surfaces.<br/>Debug views draw over the finished frame (after fog and bloom), so "

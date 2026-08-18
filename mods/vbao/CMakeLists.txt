@@ -1,5 +1,8 @@
 # VBAO — Visibility Bitmask Ambient Occlusion. Service-only (gfx/camera/config/ui/resource/log),
 # no game headers or hooks. The mod SDK is configured once by the top-level CMakeLists.
+#
+# It reads the game's authored surface normals straight from GfxService (get_scene_normals), so it
+# has no service imports beyond the stock ones and no dependency on any other mod.
 add_mod(vbao
     FEATURES webgpu
     SOURCES  src/mod.cpp
@@ -7,8 +10,4 @@ add_mod(vbao
     RES_DIR  res
 )
 
-# Optional integration with the depth-to-normal service (shared header), now exported by
-# Graphics Hub.
-target_include_directories(vbao PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../graphics_hub/include
-    ${CMAKE_SOURCE_DIR}/common)
+target_include_directories(vbao PRIVATE ${CMAKE_SOURCE_DIR}/common)

@@ -9,10 +9,8 @@
 //
 // Debug views:
 //   1 = AO visibility as grayscale (the exact term the composite would apply)
-//   2 = the view-space normals the AO pass consumes: the Depth to Normal provider's normal
-//       (authored where the game supplies one) when flags bit 3 is set, else the inline
-//       depth reconstruction - the same choice vbao.wgsl makes, so the view never claims
-//       a normal source the AO isn't actually using
+//   2 = the view-space scene normals the AO pass consumes, black where the scene has none
+//       (sky, billboards) - exactly the pixels vbao.wgsl leaves fully visible
 //   3 = the preprocessed depth input
 //   4 = depth staircase detector
 
@@ -20,7 +18,6 @@ struct Uniforms {
     projection: mat4x4f,
     inverse_projection: mat4x4f,
     reproject: mat4x4f,
-    view_from_world: mat4x4f,  // rotates the provider's world normal into view (debug view 2)
     size: vec2f,        // AO chain size in pixels (may be half the render size)
     inv_size: vec2f,
     depth_scale: vec2f, // input depth snapshot pixels per chain pixel (1 or 2)
@@ -60,10 +57,9 @@ struct Uniforms {
 @group(0) @binding(1) var preprocessed_depth: texture_2d<f32>;
 @group(0) @binding(2) var scene_depth_raw: texture_2d<f32>;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
-// The provider's world-space normal, for debug view 2. Read only when flags bit 3 is set; the
-// depth snapshot stands in (also a texture_2d<f32>) otherwise so the bind group is always
-// complete.
-@group(0) @binding(4) var d2n_normal: texture_2d<f32>;
+// GfxService's scene normal snapshot, for debug view 2. Full render resolution, view space,
+// encoded xyz * 0.5 + 0.5 with alpha 1 where the normal is usable.
+@group(0) @binding(4) var scene_normal: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -135,63 +131,24 @@ fn view_position_at(pixel_coordinates: vec2<i32>) -> vec3f {
     return reconstruct_view_space_position(depth, uv);
 }
 
-fn reconstruct_normal(pixel_coordinates: vec2<i32>, pixel_position: vec3f, depth_center: f32) -> vec3f {
-    let depth_left1 = load_depth(pixel_coordinates + vec2<i32>(-1i, 0i));
-    let depth_left2 = load_depth(pixel_coordinates + vec2<i32>(-2i, 0i));
-    let depth_right1 = load_depth(pixel_coordinates + vec2<i32>(1i, 0i));
-    let depth_right2 = load_depth(pixel_coordinates + vec2<i32>(2i, 0i));
-    let depth_top1 = load_depth(pixel_coordinates + vec2<i32>(0i, -1i));
-    let depth_top2 = load_depth(pixel_coordinates + vec2<i32>(0i, -2i));
-    let depth_bottom1 = load_depth(pixel_coordinates + vec2<i32>(0i, 1i));
-    let depth_bottom2 = load_depth(pixel_coordinates + vec2<i32>(0i, 2i));
-
-    let use_left = abs(2.0 * depth_left1 - depth_left2 - depth_center) <
-        abs(2.0 * depth_right1 - depth_right2 - depth_center);
-    let use_top = abs(2.0 * depth_top1 - depth_top2 - depth_center) <
-        abs(2.0 * depth_bottom1 - depth_bottom2 - depth_center);
-
-    var ddx: vec3f;
-    if use_left {
-        ddx = pixel_position - view_position_at(pixel_coordinates + vec2<i32>(-1i, 0i));
-    } else {
-        ddx = view_position_at(pixel_coordinates + vec2<i32>(1i, 0i)) - pixel_position;
-    }
-    var ddy: vec3f;
-    if use_top {
-        ddy = pixel_position - view_position_at(pixel_coordinates + vec2<i32>(0i, -1i));
-    } else {
-        ddy = view_position_at(pixel_coordinates + vec2<i32>(0i, 1i)) - pixel_position;
-    }
-
-    var normal = normalize(cross(ddy, ddx));
-    if dot(normal, pixel_position) > 0.0 {
-        normal = -normal;
-    }
-    return normal;
-}
-
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     if uniforms.debug_view == 2u {
-        // The view-space normal the AO pass consumes, [-1,1] -> RGB.
-        let pixel = vec2<i32>(in.uv * uniforms.size);
-        let depth = load_depth(pixel);
-        if (uniforms.flags & 8u) != 0u {
-            // Provider normal: sample at this pixel's full-res position (the provider buffer is
-            // full resolution even when the AO chain is half), then rotate world -> view.
-            let n_dims = vec2f(textureDimensions(d2n_normal));
-            let n_texel =
-                clamp(vec2<i32>(in.uv * n_dims), vec2<i32>(0i), vec2<i32>(n_dims) - vec2<i32>(1i));
-            let world_n = textureLoad(d2n_normal, n_texel, 0i).xyz;
-            let r = uniforms.view_from_world;
-            let normal = normalize(
-                r[0].xyz * world_n.x + r[1].xyz * world_n.y + r[2].xyz * world_n.z);
-            return vec4f(normal * 0.5 + 0.5, 1.0);
+        // The view-space scene normal the AO pass consumes, [-1,1] -> RGB. Sampled at this
+        // pixel's full-res position: the snapshot is full resolution even when the AO chain is
+        // half. NOTE this is 1:1 with the screen pixel, whereas vbao.wgsl samples through
+        // chain_uv(), which under halfRes + temporal is the JITTERED full-res texel (one per 2x2
+        // block per frame). The difference is deliberate - do not "align" them, or half-res loses
+        // the temporal upsampling of normal detail.
+        let n_dims = vec2f(textureDimensions(scene_normal));
+        let n_texel =
+            clamp(vec2<i32>(in.uv * n_dims), vec2<i32>(0i), vec2<i32>(n_dims) - vec2<i32>(1i));
+        let scene_n = textureLoad(scene_normal, n_texel, 0i);
+        if scene_n.w < 0.5 {
+            // No authored normal here - the AO pass takes full visibility on these pixels.
+            return vec4f(0.0, 0.0, 0.0, 1.0);
         }
-        let uv = (vec2f(pixel) + 0.5) * uniforms.inv_size;
-        let position = reconstruct_view_space_position(depth, uv);
-        let normal = reconstruct_normal(pixel, position, depth);
-        return vec4f(normal * 0.5 + 0.5, 1.0);
+        return vec4f(normalize(scene_n.xyz * 2.0 - 1.0) * 0.5 + 0.5, 1.0);
     }
     if uniforms.debug_view == 3u {
         // Preprocessed depth as an exponential distance gradient (white = near, black = far).

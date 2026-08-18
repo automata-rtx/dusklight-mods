@@ -3,23 +3,55 @@
 Mod id `dev.automata.vbao` (directory `mods/vbao/`). Service-only (no game code): stages + snapshots from the
 gfx service, matrices from the camera service.
 
-**Optionally uses the Depth to Normal mod** (`dev.automata.depth_to_normal`) as of 1.5.0. When
-that provider is present, VBAO sources its receiver normal from it (full-res, shared with shadows
-and any other consumer) and rotates it into view space, instead of reconstructing its own — so the
-normal reconstruction runs once for the whole suite rather than per mod. This is an *optional*
-import: without the provider, VBAO falls back to its own atyuwen 5-tap reconstruction exactly as
-before. The half-res AO toggle is independent of the normal source; when the provider is present,
-half-res AO samples the full-res normal at each chain pixel's jittered position, so temporal
-accumulation reconstructs full-res normal detail even in half-res mode (a quality win at no change
-to the AO sampling cost). See `docs/depth_to_normal_plan.md` for the per-frame cost tradeoff.
+**Normals come from the gfx service** (`get_scene_normals`, GfxService 1.3) as of 1.6.0. The game's
+renderer writes the artist-authored vertex normal into a second colour attachment on the scene pass,
+and the HOST snapshots it once per frame — immediately after the opaque lists, before any
+`SCENE_AFTER_OPAQUE` hook — then hands the same texture to every mod that asks. VBAO just asks.
+
+That means **no dependency on any other mod**: VBAO imports only the stock services (gfx, camera,
+config, ui, resource, log). It also means **no reconstructed *shading* normal** — no fallback path
+to maintain, and none of the faceting a depth-gradient normal has by construction.
+
+> **`geometric_normal_view()` in `vbao.wgsl` is still a depth-derived normal, and it stays.** It is
+> not leftover reconstruction. It is the plane used to reject occlusion samples that lie *below* the
+> surface, which is a property of the geometry rather than of the artist's smoothed vertex normal —
+> and it is now permanently load-bearing, because the shading normal is always the authored one.
+> Deleting it does not simplify the port; passing it a zero vector switches AO off entirely. See
+> `docs/authored_normals.md` §8.11 and §8.11a. The snapshot is
+full render resolution and already in view space, so half-res AO samples it at each chain pixel's
+jittered full-res position and temporal accumulation integrates full-res normal detail even in
+half-res mode, at no change to the AO sampling cost.
+
+Two consequences worth knowing:
+
+- **Pixels with no authored normal take full visibility.** Alpha 0 means there is no usable normal
+  here, so there is no hemisphere to build and VBAO leaves the pixel alone. The *attachment's*
+  coverage is exactly the depth buffer's — a draw writes a normal iff it writes depth — but **alpha
+  1 is not implied by depth coverage**: a draw whose NRM vertex attribute is simply absent writes
+  depth and stores alpha 0, as does a vertex normal that interpolation cancelled to zero. So this is
+  not only sky and billboards. Those pixels also have their denoiser edge weights zeroed, which
+  keeps their full-visibility value from bleeding into neighbours as a bright rim — sky never needed
+  that because sky is depth-discontinuous and the depth gate already rejected it, but an alpha-0
+  *surface* is depth-continuous with everything around it. Debug view 2 doubles as the coverage
+  map: it paints those pixels black.
+- **The compatibility renderers cannot provide it.** On the D3D11 and OpenGL ES backends the
+  snapshot is unavailable and VBAO disables itself with a one-time log line saying so. It needs a
+  core-features device (D3D12 / Vulkan / Metal).
+
+The stored direction carries the sign the game gave it and is **never** flipped toward the camera —
+see `docs/authored_normals.md` §2a for the three separate places that guard had to be deleted from.
 
 ## Pipeline (per frame, at `GFX_STAGE_SCENE_AFTER_OPAQUE`)
 
-1. `resolve_pass` snapshots scene color + depth (R32Float, reversed-Z, single-sample).
+1. `get_scene_normals` returns the host's per-frame normal snapshot (taken before this stage), and
+   `resolve_pass` snapshots depth (R32Float, reversed-Z, single-sample). Colour is **not** resolved —
+   the composite blends over the live target. Without either input VBAO disables itself for the
+   frame.
 2. **`preprocess_depth.wgsl`** — builds a 5-level MIP depth chain (XeGTAO-style weighted
    downsample) so distant AO samples read small MIPs instead of thrashing bandwidth.
-3. **`vbao.wgsl`** — the occlusion estimator. Per pixel: reconstruct view position, pick the
-   better-conditioned side per axis for the normal (atyuwen 5-tap), then walk `slice_count`
+3. **`vbao.wgsl`** — the occlusion estimator. Per pixel: unproject the view position, read the
+   scene normal from the service snapshot (skipping to full visibility where it has none), derive a
+   separate 4-tap geometric plane from depth for sample rejection, then walk `slice_count`
    hemisphere slices × `steps_per_side` marching steps, carving a 32-bit sector bitmask
    per slice (Therrien et al. 2022 visibility bitmask). Occlusion = carved fraction weighted
    by a cosine lobe. Sampling noise: Hilbert LUT + R2 sequence, advanced per frame when

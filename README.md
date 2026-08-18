@@ -22,6 +22,11 @@ this).
 Each `.dusk` is a **single cross-platform bundle** (Windows x64/arm64, macOS arm64/x64,
 Linux x64/arm64, Android arm64) produced by CI.
 
+> **Only VBAO is built right now.** The graphics service changed how mods get surface normals
+> (GfxService 1.3 `get_scene_normals`), and VBAO is the first mod ported to it, so a test drop
+> contains exactly one `.dusk` rather than a mix of mods at different stages. The others are still
+> in the tree and come back a mod at a time; see the note in `CMakeLists.txt`.
+
 ## Installing
 
 1. Install the matching game build: the `win32-msvc-x86_64` archive from the
@@ -34,10 +39,10 @@ Linux x64/arm64, Android arm64) produced by CI.
    - Linux: `~/.local/share/TwilitRealm/Dusklight/mods`
    - macOS: `~/Library/Application Support/TwilitRealm/Dusklight/mods`
 4. In game: Mods menu → enable them. Settings live in each mod's detail pane.
-5. Optional, for smooth (authored) surface normals: turn on **Video → Rendering → Scene
-   Normal Buffer** and restart. It ships off, and is unavailable in compatibility mode
-   (D3D11 / OpenGL ES). Without it every mod reconstructs normals from depth — correct,
-   just faceted.
+5. Nothing to enable for surface normals: the platform always carries them and the graphics
+   service hands them to any mod that asks. They are unavailable only on the **compatibility
+   renderers** (D3D11 / OpenGL ES), where VBAO disables itself and says so in the log — it
+   needs a D3D12 / Vulkan / Metal device.
 
 The game-linked mods resolve their hook targets by symbol at load, so a `.dusk` and the game build
 it was compiled against are a matched pair. These are built against `automata-rtx/dusklight-ao` at
