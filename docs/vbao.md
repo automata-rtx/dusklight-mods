@@ -55,7 +55,11 @@ see `docs/authored_normals.md` §2a for the three separate places that guard had
    hemisphere slices × `steps_per_side` marching steps, carving a 32-bit sector bitmask
    per slice (Therrien et al. 2022 visibility bitmask). Occlusion = carved fraction weighted
    by a cosine lobe. Sampling noise: Hilbert LUT + R2 sequence, advanced per frame when
-   temporal accumulation is on (so successive frames measure different directions).
+   temporal accumulation is on (so successive frames measure different directions), and the
+   radial position of each march step is jittered **per (slice, step)** along a golden-ratio
+   sequence, as XeGTAO and the demo do — one shared per-pixel offset left every slice sampling
+   the same radii, so their errors were correlated and read as concentric structure instead of
+   as noise the denoiser and accumulator can average away.
    Thickness handling: front/back horizons with a log-scaled thickness and depth-difference
    fade (`t_eff = t_base * clamp(1 - |dz|/depth_range)`) — this is what keeps grass/foliage
    from over-darkening.
@@ -75,6 +79,15 @@ see `docs/authored_normals.md` §2a for the three separate places that guard had
 
 The occlusion estimate runs at snapshot resolution, or half of it with **Half Res** on; the
 temporal history and composite are always full render resolution.
+
+The composite draw callback refuses any pass whose attachment layout is not the one its pipelines
+were built against (`gfx_compat::draw_layout_matches`, `common/gfx_scene_pass.h`). The pipelines
+are created once at init; if the renderer ever rebuilds the scene targets in a different *shape*,
+recording a stale pipeline is a WebGPU validation error rather than a missing effect. The key
+aurora hashes covers the attachment count, semantics, formats, depth format and sample count — not
+width or height — so a resolution change cannot trip the guard and silently kill the composite.
+If it ever does fire, the mod says so once in the log from `mod_update` (the draw callback runs on
+the render worker, where `svc_log` is not usable, so it sets an atomic the game thread reports).
 
 ### Half-res temporal upsampling
 
@@ -115,6 +128,7 @@ Ints are fixed-point (usually /100) unless noted.
 | `thickness` | 150 | occluder thickness ×0.01 (log-scaled internally) |
 | `thickFade` | 150 | thickness fade range, ×0.01 of view radius |
 | `thickDist` | 60 | distance thickness: radius-proportional thickness floor, ‰ of the view radius. The log-scaled base thickness becomes a vanishing fraction of the (depth-proportional) radius with distance and starves mid/far occlusion; this restores it. 0 = old behavior |
+| `radiusFalloff` | 0 (off) | fades an occluder out over the outer share of the search radius, by tapering its thickness to nothing — the bitmask analogue of GTAO's horizon falloff, which the demo runs at a fixed 0.615. Off by default because it also weakens mid/far occlusion, which `thickDist` exists to restore; 62 reproduces the demo's constant. Its purpose is popping: without it an occluder leaving the radius *sideways*, at constant depth, cuts out abruptly — `thickFade` only fades along the depth axis and cannot see that case |
 | `depthBias` | 4 | self-occlusion bias, ‰ toward camera |
 | `temporal` | on | temporal accumulation master |
 | `temporalFrames` | 5 | accumulation length → alpha = 1/frames |
@@ -134,6 +148,36 @@ Ints are fixed-point (usually /100) unless noted.
 Debug views draw at `FRAME_BEFORE_HUD` (the normal composite stays at `SCENE_AFTER_OPAQUE`)
 so deferred fog, translucency, and bloom never paint over them — judging AO strength through
 a fogged debug view reads as much weaker than the effect actually is.
+
+## Where the composite lands, and why Deferred Fog still exists
+
+**The AO composite is pushed from the `GFX_STAGE_SCENE_AFTER_OPAQUE` stage callback, the same
+stage the `ao_mod` demo uses, and has been since the mod was written.** The only draw VBAO defers
+to `FRAME_BEFORE_HUD` is the *debug view*, for the reason above. Registering a `FRAME_BEFORE_HUD`
+hook is not the same as compositing there — `on_frame_before_hud` pushes nothing unless
+`debugMode` is non-zero.
+
+**That stage does not get you a fog-free scene, and no stage does.** TP fogs *per fragment while
+drawing*: J3D materials bake the fog BP state into their display lists and direct drawers call
+`GXSetFog`, so by the time the opaque lists are finished — which is exactly what
+`SCENE_AFTER_OPAQUE` means (`m_Do_graphic.cpp`, right after `dComIfGd_drawOpaListPacket`) — the
+fog is already *in* the colour of every opaque pixel. Multiplying AO over it therefore darkens the
+fog itself rather than the surface under it. `ao_mod` has precisely the same behaviour; it simply
+never addressed it.
+
+So the choice is not "which stage", it is what to do about forward fog:
+
+- **Graphics Hub → Deferred Fog** removes the cause: it suppresses the game's per-draw fog across
+  the opaque lists and re-applies it, bit-exact, after every mod's `SCENE_AFTER_OPAQUE` composite.
+  This is the only option that makes AO darken the surface and *then* fog the result, which is the
+  correct order.
+- **`distanceFade`** (off by default) is the service-only approximation: it drives the AO term back
+  to 1 over a world-unit band, so heavily fogged distance keeps no AO to darken. It does not need
+  a game-linked mod, and it does not fix mid-range fog — it only stops the far field from reading
+  as harsh shading floating on haze.
+
+Both are in the mod already. There is no third option available to a service-only mod, because
+nothing in the gfx service can hand back the pre-fog colour.
 
 ## Defaults rationale + performance notes
 

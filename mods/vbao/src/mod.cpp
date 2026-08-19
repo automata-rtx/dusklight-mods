@@ -19,6 +19,13 @@
 //    device: the D3D11 and OpenGL ES backends cannot carry the attachment, and VBAO disables
 //    itself there with a one-time log line.
 //
+// WHERE THIS COMPOSITES: the AO draw is pushed from the GFX_STAGE_SCENE_AFTER_OPAQUE stage
+// callback, exactly like the demo. The FRAME_BEFORE_HUD hook below carries the DEBUG VIEW only,
+// so it is not painted over by translucency/bloom. Note that neither stage sees an unfogged
+// scene - TP fogs per fragment during the opaque draws themselves, so the fog is already in the
+// colour whatever stage a mod composites at; Graphics Hub's Deferred Fog is what changes that,
+// and `distanceFade` is the service-only approximation. See docs/vbao.md.
+//
 // The framework WGSL in res/ derives from Bevy Engine's SSAO (MIT OR Apache-2.0) and Intel
 // XeGTAO (MIT); see res/licenses/ and the headers of each shader.
 
@@ -68,6 +75,7 @@ ConfigVarHandle g_cvarBlackPoint = 0;
 ConfigVarHandle g_cvarThickness = 0;
 ConfigVarHandle g_cvarThickFade = 0;
 ConfigVarHandle g_cvarThickDist = 0;
+ConfigVarHandle g_cvarRadiusFalloff = 0;
 ConfigVarHandle g_cvarDebugDepthRange = 0;
 ConfigVarHandle g_cvarDepthBias = 0;
 ConfigVarHandle g_cvarTemporal = 0;
@@ -97,6 +105,9 @@ ResourceBuffer g_temporalSource = RESOURCE_BUFFER_INIT;
 ResourceBuffer g_compositeSource = RESOURCE_BUFFER_INIT;
 
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
+// The scene pass's attachment layout, captured once at init: every composite pipeline below is
+// built against it, and on_draw refuses a pass that no longer matches it.
+gfx_compat::ScenePassLayout g_scenePassLayout;
 WGPUComputePipeline g_preprocessPipeline = nullptr;
 WGPUComputePipeline g_mip4Pipeline = nullptr;
 WGPUComputePipeline g_vbaoPipeline = nullptr;
@@ -151,6 +162,11 @@ float g_prevProjFromWorld[16] = {};
 
 bool g_warnedNoInputs = false;
 bool g_loggedChain = false;
+// Set by the render worker when a draw is refused for a layout mismatch; reported once from
+// mod_update on the game thread (svc_log is not for the worker thread). A silent skip is exactly
+// the failure mode this repo has been bitten by before, so it says so.
+std::atomic g_layoutMismatch{false};
+bool g_loggedLayoutMismatch = false;
 float g_loggedFarPlane = 1.0f;  // last far plane reported to the log (world-unit calibration)
 std::atomic g_chainExecuted{false};
 
@@ -189,7 +205,7 @@ struct AoUniforms {
     float radius_ramp_start; // radius ramp band start, world units of view depth
     float radius_ramp_end;   // radius ramp band end, world units of view depth
     float denoise_strength;  // spatial denoise blend, 0 raw .. 1 fully blurred
-    float _pad0;
+    float radius_falloff;    // occluder thickness taper over the outer fraction of the radius; 0 = off
     float _pad1;
     float _pad2;
 };
@@ -352,8 +368,8 @@ bool build_composite_pipeline(
     // renderer's logic that goes silently wrong whenever the pass changes shape. Every target the
     // mod does not own comes back write-masked off, so this composite writes scene colour only and
     // leaves the game's normals untouched.
-    gfx_compat::ScenePassLayout layout;
-    if (!gfx_compat::scene_pass_layout(mod_ctx, svc_gfx, g_deviceInfo, layout)) {
+    gfx_compat::ScenePassLayout layout = g_scenePassLayout;
+    if (layout.color_target_count == 0) {
         wgpuShaderModuleRelease(module);
         return false;
     }
@@ -695,7 +711,16 @@ void on_compute(
 // Render worker thread: composite the AO over the scene (or show it, in debug view).
 void on_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
+    // Refuse a pass whose attachment layout is not the one the composite pipelines were built
+    // against. The pipelines are created once, at init; if the renderer rebuilds the scene targets
+    // in a different SHAPE afterwards, recording them is a WebGPU validation error rather than a
+    // missing effect. The demo mod guards the same way. It costs one comparison and cannot misfire
+    // on a resolution change - the key hashes formats and sample count, never the size.
     if (payloadSize != sizeof(CompositePayload)) {
+        return;
+    }
+    if (!gfx_compat::draw_layout_matches(ctx, g_scenePassLayout)) {
+        g_layoutMismatch.store(true, std::memory_order_release);
         return;
     }
     CompositePayload data;
@@ -843,6 +868,9 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.black_point = percent(g_cvarBlackPoint, 3, 0, 30);
     uniforms.radius_max = percent(g_cvarRadiusMax, 40, 10, 100);
     uniforms.thick_fade = percent(g_cvarThickFade, 150, 50, 400);
+    // Radial falloff span, as a fraction of the search radius (0 = off, the shipped default, which
+    // is bit-for-bit the previous behavior). GTAO's own constant is 0.615.
+    uniforms.radius_falloff = percent(g_cvarRadiusFalloff, 0, 0, 100);
     // Radius-proportional occluder thickness floor: restores mid/far occlusion that the
     // log-scaled base thickness starves (the value is per-mille of the view radius).
     uniforms.thick_dist_scale =
@@ -1066,6 +1094,13 @@ ModResult build_controls_tab(
         "this to keep distant geometry darkening at full strength. 0 restores the old "
         "behavior.",
         0, 100, 5, nullptr);
+    add_number(left, "Radius Falloff", g_cvarRadiusFalloff,
+        "Fades an occluder out over the outer part of the search radius, as a share of that "
+        "radius, so geometry crossing the radius boundary fades instead of popping as the camera "
+        "moves. 0 (default) keeps the hard cutoff; 62% matches the GTAO demo's constant. It also "
+        "weakens mid/far occlusion, which Distance Thickness exists to restore - raise the two "
+        "together if you want both.",
+        0, 100, 5, "%");
     add_number(left, "Depth Bias", g_cvarDepthBias,
         "Small bias toward the camera that suppresses a surface shadowing itself (speckle/acne "
         "on flat surfaces). Raise if flat surfaces show noise; too high loses fine contact "
@@ -1263,6 +1298,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"thickness", 150, &g_cvarThickness},
         {"thickFade", 150, &g_cvarThickFade},
         {"thickDist", 60, &g_cvarThickDist},
+        {"radiusFalloff", 0, &g_cvarRadiusFalloff},
         {"depthBias", 4, &g_cvarDepthBias},
         {"debugDepthRange", 3300, &g_cvarDebugDepthRange},
         {"temporalFrames", 5, &g_cvarTemporalFrames},
@@ -1285,6 +1321,11 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to query device info");
+    }
+    // Capture the scene pass's attachment layout once: the composite pipelines are built against
+    // it, and on_draw compares every pass it is handed to it.
+    if (!gfx_compat::scene_pass_layout(mod_ctx, svc_gfx, g_deviceInfo, g_scenePassLayout)) {
+        return mods::set_error(error, MOD_ERROR, "failed to query the scene pass layout");
     }
     if (!build_compute_pipeline("Enhanced AO preprocess depth", g_preprocessSource,
             "preprocess_depth", g_preprocessPipeline, g_preprocessLayout) ||
@@ -1343,6 +1384,12 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 }
 
 MOD_EXPORT ModResult mod_update(ModError*) {
+    if (!g_loggedLayoutMismatch && g_layoutMismatch.load(std::memory_order_acquire)) {
+        g_loggedLayoutMismatch = true;
+        svc_log->warn(mod_ctx,
+            "composite skipped: the scene pass no longer matches the attachment layout the "
+            "pipelines were built against - reload the mod to rebuild them");
+    }
     if (!g_loggedChain && g_chainExecuted.load(std::memory_order_acquire)) {
         g_loggedChain = true;
         svc_log->info(mod_ctx, "Enhanced AO chain executed OK");
@@ -1407,14 +1454,18 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarRadius = g_cvarRadiusFar = g_cvarRadiusRampStart = g_cvarRadiusRampEnd = 0;
     g_cvarRadiusMax = g_cvarIntensity = g_cvarContrast = 0;
     g_cvarBlackPoint = g_cvarThickness = g_cvarThickFade = g_cvarThickDist = g_cvarDepthBias = 0;
+    g_cvarRadiusFalloff = 0;
     g_cvarDebugDepthRange = 0;
     g_cvarTemporal = g_cvarTemporalFrames = g_cvarTemporalClamp = g_cvarMotionResponse = 0;
     g_cvarContentThresh = g_cvarDisoccTol = g_cvarDenoisePasses = g_cvarDenoiseStrength = 0;
     g_cvarDistanceFade = g_cvarFadeStart = g_cvarFadeEnd = 0;
     g_cvarHalfRes = g_cvarDebugView = 0;
     g_computeType = g_drawType = 0;
+    g_scenePassLayout = gfx_compat::ScenePassLayout{};
     g_afterOpaqueHook = g_beforeHudHook = 0;
     g_debugDrawPending = false;
+    g_layoutMismatch.store(false, std::memory_order_release);
+    g_loggedLayoutMismatch = false;
     g_controlsWindow = 0;
     g_frameIndex = 0;
     g_historyWriteIndex = 0;

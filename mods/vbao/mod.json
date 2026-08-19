@@ -1,7 +1,7 @@
 {
   "id": "dev.automata.vbao",
   "name": "VBAO",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "author": "automata-rtx",
   "description": "VBAO (Visibility Bitmask Ambient Occlusion): a 32-sector visibility-bitmask occlusion estimator (handles thin geometry like grass without overdarkening) with temporal accumulation, depth-aware upscaling, and thickness/contrast controls. Reads the game's own authored surface normals from the graphics service, so shading follows the artist's smooth normals rather than the flat facets a depth-based estimate produces. Standalone - no other mods required. Needs a D3D12/Vulkan/Metal device; the compatibility renderers cannot supply the normals. A distinct technique from Encounter's GTAO demo mod, whose framework it was originally derived from (Bevy Engine SSAO / Intel XeGTAO)."
 }

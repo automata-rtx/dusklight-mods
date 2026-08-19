@@ -50,7 +50,7 @@ struct Uniforms {
     radius_ramp_start: f32, // radius ramp band start, world units of view depth
     radius_ramp_end: f32,   // radius ramp band end, world units of view depth
     denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
-    _pad0: f32,
+    radius_falloff: f32,   // occluder thickness taper over the outer fraction of the radius; 0 = off
     _pad1: f32,
     _pad2: f32,
 }
@@ -351,11 +351,34 @@ fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
         var occ: u32 = 0xFFFFFFFFu;
         for (var step = 1.0; step <= steps; step += 1.0) {
-            let s01 = clamp((step - noise.y) / steps, 0.0, 1.0);
-            let dist = s01 * s01 * radius_pix; // x^2 sample distribution
+            // Radial jitter, advanced per (slice, step) along a golden-ratio sequence - the demo's
+            // XeGTAO inner loop does the same. This used to be one per-pixel offset (`noise.y`)
+            // reused for every step of every slice, which leaves the slices radially CORRELATED:
+            // they all sample the same set of radii, so a missed or hit occluder is missed or hit
+            // by all of them at once and the error shows as concentric structure rather than as
+            // noise the denoiser and the temporal accumulator can average away. Same sample count,
+            // same expected value - only the distribution of the error changes.
+            let step_noise = fract(noise.y + (s * steps + (step - 1.0)) * 0.6180339887498949);
+            let s01 = clamp((step - step_noise) / steps, 0.0, 1.0);
+            let radial = s01 * s01;            // x^2 sample distribution
+            let dist = radial * radius_pix;
             let offset = dir * dist * uniforms.inv_size;
             // MIP level from the sample's screen distance in pixels (bandwidth optimization).
             let sample_mip_level = clamp(log2(max(dist, 1.0)) - 3.3, 0.0, 4.0);
+            // Radial falloff, off by default. GTAO (and the demo) fades a sample's horizon back
+            // toward "no occlusion" over the outer part of the search radius, so an occluder
+            // crossing the radius boundary fades out instead of popping; VBAO's only distance term
+            // is `thick_fade`, which acts on the DEPTH difference and so does nothing for an
+            // occluder that leaves the radius sideways at constant depth. The bitmask analogue of
+            // pulling the horizon back is tapering the occluder's THICKNESS, which shrinks the
+            // sector span it carves to nothing - the same mechanism thick_fade already uses.
+            // radius_falloff is the fraction of the radius the taper spans (the demo's constant is
+            // 0.615); 0 disables it and restores the hard cutoff exactly.
+            var t_step = t_base;
+            if uniforms.radius_falloff > 0.0 {
+                let falloff_from = 1.0 - clamp(uniforms.radius_falloff, 0.0, 1.0);
+                t_step = t_base * (1.0 - smoothstep(falloff_from, 1.0, radial));
+            }
 
             // Geometric rejection: only samples ABOVE the occluding surface's own plane can
             // occlude it. This is always load-bearing now, because the shading normal is always the
@@ -366,11 +389,11 @@ fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
             // IS the plane. There is no such path any more.)
             let sp = load_sample_position(uv + offset, sample_mip_level);
             if sp.w > 0.0 && dot(sp.xyz - pixel_position, geo_n) > 0.0 {
-                occ = carve_sample(occ, sp.xyz - pixel_position, view_vec, n, t_base, depth_range, false);
+                occ = carve_sample(occ, sp.xyz - pixel_position, view_vec, n, t_step, depth_range, false);
             }
             let sn = load_sample_position(uv - offset, sample_mip_level);
             if sn.w > 0.0 && dot(sn.xyz - pixel_position, geo_n) > 0.0 {
-                occ = carve_sample(occ, sn.xyz - pixel_position, view_vec, n, t_base, depth_range, true);
+                occ = carve_sample(occ, sn.xyz - pixel_position, view_vec, n, t_step, depth_range, true);
             }
         }
 

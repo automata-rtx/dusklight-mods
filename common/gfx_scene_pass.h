@@ -31,6 +31,10 @@
 // composite that only reads the scene leaves the game's authored normals untouched without having
 // to know what they are. Offscreen passes from `create_pass` are single-target and skip all this.
 //
+// `draw_layout_matches(ctx, layout)` is the other half, on the draw side: it answers "is the pass
+// this callback was handed still the one my pipeline was built for". Cheap, and it turns a stale
+// pipeline into a skipped draw instead of a validation error.
+//
 // `has_normal_attachment` answers "does this build actually carry authored normals" from the same
 // query, which is the ONLY correct way to ask now. It used to be
 // `normal_format(g_deviceInfo) != Undefined`; `GfxDeviceInfo::normal_format` no longer exists in
@@ -100,7 +104,40 @@ struct ScenePassLayout {
     /// actually producing authored normals right now. Always false on a base without the feature
     /// and while the user has the game's own Scene Normal Buffer setting switched off.
     bool has_normal_attachment = false;
+    /// The pass's pipeline-compatibility token, for `draw_layout_matches` below. `key_valid` is
+    /// false on an SDK that has no layout query, where there is nothing to compare against.
+    uint64_t key = 0;
+    bool key_valid = false;
 };
+
+/// Does the pass a draw callback was handed still match the layout its pipeline was built for?
+///
+/// A pipeline is only valid in a pass whose attachments it describes exactly. Ours is built once,
+/// at init, against the scene pass as it was then; if the renderer later rebuilds the scene targets
+/// in a different SHAPE, the pipeline is stale and recording it is a WebGPU validation error rather
+/// than a missing effect. Comparing the layout key skips the draw instead.
+///
+/// Safe to gate a draw on, and specifically safe across a resolution change: aurora hashes the key
+/// from the attachment count, each attachment's semantic and format, the depth-stencil format and
+/// the sample count — `finalize_render_target_layout`, aurora `lib/gfx/frame_packet.hpp`. Width and
+/// height are carried in the layout but deliberately NOT hashed, exactly because they do not affect
+/// pipeline compatibility. A resize therefore keeps the key, and this never silently disables an
+/// effect for the rest of the session.
+///
+/// Returns true whenever it cannot tell — a pre-1.2 SDK with no `layout` on the draw context, a
+/// context too short to carry one, or a layout we never captured. Not knowing is not a mismatch.
+inline bool draw_layout_matches(const GfxDrawContext* ctx, const ScenePassLayout& expected) {
+#if GFX_COMPAT_HAVE_SCENE_TARGET_LAYOUT
+    if (ctx == nullptr || !expected.key_valid || ctx->struct_size < sizeof(GfxDrawContext)) {
+        return true;
+    }
+    return ctx->layout.key == expected.key;
+#else
+    (void)ctx;
+    (void)expected;
+    return true;
+#endif
+}
 
 /// Fills `out` with the scene pass's attachment layout. Returns false only when the service call
 /// fails outright, which leaves the caller with no valid pipeline to build.
@@ -130,6 +167,8 @@ inline bool scene_pass_layout(
     }
     out.depth_format = layout.depth_stencil_format;
     out.sample_count = layout.sample_count;
+    out.key = layout.key;
+    out.key_valid = true;
     for (uint32_t i = 0; i < layout.color_attachment_count && i < kMaxSceneColorTargets; ++i) {
         if (layout.color_attachments[i].semantic == GFX_ATTACHMENT_NORMAL) {
             out.has_normal_attachment = true;
