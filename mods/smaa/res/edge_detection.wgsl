@@ -8,13 +8,19 @@
 // Two detectors are unioned:
 //   * Luma: the reference SMAA luma edge detector with local contrast adaptation (MIT SMAA,
 //     Jimenez et al.). Catches shading / texture / alpha-test edges.
-//   * Geometric: an angular difference of the Depth to Normal service's reconstructed world-space
+//   * Geometric: an angular difference of the game's authored view-space
 //     normal, plus a relative raw-depth discontinuity. Catches silhouettes AND creases (surfaces
 //     meeting at an angle with continuous depth) that luma misses on TP's flat-shaded art. Enabled
-//     only when the provider is present (flags bit 0).
+//     only when the scene normals and a depth snapshot are both available (flags bit 0).
 //
-// Reversed-Z: sky raw depth is 0; near is 1. The normal buffer packs xyz = unit world normal,
-// w = raw reversed-Z depth.
+// Reversed-Z: sky raw depth is 0; near is 1. The scene normal texture holds the game's AUTHORED
+// view-space normal encoded xyz * 0.5 + 0.5, with alpha 1 where it is usable and 0 where it is not
+// (sky, billboards, draws with no normal attribute). Depth comes from its own snapshot: the old
+// old provider packed depth into this texture's alpha; the service uses that alpha for validity.
+//
+// The angle test below is a dot product between two normals in the SAME space, which is invariant
+// under a shared rotation - so view-space normals need no conversion here, unlike a shading term.
+//
 
 struct Uniforms {
     screen_size: vec2f,
@@ -38,6 +44,7 @@ struct Uniforms {
 @group(0) @binding(2) var edges_out: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(3) var blend_clear_out: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(4) var<uniform> uniforms: Uniforms;
+@group(0) @binding(5) var depth_tex: texture_2d<f32>;
 
 const LUMA = vec3f(0.2126, 0.7152, 0.0722);
 
@@ -84,21 +91,40 @@ fn edge_detection(@builtin(global_invocation_id) gid: vec3u) {
 
     var edges = luma_edges;
 
-    // --- Geometric edge detection from the reconstructed normal + depth ---
+    // --- Geometric edge detection from the scene normals + depth ---
     if ((uniforms.flags & 1u) != 0u) {
         let ndims = textureDimensions(normal_tex);
         let nc = textureLoad(normal_tex, clamp_coord(p, ndims), 0i);
         let nl = textureLoad(normal_tex, clamp_coord(p + vec2i(-1i, 0i), ndims), 0i);
         let nt = textureLoad(normal_tex, clamp_coord(p + vec2i(0i, -1i), ndims), 0i);
 
-        // Angular difference: 0 = coplanar, grows with the crease/silhouette angle.
-        let normal_delta = vec2f(1.0 - dot(nc.xyz, nl.xyz), 1.0 - dot(nc.xyz, nt.xyz));
+        // Decode before comparing. The stored value is xyz * 0.5 + 0.5, so a dot product of the
+        // RAW texels is meaningless - every component is biased positive and even opposed normals
+        // would score as similar.
+        let dc_n = normalize(nc.xyz * 2.0 - 1.0);
+        let dl_n = normalize(nl.xyz * 2.0 - 1.0);
+        let dt_n = normalize(nt.xyz * 2.0 - 1.0);
+
+        // Angular difference: 0 = coplanar, grows with the crease/silhouette angle. Only meaningful
+        // where BOTH texels are valid: alpha 0 stores (0.5,0.5,0.5), which decodes to a zero vector
+        // and would normalize() to NaN, and NaN compares false so the edge would silently vanish.
+        // Gate explicitly instead, and let the DEPTH test carry those pixels - a sky or billboard
+        // boundary is a depth discontinuity, which is exactly what that test is for.
+        let valid_l = nc.w >= 0.5 && nl.w >= 0.5;
+        let valid_t = nc.w >= 0.5 && nt.w >= 0.5;
+        let normal_delta = vec2f(
+            select(0.0, 1.0 - dot(dc_n, dl_n), valid_l),
+            select(0.0, 1.0 - dot(dc_n, dt_n), valid_t));
+
         // Relative raw-depth discontinuity (reversed-Z; robust across the depth range and to sky=0).
-        let dc = nc.w;
+        let ddims = textureDimensions(depth_tex);
+        let dc = textureLoad(depth_tex, clamp_coord(p, ddims), 0i).r;
+        let dl = textureLoad(depth_tex, clamp_coord(p + vec2i(-1i, 0i), ddims), 0i).r;
+        let dt = textureLoad(depth_tex, clamp_coord(p + vec2i(0i, -1i), ddims), 0i).r;
         let eps = 1.0e-5;
         let depth_delta = vec2f(
-            abs(dc - nl.w) / max(max(dc, nl.w), eps),
-            abs(dc - nt.w) / max(max(dc, nt.w), eps));
+            abs(dc - dl) / max(max(dc, dl), eps),
+            abs(dc - dt) / max(max(dc, dt), eps));
 
         let geo_edges = max(
             step(vec2f(uniforms.normal_threshold), normal_delta),

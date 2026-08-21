@@ -1,5 +1,29 @@
 # Deferred Fog
 
+> **History:** this was folded into a combined "Graphics Hub" mod for a while, alongside a Depth to
+> Normal provider. Graphics Hub is retired — GfxService 1.3's `get_scene_normals` gives every mod the
+> game's authored normals directly, so the provider had nothing left to do — and Deferred Fog is a
+> standalone mod again, which is what this document already described.
+
+## The exported service is for ORDERING, not data
+
+Deferred Fog exports `dev.automata.deferred_fog` (`include/deferred_fog_service.h`) with a single
+`get_state` reporting whether the frame actually deferred. Consumers do not need the *data*; they
+need the **import**, because the mod API has no priority field on a stage hook. Hooks run in
+registration order, registration happens in `mod_initialize`, and the loader initializes in
+dependency order — so importing a mod's service is the only way to say "initialize that one first".
+
+Which matters only for one case. The fog quad draws at `FRAME_BEFORE_HUD`; the
+`SCENE_AFTER_OPAQUE` hook merely arms it. So:
+
+- A mod compositing at `SCENE_AFTER_OPAQUE` is **already** ordered before the fog by stage
+  separation, and needs no import. That is the main path and the whole point of the mod.
+- A mod that *also* draws at `FRAME_BEFORE_HUD` and wants to be **on top of** the fog — a debug
+  overlay — must register after Deferred Fog, so it must import this. VBAO does exactly that.
+
+Import it **optionally**: Deferred Fog is a separate install and a consumer must run without it.
+
+
 Mod id `dev.automata.deferred_fog`. Game-linked: hooks game/J3D functions, so it is coupled
 to the pinned game build like the shadow mod. Standalone by design: **other mods need no
 changes and no awareness of this mod to benefit** — anything composited over the opaque

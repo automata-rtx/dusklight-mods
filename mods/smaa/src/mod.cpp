@@ -1,9 +1,9 @@
 // SMAA — subpixel morphological antialiasing (service-only).
 //
 // A screen-space AA mod in the SMAA lineage, built entirely on mod-API services (gfx, config, ui,
-// resource, log) plus the optional Depth to Normal provider. Three passes:
+// resource, log). Three passes:
 //   1. edge detection (compute)      — luma edges (reference SMAA) UNIONed with geometric edges
-//                                      from the reconstructed world normal + depth; also clears the
+//                                      from the scene normals + depth; also clears the
 //                                      blend target.
 //   2. blend-weight calc (compute)   — CMAA2-style compaction: edge pixels in each 16x16 workgroup
 //                                      are packed into contiguous threads, then the orthogonal
@@ -18,11 +18,9 @@
 // updates without a rebuild), like VBAO / SSILVB.
 
 #include "mods/service.hpp"
-#include "depth_to_normal_service.h"
 #include "mods/svc/config.h"
 #include "mods/svc/gfx.h"
 
-#include "gfx_normal_compat.h"
 #include "gfx_scene_pass.h"
 #include "mods/svc/log.h"
 #include "mods/svc/resource.h"
@@ -44,10 +42,10 @@ IMPORT_SERVICE(ConfigService, svc_config);
 IMPORT_SERVICE(ResourceService, svc_resource);
 IMPORT_SERVICE(UiService, svc_ui);
 IMPORT_SERVICE(GfxService, svc_gfx);
-// Optional: when the Depth to Normal provider (Graphics Hub) is present, its world normal + depth
-// drive geometric edge detection. Optional so SMAA still loads and does luma-only edge detection
-// when the provider is absent.
-IMPORT_OPTIONAL_SERVICE(DepthToNormalService, svc_n2d);
+// No optional service imports: the scene normals come straight from GfxService (get_scene_normals),
+// so SMAA depends on no other mod. Where they are unavailable - the D3D11 and OpenGL ES
+// compatibility renderers cannot carry the attachment - geometric edge detection turns itself off
+// and SMAA runs on its luma detector alone, which is the reference SMAA behaviour.
 
 namespace {
 
@@ -124,7 +122,8 @@ static_assert(sizeof(SmaaUniforms) % 16 == 0);
 
 struct ComputePayload {
     WGPUTextureView sceneColor;
-    WGPUTextureView normal; // Depth to Normal output, or sceneColor stand-in when absent
+    WGPUTextureView normal; // GfxService scene normal snapshot (view space, alpha = validity)
+    WGPUTextureView depth;  // raw depth snapshot - the normal texture's alpha is validity, not depth
     WGPUTextureView edges;
     WGPUTextureView blend;
     uint32_t uniform_offset;
@@ -195,8 +194,8 @@ bool build_neighborhood_pipeline() {
     if (module == nullptr) {
         return false;
     }
-    // The pipeline has to describe the scene pass's attachments, whatever they currently are: with
-    // the host's scene normal buffer on, the pass carries a second, renderer-owned colour target,
+    // The pipeline has to describe the scene pass's attachments, whatever they currently are. On
+    // a device that carries the scene normals, the pass has a second, renderer-owned colour target,
     // and a one-target pipeline is rejected outright. Asking the service beats rebuilding the
     // layout from GfxDeviceInfo, which is a copy of the renderer's logic that goes silently wrong
     // whenever the pass gains an attachment. The extra target comes back write-masked off, so the
@@ -344,7 +343,7 @@ void on_compute(
 
     WGPUBindGroup edgeGroup = makeBindGroup(g_edgeLayout,
         {textureEntry(0, data.sceneColor), textureEntry(1, data.normal), textureEntry(2, data.edges),
-            textureEntry(3, data.blend), uniformEntry(4)});
+            textureEntry(3, data.blend), uniformEntry(4), textureEntry(5, data.depth)});
     WGPUBindGroup blendGroup = makeBindGroup(g_blendLayout,
         {textureEntry(0, data.edges), textureEntry(1, data.blend), uniformEntry(2)});
     if (edgeGroup == nullptr || blendGroup == nullptr) {
@@ -434,7 +433,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
 
     GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
     resolveDesc.color = true;
-    resolveDesc.depth = false;
+    resolveDesc.depth = true;
     GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
     if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) != MOD_OK ||
         resolved.color == nullptr) {
@@ -449,11 +448,14 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         return;
     }
 
-    // The reconstructed normal + depth (queued into the command stream ahead of our compute).
-    DepthToNormalFrame n2dFrame = DEPTH_TO_NORMAL_FRAME_INIT;
-    const bool haveNormal = svc_n2d != nullptr &&
-        svc_n2d->get_frame(mod_ctx, &n2dFrame) == MOD_OK && n2dFrame.normal != nullptr;
-    const bool useNormalEdges = haveNormal && get_bool_option(g_cvarUseNormalEdges, true);
+    // Geometric edges need BOTH the scene normals (creases) and raw depth (silhouettes). The old
+    // provider packed depth into the normal texture's alpha; the service uses that alpha for
+    // VALIDITY, so depth is resolved separately above. Either being absent just turns geometric
+    // edges off - SMAA still runs on its luma detector, which is the reference behaviour.
+    GfxSceneNormals sceneNormals = GFX_SCENE_NORMALS_INIT;
+    svc_gfx->get_scene_normals(mod_ctx, &sceneNormals);
+    const bool haveGeometry = sceneNormals.view != nullptr && resolved.depth != nullptr;
+    const bool useNormalEdges = haveGeometry && get_bool_option(g_cvarUseNormalEdges, true);
 
     const auto scaled = [](ConfigVarHandle cvar, int64_t fallback, int64_t lo, int64_t hi,
                             float scale) {
@@ -467,7 +469,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.inv_screen_size[0] = 1.0f / uniforms.screen_size[0];
     uniforms.inv_screen_size[1] = 1.0f / uniforms.screen_size[1];
     uniforms.threshold = scaled(g_cvarEdgeThreshold, 10, 5, 20, 0.01f);
-    uniforms.normal_threshold = scaled(g_cvarNormalThreshold, 10, 2, 50, 0.01f);
+    uniforms.normal_threshold = scaled(g_cvarNormalThreshold, 5, 2, 50, 0.01f);
     uniforms.depth_threshold = scaled(g_cvarDepthThreshold, 20, 1, 200, 0.001f);
     uniforms.max_search_steps =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarMaxSearchSteps, 16), 4, 32));
@@ -486,9 +488,10 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
 
     ComputePayload computePayload{};
     computePayload.sceneColor = resolved.color;
-    // The edge shader samples binding 1 only when flags bit 0 is set; stand in with the colour
-    // snapshot (also a texture_2d<f32>) otherwise so the bind group is always complete.
-    computePayload.normal = useNormalEdges ? n2dFrame.normal : resolved.color;
+    // The edge shader samples bindings 1 and 5 only when flags bit 0 is set; stand in with the
+    // colour snapshot (also a texture_2d<f32>) otherwise so the bind group is always complete.
+    computePayload.normal = useNormalEdges ? sceneNormals.view : resolved.color;
+    computePayload.depth = useNormalEdges ? resolved.depth : resolved.color;
     computePayload.edges = g_targets.edgesView;
     computePayload.blend = g_targets.blendView;
     computePayload.uniform_offset = uniformRange.offset;
@@ -568,18 +571,19 @@ ModResult build_controls_tab(
         "edges inside high-contrast texture). 200% is the SMAA default.",
         100, 400, 10, "%");
     add_toggle(left, "Geometric Edges", g_cvarUseNormalEdges,
-        "Also detect edges from the surface normal and depth (Depth to Normal service). Catches "
+        "Also detect edges from the game's own surface normals and the depth buffer. Catches "
         "silhouettes and creases where two flat-shaded surfaces have similar brightness. No effect "
-        "if the provider is absent.");
+        "if the scene normals are unavailable (the D3D11 and OpenGL ES compatibility renderers "
+        "cannot provide them).");
     add_number(left, "Normal Threshold", g_cvarNormalThreshold,
-        "How sharp a normal difference counts as a geometric edge (angular; 10% is a shallow "
-        "crease). Lower catches subtler creases; higher only steep angles.<br/>What counts as "
-        "'subtler' depends on which normal the provider is serving. A depth-reconstructed normal is "
-        "flat per triangle, so every facet boundary on a curved low-poly surface is a normal step "
-        "and a low threshold lights up geometry that is not really an edge - the default is set to "
-        "clear that noise. With <b>authored normals</b> on, those interior steps are gone and only "
-        "real creases and silhouettes remain, so lower values become usable and catch edges this "
-        "default misses.",
+        "How sharp a normal difference counts as a geometric edge. The value is angular: 5% is "
+        "about an 18 degree crease, 10% about 26 degrees. Lower catches subtler creases; higher "
+        "only steep angles.<br/>The default was 10% when this read a normal reconstructed from "
+        "depth - that normal is flat per triangle, so every facet boundary on a curved low-poly "
+        "surface registered as a step and a low threshold lit up geometry that was not really an "
+        "edge. It now reads the game's <b>authored</b> normals, which are smooth across a surface, "
+        "so those interior steps do not exist and 5% is safe. Raise it if creases you consider "
+        "part of the shading are being antialiased as edges.",
         2, 50, 1, "%");
     add_number(left, "Depth Threshold", g_cvarDepthThreshold,
         "Relative depth discontinuity that counts as a geometric edge (silhouettes). Lower catches "
@@ -687,7 +691,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         ConfigVarHandle* handle;
     } intOptions[] = {
         {"edgeThreshold", 10, &g_cvarEdgeThreshold},
-        {"normalThreshold", 10, &g_cvarNormalThreshold},
+        {"normalThreshold", 5, &g_cvarNormalThreshold},
         {"depthThreshold", 20, &g_cvarDepthThreshold},
         {"maxSearchSteps", 16, &g_cvarMaxSearchSteps},
         {"blendStrength", 100, &g_cvarBlendStrength},

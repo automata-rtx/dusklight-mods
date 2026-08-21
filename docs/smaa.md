@@ -1,17 +1,34 @@
 # SMAA — Subpixel Morphological Antialiasing
 
 Mod id `dev.automata.smaa` (directory `mods/smaa/`). Service-only (no game code, no hooks): stages +
-snapshots from the gfx service, config/ui/resource/log, plus the **optional** Depth to Normal service.
+snapshots from the gfx service, config/ui/resource/log. It depends on no other mod.
 Spatial SMAA 1x — no camera jitter, no motion vectors, no temporal component (the mod API can't
 inject a jittered projection or expose a velocity buffer, so the temporal SMAA variants aren't
 reachable service-only; see "Scope / why 1x").
 
-**Uses the Depth to Normal mod** (`dev.automata.depth_to_normal`, exported by Graphics Hub) as a
-geometric edge input. When the provider is present, edge detection unions the luma detector with a
-normal-angle + relative-depth discontinuity test, so silhouettes and creases are caught even where
-two flat-shaded TP surfaces have almost no brightness contrast. It's an *optional* import: absent the
-provider (or with "Geometric Edges" off), the mod does luma-only SMAA and still loads/runs. This is
-the "geometry-guided AA" entry from `docs/depth_to_normal_consumers.md`.
+**Geometric edges come from the gfx service** (`get_scene_normals`, GfxService 1.3) plus a depth
+snapshot. Edge detection unions the luma detector with a normal-angle + relative-depth discontinuity
+test, so silhouettes and creases are caught even where two flat-shaded TP surfaces have almost no
+brightness contrast.
+
+Three things about that normal are worth stating precisely:
+
+- It is the artist's **authored** vertex normal, not a reconstruction from depth, so it is smooth
+  across a curved surface rather than flat per triangle. Facet boundaries on low-poly geometry no
+  longer register as normal steps, which is why `normalThreshold` now defaults to **5%** (~18°)
+  where the reconstruction era needed 10% to mask that noise.
+- It is in **view space**, and that does not matter here. The test is `1 - dot(n0, n1)` between two
+  normals in the same space, and a shared rotation leaves a dot product unchanged. (It would matter
+  for a shading term. This is not one.)
+- Its alpha is **validity, not depth**. The retired provider packed raw depth into alpha; the
+  service uses that channel to mark pixels with no usable normal (sky, billboards, draws with no
+  normal attribute). Depth is therefore resolved separately, and the angle test is gated on both
+  texels being valid — a zero-vector normal would `normalize()` to NaN and compare false, silently
+  losing the edge. Those boundaries are depth discontinuities anyway, which the depth half catches.
+
+If the scene normals are unavailable — the D3D11 and OpenGL ES compatibility renderers cannot carry
+the attachment — geometric edges turn themselves off and the mod does luma-only SMAA, which is the
+reference SMAA behaviour. Same with "Geometric Edges" unticked.
 
 ## Where it runs, and why
 
@@ -24,8 +41,8 @@ right layer for TP specifically:
   opaque scene colour is already in the perceptual/gamma space SMAA's luma thresholds expect — there
   is no "AA must run after tonemap" constraint to push us later.
 - The **alpha-test foliage** (TP's worst aliaser) is drawn in the opaque pass, so it's present here.
-- The **reconstructed normal + depth** are derived from the opaque scene depth, so they're freshest
-  and most meaningful at this stage.
+- The **scene normals** are snapshotted by the host right after the opaque lists, and the depth
+  snapshot is taken at this stage, so both describe exactly the surfaces being antialiased.
 
 The colour input is the frame's **resolved scene snapshot** (`resolve_pass`, a copy), while the final
 blend writes the **live** target — reading a copy and writing the original is hazard-free.
@@ -45,7 +62,7 @@ reference a freed view.
    - **Luma edges**: the reference SMAA luma detector (Jimenez et al., MIT) with local-contrast
      adaptation (suppresses an edge when a much stronger parallel gradient sits next to it — kills
      doubled edges inside high-contrast texture). Catches shading / texture / alpha-test edges.
-   - **Geometric edges** (when the provider is present): angular difference of the reconstructed
+   - **Geometric edges** (when the scene normals are available): angular difference of the authored
      **world normal** (`1 - dot(n_c, n_neighbor)`) unioned with a **relative raw-depth** discontinuity
      (`|Δd| / max(d, ε)`, robust across reversed-Z and to sky = 0). The normal angle catches
      silhouettes *and* creases (continuous depth, flipping normal); the depth test catches silhouettes
@@ -94,8 +111,8 @@ live has no rebuild or pipeline cost.
 | `blendStrength` | 100 | overall edge-blend strength, ×0.01 (0–150). Lower keeps edges crisper; higher smooths harder (and softens slightly) |
 | `edgeThreshold` | 10 | luma edge threshold, ×0.01 (0.05–0.20). Lower catches more edges (softer, can blur texture); higher is more selective |
 | `localContrast` | 200 | local-contrast adaptation factor, ×0.01 (SMAA default 2.0). Suppresses an edge dwarfed by a parallel neighbour gradient |
-| `useNormalEdges` | on | union the geometric (normal/depth) detector with luma. No effect if the Depth to Normal provider is absent |
-| `normalThreshold` | 10 | geometric edge: `1 - dot(normals)` threshold, ×0.01 (~0.10 ≈ a shallow crease). Lower catches subtler creases |
+| `useNormalEdges` | on | union the geometric (normal/depth) detector with luma. No effect where the scene normals are unavailable (compatibility renderers) |
+| `normalThreshold` | 5 | geometric edge: `1 - dot(normals)` threshold, ×0.01 (0.05 ≈ an 18° crease). Was 10 when the normal was reconstructed from depth and every facet boundary registered as a step; authored normals are smooth, so 5 is safe. Raise it if creases you consider shading are being antialiased |
 | `depthThreshold` | 20 | geometric edge: relative depth discontinuity, ‰ (×0.001 → 0.02). Lower catches more distant silhouettes |
 | `maxSearchSteps` | 16 | pattern search reach in pixels (4–32). Higher smooths longer near-horizontal/vertical edges, costs more per edge pixel |
 | `debugMode` | 0 | 0 off, 1 edges (red = vertical, green = horizontal), 2 weights (warm = vertical blend, cool = horizontal) |

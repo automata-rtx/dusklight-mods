@@ -15,7 +15,7 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   **Game-linked**: it includes game headers and hooks game functions, so it is coupled to the
   pinned game build. It does **not** hook `drawCloudShadow` — that is the moya haze packet, not a
   shadow, and suppressing it was the cause of the long-standing "distortion particles vanish"
-  bug; moya belongs to Effect Remover's Haze Removal. **Two normals, never interchangeable**: the *shading* normal (the provider's
+  bug; moya belongs to Effect Remover's Haze Removal. **Two normals, never interchangeable**: the *shading* normal (the game's
   authored one) drives `n·L` / attached shadows / normal offset, the *geometric* face normal drives
   the bias — see `docs/realtime_sun_shadows.md` "Shadow term assembly" and
   `docs/authored_normals.md` §8.6. The `normalSmooth` blur pass was **deleted**; do not
@@ -23,7 +23,7 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   source, and it flattened real curvature. The two shading problems that used to be open here (harsh
   faceting, and broken shading on back-lit Link) are **both closed and confirmed in-game**; see
   "Shading history" in `docs/realtime_sun_shadows.md`. Faceting now appears only on the
-  reconstruction fallback — the Scene Normal Buffer setting off, or compatibility mode. Debug View
+  reconstruction fallback, which now means only the compatibility renderers. Debug View
   15 ("Shadow Terms") is the view that separates a missing occluder from a misread `n·L` — they look
   identical otherwise.
   **`linkCascade` on also removes Link from the world cascades** rather than drawing him into
@@ -44,8 +44,8 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   Therrien et al. 2023 — the mod carries the paper's name): VBAO's bitmask sampling chain extended
   with a one-bounce indirect-diffuse accumulate; with the bounce toggled off it doubles as a
   standalone directional-AO mod. Consumes the scene-color snapshot as its light input and the
-  Depth to Normal service (hard dependency, now exported by **Graphics Hub**) for per-sample
-  normals; composites GI additively and AO multiplicatively in a single blend draw. Since 0.10.0 it
+  (**not currently built** — it still imports the retired depth-to-normal service and needs the same
+  `get_scene_normals` conversion VBAO and SMAA got) the provider's normal for per-sample normals; composites GI additively and AO multiplicatively in a single blend draw. Since 0.10.0 it
   also carries an **environment probe**: a persistent world-space ambient cube (6 axes + coverage
   confidence, 8×1 texture) measured from MIP 4 of its own colour chain in one workgroup, evaluated
   in each slice's bent direction and applied through the sectors the march found *nothing* in — so
@@ -57,61 +57,45 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
 
 - **`mods/smaa/`** — "SMAA" (subpixel morphological antialiasing): a spatial post-process AA mod
   (SMAA 1x). Edge detection unions the reference SMAA luma detector with **geometric edges from the
-  Depth to Normal service** (normal-angle + relative-depth discontinuity — catches silhouettes and
-  creases where luma contrast is weak). The expensive blend-weight pass uses **CMAA2-style compute
+  game's own authored normals** (`get_scene_normals`; normal-angle + relative-depth discontinuity —
+  catches silhouettes and creases where luma contrast is weak). Since those normals are smooth
+  rather than per-triangle flat, `normalThreshold` defaults to 5% (~18°) where the reconstruction
+  era needed 10% to mask facet noise. The expensive blend-weight pass uses **CMAA2-style compute
   compaction** (Intel 2018): edge pixels in each 16×16 workgroup are packed into contiguous threads
   via a groupshared list so sparse edges run in fully-occupied warps. Composites at
   `SCENE_AFTER_OPAQUE` (before bloom/translucency, so the game's post effects operate on
   antialiased geometry). Three passes: edge-detect (compute) → compacted blend-weights (compute) →
   neighborhood blend (draw). No LUT assets — orthogonal search is linear, coverage analytic; v1
-  defers diagonals/corners. **Service-only** (gfx/config/ui/resource/log + optional Depth to Normal).
+  defers diagonals/corners. **Service-only** (gfx/config/ui/resource/log); depends on no other mod.
   The SMAA algorithm is reimplemented from the MIT reference (iryoku/smaa) — Marty's proprietary
   iMMERSE port was studied for the optimization ideas only, never copied. Docs: `docs/smaa.md`.
-- **`mods/graphics_hub/`** — "[WIP] Graphics Hub": a **combination mod** hosting the screen-space
-  infrastructure other mods build on, so effects layer correctly over the game's original rendering.
-  It merges two former standalone mods, each in its own namespace inside `src/mod.cpp`
-  (`hub_dtn` / `hub_fog`) with its own section in the shared UI panel and independent config:
-  - **Depth to Normal** (`hub_dtn`): provides a per-pixel world-space surface normal (+ raw depth)
-    once per frame and **publishes it as the mod-exported service**
-    `include/depth_to_normal_service.h` (service id `dev.automata.depth_to_normal`, **unchanged** so
-    SSILVB/Realtime Sun Shadows/VBAO/SMAA resolve it as before — they include
-    `../graphics_hub/include`). Two sources: the game's **authored vertex normals** from a renderer
-    thin g-buffer (smooth — no faceting), falling back per pixel to the **depth reconstruction**
-    (atyuwen's 5-tap method) wherever there is no authored normal. The current platform **does**
-    provide the buffer, but **it ships switched off**: the user must turn on the game's own
-    **Video → Rendering → Scene Normal Buffer** and restart. Until then every pixel takes the
-    reconstruction, "Use Authored Normals" greys out, and the status line names the setting to turn
-    on — correct, not a regression. Same fallback on a base without the buffer, and in compatibility
-    mode (D3D11 / OpenGL ES), where the renderer refuses it whatever the setting says. Passive
-    provider: no on/off. Docs: `docs/authored_normals.md`, `docs/normal_buffer_portability.md`.
-  - **Deferred Fog** (`hub_fog`): suppresses the game's per-draw fog during the opaque world lists
-    and re-applies it (bit-exact aurora fog math) as a fullscreen pass after every mod's
-    `SCENE_AFTER_OPAQUE` composites, so AO/shadows darken surfaces under the fog instead of the fog
-    itself. Mixed fog configs auto-revert to vanilla (or exact per-pixel replay). Independently
-    toggleable. Special-cases the Hyrule Castle Ganon barrier (`d_a_obj_ganonwall2`, a translucent
-    dome drawn in the *opaque* BG list with pure-black `endZ 250000` fog) via `is_barrier_fog`: it
-    is left on vanilla forward fog, never suppressed/deferred, so its black fog isn't stamped onto
-    the castle/trees inside it. Also handles TP's **near-fog + distant-scenery-fog split** (Hyrule
-    Field draws distant geometry — Death Mountain, the castle — with a *wider projection far plane*
-    and a separate gentle long-range fog config): the single-projection config-ID replay clips that
-    far geometry, so its pixels are uncovered; the fog quad falls those back to `widest_far_index()`
-    (the widest-far config = the distant fog) rather than config 0 (the aggressive near fog), and
-    the barrier dome stamps that same distant index in the replay — so distant subjects keep their
-    correct light fog instead of being over-fogged toward the dark near fog. Diagnostic: a
-    `fogLogConfigs` toggle dumps the frame's captured fog-config table.
+- **`mods/deferred_fog/`** — "Deferred Fog": suppresses the game's per-draw fog during the opaque
+  world lists and re-applies it (bit-exact aurora fog math, `src/fog_math.h`) as a fullscreen pass at
+  `FRAME_BEFORE_HUD`, so AO/shadows darken surfaces *under* the fog instead of darkening the fog
+  itself. Mixed fog configs auto-revert to vanilla (or exact per-pixel replay). Special-cases the
+  Hyrule Castle Ganon barrier (`d_a_obj_ganonwall2`, a translucent dome drawn in the *opaque* BG list
+  with pure-black `endZ 250000` fog) via `is_barrier_fog`: left on vanilla forward fog so its black
+  fog isn't stamped onto the castle/trees inside it. Also handles TP's **near-fog +
+  distant-scenery-fog split** (Hyrule Field draws distant geometry with a *wider projection far
+  plane* and a separate gentle long-range fog): the single-projection config-ID replay clips that far
+  geometry, so the fog quad falls those pixels back to `widest_far_index()` rather than config 0.
+  Diagnostic: `fogLogConfigs` dumps the frame's captured fog-config table. **Game-linked** + webgpu.
+  Docs: `docs/deferred_fog.md`.
 
-  **Game-linked** (Deferred Fog hooks game functions) + webgpu. Docs: `docs/deferred_fog.md`,
-  **`docs/authored_normals.md`** (§0 = state of play, §8 = the findings that each cost hours —
-  read both before theorising about normals or shadows), `docs/depth_to_normal_plan.md`,
-  `docs/depth_to_normal_consumers.md`.
+  **It exports `dev.automata.deferred_fog` purely so consumers can declare an ORDERING dependency.**
+  The mod API has no priority field on a stage hook — hooks run in registration order, registration
+  happens in `mod_initialize`, and the loader initializes in dependency order, so importing a mod's
+  service is the only way to say "init that one first". A mod compositing at `SCENE_AFTER_OPAQUE` is
+  already ahead of the fog by stage separation and needs no import; a mod that *also* draws at
+  `FRAME_BEFORE_HUD` and wants to be **on top of** the fog does. VBAO imports it optionally for
+  exactly that (its debug views). See `mods/deferred_fog/include/deferred_fog_service.h`.
 
-  The service returns the surface direction with **the game's own sign**, and consumers take it as
-  given. **Never flip an authored normal toward the camera, at any threshold** — `dot(n, view_ray)`
-  is not a property of the surface (the ray sweeps across the screen), so any such test negates
-  everything past a line and seams flat ground. This was got wrong three times, each time by
-  retuning the threshold instead of deleting the test: the provider at 0 then 0.5, and VBAO/SSILVB
-  re-applying their own at 0.15. All are gone. The only flips left in the tree are on cross-product
-  reconstructions, whose sign genuinely is arbitrary. See `docs/authored_normals.md` §2a.
+  **Graphics Hub is RETIRED.** It bundled this with a "Depth to Normal" provider that reconstructed
+  a world-space normal from depth and published it as a service. GfxService 1.3's `get_scene_normals`
+  supersedes that completely — the host hands every mod the game's *authored* normal directly — so
+  the provider had nothing left to do and the combination had no reason to exist. `docs/
+  depth_to_normal_plan.md` and `docs/depth_to_normal_consumers.md` are marked historical.
+
 - **`mods/effect_remover/`** — "Effect Remover": a **combination mod** that cuts down TP's built-in
   fake-shading so it doesn't fight the realtime stack. It merges three former standalone mods, each
   in its own namespace inside `src/mod.cpp` (`er_psr` / `er_tsr` / `er_vu`) with its own UI section
@@ -250,9 +234,9 @@ The user typically does not build locally. Iteration loop:
   not to build or modify mods.
 - **Default to service-only.** A new screen-space effect (e.g. SSDO, 1-bounce SSGI, SSR,
   outlines) should follow the VBAO / SSILVB pattern: consume depth + the world-space
-  normal from the **Depth to Normal service** (`mods/graphics_hub/include/depth_to_normal_service.h`,
-  exported by Graphics Hub) + the scene color, all via mod-API services — **no game headers, no
-  hooks**. That keeps it off the ABI treadmill: it survives game updates and needs no platform
+  normal from **GfxService** (`get_scene_normals` — the game's own authored normal, snapshotted by
+  the host once per frame) + the scene color, all via mod-API services — **no game headers, no
+  hooks**, and no dependency on another mod. That keeps it off the ABI treadmill: it survives game updates and needs no platform
   rebuild. `docs/depth_to_normal_consumers.md` is the menu of exactly these effects plus the
   consumer integration boilerplate — read it first.
 - Make a mod **game-linked** only if it genuinely needs a game buffer the gfx service does not
@@ -357,14 +341,13 @@ The user typically does not build locally. Iteration loop:
     nothing. Two vendors appending to the same struct is not forward compatibility.
   - **Two color attachments.** When the host normal buffer is on the scene pass has two color targets,
     and *every* pipeline recorded into it must declare two or WebGPU rejects the draw. All six
-    scene-pass pipelines (ssilvb, vbao, realtime_sun_shadows, smaa, and graphics_hub's deferred fog +
-    normal overlay) take their layout from `gfx_compat::scene_pass_layout`, so they follow the pass
+    scene-pass pipelines (vbao, smaa, deferred_fog, and — once ported — ssilvb and
+    realtime_sun_shadows) take their layout from `gfx_compat::scene_pass_layout`, so they follow the pass
     whichever shape it has. Any new scene-pass mod must do the same.
   - **Authored normals are back — but off until the user switches them on.** The platform provides
     the buffer; the game ships it disabled (**Video → Rendering → Scene Normal Buffer**, applies on
-    the next launch) and cannot provide it at all in compatibility mode. Until then Graphics Hub
-    reconstructs from depth for every pixel and its status line says which setting to turn on. That
-    is correct, not a regression. `common/gfx_normal_compat.h` makes a base *without* the buffer a
+    always, with no setting and no restart; only the compatibility renderers (D3D11 / OpenGL ES)
+    cannot carry the attachment, and a mod that needs normals disables itself there and says so. `common/gfx_normal_compat.h` makes a base *without* the buffer a
     compile-time non-event; see `docs/normal_buffer_portability.md`.
   - **Link stubs come from the same release as the game build.** `DUSKLIGHT_SDK_STUB_URL` points at
     `automata-rtx/dusklight-ao` `releases/download/platform-normals-test`, which publishes every
@@ -396,15 +379,15 @@ The user typically does not build locally. Iteration loop:
    files were run on an upstream build). The **game service major version** is a second, blunter
    version of the same trap — a bump there refuses every mod built against the older SDK regardless
    of hooks.
-3. **Re-verify the game-linked mods in-game** — Realtime Sun Shadows, Graphics Hub's Deferred Fog,
+3. **Re-verify the game-linked mods in-game** — Deferred Fog, Realtime Sun Shadows,
    Effect Remover, Celestial Orbit. They hook specific game functions and a decomp delta can move or
    rename what they hook. The service-only mods (VBAO, SSILVB, SMAA) need no re-verification.
 4. The shadow mod's cascade replays are still the heaviest consumer of aurora's per-frame
    streaming buffers, so they are the thing to watch if a *new* base ever shrinks them. At the
    current upstream sizes (Vertex 5 MB / Index 2 MB / Storage 8 MB) this is a framerate
    consideration, not a crash risk.
-5. If the new base has no scene normal buffer, expect Graphics Hub to say so and normals to be
-   faceted. That is correct, and needs no source change.
+5. If the new base has no scene normal buffer, expect the normal consumers to disable themselves and
+   say so. That is correct, and needs no source change.
 
 ## Where the platform is going (state this plainly — it is not a secret)
 

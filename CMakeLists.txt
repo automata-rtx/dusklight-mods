@@ -62,7 +62,7 @@ project(dusklight_mods CXX)
 # Keep the pin matched to the game build actually being run — the game-linked mods resolve hook
 # targets by symbol at load, and a mod built against a different base can fail to load outright.
 if (NOT DUSKLIGHT_VERSION)
-    set(DUSKLIGHT_VERSION "19c3ea89b9e57e22fc543a3debda2a06b2d7839d")
+    set(DUSKLIGHT_VERSION "af87a9ec2c7617b1c8b6dec9799fbf3d83830764")
 endif ()
 
 if (NOT DEFINED DUSKLIGHT_REPOSITORY)
@@ -80,29 +80,32 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/FetchDusklight.cmake")
 
 add_subdirectory("${DUSKLIGHT_DIR}/sdk" dusklight-sdk EXCLUDE_FROM_ALL)
 
-# ONLY VBAO BUILDS RIGHT NOW — deliberate, so a test drop contains exactly one .dusk and testers
-# are not handed a mixed bag of mods at different stages. CI globs build/mods/*.dusk, so gating the
-# add_subdirectory calls here is all it takes.
+# THREE MODS BUILD RIGHT NOW — VBAO, Deferred Fog, SMAA. Deliberate scope control: a test drop is
+# exactly these three, not a mixed bag of mods at different stages. CI globs build/mods/*.dusk, so
+# gating the add_subdirectory calls here is all it takes.
 #
-# The other six are commented out rather than deleted because they still consume the RETIRED
-# normal API. GfxService 1.3 replaced the per-mod resolve pair (GfxResolveDesc::normal ->
-# GfxResolvedTargets::normal) with a host-side snapshot behind get_scene_normals, and it removed
-# the mod-side reason for a normal PROVIDER at all: every mod can now ask the service directly.
-# So before re-enabling any of these, port it the way VBAO was ported here:
+# Deferred Fog must come before VBAO: VBAO declares it as a SOFT dependency so the loader orders
+# VBAO's AO composite ahead of the fog re-application. (The dependency is ordering only — no service
+# data crosses between them.)
+add_subdirectory(mods/deferred_fog)
+add_subdirectory(mods/vbao)
+add_subdirectory(mods/smaa)
+
+# The rest stay out of the build until they are ported. GfxService 1.3 replaced the mod-side normal
+# PROVIDER with a host snapshot behind get_scene_normals, so anything that imported
+# dev.automata.depth_to_normal needs the same conversion VBAO and SMAA got:
 #
-#   mods/graphics_hub        Depth to Normal is OBSOLETE as a concept - the service supersedes it.
-#                            Decide whether the mod keeps only Deferred Fog, or is retired.
-#   mods/ssilvb              same conversion as VBAO (its AO half is the same chain).
-#   mods/realtime_sun_shadows, mods/smaa
-#                            drop the depth_to_normal import, call get_scene_normals.
+#   mods/ssilvb              same conversion as VBAO — its AO half is the same chain. May be
+#                            retired instead; not yet decided.
+#   mods/realtime_sun_shadows
+#                            drop the depth_to_normal import, call get_scene_normals. Note it wants
+#                            BOTH normals: the authored one for n.L, a depth-derived face normal for
+#                            the bias. See docs/authored_normals.md 8.6.
 #   mods/celestial_orbit, mods/effect_remover
 #                            no normal use; they only need re-enabling.
 #
 # Re-enable them a mod at a time, not all at once.
-add_subdirectory(mods/vbao)
-# add_subdirectory(mods/graphics_hub)
 # add_subdirectory(mods/celestial_orbit)
 # add_subdirectory(mods/ssilvb)
 # add_subdirectory(mods/realtime_sun_shadows)
 # add_subdirectory(mods/effect_remover)
-# add_subdirectory(mods/smaa)

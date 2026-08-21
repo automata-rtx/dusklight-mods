@@ -41,6 +41,15 @@ Two consequences worth knowing:
 The stored direction carries the sign the game gave it and is **never** flipped toward the camera —
 see `docs/authored_normals.md` §2a for the three separate places that guard had to be deleted from.
 
+**Install Deferred Fog alongside it.** VBAO composites at `SCENE_AFTER_OPAQUE`, which is *inside*
+the fogged frame: without Deferred Fog the game has already applied fog per draw, so the AO
+multiplies over fogged pixels and distant occlusion reads as grime on the haze rather than depth in
+the world. Deferred Fog moves the fog after the composite and the AO lands under it. VBAO imports
+`dev.automata.deferred_fog` **optionally**, and purely as an ordering declaration — no data crosses
+between them, and VBAO runs correctly on its own. The import exists so VBAO's debug views, which
+draw at `FRAME_BEFORE_HUD` like the fog quad, land on top of the fog rather than under it. See
+`docs/deferred_fog.md`.
+
 ## Pipeline (per frame, at `GFX_STAGE_SCENE_AFTER_OPAQUE`)
 
 1. `get_scene_normals` returns the host's per-frame normal snapshot (taken before this stage), and

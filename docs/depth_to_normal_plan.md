@@ -1,5 +1,12 @@
 # Depth to Normal — plan (scoped input mod)
 
+> **RETIRED — historical.** The Depth to Normal provider mod this document designs no longer exists.
+> GfxService 1.3 (`get_scene_normals`) supersedes it: the host snapshots the game's *authored* normals
+> once per frame and hands the same texture to every mod that asks, so there is nothing left for a
+> provider mod to reconstruct or publish. Graphics Hub, which hosted it, is retired; its other half
+> lives on as `mods/deferred_fog`. Kept for the reasoning about per-frame cost and the normal
+> reconstruction itself, both of which informed what replaced them. **Do not implement from this.**
+
 > **Historical.** This is the original design record. The provider shipped and now lives inside
 > **Graphics Hub** (`hub_dtn`), and its primary normal source is no longer the depth reconstruction
 > described below but the game's **authored vertex normals**, with this reconstruction kept as the

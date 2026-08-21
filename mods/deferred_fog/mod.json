@@ -1,0 +1,7 @@
+{
+  "id": "dev.automata.deferred_fog",
+  "name": "Deferred Fog",
+  "version": "1.0.0",
+  "author": "automata-rtx",
+  "description": "Moves the game's fog to after the opaque scene, so screen-space effects darken the world under the fog instead of darkening the fog itself. Without this, ambient occlusion and similar effects multiply over pixels that are already fogged, and distant shading reads as grime on the haze rather than depth in the world. The fog itself is unchanged - it is re-applied with the renderer's own math, just later in the frame. Mixed fog configurations fall back to the game's original behaviour automatically. Install alongside VBAO for correct-looking distant occlusion. EXPERIMENTAL"
+}

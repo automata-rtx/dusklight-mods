@@ -23,6 +23,8 @@
 // XeGTAO (MIT); see res/licenses/ and the headers of each shader.
 
 #include "mods/service.hpp"
+
+#include "deferred_fog_service.h"
 #include "mods/svc/camera.h"
 #include "mods/svc/config.h"
 #include "mods/svc/gfx.h"
@@ -50,6 +52,19 @@ IMPORT_SERVICE(ResourceService, svc_resource);
 IMPORT_SERVICE(UiService, svc_ui);
 IMPORT_SERVICE(GfxService, svc_gfx);
 IMPORT_SERVICE(CameraService, svc_camera);
+// SOFT dependency on Deferred Fog, and it is an ORDERING declaration rather than a data one.
+//
+// The AO composite itself needs nothing from it: VBAO composites at SCENE_AFTER_OPAQUE and the fog
+// quad draws at FRAME_BEFORE_HUD, so the AO already lands UNDER the fog by stage separation - which
+// is the whole point of installing Deferred Fog alongside this mod, since otherwise AO multiplies
+// over already-fogged pixels and distant shading reads as grime on the haze.
+//
+// What the import buys is the DEBUG VIEWS, which also draw at FRAME_BEFORE_HUD and must land on top
+// of the fog. GfxService runs a stage's hooks in registration order, registration happens in
+// mod_initialize, and the loader initializes in dependency order - so importing this is the only
+// way to say "run Deferred Fog's hook before mine". Optional, because Deferred Fog is a separate
+// install and VBAO must work without it.
+IMPORT_OPTIONAL_SERVICE(DeferredFogService, svc_deferred_fog);
 
 namespace {
 

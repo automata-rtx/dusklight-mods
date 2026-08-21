@@ -1,5 +1,11 @@
 # Depth to Normal — building on it (future consumer mods)
 
+> **RETIRED — historical.** The `dev.automata.depth_to_normal` service this document is the integration
+> guide for no longer exists, and neither does its provider mod. Consume normals with GfxService's
+> `get_scene_normals` instead — see `docs/authored_normals.md`, and `mods/vbao` or `mods/smaa` for a
+> worked consumer. The menu of *effects* below is still a useful list of what the normals enable.
+> **Do not copy the integration boilerplate.**
+
 The **Depth to Normal** provider mod (`dev.automata.depth_to_normal`) publishes one thing: a
 per-pixel **world-space surface normal** (+ raw depth), computed once per frame, as a mod-exported
 service. The game's forward renderer never exposed a screen-space normal to shaders, so having one
