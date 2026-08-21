@@ -17,16 +17,34 @@
 // Sky pixels (raw depth 0) are skipped: the sky draws before the world lists, outside the
 // suppression scope, and keeps its own forward fog.
 
+// GX fog range adjustment ("XFog"), reproduced from aurora's build_fog_range_lut. Fog is driven by
+// Z, the distance along the view axis, but a pixel at the screen edge is genuinely further from the
+// eye than a centre pixel of the same Z; the hardware corrects for that with a per-column
+// multiplier on the fog term, applied BEFORE the start-Z bias c is subtracted. TP enables it
+// globally (envcolor_init, d_kankyo.cpp:1257) and re-arms it after every fog set, so it is part
+// of what vanilla renders. Aurora bakes one multiplier per target column into a storage buffer;
+// this evaluates the identical function per pixel instead, which needs no storage binding.
+struct FogRange {
+    center: f32,    // fog-range centre column in NDC x (2 * center / viewport_width - 1)
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+    k: array<vec4f, 3>,  // the 10 range constants, pair-swapped and scaled by 1/64 as aurora does
+}
+
 struct FogUniforms {
     color: vec4f,   // fog color (rgb; a unused)
     a: f32,         // decoded fog coefficients, see above
     b: f32,
     c: f32,
-    fog_type: u32,  // low 3 bits of GXFogType: 2 LIN, 4 EXP, 5 EXP2, 6 REVEXP, 7 REVEXP2
+    fog_type: u32,  // low 3 bits of GXFogType: 2 LIN, 4 EXP, 5 EXP2, 6 REVEXP, 7 REVEXP2.
+                    // Bit 4 (0x10) additionally means "apply the range adjustment" — GXFogType's
+                    // own bit 3 means orthographic, so the flag sits above the masked type.
     debug_mode: u32, // 1 = output the fog factor as grayscale (unblended pipeline)
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
+    range: FogRange,
 }
 
 // Mixed-configuration mode (fs_mixed): a per-pixel config-ID buffer, produced by replaying the
@@ -47,8 +65,9 @@ struct MixedFogUniforms {
     configs: array<MixedFogEntry, 8>,
     count: u32,
     debug_mode: u32, // 1 = combined fog factor, 2 = config-ID visualization
-    fallback_index: u32, // config for pixels the ID replay didn't cover (clipped distant scenery)
+    fallback_index: u32, // config for pixels the ID replay could not cover (see config_index_at)
     _pad1: f32,
+    range: FogRange, // shared by every config; each config opts in via its fog_type bit 0x10
 }
 
 @group(0) @binding(0) var scene_depth: texture_2d<f32>;
@@ -77,11 +96,30 @@ fn scene_depth_at(uv: vec2f) -> f32 {
     return textureLoad(scene_depth, texel, 0i).r;
 }
 
-// Aurora's fog term, verbatim: (1.0 - depth) is the GC screen-z convention (0 = near).
-fn fog_z_for(a: f32, b: f32, c: f32, fog_type: u32, depth: f32) -> f32 {
-    var fog_f = clamp((a / (b - (1.0 - depth))) - c, 0.0, 1.0);
+// The per-column range-adjust multiplier, matching aurora's build_fog_range_lut exactly: the table
+// is indexed from the centre outwards (entry 9 at the centre column, entry 0 at |offset| >= 1) with
+// linear interpolation between neighbours, and the multiplier is the ratio between the eye distance
+// and the axial distance for a column that far off centre.
+fn fog_range_factor(range: FogRange, ndc_x: f32) -> f32 {
+    let offset = ndc_x - range.center;
+    let index = clamp(9.0 - abs(offset) * 9.0, 0.0, 9.0);
+    let lower = u32(index);
+    let upper = min(lower + 1u, 9u);
+    let fraction = index - f32(lower);
+    let k_lower = range.k[lower / 4u][lower % 4u];
+    let k_upper = range.k[upper / 4u][upper % 4u];
+    let k = max(mix(k_lower, k_upper, fraction), 0.000001);
+    return sqrt(offset * offset + k * k) / k;
+}
+
+// Aurora's fog term, verbatim: (1.0 - depth) is the GC screen-z convention (0 = near). range_mul is
+// the range-adjust multiplier (1.0 when the config has it off); aurora applies it to the a/(b - z)
+// term before subtracting c, and where it lands matters — c is a large constant for narrow
+// far-starting bands, so folding it in afterwards would scale the bias too.
+fn fog_z_for(a: f32, b: f32, c: f32, fog_type: u32, depth: f32, range_mul: f32) -> f32 {
+    var fog_f = clamp((a / (b - (1.0 - depth))) * range_mul - c, 0.0, 1.0);
     var fog_z: f32;
-    switch fog_type {
+    switch fog_type & 7u {
         case 4u: { // GX_FOG_(PERSP|ORTHO)_EXP
             fog_z = 1.0 - exp2(-8.0 * fog_f);
         }
@@ -113,7 +151,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         return vec4f(0.0);
     }
 
-    let fog_z = fog_z_for(uniforms.a, uniforms.b, uniforms.c, uniforms.fog_type, depth);
+    var range_mul = 1.0;
+    if (uniforms.fog_type & 0x10u) != 0u {
+        range_mul = fog_range_factor(uniforms.range, in.uv.x * 2.0 - 1.0);
+    }
+    let fog_z =
+        fog_z_for(uniforms.a, uniforms.b, uniforms.c, uniforms.fog_type, depth, range_mul);
     if uniforms.debug_mode != 0u {
         return vec4f(fog_z, fog_z, fog_z, 1.0);
     }
@@ -129,10 +172,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
 // ~0 rejects all of that so it falls back to config 0 (the reference config, which is the
 // correct room fog for grass anyway) instead of a per-pixel config that flickers with the
 // lighting. (Pure-red bypassed geometry could still alias, but none occurs in practice.)
-// Returns the fog-config index for a pixel from the ID buffer. Pixels the replay did not cover
-// (background/clipped distant scenery, or non-J3D drawers) decode as invalid and fall back to
-// mixed.fallback_index — the widest-far distant fog — rather than config 0 (the near fog), so
-// distant geometry the single-projection replay clipped is not over-fogged by the near config.
+// Returns the fog-config index for a pixel from the ID buffer. Pixels the replay could not stamp
+// (translucent surfaces drawn in the opaque lists, notably the Ganon barrier dome, and any
+// remaining non-J3D drawer) decode as invalid and fall back to mixed.fallback_index — the config
+// whose fog reaches furthest this frame, since an uncovered pixel is most often distant geometry —
+// rather than to config 0.
 fn config_index_at(uv: vec2f) -> u32 {
     let size = vec2<i32>(textureDimensions(config_ids));
     let texel = clamp(vec2<i32>(uv * vec2f(size)), vec2<i32>(0i), size - 1i);
@@ -165,7 +209,11 @@ fn fs_mixed(in: VertexOutput) -> @location(0) vec4f {
         return vec4f(value, value, value, 1.0);
     }
     let entry = mixed.configs[index];
-    let fog_z = fog_z_for(entry.a, entry.b, entry.c, entry.fog_type, depth);
+    var range_mul = 1.0;
+    if (entry.fog_type & 0x10u) != 0u {
+        range_mul = fog_range_factor(mixed.range, in.uv.x * 2.0 - 1.0);
+    }
+    let fog_z = fog_z_for(entry.a, entry.b, entry.c, entry.fog_type, depth, range_mul);
     if mixed.debug_mode != 0u {
         return vec4f(fog_z, fog_z, fog_z, 1.0);
     }

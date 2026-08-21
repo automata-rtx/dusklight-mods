@@ -394,7 +394,7 @@ is shared while the *colour* is not.
 
 So "the game's fog" is not one configuration. **Water surfaces are deliberately fogged
 to black or white while everything else is fogged to the palette colour**, and the
-selector is a material name. `hub_fog` reverts to vanilla on "mixed fog configs"; this
+selector is a material name. Deferred Fog reverts to vanilla on "mixed fog configs"; this
 says the mixed case is not an edge case, it is the game's design for a whole material
 class, and it is identifiable by name rather than by inspecting state.
 
@@ -423,6 +423,51 @@ Two consequences worth having straight:
 **Still not established:** whether the same ordering holds for the non-terrain callers of
 `dKy_bg_MAxx_proc` under every actor's own draw sequence. The two checked agree; the
 remaining five were not traced.
+
+---
+
+### 4.6 `XFog` is the fog **range adjustment**, and it is on everywhere — **DOC CORRECTED**
+
+Found while auditing Deferred Fog for vanilla accuracy.
+
+`GxXFog_set` (`d_kankyo.cpp:9463`), `dKyd_xfog_table_set` (`d_kankyo_data.cpp:775`) and
+`S_xfog_table_data` (`:766`) are authored names, and the *X* is the **screen x axis** — this
+is GX's fog range adjustment, the per-column multiplier the hardware applies to the fog term
+because a pixel at the screen edge is genuinely further from the eye than a centre pixel at the
+same Z. Read as "extra fog" or "cross fade" it disappears; read correctly it is one function
+call away from `GXSetFogRangeAdj`, which is the only place it can be.
+
+What the reading found:
+
+- `envcolor_init` (`d_kankyo.cpp:1240`) turns it on at environment init — `:1257-1260`:
+  `mFogAdjEnable = true`, table type `0`, centre `0x140` = 320, the middle column of the
+  640-wide logical framebuffer (corroborated by `:1110`, which seeds the debug mirror with the
+  literal `320`) — and **nothing ever clears `mFogAdjEnable`**. The 2D/ortho passes call
+  `GXSetFogRangeAdj(GX_DISABLE, ...)` directly, but they carry no fog anyway, and every world
+  fog set re-arms it.
+- Every path that sets fog re-arms it. `GxXFog_set()` runs immediately after each of the three
+  direct setters (`:9416`, `:9438`, `:9460`), and `setLightTevColorType_MAJI_sub` copies the
+  same globals into every BG material's `J3DFogInfo` (`:4481-4484`) so `J3DFog::load()` re-issues
+  it per material.
+- Aurora implements it: its fog-range LUT builder bakes one multiplier per target column and
+  the generated fragment shader applies it to `a / (b − z)` *before* subtracting `c`.
+
+`docs/deferred_fog.md` asserted the opposite — that the game sets range adjustment but aurora
+ignores it, "so the deferred pass correctly ignores it too". That was false on this pin, and it
+is why the deferred pass flattened a horizontal gradient vanilla has for as long as it did. The
+mod now reproduces it.
+
+### 4.7 `dBgp_c` is "bg **parts**" — map units, and they do not draw like anything else
+
+Also from the Deferred Fog audit. `dBgS`/`dBgW` are the **collision** system; `dBgp_c`
+(`d_bg_parts.cpp`) is unrelated to them despite the shared prefix — it is the shared, instanced
+**map units** a stage is assembled from, which in the field is most of the distant scenery.
+
+The reason it matters to us is a draw-path fact, not a naming one, but the name is what leads
+you there: `dBgp_c::modelMaterial_c::drawSimple` (`:20`) calls `mpMaterial->loadSharedDL()` and
+then walks the shape's matrix groups calling `J3DShapeDraw::draw()` **directly** — never
+`J3DShape::drawFast`. Any mod that intercepts J3D drawing at `drawFast` silently misses it. See
+`docs/deferred_fog.md`, "Draw paths that do not go through `J3DShape::drawFast`".
 
 ---
 

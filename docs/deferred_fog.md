@@ -76,8 +76,98 @@ Any screen-space effect composited after the opaque scene therefore multiplies o
    included), so the deferred pass reproduces forward fog bit-identically for opaque pixels
    (verified: coefficients match an independent transcription of both sides exactly, and the
    shader executed on llvmpipe matches a CPU reference of aurora's formula to 0 ULP across
-   all five fog curves). GX fog *range adjustment* is set by the game but ignored by
-   aurora's command processor, so the deferred pass correctly ignores it too.
+   all five fog curves).
+5. **Fog range adjustment** ("XFog" in the game's own naming) is reproduced too. GX fog is
+   driven by Z — the distance along the view axis — but a pixel at the screen edge is
+   genuinely further from the eye than a centre pixel at the same Z, and the hardware
+   corrects for it with a per-column multiplier applied to `a / (b − z)` *before* `c` is
+   subtracted. TP turns it on at environment init and never clears it (`envcolor_init`,
+   `d_kankyo.cpp:1257`: `mFogAdjEnable = true`, table 0, centre `0x140`), and every fog
+   setter re-arms it — `GxXFog_set()` after each of the three direct setters, and each BG
+   material's `J3DFog` block, stamped from the same globals, re-issues it on load. Aurora
+   implements it (`build_fog_range_lut` bakes one multiplier per target column;
+   `fogBase *= lut[u32(in.pos.x)]`), so it is part of what vanilla renders. `res/fog.wgsl`
+   evaluates the identical function analytically per pixel (`fog_range_factor`) from the
+   same constants, in the same pair-swapped order, at the same 1/64 scale. Omitting it cost
+   a horizontal gradient the game has: `(lut − 1)·(c + fogF)`, ~3% of the fog term at the
+   screen edges, which is a fraction of a point for near fog but reaches double digits for
+   the narrow, far-*starting* bands distant haze uses, where `c = startZ/(endZ − startZ)` is
+   large. **An earlier revision of this document claimed aurora ignored range adjustment and
+   that the mod therefore correctly ignored it too. That was false, and it is why nobody
+   looked.**
+
+## Draw paths that do not go through `J3DShape::drawFast`
+
+The `drawFast` pre-hook covers the mainstream J3D packet path, but not everything draws that
+way, and a path it misses keeps its forward fog *and* receives the deferred quad — double
+fog, worst exactly where the fog term is largest.
+
+- **Grass / flowers** program fog through `GFSetFog`; that hook covers them.
+- **Map units** (`dBgp_c`, "bg parts" — the shared, instanced pieces a stage is assembled
+  from, which in the field is most of the distant scenery) draw themselves:
+  `dBgp_c::modelMaterial_c::drawSimple` (`d_bg_parts.cpp:20`) calls
+  `mpMaterial->loadSharedDL()` and then walks the shape's matrix groups calling
+  `J3DShapeDraw::draw()` directly. The packet-level fog it sets first *is* caught (that is a
+  real `dKy_GxFog_tevstr_set` → `GXSetFog`), but the material display list replayed by
+  `loadSharedDL` re-issues `J3DGDSetFog` from the material's own fog block afterwards, and
+  nothing hooked runs in between. In exact mode the same gap meant the replay never stamped
+  that geometry, so it rasterized real lit colours, decoded as "uncovered", and fell through
+  to the fallback config instead of its own. A **post-hook on `loadSharedDL`** (all three
+  material-class overrides) lands exactly between the display list and the shapes and closes
+  both.
+
+  It is **scoped to `dBgp_c`** by a bracketing hook on `drawSimple`, and that is required,
+  not caution: every other `loadSharedDL` caller (`d_model.cpp:22`, `d_particle.cpp:593`, the
+  fchain / wchain / hookshot chain shapes) calls `dKy_GxFog_tevstr_set` *immediately after*
+  loading the display list, so the material's own fog is overwritten before a triangle
+  rasterizes and never renders at all. Registering it would put a config in the frame table
+  that vanilla never draws with — enough to make a uniform scene read as "mixed", which in
+  Vanilla mode reverts the whole scene to forward fog. `dBgp_c` is the one caller that sets
+  its fog *before* the material loop, so there, and only there, the display list has the last
+  word. The Status line reports how many shared-DL materials carried live fog in the frame.
+
+## The Ganon barrier, and what its signature must NOT match
+
+The Hyrule Castle barrier dome (`d_a_obj_ganonwall2`, `d_a_obj_ganonwall`) is translucent but
+draws in the **opaque BG list**, so it lands inside the suppression scope. Both actors rewrite
+their material fog to pure black with `mStartZ = 1000.0f`, `mEndZ = 250000.0f` every frame
+(`d_a_obj_ganonwall2.cpp:112-116`). Deferring that config breaks two ways at once: the
+config-ID replay rasterizes the dome **solid** and stamps its black fog onto the castle and
+trees inside it, and the dome's own fog-then-blend compositing is lost. So the mod recognises
+that one signature and leaves the barrier entirely on its vanilla forward fog — never
+suppressed, never registered as a frame config — and in the replay resolves its pixels to the
+frame's widest fog (what the castle behind it uses) rather than to config 0. A single
+fullscreen pass cannot reproduce per-fragment fog *through* a translucent surface, so the
+residual is that the quad still adds the field fog over the dome's pixels; that is far better
+than the black-stamped geometry it replaces.
+
+The match is the **exact literal triple**. It used to be `black && endZ > 100000`, which
+matched a whole material class rather than an actor: `mType = 7` is the game's own black-fog
+sentinel, stamped by `dKy_bg_MAxx_proc` on the terrain **water** family `MA03`/`MA17`/`MA19`
+(`d_kankyo.cpp:11390`) and on `MA20` (`:11588`). `setLightTevColorType_MAJI_sub` reads that
+sentinel and forces the fog **colour** to pure black (`:4466-4470`) while the start/end Z stay
+the room palette's — and per `docs/japanese-naming.md` §4.5 the polygon-code pass runs *after*
+the translation and re-stamps the type, so what reaches the GPU is black fog over the palette's
+range. In any room whose palette `fog_end_z` exceeded 100000, every water surface and every
+`MA20` material therefore looked like the barrier: left on forward fog **and** painted over by
+the quad — double fog. Palette fog is interpolated by `float_kankyo_color_ratio_set`
+and cannot land on both literals, so the exact test cannot collide with it.
+
+## What an uncovered pixel falls back to
+
+Pixels the ID replay does not cover fall back to the config with the **widest `endZ`** of the
+frame. This used to rank by the projection **far plane**, modelling a "distant scenery fog
+drawn with a wider projection" that TP does not have: every fog config in a frame is stamped
+with the same near/far, read from the one live view (`d_kankyo.cpp:4461-4463` for every BG
+material, `:9394`/`:9429`/`:9451` for the three direct setters), the world lists draw under a
+single perspective projection (`m_Do_graphic.cpp:2338`), and nothing sets another one inside the
+suppression window.
+So the old strict `farZ >` scan from index 0 never fired and the function was a long way of
+writing `return 0` — the *near* fog, which is why uncovered distant geometry read as
+over-fogged. What TP actually widens for distant scenery is the CPU **clipper**
+(`d_a_bg.cpp:298` `changeFar(1000000)`, `d_bg_parts.cpp:681` `changeFar(100000)`), decided at
+list-build time by `hide()`/`show()` — which the replay reproduces on its own and which never
+touches fog.
 
 ## Mixed fog configurations
 
@@ -86,7 +176,7 @@ differences (Δcolor ≤ 6, Δstart/end ≤ 2% of the fog span); anything beyond
 distinct configuration. Many areas mix several (rooms lagging the stage's palette blend,
 special-fog materials), and the two modes handle that differently (`mixedMode`):
 
-- **Exact (replay), the default**: every fogged draw is suppressed and its configuration
+- **Exact (replay)**: every fogged draw is suppressed and its configuration
   captured into a per-frame table (up to 8 distinct). A uniform frame takes the ordinary
   single-quad path at no extra cost. A mixed frame replays the opaque draw lists once into
   a mod-owned offscreen pass — same save-replay-resolve bracket as the shadow mod's
@@ -112,7 +202,7 @@ special-fog materials), and the two modes handle that differently (`mixedMode`):
     between configs as the lighting changed — the day/night grass artifact.) Residual: a
     genuinely pure-red bypassed surface could still alias, but none occurs in practice.
   - MSAA silhouettes may resolve to an invalid ID on 1-px fringes → reference config.
-- **Vanilla**: the original behavior — only draws matching the frame's reference config
+- **Vanilla, the default**: the original behavior — only draws matching the frame's reference config
   are suppressed; any deviant reverts the scene to forward fog from the next frame until
   it is uniform again. Twilight black fog (type 7 → linear black), wolf-senses white fog
   (type 6), and room transitions all take the vanilla path in this mode.
@@ -141,12 +231,19 @@ fog itself at range (unnatural darkening on distant fog-washed terrain). Tools:
 
 | Var | Default | Meaning |
 |---|---|---|
-| `effectEnabled` | on | master toggle (off = vanilla forward fog) |
-| `mixedMode` | 1 (Exact) | mixed-scene handling: 0 = Vanilla (revert to forward fog), 1 = Exact (per-pixel config-ID replay) |
-| `debugView` | 0 | 1 = deferred fog factor as grayscale, 2 = config IDs (exact mode, mixed frames) |
+| `fogEnabled` | on | master toggle (off = vanilla forward fog) |
+| `fogMixedMode` | 0 (Vanilla) | mixed-scene handling: 0 = Vanilla (revert to forward fog), 1 = Exact (per-pixel config-ID replay) |
+| `fogDebug` | 0 | 1 = deferred fog factor as grayscale, 2 = config IDs (exact mode, mixed frames) |
+| `fogLogConfigs` | off | dump the frame's captured fog-config table to the log whenever it changes |
+
+These are the names `register_var` is actually called with; an earlier revision of this table
+listed `effectEnabled` / `mixedMode` / `debugView`, which the mod has never registered, and gave
+the wrong default for the mixed mode. `exact_mode()`'s read fallback must stay equal to
+`fogMixedMode`'s registered default — it was 1 against a default of 0, so a failed config read
+would silently have run Exact while the UI showed Vanilla.
 
 The mods panel shows the **Enabled** toggle, a read-only **Status** line (see "Diagnosing
-fog issues"), and an **Open Controls** button; `mixedMode` and `debugView` are SELECT
+fog issues"), and an **Open Controls** button; `fogMixedMode` and `fogDebug` are SELECT
 controls, which the UI only renders inside a window tab (not the flat panel), so they live in
 the Open Controls window.
 

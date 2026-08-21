@@ -17,7 +17,9 @@
  *     under the fog rather than on top of it.
  *   - A mod that also draws at FRAME_BEFORE_HUD and wants to be ON TOP of the fog — a debug
  *     overlay, say — must register its hook AFTER Deferred Fog's, so it must initialize after it,
- *     so it must import this. VBAO does exactly that for its debug views.
+ *     so it must import this. Drawing at FRAME_AFTER_HUD instead is simpler and needs no import at
+ *     all, which is what VBAO's debug views switched to; nothing in this repo imports this service
+ *     for ordering today.
  *
  * Import it OPTIONALLY (IMPORT_OPTIONAL_SERVICE). Deferred Fog is a separate install, and a
  * consumer must run correctly without it — the fog is simply the game's own forward fog then, and

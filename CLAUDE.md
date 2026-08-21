@@ -72,14 +72,31 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
 - **`mods/deferred_fog/`** — "Deferred Fog": suppresses the game's per-draw fog during the opaque
   world lists and re-applies it (bit-exact aurora fog math, `src/fog_math.h`) as a fullscreen pass at
   `FRAME_BEFORE_HUD`, so AO/shadows darken surfaces *under* the fog instead of darkening the fog
-  itself. Mixed fog configs auto-revert to vanilla (or exact per-pixel replay). Special-cases the
-  Hyrule Castle Ganon barrier (`d_a_obj_ganonwall2`, a translucent dome drawn in the *opaque* BG list
-  with pure-black `endZ 250000` fog) via `is_barrier_fog`: left on vanilla forward fog so its black
-  fog isn't stamped onto the castle/trees inside it. Also handles TP's **near-fog +
-  distant-scenery-fog split** (Hyrule Field draws distant geometry with a *wider projection far
-  plane* and a separate gentle long-range fog): the single-projection config-ID replay clips that far
-  geometry, so the fog quad falls those pixels back to `widest_far_index()` rather than config 0.
-  Diagnostic: `fogLogConfigs` dumps the frame's captured fog-config table. **Game-linked** + webgpu.
+  itself. Mixed fog configs auto-revert to vanilla (default) or take an exact per-pixel replay.
+  It reproduces **fog range adjustment** ("XFog"), the per-column multiplier GX applies to the fog
+  term because screen-edge pixels are further from the eye than their Z says: TP enables it globally
+  (`d_kankyo.cpp:1257`) and aurora implements it, so omitting it flattened a horizontal gradient
+  vanilla has — small for near fog, double-digit percentage points for the narrow far-*starting*
+  bands distant haze uses. `docs/deferred_fog.md` used to claim aurora ignored it; that was false.
+  **Not every draw goes through `J3DShape::drawFast`.** `dBgp_c` map units (most of the field's
+  distant scenery) call `loadSharedDL()` and then `J3DShapeDraw::draw()` directly, so the material
+  display list re-issues `J3DGDSetFog` after the packet's `GXSetFog` was suppressed — double fog,
+  and unstamped geometry in the replay. A post-hook on `loadSharedDL`, **bracketed to `dBgp_c` by a
+  `drawSimple` hook**, closes it; the bracket is required, because every other `loadSharedDL` caller
+  sets its fog *after* the display list, so registering that fog would invent a config vanilla never
+  draws with.
+  Special-cases the Hyrule Castle Ganon barrier (`d_a_obj_ganonwall2`, a translucent dome drawn in
+  the *opaque* BG list) via `is_barrier_fog`: left on vanilla forward fog so its black fog isn't
+  stamped onto the castle/trees inside it. That test matches the **exact literal triple** the actor
+  writes (black, `startZ 1000`, `endZ 250000`) — it used to be `black && endZ > 100000`, which also
+  matched the game's own `mType = 7` black-fog sentinel (which forces the fog *colour* black over the
+  room palette's range) on the water family and `MA20`, double-fogging them in any room with a
+  distant palette fog. **TP has no near-fog/distant-scenery-fog split**: every
+  config in a frame carries the same near/far from the one live view, so the old `widest_far_index()`
+  (ranked by far plane) was a long way of writing `return 0`; the uncovered-pixel fallback now ranks
+  by `endZ`. What TP widens for distant scenery is the CPU clipper, which never touches fog.
+  Diagnostic: `fogLogConfigs` dumps the frame's captured fog-config table; the Status line reports
+  how many shared-DL materials carried live fog. **Game-linked** + webgpu.
   Docs: `docs/deferred_fog.md`.
 
   **No other mod depends on it, and that is deliberate.** It exports `dev.automata.deferred_fog`
