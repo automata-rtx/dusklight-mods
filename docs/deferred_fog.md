@@ -19,9 +19,13 @@ Which matters only for one case. The fog quad draws at `FRAME_BEFORE_HUD`; the
 - A mod compositing at `SCENE_AFTER_OPAQUE` is **already** ordered before the fog by stage
   separation, and needs no import. That is the main path and the whole point of the mod.
 - A mod that *also* draws at `FRAME_BEFORE_HUD` and wants to be **on top of** the fog — a debug
-  overlay — must register after Deferred Fog, so it must import this. VBAO does exactly that.
+  overlay — would have to register after Deferred Fog, so it would have to import this.
 
-Import it **optionally**: Deferred Fog is a separate install and a consumer must run without it.
+**In practice, prefer `FRAME_AFTER_HUD` to the import.** That stage runs after everything including
+the HUD, so an overlay lands on top of the fog with no dependency at all. VBAO used the import for
+its debug views and now uses the later stage instead; nothing currently imports this service. Keep
+it exported anyway — it is the only lever available if a future mod genuinely needs to interleave
+*within* `FRAME_BEFORE_HUD`. Import it **optionally** if so: Deferred Fog is a separate install.
 
 
 Mod id `dev.automata.deferred_fog`. Game-linked: hooks game/J3D functions, so it is coupled

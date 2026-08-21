@@ -44,11 +44,13 @@ see `docs/authored_normals.md` §2a for the three separate places that guard had
 **Install Deferred Fog alongside it.** VBAO composites at `SCENE_AFTER_OPAQUE`, which is *inside*
 the fogged frame: without Deferred Fog the game has already applied fog per draw, so the AO
 multiplies over fogged pixels and distant occlusion reads as grime on the haze rather than depth in
-the world. Deferred Fog moves the fog after the composite and the AO lands under it. VBAO imports
-`dev.automata.deferred_fog` **optionally**, and purely as an ordering declaration — no data crosses
-between them, and VBAO runs correctly on its own. The import exists so VBAO's debug views, which
-draw at `FRAME_BEFORE_HUD` like the fog quad, land on top of the fog rather than under it. See
-`docs/deferred_fog.md`.
+the world. Deferred Fog moves the fog after the composite and the AO lands under it.
+
+**There is no dependency between the two mods, in either direction.** VBAO composites at
+`SCENE_AFTER_OPAQUE` and the fog quad draws at `FRAME_BEFORE_HUD`, so the ordering that matters is
+guaranteed by stage separation alone. VBAO's debug views draw at `FRAME_AFTER_HUD` — the last stage
+in the frame — so they land on top of the fog without needing the two mods to agree on anything.
+See `docs/deferred_fog.md`.
 
 ## Pipeline (per frame, at `GFX_STAGE_SCENE_AFTER_OPAQUE`)
 

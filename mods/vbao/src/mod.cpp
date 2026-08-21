@@ -24,7 +24,6 @@
 
 #include "mods/service.hpp"
 
-#include "deferred_fog_service.h"
 #include "mods/svc/camera.h"
 #include "mods/svc/config.h"
 #include "mods/svc/gfx.h"
@@ -52,19 +51,6 @@ IMPORT_SERVICE(ResourceService, svc_resource);
 IMPORT_SERVICE(UiService, svc_ui);
 IMPORT_SERVICE(GfxService, svc_gfx);
 IMPORT_SERVICE(CameraService, svc_camera);
-// SOFT dependency on Deferred Fog, and it is an ORDERING declaration rather than a data one.
-//
-// The AO composite itself needs nothing from it: VBAO composites at SCENE_AFTER_OPAQUE and the fog
-// quad draws at FRAME_BEFORE_HUD, so the AO already lands UNDER the fog by stage separation - which
-// is the whole point of installing Deferred Fog alongside this mod, since otherwise AO multiplies
-// over already-fogged pixels and distant shading reads as grime on the haze.
-//
-// What the import buys is the DEBUG VIEWS, which also draw at FRAME_BEFORE_HUD and must land on top
-// of the fog. GfxService runs a stage's hooks in registration order, registration happens in
-// mod_initialize, and the loader initializes in dependency order - so importing this is the only
-// way to say "run Deferred Fog's hook before mine". Optional, because Deferred Fog is a separate
-// install and VBAO must work without it.
-IMPORT_OPTIONAL_SERVICE(DeferredFogService, svc_deferred_fog);
 
 namespace {
 
@@ -102,7 +88,7 @@ ConfigVarHandle g_cvarDebugView = 0;
 GfxComputeTypeHandle g_computeType = 0;
 GfxDrawTypeHandle g_drawType = 0;
 GfxStageHookHandle g_afterOpaqueHook = 0;
-GfxStageHookHandle g_beforeHudHook = 0;
+GfxStageHookHandle g_afterHudHook = 0;
 UiWindowHandle g_controlsWindow = 0;
 
 ResourceBuffer g_preprocessSource = RESOURCE_BUFFER_INIT;
@@ -244,9 +230,14 @@ struct CompositePayload {
 static_assert(sizeof(CompositePayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
 static_assert(std::is_trivially_copyable_v<CompositePayload>);
 
-// Debug views draw at FRAME_BEFORE_HUD instead of SCENE_AFTER_OPAQUE so nothing layered on
-// after the opaque scene (deferred fog, bloom, translucency) obscures them; the payload is
-// staged here between the two stages (game thread only; its views live for the frame).
+// Debug views draw at FRAME_AFTER_HUD instead of SCENE_AFTER_OPAQUE so nothing layered on after
+// the opaque scene obscures them - bloom, translucency, and Deferred Fog's quad all land before
+// this point. AFTER the HUD specifically, rather than before it: that is the last stage in the
+// frame, so it needs no cooperation from any other mod. (This used to be FRAME_BEFORE_HUD, which
+// shares a stage with Deferred Fog's fog quad and therefore depended on hook registration order -
+// VBAO carried an optional import of dev.automata.deferred_fog purely to force that order. Moving
+// one stage later removes the coupling outright.) The payload is staged here between the two
+// stages (game thread only; its views live for the frame).
 CompositePayload g_pendingDebugDraw{};
 bool g_debugDrawPending = false;
 
@@ -948,8 +939,9 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         resolved.depth, computePayload.sceneNormal, uniformRange.offset, uniformRange.size,
         debugMode};
     if (debugMode != 0) {
-        // Debug views draw at FRAME_BEFORE_HUD so deferred fog, translucency, and bloom
-        // don't paint over them (all payload views stay valid for the rest of the frame).
+        // Debug views draw at FRAME_AFTER_HUD, the last stage in the frame, so deferred fog,
+        // translucency, bloom and the HUD are all already down (all payload views stay valid for
+        // the rest of the frame).
         g_pendingDebugDraw = drawPayload;
         g_debugDrawPending = true;
     } else {
@@ -967,7 +959,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
 
 // Game thread, after the full 3D scene: push the staged debug-view draw, unobscured by
 // everything the scene layered on after the opaque pass.
-void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
+void on_frame_after_hud(ModContext*, const GfxStageContext*, void*) {
     if (!g_debugDrawPending) {
         return;
     }
@@ -1342,9 +1334,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     {
         return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
-    stageDesc.callback = on_frame_before_hud;
+    stageDesc.callback = on_frame_after_hud;
     if (svc_gfx->register_stage_hook(
-            mod_ctx, GFX_STAGE_FRAME_BEFORE_HUD, &stageDesc, &g_beforeHudHook) != MOD_OK)
+            mod_ctx, GFX_STAGE_FRAME_AFTER_HUD, &stageDesc, &g_afterHudHook) != MOD_OK)
     {
         return mods::set_error(error, MOD_ERROR, "failed to register stage hook");
     }
@@ -1428,7 +1420,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarDistanceFade = g_cvarFadeStart = g_cvarFadeEnd = 0;
     g_cvarHalfRes = g_cvarDebugView = 0;
     g_computeType = g_drawType = 0;
-    g_afterOpaqueHook = g_beforeHudHook = 0;
+    g_afterOpaqueHook = g_afterHudHook = 0;
     g_debugDrawPending = false;
     g_controlsWindow = 0;
     g_frameIndex = 0;

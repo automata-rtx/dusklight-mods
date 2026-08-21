@@ -10,6 +10,4 @@ add_mod(vbao
     RES_DIR  res
 )
 
-target_include_directories(vbao PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../deferred_fog/include
-    ${CMAKE_SOURCE_DIR}/common)
+target_include_directories(vbao PRIVATE ${CMAKE_SOURCE_DIR}/common)

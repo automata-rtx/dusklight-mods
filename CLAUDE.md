@@ -82,13 +82,15 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   Diagnostic: `fogLogConfigs` dumps the frame's captured fog-config table. **Game-linked** + webgpu.
   Docs: `docs/deferred_fog.md`.
 
-  **It exports `dev.automata.deferred_fog` purely so consumers can declare an ORDERING dependency.**
-  The mod API has no priority field on a stage hook — hooks run in registration order, registration
-  happens in `mod_initialize`, and the loader initializes in dependency order, so importing a mod's
-  service is the only way to say "init that one first". A mod compositing at `SCENE_AFTER_OPAQUE` is
-  already ahead of the fog by stage separation and needs no import; a mod that *also* draws at
-  `FRAME_BEFORE_HUD` and wants to be **on top of** the fog does. VBAO imports it optionally for
-  exactly that (its debug views). See `mods/deferred_fog/include/deferred_fog_service.h`.
+  **No other mod depends on it, and that is deliberate.** It exports `dev.automata.deferred_fog`
+  (a one-call state query) because the mod API has no priority field on a stage hook — hooks run in
+  registration order, registration follows `mod_initialize`, and the loader initializes in
+  dependency order, so importing a service is the only lever for "init that one first". But the
+  lever is rarely needed: a mod compositing at `SCENE_AFTER_OPAQUE` is already ahead of the fog quad
+  (`FRAME_BEFORE_HUD`) by stage separation. VBAO briefly imported it so its debug views could sit on
+  top of the fog; drawing those at `FRAME_AFTER_HUD` — the last stage in the frame — achieves the
+  same thing with no coupling, which is what it does now. Reach for the import only if you need to
+  interleave *within* a stage. See `mods/deferred_fog/include/deferred_fog_service.h`.
 
   **Graphics Hub is RETIRED.** It bundled this with a "Depth to Normal" provider that reconstructed
   a world-space normal from depth and published it as a service. GfxService 1.3's `get_scene_normals`

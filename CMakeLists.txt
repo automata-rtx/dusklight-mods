@@ -84,9 +84,10 @@ add_subdirectory("${DUSKLIGHT_DIR}/sdk" dusklight-sdk EXCLUDE_FROM_ALL)
 # exactly these three, not a mixed bag of mods at different stages. CI globs build/mods/*.dusk, so
 # gating the add_subdirectory calls here is all it takes.
 #
-# Deferred Fog must come before VBAO: VBAO declares it as a SOFT dependency so the loader orders
-# VBAO's AO composite ahead of the fog re-application. (The dependency is ordering only — no service
-# data crosses between them.)
+# Order here is alphabetical-ish and does not matter: no mod in this set imports another. The
+# AO-under-fog ordering that Deferred Fog exists for is guaranteed at RUNTIME by stage separation
+# (VBAO composites at SCENE_AFTER_OPAQUE, the fog quad draws at FRAME_BEFORE_HUD), not by build or
+# load order.
 add_subdirectory(mods/deferred_fog)
 add_subdirectory(mods/vbao)
 add_subdirectory(mods/smaa)
