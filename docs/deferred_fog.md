@@ -126,6 +126,50 @@ fog, worst exactly where the fog term is largest.
   its fog *before* the material loop, so there, and only there, the display list has the last
   word. The Status line reports how many shared-DL materials carried live fog in the frame.
 
+## Blended draws inside the opaque lists cannot have their fog deferred
+
+**GX fog runs per fragment, before the blend.** The hardware computes `mix(src, fogColour, f)` and
+blends *that* over the framebuffer. A fullscreen pass can only do the outer operation,
+`mix(blend(src, dst), fogColour, f)`. The two are the same operation only when the draw **replaces**
+what is under it. For a blended draw they are different, and no tuning makes them equal:
+
+- an **additive** pass fogged toward a bright fog colour gets *brighter* with distance, because the
+  fog colour is what gets added. A deferred pass can only pull the finished pixel toward the fog
+  colour, so the same surface comes out dimmer. The terrain material vocabulary names this class of
+  material — `_Kasan` (加算, "addition"); see `docs/japanese-naming.md`.
+- a surface fogged toward **black** fades *out* with distance. Deferring instead paints the room's
+  pale fog over the surface **and** over everything visible through it.
+
+TP does this in at least two places, both verified in the decompilation:
+
+- **The Hyrule Castle barrier.** `d_a_obj_ganonwall2::Draw` (and `d_a_obj_ganonwall`) rewrites every
+  material's fog to pure black over `startZ 1000` / `endZ 250000` *every frame*, then enters the
+  model with `dComIfGd_setListBG()` — a translucent dome in the **opaque BG list**, deliberately
+  fading to black with distance.
+- **Water.** `dKy_bg_MAxx_proc` stamps `mType = 7` on the terrain water family `MA03`/`MA17`/`MA19`
+  (`d_kankyo.cpp:11390`) and on `MA20` (`:11588`), and `mType = 6` on `MA09` (`:11381`), which
+  `setLightTevColorType_MAJI_sub` turns into pure **black** and pure **white** fog respectively. The
+  same pass moves them into the DarkBG opaque list (`:11371`). So the game fogs the *water's own
+  colour* to black before blending it over the riverbed — which is what makes deep water darken.
+  Deferring fogged the water **and the riverbed under it** toward black instead, which is why
+  deferred water read so differently.
+
+**So a blended draw keeps its vanilla forward fog**, is never registered as a frame config, and in
+the replay writes no colour — leaving the config of whatever is behind it, which is the config the
+deferred quad should use for those pixels. Where the blended surface does not write depth (the usual
+case) that is exactly right: the geometry behind gets its deferred fog and the surface keeps its own
+forward fog on top, same as vanilla. Where it *does* write depth, the quad still fogs at the
+surface's depth — the one residual a single fullscreen pass cannot avoid.
+
+"Blended" is read from the material's PE block: an explicit blend that is not a `ONE/ZERO` replace,
+or a `J3DPEBlockXlu` (whose PE block carries no blend state to read, but whose *type* says it is
+translucent). `J3DPEBlockTexEdge` is alpha-**tested**, not blended — it replaces what is under it,
+so foliage cutouts still defer correctly. The toggle **Blended Draws Keep Vanilla Fog** (default on)
+turns the rule off for comparison.
+
+This **generalises** the Ganon-barrier special case below, which is kept as a second trigger for the
+same treatment so the barrier is handled even if a material's blend state cannot be read.
+
 ## The Ganon barrier, and what its signature must NOT match
 
 The Hyrule Castle barrier dome (`d_a_obj_ganonwall2`, `d_a_obj_ganonwall`) is translucent but
@@ -135,11 +179,10 @@ their material fog to pure black with `mStartZ = 1000.0f`, `mEndZ = 250000.0f` e
 config-ID replay rasterizes the dome **solid** and stamps its black fog onto the castle and
 trees inside it, and the dome's own fog-then-blend compositing is lost. So the mod recognises
 that one signature and leaves the barrier entirely on its vanilla forward fog — never
-suppressed, never registered as a frame config — and in the replay resolves its pixels to the
-frame's widest fog (what the castle behind it uses) rather than to config 0. A single
-fullscreen pass cannot reproduce per-fragment fog *through* a translucent surface, so the
-residual is that the quad still adds the field fog over the dome's pixels; that is far better
-than the black-stamped geometry it replaces.
+suppressed, never registered as a frame config — and in the replay lets it write no colour, so
+its pixels keep the config of the castle and hills behind it. That is the same treatment every
+blended draw now gets (see above); the signature survives as a second trigger in case a
+material's blend state cannot be read.
 
 The match is the **exact literal triple**. It used to be `black && endZ > 100000`, which
 matched a whole material class rather than an actor: `mType = 7` is the game's own black-fog
@@ -156,7 +199,9 @@ and cannot land on both literals, so the exact test cannot collide with it.
 ## What an uncovered pixel falls back to
 
 Pixels the ID replay cannot stamp fall back to **the config the self-drawing opaque packets
-used** — grass and flowers, which are almost all of the uncovered area.
+used** — grass and flowers, which are almost all of the uncovered area. (Blended draws are *not*
+in this category: they write no colour in the replay, so their pixels carry the config of whatever
+is behind them rather than falling back.)
 
 Field/tall grass (`dGrass_packet_c`) and flowers (`dFlower_packet_c`) do not draw through J3D at
 all: they set the room's fog, replay their own static material display lists, and emit raw GX
@@ -171,9 +216,8 @@ config 0 — the frame's reference config, which is that same room fog in an ord
 **This briefly ranked by the widest `endZ` instead, and that was a regression** — the config with
 the largest `endZ` is the one with the *weakest* fog at any given depth, so grass and flowers
 stopped darkening with distance and read as if they were lit right next to the camera, most
-obviously in heavy fog. The widest-`endZ` config is still used for one thing: resolving the Ganon
-barrier dome, which is excluded from the config table but rasterizes solid in the replay, so its
-pixels have to be given the fog the castle behind it uses.
+obviously in heavy fog. That helper is gone entirely: its other caller, the barrier dome, now gets
+the config of the geometry behind it like every other blended draw.
 
 Before that it ranked by the projection **far plane**, modelling a "distant scenery fog drawn
 with a wider projection" that TP does not have: every fog config in a frame is stamped with the
@@ -251,6 +295,7 @@ fog itself at range (unnatural darkening on distant fog-washed terrain). Tools:
 | `fogEnabled` | on | master toggle (off = vanilla forward fog) |
 | `fogMixedMode` | 1 (Exact) | mixed-scene handling: 0 = Vanilla (revert to forward fog), 1 = Exact (per-pixel config-ID replay). Exact is the default because most outdoor scenes mix configs, and Vanilla hands those back to forward fog — which is exact, but puts AO on top of the fog again in precisely the scenes the mod exists for |
 | `fogDebug` | 0 | 1 = deferred fog factor as grayscale, 2 = config IDs (exact mode, mixed frames) |
+| `fogBlendedVanilla` | on | leave blended draws in the opaque lists on the game's own forward fog (see "Blended draws...") |
 | `fogLogConfigs` | off | dump the frame's captured fog-config table to the log whenever it changes |
 
 These are the names `register_var` is actually called with; an earlier revision of this table

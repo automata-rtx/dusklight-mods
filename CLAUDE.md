@@ -87,16 +87,26 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   `drawSimple` hook**, closes it; the bracket is required, because every other `loadSharedDL` caller
   sets its fog *after* the display list, so registering that fog would invent a config vanilla never
   draws with.
-  Special-cases the Hyrule Castle Ganon barrier (`d_a_obj_ganonwall2`, a translucent dome drawn in
-  the *opaque* BG list) via `is_barrier_fog`: left on vanilla forward fog so its black fog isn't
-  stamped onto the castle/trees inside it. That test matches the **exact literal triple** the actor
+  **GX fog runs BEFORE the blend, so a blended draw's fog cannot be deferred at all** —
+  `mix(src, fogCol, f)` then blend is not `mix(blend(src,dst), fogCol, f)`. TP draws see-through
+  surfaces inside the *opaque* lists: the Ganon barrier dome (`d_a_obj_ganonwall2` rewrites its fog
+  to black over 1000..250000 every frame, then `dComIfGd_setListBG()`), **water** (`dKy_bg_MAxx_proc`
+  stamps `mType = 7` on `MA03`/`MA17`/`MA19`/`MA20` → forced **black** fog, `mType = 6` on `MA09` →
+  **white**, and moves them to the DarkBG opaque list), and additive terrain passes (`_Kasan`, 加算).
+  Deferring those fogged the water *and the riverbed under it* toward black, and dimmed additive
+  glows the game's fog is supposed to brighten. So a blended draw (blend that isn't a `ONE/ZERO`
+  replace, or a `J3DPEBlockXlu`; `TexEdge` is alpha-*tested* and still defers) keeps vanilla forward
+  fog, is never registered as a config, and writes no colour in the replay so its pixels take the
+  config *behind* it. Toggle `fogBlendedVanilla` (default on).
+  `is_barrier_fog` survives as a second trigger for the same treatment: That test matches the **exact literal triple** the actor
   writes (black, `startZ 1000`, `endZ 250000`) — it used to be `black && endZ > 100000`, which also
   matched the game's own `mType = 7` black-fog sentinel (which forces the fog *colour* black over the
   room palette's range) on the water family and `MA20`, double-fogging them in any room with a
   distant palette fog. **TP has no near-fog/distant-scenery-fog split**: every
   config in a frame carries the same near/far from the one live view, so the old `widest_far_index()`
   (ranked by far plane) was a long way of writing `return 0`. What TP widens for distant scenery is
-  the CPU clipper, which never touches fog.
+  the CPU clipper, which never touches fog. That helper is now **deleted** — both its callers have
+  exact answers instead of a ranking.
   **The uncovered-pixel fallback is the config the SELF-DRAWING packets used.** Grass
   (`dGrass_packet_c`) and flowers (`dFlower_packet_c`) emit raw GX batches after replaying their own
   material lists, so the replay's flat-ID override structurally cannot reach them and every grass

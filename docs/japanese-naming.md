@@ -394,7 +394,10 @@ is shared while the *colour* is not.
 
 So "the game's fog" is not one configuration. **Water surfaces are deliberately fogged
 to black or white while everything else is fogged to the palette colour**, and the
-selector is a material name. Deferred Fog reverts to vanilla on "mixed fog configs"; this
+selector is a material name. That black is applied to the water's *own* colour before it is
+blended over the riverbed — which is what makes deep water darken with distance, and why a
+deferred fullscreen pass cannot reproduce it. See `docs/deferred_fog.md`, "Blended draws inside
+the opaque lists". Deferred Fog reverts to vanilla on "mixed fog configs"; this
 says the mixed case is not an edge case, it is the game's design for a whole material
 class, and it is identifiable by name rather than by inspecting state.
 

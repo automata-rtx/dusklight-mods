@@ -95,6 +95,7 @@ DEFINE_HOOK(&J3DLockedMaterial::loadSharedDL, LockedMaterialSharedDL);
 ConfigVarHandle g_cvarFogEnabled = 0;    // DEFAULT below in init()
 ConfigVarHandle g_cvarFogMixed = 0;      // DEFAULT below in init()
 ConfigVarHandle g_cvarFogDebug = 0;      // DEFAULT below in init()
+ConfigVarHandle g_cvarFogBlended = 0;    // DEFAULT below in init()
 
 UiWindowHandle g_controlsWindow = 0;
 GfxDrawTypeHandle g_drawType = 0;
@@ -265,6 +266,15 @@ bool effect_enabled() {
     return get_bool_option(g_cvarFogEnabled, true) && g_shapeHookOk;
 }
 
+// See material_blends(). Exposed as a toggle because it changes which draws the mod touches at all;
+// turning it off restores the previous behaviour for A/B comparison. Sampled once per frame in
+// on_scene_begin — keeps_forward_fog() runs per draw and must not hit the config service there.
+bool g_blendedStayVanilla = true;
+
+bool read_blended_draws_stay_vanilla() {
+    return get_bool_option(g_cvarFogBlended, true);
+}
+
 // The frame's world viewport width in the game's logical (640-wide) space, sampled once per frame
 // while the world viewport is still current. Only the width is needed: aurora's centre term is
 // ((center - vp.left) / vp.width) * 2 - 1 + (renderVp.left / renderVp.width) * 2, and the render
@@ -379,37 +389,14 @@ bool is_barrier_fog(const FogConfig& c) {
         c.endZ == 250000.0f;
 }
 
-// The config whose fog reaches furthest this frame. Used for ONE thing: resolving the Ganon
-// barrier dome, which is excluded from the config table but still rasterizes (solid) in the replay,
-// so its pixels have to be given some config and the castle behind it is what they mostly show.
-//
-// IT IS NOT THE UNCOVERED-PIXEL FALLBACK ANY MORE — see g_selfDrawnIndex for that. Using it there
-// was a regression: grass and flowers land on the fallback by construction, and this picks the
-// config with the LARGEST endZ, i.e. the weakest fog at any given depth, so grass stopped darkening
-// with distance and read as if it were lit right next to the camera.
-//
-// THIS USED TO RANK BY PROJECTION FAR PLANE, modelling a "distant scenery fog" that TP does not
-// have. Every fog config in a frame is stamped with the SAME near/far, read from the one live view
-// (d_kankyo.cpp:4461-4463 for every BG material, and :9394/:9429/:9451 for the three direct
-// setters), and there is exactly one world perspective projection per frame
-// (m_Do_graphic.cpp:2338) - none inside the suppression window. So a strict `farZ >` scan from
-// index 0 never fired and the function was a long way of writing `return 0`. What TP actually
-// widens for distant scenery is the CPU CLIPPER (d_a_bg.cpp:298 changeFar(1000000),
-// d_bg_parts.cpp:681 changeFar(100000)), decided at list-build time by hide()/show() - which the
-// replay reproduces on its own and which never touches fog.
-//
-// Ranking by endZ is the honest version of what the name always claimed.
-uint32_t widest_fog_index() {
-    uint32_t idx = 0;
-    float widest = g_frameConfigCount > 0 ? g_frameConfigs[0].endZ : 0.0f;
-    for (uint32_t i = 1; i < g_frameConfigCount; ++i) {
-        if (g_frameConfigs[i].endZ > widest) {
-            widest = g_frameConfigs[i].endZ;
-            idx = i;
-        }
-    }
-    return idx;
-}
+// (A "widest fog" helper used to live here, ranking the frame's configs by reach so uncovered
+// pixels and the barrier dome could be given "the distant fog". It is gone. There is no distant
+// fog to find: every config in a frame carries the same near/far from the one live view
+// (d_kankyo.cpp:4461-4463 for BG materials, :9394/:9429/:9451 for the direct setters), the world
+// lists draw under one perspective projection (m_Do_graphic.cpp:2338), and what TP widens for
+// distant scenery is the CPU clipper (d_a_bg.cpp:298, d_bg_parts.cpp:681), which never touches
+// fog. Both of its callers now have exact answers instead of a ranking: uncovered pixels take
+// g_selfDrawnIndex, and blended draws take the config of whatever is behind them.)
 
 // The fallback here MUST be the value fogMixedMode is registered with (1 = Exact). The two
 // disagreed once already, which meant a failed config read silently ran the mode the UI was not
@@ -476,6 +463,68 @@ bool vote_config(const FogConfig& config) {
 
 void push_fog_quad();
 
+// TP DRAWS TRANSLUCENT SURFACES INSIDE THE OPAQUE LISTS, AND THEIR FOG CANNOT BE DEFERRED AT ALL.
+//
+// GX fog is per fragment and runs BEFORE the blend: the hardware computes mix(src, fogColour, f)
+// and blends THAT over the framebuffer. A fullscreen pass can only do the outer operation,
+// mix(blend(src, dst), fogColour, f). The two agree only when the draw REPLACES what is under it.
+// For a blended draw they are different operations, and no amount of tuning makes them equal:
+//
+//   * an ADDITIVE pass fogged toward a bright fog colour gets BRIGHTER with distance, because the
+//     fog colour is what gets added. Deferring can only pull the finished pixel toward the fog
+//     colour, so the same surface comes out dimmer — the terrain vocabulary even names this class
+//     of material, `_Kasan` (加算, "addition"); see docs/japanese-naming.md;
+//   * a surface fogged toward BLACK fades OUT with distance. Deferring instead paints the room's
+//     pale fog over the surface AND over everything visible through it.
+//
+// Two places in TP do exactly this, both verified in the decompilation:
+//
+//   * the Hyrule Castle barrier. d_a_obj_ganonwall2::Draw (and d_a_obj_ganonwall) rewrites every
+//     material's fog to pure black over startZ 1000 / endZ 250000 every frame and then enters the
+//     model with dComIfGd_setListBG() — a translucent dome in the OPAQUE BG list, deliberately
+//     fading to black with distance.
+//   * water. dKy_bg_MAxx_proc stamps mType = 7 on the terrain water family MA03/MA17/MA19 and on
+//     MA20 (d_kankyo.cpp:11390/:11588) and mType = 6 on MA09 (:11381), which
+//     setLightTevColorType_MAJI_sub turns into pure BLACK and pure WHITE fog respectively — and
+//     the same pass moves them into the DarkBG opaque list (:11371). So the game fogs the water's
+//     own colour to black before blending it over the riverbed. Deferring instead fogged the water
+//     AND the riverbed under it toward black, which is why deferred water read so differently.
+//
+// So: a blended draw keeps its vanilla forward fog, is never registered as a frame config, and in
+// the replay writes no colour — leaving the config of whatever is behind it, which is the config
+// the deferred quad should use for those pixels. Where the blended surface does not write depth
+// (the usual case) that is exactly right: the geometry behind gets its own deferred fog and the
+// surface keeps its own forward fog on top, same as vanilla. Where it does write depth the quad
+// still fogs at the surface's depth, which is the one residual a single fullscreen pass cannot
+// avoid.
+//
+// This GENERALISES the old is_barrier_fog special case, which is kept as a second trigger for the
+// same treatment so the barrier is handled even if a material's blend state cannot be read.
+bool material_blends(J3DMaterial* material) {
+    J3DPEBlock* peBlock = material != nullptr ? material->getPEBlock() : nullptr;
+    if (peBlock == nullptr) {
+        return false;
+    }
+    const J3DBlend* blend = peBlock->getBlend();
+    if (blend == nullptr) {
+        // J3DPEBlockOpa / TexEdge / Xlu carry no blend state to read; only the Xlu variant is a
+        // blended material, and its PE block type says so. (TexEdge is alpha-TESTED, not blended:
+        // it replaces what is under it, so its fog defers correctly.)
+        return peBlock->getType() == 'PEXL';
+    }
+    const GXBlendMode mode = blend->getBlendMode();
+    if (mode == GX_BM_NONE) {
+        return false;
+    }
+    // GX_BM_BLEND with ONE/ZERO is a replace, whatever it calls itself.
+    if (mode == GX_BM_BLEND && blend->getSrcFactor() == GX_BL_ONE &&
+        blend->getDstFactor() == GX_BL_ZERO)
+    {
+        return false;
+    }
+    return true;
+}
+
 // The fog a material's own PE block carries, if it has one. Only J3DPEBlockFull carries fog at all
 // — J3DPEBlockOpa / TexEdge / Xlu / FogOff all return NULL from getFog() and their display lists
 // leave the fog registers alone, so those materials simply inherit whatever the last GXSetFog put
@@ -499,6 +548,7 @@ bool material_fog_config(J3DMaterial* material, FogConfig& out) {
 // Replay mode: force everything this draw emits to a flat config-ID colour, and no fog.
 void stamp_replay_id(uint32_t index) {
     const auto idByte = static_cast<u8>((index + 1) * 24);
+    GXSetColorUpdate(GX_TRUE);
     GXSetNumTevStages(1);
     GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
     GXSetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
@@ -511,27 +561,38 @@ void stamp_replay_id(uint32_t index) {
     GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, GXColor{0, 0, 0, 0});
 }
 
+// Count of draws this frame left on vanilla forward fog because they blend (diagnostic).
+uint32_t g_blendedDrawCount = 0;
+
+bool keeps_forward_fog(J3DMaterial* material, const FogConfig& config) {
+    return (g_blendedStayVanilla && material_blends(material)) || is_barrier_fog(config);
+}
+
 void replay_stamp_material(J3DMaterial* material) {
     FogConfig config;
-    uint32_t index = 0;
-    if (material_fog_config(material, config)) {
-        // The barrier dome (excluded from the config table) is a translucent surface drawn solid in
-        // the replay; stamping it as the near config 0 would darken the distant castle behind it.
-        // Resolve it to the widest fog instead, which is what that castle uses.
-        index = is_barrier_fog(config) ? widest_fog_index() : lookup_frame_config(config);
+    const bool hasFog = material_fog_config(material, config);
+    if (keeps_forward_fog(material, hasFog ? config : FogConfig{})) {
+        // Write no colour, so the config of whatever is behind this surface survives in the ID
+        // buffer — that is the config the deferred quad should use for these pixels. stamp_replay_id
+        // turns colour writes back on for the next ordinary draw, and replay_config_ids restores
+        // them at the end of the pass.
+        GXSetColorUpdate(GX_FALSE);
+        return;
     }
-    stamp_replay_id(index);
+    stamp_replay_id(hasFog ? lookup_frame_config(config) : 0u);
 }
 
 // Capture mode: register the material's own fog and suppress it if we are deferring it. Returns
 // whether the material carried live fog at all (for the shared-DL diagnostic).
 bool suppress_material_fog(J3DMaterial* material) {
     FogConfig config;
-    if (!material_fog_config(material, config)) {
-        return false;
+    const bool hasFog = material_fog_config(material, config);
+    if (keeps_forward_fog(material, hasFog ? config : FogConfig{})) {
+        ++g_blendedDrawCount;
+        return hasFog;
     }
-    if (is_barrier_fog(config)) {
-        return true;  // leave the Ganon barrier on its own forward fog (see is_barrier_fog)
+    if (!hasFog) {
+        return false;
     }
     if (vote_config(config)) {
         GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, GXColor{0, 0, 0, 0});
@@ -865,6 +926,10 @@ bool replay_config_ids(uint32_t width, uint32_t height) {
     j3dSys.setModel(savedModel);
     j3dSys.reinitGX();
     J3DShape::resetVcdVatCache();
+    // Blended draws switch colour writes off for their own geometry (see replay_stamp_material);
+    // make sure the pass never ends with them off.
+    GXSetColorUpdate(GX_TRUE);
+    GXSetAlphaUpdate(GX_TRUE);
     restore();
 
     GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
@@ -931,6 +996,8 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
     g_deviantCount = 0;
     g_frameConfigCount = 0;
     g_sharedDlFogCount = 0;
+    g_blendedDrawCount = 0;
+    g_blendedStayVanilla = read_blended_draws_stay_vanilla();
     g_configIdView = nullptr;
     g_quadArmed = false;
     g_inBgpMaterial = false;
@@ -1024,19 +1091,19 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
         std::snprintf(g_statusText, sizeof(g_statusText), "No fogged draws this frame");
     } else if (exact) {
         std::snprintf(g_statusText, sizeof(g_statusText),
-            "Deferring fog (exact: %u draws, %u config%s%s; %u shared-DL)",
+            "Deferring fog (exact: %u draws, %u config%s%s; %u shared-DL, %u blended)",
             g_suppressedCount + g_deviantCount, g_frameConfigCount,
             g_frameConfigCount == 1 ? "" : "s",
             g_frameConfigCount > 1 && g_configIdView == nullptr ? ", replay failed" : "",
-            g_sharedDlFogCount);
+            g_sharedDlFogCount, g_blendedDrawCount);
     } else if (g_deviantCount > 0) {
         std::snprintf(g_statusText, sizeof(g_statusText),
             "REVERTED: mixed fog configs (%u matching / %u deviant)", g_suppressedCount,
             g_deviantCount);
     } else {
         std::snprintf(g_statusText, sizeof(g_statusText),
-            "Deferring fog (%u draws this frame; %u shared-DL)", g_suppressedCount,
-            g_sharedDlFogCount);
+            "Deferring fog (%u draws this frame; %u shared-DL, %u blended)", g_suppressedCount,
+            g_sharedDlFogCount, g_blendedDrawCount);
     }
 
     log_fog_configs();
@@ -1116,6 +1183,21 @@ ModResult build_controls_tab(
     control.config_var = g_cvarFogMixed;
     control.options = kMixedOptions;
     control.option_count = 2;
+    add_control(left, control);
+
+    control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_TOGGLE;
+    control.label = "Blended Draws Keep Vanilla Fog";
+    control.help_rml =
+        "The game's fog is applied to each surface <i>before</i> it is blended, so a single "
+        "fullscreen pass cannot reproduce it for anything see-through. A few surfaces are drawn "
+        "see-through inside the opaque world lists - water (which the game fogs to <b>black</b>, "
+        "so it darkens with depth), the Hyrule Castle barrier dome (also fogged to black so it "
+        "fades out at distance), and additively blended terrain passes (which the game's fog makes "
+        "<i>brighter</i>). With this on, those draws are left on the game's own fog and only the "
+        "surfaces behind them are deferred, which matches vanilla. Turn it off to compare.";
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = g_cvarFogBlended;
     add_control(left, control);
 
     static const char* kDebugOptions[] = {"Off", "Fog Factor", "Config IDs"};
@@ -1267,6 +1349,16 @@ ModResult init(ModError* error) {
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogMixed) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
+    // DEFAULT: blended draws keep vanilla forward fog (on). See material_blends() — GX fog runs
+    // before the blend, so a fullscreen pass cannot reproduce it for anything that does not replace
+    // what is under it. Off restores the pre-fix behaviour for A/B comparison.
+    cvarDesc = CONFIG_VAR_DESC_INIT;
+    cvarDesc.name = "fogBlendedVanilla";
+    cvarDesc.type = CONFIG_VAR_BOOL;
+    cvarDesc.default_bool = true;
+    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogBlended) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register fog option");
+    }
     // DEFAULT: fog debug view off (0).
     cvarDesc = CONFIG_VAR_DESC_INIT;
     cvarDesc.name = "fogDebug";
@@ -1386,7 +1478,7 @@ void shutdown() {
     releaseLayout(g_fogDebugLayout);
     releaseLayout(g_mixedLayout);
     releaseLayout(g_mixedDebugLayout);
-    g_cvarFogEnabled = g_cvarFogMixed = g_cvarFogDebug = g_cvarFogLog = 0;
+    g_cvarFogEnabled = g_cvarFogMixed = g_cvarFogDebug = g_cvarFogLog = g_cvarFogBlended = 0;
     g_lastFogLogSig[0] = '\0';
     g_controlsWindow = 0;
     g_drawType = g_sceneBeginHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;
@@ -1399,7 +1491,7 @@ void shutdown() {
     g_firstDeviant = FogConfig{};
     g_suppressedCount = g_deviantCount = 0;
     g_frameConfigCount = 0;
-    g_sharedDlFogCount = 0;
+    g_sharedDlFogCount = g_blendedDrawCount = 0;
     g_configIdView = nullptr;
     std::snprintf(g_statusText, sizeof(g_statusText), "Waiting for first fogged frame");
 }
