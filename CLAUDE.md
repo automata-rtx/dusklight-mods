@@ -87,18 +87,23 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   `drawSimple` hook**, closes it; the bracket is required, because every other `loadSharedDL` caller
   sets its fog *after* the display list, so registering that fog would invent a config vanilla never
   draws with.
-  **GX fog runs BEFORE the blend, so a blended draw's fog cannot be deferred at all** —
-  `mix(src, fogCol, f)` then blend is not `mix(blend(src,dst), fogCol, f)`. TP draws see-through
-  surfaces inside the *opaque* lists: the Ganon barrier dome (`d_a_obj_ganonwall2` rewrites its fog
-  to black over 1000..250000 every frame, then `dComIfGd_setListBG()`), **water** (`dKy_bg_MAxx_proc`
-  stamps `mType = 7` on `MA03`/`MA17`/`MA19`/`MA20` → forced **black** fog, `mType = 6` on `MA09` →
-  **white**, and moves them to the DarkBG opaque list), and additive terrain passes (`_Kasan`, 加算).
-  Deferring those fogged the water *and the riverbed under it* toward black, and dimmed additive
-  glows the game's fog is supposed to brighten. So a blended draw (blend that isn't a `ONE/ZERO`
-  replace, or a `J3DPEBlockXlu`; `TexEdge` is alpha-*tested* and still defers) keeps vanilla forward
-  fog, is never registered as a config, and writes no colour in the replay so its pixels take the
-  config *behind* it. Toggle `fogBlendedVanilla` (default on).
-  `is_barrier_fog` survives as a second trigger for the same treatment: That test matches the **exact literal triple** the actor
+  **WHERE THE QUAD LANDS IS NOT A FIXED POINT IN THE FRAME.** It wants to go in right after every
+  mod's `SCENE_AFTER_OPAQUE` composite and before the translucent lists (`m_Do_graphic.cpp:2426`,
+  one line before `dComIfGd_drawXluListBG`) — but there is no stage hook there and every list entry
+  point inlines, so the mod anchors on the first `J3DShape::drawFast` after the stage closes. A view
+  with **no translucent J3D at all** (open field: alpha-tested trees, self-drawing grass packets,
+  JPA particles) used to fall through to `FRAME_BEFORE_HUD` (`:2795`) — after motion blur, DOF, all
+  particles and **bloom** (`:2663`). Fog applied after bloom is fog the bloom never saw, so the
+  bright distant subjects vanilla blooms hardest come out dimmer. A pre-hook on
+  `mDoGph_gInf_c::bloom_c::draw` is now the fallback; the Status line reports which anchor fired
+  (`[at translucents]` / `[before bloom]` / `[AFTER BLOOM]`).
+  **A "blended draws keep vanilla fog" rule was tried and reverted** — it measured worse in-game and
+  did not explain the barrier/Death Mountain difference. The premise is right (GX fogs before the
+  blend, and TP draws water and the Ganon barrier see-through inside the opaque lists), but the
+  exemption backfires: the quad still fogs those pixels, so the surface is fogged twice. That needs a
+  per-pixel "no deferred fog" mark in the ID buffer, not a suppression exemption.
+  `is_barrier_fog` keeps its exemption because black fog over 1000..250000 in the config table is
+  worse still: That test matches the **exact literal triple** the actor
   writes (black, `startZ 1000`, `endZ 250000`) — it used to be `black && endZ > 100000`, which also
   matched the game's own `mType = 7` black-fog sentinel (which forces the fog *colour* black over the
   room palette's range) on the water family and `MA20`, double-fogging them in any room with a

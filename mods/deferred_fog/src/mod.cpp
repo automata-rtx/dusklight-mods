@@ -35,6 +35,7 @@
 #include "d/actor/d_grass.h"
 #include "d/d_bg_parts.h"
 #include "d/d_com_inf_game.h"
+#include "m_Do/m_Do_graphic.h"
 #include "dolphin/gf/GFPixel.h"
 #include "dolphin/gx/GXAurora.h"
 #include "dolphin/gx/GXGeometry.h"
@@ -89,13 +90,14 @@ DEFINE_HOOK(&dBgp_c::modelMaterial_c::drawSimple, BgpDrawSimple);
 DEFINE_HOOK(&dGrass_packet_c::draw, GrassPacketDraw);
 DEFINE_HOOK(&dFlower_packet_c::draw, FlowerPacketDraw);
 DEFINE_HOOK(&J3DMaterial::loadSharedDL, MaterialSharedDL);
+// Last chance to get the fog quad in before the game's own post-processing — see g_quadAnchor.
+DEFINE_HOOK(&mDoGph_gInf_c::bloom_c::draw, BloomDraw);
 DEFINE_HOOK(&J3DPatchedMaterial::loadSharedDL, PatchedMaterialSharedDL);
 DEFINE_HOOK(&J3DLockedMaterial::loadSharedDL, LockedMaterialSharedDL);
 
 ConfigVarHandle g_cvarFogEnabled = 0;    // DEFAULT below in init()
 ConfigVarHandle g_cvarFogMixed = 0;      // DEFAULT below in init()
 ConfigVarHandle g_cvarFogDebug = 0;      // DEFAULT below in init()
-ConfigVarHandle g_cvarFogBlended = 0;    // DEFAULT below in init()
 
 UiWindowHandle g_controlsWindow = 0;
 GfxDrawTypeHandle g_drawType = 0;
@@ -160,6 +162,34 @@ struct FogConfig {
 
 bool g_scopeActive = false;
 bool g_quadArmed = false;
+
+// WHERE IN THE FRAME THE FOG QUAD ACTUALLY LANDED. This is a diagnostic because the anchor is not
+// a fixed point in the frame, and the difference between the anchors is large.
+//
+// The quad wants to go in immediately after every mod's SCENE_AFTER_OPAQUE composite and before the
+// translucent lists — the game runs the stage hook at m_Do_graphic.cpp:2426, one line before
+// dComIfGd_drawXluListBG. There is no stage hook there and the list entry points are all inline, so
+// the mod anchors on the first J3DShape::drawFast AFTER the stage closes, which is the first
+// translucent J3D packet. When a frame HAS one, that is exactly the right place.
+//
+// When a frame has none — an open field view can genuinely contain no translucent J3D at all; the
+// trees are alpha-tested opaque, the grass is a self-drawing packet, the particles are JPA — the
+// quad used to fall all the way through to FRAME_BEFORE_HUD, which the game runs at :2795. That is
+// AFTER motion blur (:2483), depth of field (:2492), every particle pass, and BLOOM (:2663). Fog
+// applied after bloom is fog the bloom never saw, so the bright distant things vanilla blooms hard
+// — Death Mountain, the Ganon barrier — come out dimmer and sharper, which is the reported symptom.
+// A pre-hook on the bloom draw is therefore a much closer fallback than the end of the frame.
+enum class QuadAnchor : uint8_t { None, Translucent, BeforeBloom, FrameEnd };
+QuadAnchor g_quadAnchor = QuadAnchor::None;
+
+const char* quad_anchor_name() {
+    switch (g_quadAnchor) {
+    case QuadAnchor::Translucent: return "at translucents";
+    case QuadAnchor::BeforeBloom: return "before bloom";
+    case QuadAnchor::FrameEnd: return "AFTER BLOOM";
+    default: return "not pushed";
+    }
+}
 // Published through the service: did this frame actually defer, or did it fall back to the game's
 // own forward fog? Written on the game thread once per frame, read by consumers on the same thread.
 bool g_lastFrameDeferred = false;
@@ -266,14 +296,6 @@ bool effect_enabled() {
     return get_bool_option(g_cvarFogEnabled, true) && g_shapeHookOk;
 }
 
-// See material_blends(). Exposed as a toggle because it changes which draws the mod touches at all;
-// turning it off restores the previous behaviour for A/B comparison. Sampled once per frame in
-// on_scene_begin — keeps_forward_fog() runs per draw and must not hit the config service there.
-bool g_blendedStayVanilla = true;
-
-bool read_blended_draws_stay_vanilla() {
-    return get_bool_option(g_cvarFogBlended, true);
-}
 
 // The frame's world viewport width in the game's logical (640-wide) space, sampled once per frame
 // while the world viewport is still current. Only the width is needed: aurora's centre term is
@@ -396,7 +418,7 @@ bool is_barrier_fog(const FogConfig& c) {
 // lists draw under one perspective projection (m_Do_graphic.cpp:2338), and what TP widens for
 // distant scenery is the CPU clipper (d_a_bg.cpp:298, d_bg_parts.cpp:681), which never touches
 // fog. Both of its callers now have exact answers instead of a ranking: uncovered pixels take
-// g_selfDrawnIndex, and blended draws take the config of whatever is behind them.)
+// g_selfDrawnIndex, and the barrier dome takes the config of whatever is behind it.)
 
 // The fallback here MUST be the value fogMixedMode is registered with (1 = Exact). The two
 // disagreed once already, which meant a failed config read silently ran the mode the UI was not
@@ -463,67 +485,20 @@ bool vote_config(const FogConfig& config) {
 
 void push_fog_quad();
 
-// TP DRAWS TRANSLUCENT SURFACES INSIDE THE OPAQUE LISTS, AND THEIR FOG CANNOT BE DEFERRED AT ALL.
+// A NOTE ON WHY THERE IS NO "BLENDED DRAWS KEEP VANILLA FOG" RULE HERE ANY MORE.
 //
-// GX fog is per fragment and runs BEFORE the blend: the hardware computes mix(src, fogColour, f)
-// and blends THAT over the framebuffer. A fullscreen pass can only do the outer operation,
-// mix(blend(src, dst), fogColour, f). The two agree only when the draw REPLACES what is under it.
-// For a blended draw they are different operations, and no amount of tuning makes them equal:
-//
-//   * an ADDITIVE pass fogged toward a bright fog colour gets BRIGHTER with distance, because the
-//     fog colour is what gets added. Deferring can only pull the finished pixel toward the fog
-//     colour, so the same surface comes out dimmer — the terrain vocabulary even names this class
-//     of material, `_Kasan` (加算, "addition"); see docs/japanese-naming.md;
-//   * a surface fogged toward BLACK fades OUT with distance. Deferring instead paints the room's
-//     pale fog over the surface AND over everything visible through it.
-//
-// Two places in TP do exactly this, both verified in the decompilation:
-//
-//   * the Hyrule Castle barrier. d_a_obj_ganonwall2::Draw (and d_a_obj_ganonwall) rewrites every
-//     material's fog to pure black over startZ 1000 / endZ 250000 every frame and then enters the
-//     model with dComIfGd_setListBG() — a translucent dome in the OPAQUE BG list, deliberately
-//     fading to black with distance.
-//   * water. dKy_bg_MAxx_proc stamps mType = 7 on the terrain water family MA03/MA17/MA19 and on
-//     MA20 (d_kankyo.cpp:11390/:11588) and mType = 6 on MA09 (:11381), which
-//     setLightTevColorType_MAJI_sub turns into pure BLACK and pure WHITE fog respectively — and
-//     the same pass moves them into the DarkBG opaque list (:11371). So the game fogs the water's
-//     own colour to black before blending it over the riverbed. Deferring instead fogged the water
-//     AND the riverbed under it toward black, which is why deferred water read so differently.
-//
-// So: a blended draw keeps its vanilla forward fog, is never registered as a frame config, and in
-// the replay writes no colour — leaving the config of whatever is behind it, which is the config
-// the deferred quad should use for those pixels. Where the blended surface does not write depth
-// (the usual case) that is exactly right: the geometry behind gets its own deferred fog and the
-// surface keeps its own forward fog on top, same as vanilla. Where it does write depth the quad
-// still fogs at the surface's depth, which is the one residual a single fullscreen pass cannot
-// avoid.
-//
-// This GENERALISES the old is_barrier_fog special case, which is kept as a second trigger for the
-// same treatment so the barrier is handled even if a material's blend state cannot be read.
-bool material_blends(J3DMaterial* material) {
-    J3DPEBlock* peBlock = material != nullptr ? material->getPEBlock() : nullptr;
-    if (peBlock == nullptr) {
-        return false;
-    }
-    const J3DBlend* blend = peBlock->getBlend();
-    if (blend == nullptr) {
-        // J3DPEBlockOpa / TexEdge / Xlu carry no blend state to read; only the Xlu variant is a
-        // blended material, and its PE block type says so. (TexEdge is alpha-TESTED, not blended:
-        // it replaces what is under it, so its fog defers correctly.)
-        return peBlock->getType() == 'PEXL';
-    }
-    const GXBlendMode mode = blend->getBlendMode();
-    if (mode == GX_BM_NONE) {
-        return false;
-    }
-    // GX_BM_BLEND with ONE/ZERO is a replace, whatever it calls itself.
-    if (mode == GX_BM_BLEND && blend->getSrcFactor() == GX_BL_ONE &&
-        blend->getDstFactor() == GX_BL_ZERO)
-    {
-        return false;
-    }
-    return true;
-}
+// GX fog runs per fragment BEFORE the blend, so for a see-through surface vanilla computes
+// blend(mix(src, fogCol, f), dst) while a fullscreen pass can only compute
+// mix(blend(src, dst), fogCol, f). That reasoning is correct, and TP really does draw see-through
+// surfaces inside the opaque lists (water: dKy_bg_MAxx_proc's mType 6/7 sentinels; the Ganon
+// barrier: d_a_obj_ganonwall2). A rule that detected blended materials and left them all on
+// vanilla forward fog was tried and MEASURED WORSE in-game than not having it, and it changed
+// nothing about the Death Mountain / barrier brightness difference it was meant to explain. The
+// reason it backfires: the deferred quad still fogs those pixels (they are in the depth buffer
+// like anything else), so a blended surface that keeps its forward fog is simply fogged TWICE.
+// Fixing that needs a per-pixel "no deferred fog" mark, not a suppression exemption. Do not
+// reintroduce the exemption on its own. Only the barrier keeps the exemption, because its own fog
+// is pure black over a huge range and stamping it into the config table is worse still.
 
 // The fog a material's own PE block carries, if it has one. Only J3DPEBlockFull carries fog at all
 // — J3DPEBlockOpa / TexEdge / Xlu / FogOff all return NULL from getFog() and their display lists
@@ -561,17 +536,10 @@ void stamp_replay_id(uint32_t index) {
     GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, GXColor{0, 0, 0, 0});
 }
 
-// Count of draws this frame left on vanilla forward fog because they blend (diagnostic).
-uint32_t g_blendedDrawCount = 0;
-
-bool keeps_forward_fog(J3DMaterial* material, const FogConfig& config) {
-    return (g_blendedStayVanilla && material_blends(material)) || is_barrier_fog(config);
-}
-
 void replay_stamp_material(J3DMaterial* material) {
     FogConfig config;
     const bool hasFog = material_fog_config(material, config);
-    if (keeps_forward_fog(material, hasFog ? config : FogConfig{})) {
+    if (hasFog && is_barrier_fog(config)) {
         // Write no colour, so the config of whatever is behind this surface survives in the ID
         // buffer — that is the config the deferred quad should use for these pixels. stamp_replay_id
         // turns colour writes back on for the next ordinary draw, and replay_config_ids restores
@@ -586,13 +554,11 @@ void replay_stamp_material(J3DMaterial* material) {
 // whether the material carried live fog at all (for the shared-DL diagnostic).
 bool suppress_material_fog(J3DMaterial* material) {
     FogConfig config;
-    const bool hasFog = material_fog_config(material, config);
-    if (keeps_forward_fog(material, hasFog ? config : FogConfig{})) {
-        ++g_blendedDrawCount;
-        return hasFog;
-    }
-    if (!hasFog) {
+    if (!material_fog_config(material, config)) {
         return false;
+    }
+    if (is_barrier_fog(config)) {
+        return true;  // leave the Ganon barrier on its own forward fog (see is_barrier_fog)
     }
     if (vote_config(config)) {
         GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, GXColor{0, 0, 0, 0});
@@ -608,6 +574,7 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     }
     if (g_quadArmed) {
         g_quadArmed = false;
+        g_quadAnchor = QuadAnchor::Translucent;
         push_fog_quad();
         return HOOK_CONTINUE;
     }
@@ -926,7 +893,7 @@ bool replay_config_ids(uint32_t width, uint32_t height) {
     j3dSys.setModel(savedModel);
     j3dSys.reinitGX();
     J3DShape::resetVcdVatCache();
-    // Blended draws switch colour writes off for their own geometry (see replay_stamp_material);
+    // The barrier switches colour writes off for its own geometry (see replay_stamp_material);
     // make sure the pass never ends with them off.
     GXSetColorUpdate(GX_TRUE);
     GXSetAlphaUpdate(GX_TRUE);
@@ -996,8 +963,7 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
     g_deviantCount = 0;
     g_frameConfigCount = 0;
     g_sharedDlFogCount = 0;
-    g_blendedDrawCount = 0;
-    g_blendedStayVanilla = read_blended_draws_stay_vanilla();
+    g_quadAnchor = QuadAnchor::None;
     g_configIdView = nullptr;
     g_quadArmed = false;
     g_inBgpMaterial = false;
@@ -1091,22 +1057,33 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
         std::snprintf(g_statusText, sizeof(g_statusText), "No fogged draws this frame");
     } else if (exact) {
         std::snprintf(g_statusText, sizeof(g_statusText),
-            "Deferring fog (exact: %u draws, %u config%s%s; %u shared-DL, %u blended)",
+            "Deferring fog (exact: %u draws, %u config%s%s; %u shared-DL) [%s]",
             g_suppressedCount + g_deviantCount, g_frameConfigCount,
             g_frameConfigCount == 1 ? "" : "s",
             g_frameConfigCount > 1 && g_configIdView == nullptr ? ", replay failed" : "",
-            g_sharedDlFogCount, g_blendedDrawCount);
+            g_sharedDlFogCount, quad_anchor_name());
     } else if (g_deviantCount > 0) {
         std::snprintf(g_statusText, sizeof(g_statusText),
             "REVERTED: mixed fog configs (%u matching / %u deviant)", g_suppressedCount,
             g_deviantCount);
     } else {
         std::snprintf(g_statusText, sizeof(g_statusText),
-            "Deferring fog (%u draws this frame; %u shared-DL, %u blended)", g_suppressedCount,
-            g_sharedDlFogCount, g_blendedDrawCount);
+            "Deferring fog (%u draws this frame; %u shared-DL) [%s]", g_suppressedCount,
+            g_sharedDlFogCount, quad_anchor_name());
     }
 
     log_fog_configs();
+}
+
+// Fires at m_Do_graphic.cpp:2663, before the game's bloom reads the framebuffer. Only does anything
+// when the frame had no translucent J3D packet to anchor on; see g_quadAnchor.
+HookAction on_bloom_draw_pre(ModContext*, void*, void*, void*) {
+    if (g_quadArmed) {
+        g_quadArmed = false;
+        g_quadAnchor = QuadAnchor::BeforeBloom;
+        push_fog_quad();
+    }
+    return HOOK_CONTINUE;
 }
 
 void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
@@ -1114,6 +1091,7 @@ void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
         return;
     }
     g_quadArmed = false;
+    g_quadAnchor = QuadAnchor::FrameEnd;
     push_fog_quad();
 }
 
@@ -1183,21 +1161,6 @@ ModResult build_controls_tab(
     control.config_var = g_cvarFogMixed;
     control.options = kMixedOptions;
     control.option_count = 2;
-    add_control(left, control);
-
-    control = UI_CONTROL_DESC_INIT;
-    control.kind = UI_CONTROL_TOGGLE;
-    control.label = "Blended Draws Keep Vanilla Fog";
-    control.help_rml =
-        "The game's fog is applied to each surface <i>before</i> it is blended, so a single "
-        "fullscreen pass cannot reproduce it for anything see-through. A few surfaces are drawn "
-        "see-through inside the opaque world lists - water (which the game fogs to <b>black</b>, "
-        "so it darkens with depth), the Hyrule Castle barrier dome (also fogged to black so it "
-        "fades out at distance), and additively blended terrain passes (which the game's fog makes "
-        "<i>brighter</i>). With this on, those draws are left on the game's own fog and only the "
-        "surfaces behind them are deferred, which matches vanilla. Turn it off to compare.";
-    control.binding = UI_BINDING_CONFIG_VAR;
-    control.config_var = g_cvarFogBlended;
     add_control(left, control);
 
     static const char* kDebugOptions[] = {"Off", "Fog Factor", "Config IDs"};
@@ -1349,16 +1312,6 @@ ModResult init(ModError* error) {
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogMixed) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
-    // DEFAULT: blended draws keep vanilla forward fog (on). See material_blends() — GX fog runs
-    // before the blend, so a fullscreen pass cannot reproduce it for anything that does not replace
-    // what is under it. Off restores the pre-fix behaviour for A/B comparison.
-    cvarDesc = CONFIG_VAR_DESC_INIT;
-    cvarDesc.name = "fogBlendedVanilla";
-    cvarDesc.type = CONFIG_VAR_BOOL;
-    cvarDesc.default_bool = true;
-    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogBlended) != MOD_OK) {
-        return mods::set_error(error, MOD_ERROR, "failed to register fog option");
-    }
     // DEFAULT: fog debug view off (0).
     cvarDesc = CONFIG_VAR_DESC_INIT;
     cvarDesc.name = "fogDebug";
@@ -1447,6 +1400,11 @@ ModResult init(ModError* error) {
             "failed to hook the grass/flower packet draws; in exact mode their pixels fall back "
             "to the frame's reference fog config instead of the one they actually drew with");
     }
+    if (mods::hook_add_pre<BloomDraw>(svc_hook, on_bloom_draw_pre) != MOD_OK) {
+        svc_log->warn(mod_ctx,
+            "failed to hook the bloom draw; frames with no translucent J3D geometry will apply "
+            "their fog after the game's bloom and post-processing instead of before it");
+    }
     if (!sharedDlOk) {
         svc_log->warn(mod_ctx,
             "failed to hook the dBgp_c shared-display-list path (drawSimple / loadSharedDL); "
@@ -1478,11 +1436,12 @@ void shutdown() {
     releaseLayout(g_fogDebugLayout);
     releaseLayout(g_mixedLayout);
     releaseLayout(g_mixedDebugLayout);
-    g_cvarFogEnabled = g_cvarFogMixed = g_cvarFogDebug = g_cvarFogLog = g_cvarFogBlended = 0;
+    g_cvarFogEnabled = g_cvarFogMixed = g_cvarFogDebug = g_cvarFogLog = 0;
     g_lastFogLogSig[0] = '\0';
     g_controlsWindow = 0;
     g_drawType = g_sceneBeginHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;
     g_scopeActive = g_quadArmed = g_suppressAllowed = g_shapeHookOk = g_wasSuppressing = false;
+    g_quadAnchor = QuadAnchor::None;
     g_lastFrameDeferred = false;
     g_fogReplayActive = g_wasMixed = g_warnedReplayFailure = false;
     g_inBgpMaterial = g_inSelfDrawnPacket = g_selfDrawnIndexValid = false;
@@ -1491,7 +1450,7 @@ void shutdown() {
     g_firstDeviant = FogConfig{};
     g_suppressedCount = g_deviantCount = 0;
     g_frameConfigCount = 0;
-    g_sharedDlFogCount = g_blendedDrawCount = 0;
+    g_sharedDlFogCount = 0;
     g_configIdView = nullptr;
     std::snprintf(g_statusText, sizeof(g_statusText), "Waiting for first fogged frame");
 }

@@ -126,49 +126,50 @@ fog, worst exactly where the fog term is largest.
   its fog *before* the material loop, so there, and only there, the display list has the last
   word. The Status line reports how many shared-DL materials carried live fog in the frame.
 
-## Blended draws inside the opaque lists cannot have their fog deferred
+## Where in the frame the fog quad lands — and why it matters
 
-**GX fog runs per fragment, before the blend.** The hardware computes `mix(src, fogColour, f)` and
-blends *that* over the framebuffer. A fullscreen pass can only do the outer operation,
-`mix(blend(src, dst), fogColour, f)`. The two are the same operation only when the draw **replaces**
-what is under it. For a blended draw they are different, and no tuning makes them equal:
+The quad wants to go in **immediately after every mod's `SCENE_AFTER_OPAQUE` composite and before
+the translucent lists**. The game runs that stage hook at `m_Do_graphic.cpp:2426`, one line before
+`dComIfGd_drawXluListBG`. There is no stage hook at that exact point and every list entry point on
+the way in is `inline` (`dComIfGd_drawXluListBG` → `dDlst_list_c::drawXluListBG` →
+`drawXluDrawList`), so nothing there can be hooked by symbol. The mod therefore anchors on the
+**first `J3DShape::drawFast` after the stage closes** — the first translucent J3D packet. When a
+frame has one, that is exactly the right place.
 
-- an **additive** pass fogged toward a bright fog colour gets *brighter* with distance, because the
-  fog colour is what gets added. A deferred pass can only pull the finished pixel toward the fog
-  colour, so the same surface comes out dimmer. The terrain material vocabulary names this class of
-  material — `_Kasan` (加算, "addition"); see `docs/japanese-naming.md`.
-- a surface fogged toward **black** fades *out* with distance. Deferring instead paints the room's
-  pale fog over the surface **and** over everything visible through it.
+**When a frame has none, the anchor used to fall all the way to `FRAME_BEFORE_HUD`, and that is a
+long way further on.** An open field view can genuinely contain no translucent J3D at all: the trees
+are alpha-tested opaque, the grass and flowers are self-drawing packets (not `J3DShape`), the
+particles are JPA. The game runs `FRAME_BEFORE_HUD` at `:2795`, which is after motion blur (`:2483`),
+depth of field (`:2492`), every particle pass, and **bloom** (`:2663`). Fog applied after bloom is
+fog the bloom never saw, so the bright distant subjects vanilla blooms hardest — Death Mountain, the
+Ganon barrier — come out dimmer and sharper than vanilla. A **pre-hook on the bloom draw**
+(`mDoGph_gInf_c::bloom_c::draw`, out-of-line and called unconditionally) is a much closer fallback,
+and it only fires when the translucent anchor did not.
 
-TP does this in at least two places, both verified in the decompilation:
+The Status line reports which anchor the frame used: `[at translucents]` is the good one,
+`[before bloom]` is the fallback, `[AFTER BLOOM]` means even the fallback did not fire.
 
-- **The Hyrule Castle barrier.** `d_a_obj_ganonwall2::Draw` (and `d_a_obj_ganonwall`) rewrites every
-  material's fog to pure black over `startZ 1000` / `endZ 250000` *every frame*, then enters the
-  model with `dComIfGd_setListBG()` — a translucent dome in the **opaque BG list**, deliberately
-  fading to black with distance.
-- **Water.** `dKy_bg_MAxx_proc` stamps `mType = 7` on the terrain water family `MA03`/`MA17`/`MA19`
-  (`d_kankyo.cpp:11390`) and on `MA20` (`:11588`), and `mType = 6` on `MA09` (`:11381`), which
-  `setLightTevColorType_MAJI_sub` turns into pure **black** and pure **white** fog respectively. The
-  same pass moves them into the DarkBG opaque list (`:11371`). So the game fogs the *water's own
-  colour* to black before blending it over the riverbed — which is what makes deep water darken.
-  Deferring fogged the water **and the riverbed under it** toward black instead, which is why
-  deferred water read so differently.
+## Blended draws: why there is no "keep vanilla fog" rule
 
-**So a blended draw keeps its vanilla forward fog**, is never registered as a frame config, and in
-the replay writes no colour — leaving the config of whatever is behind it, which is the config the
-deferred quad should use for those pixels. Where the blended surface does not write depth (the usual
-case) that is exactly right: the geometry behind gets its deferred fog and the surface keeps its own
-forward fog on top, same as vanilla. Where it *does* write depth, the quad still fogs at the
-surface's depth — the one residual a single fullscreen pass cannot avoid.
+GX fog runs per fragment **before** the blend, so for a see-through surface vanilla computes
+`blend(mix(src, fogCol, f), dst)` while a fullscreen pass can only compute
+`mix(blend(src, dst), fogCol, f)`. That reasoning is correct, and TP really does draw see-through
+surfaces inside the opaque lists:
 
-"Blended" is read from the material's PE block: an explicit blend that is not a `ONE/ZERO` replace,
-or a `J3DPEBlockXlu` (whose PE block carries no blend state to read, but whose *type* says it is
-translucent). `J3DPEBlockTexEdge` is alpha-**tested**, not blended — it replaces what is under it,
-so foliage cutouts still defer correctly. The toggle **Blended Draws Keep Vanilla Fog** (default on)
-turns the rule off for comparison.
+- **The Hyrule Castle barrier.** `d_a_obj_ganonwall2::Draw` rewrites every material's fog to pure
+  black over `startZ 1000` / `endZ 250000` every frame, then enters the model with
+  `dComIfGd_setListBG()`.
+- **Water.** `dKy_bg_MAxx_proc` stamps `mType = 7` on `MA03`/`MA17`/`MA19` (`d_kankyo.cpp:11390`)
+  and on `MA20` (`:11588`), and `mType = 6` on `MA09` (`:11381`), which
+  `setLightTevColorType_MAJI_sub` turns into pure **black** and pure **white** fog. The same pass
+  moves them into the DarkBG opaque list (`:11371`).
 
-This **generalises** the Ganon-barrier special case below, which is kept as a second trigger for the
-same treatment so the barrier is handled even if a material's blend state cannot be read.
+A rule that detected blended materials and left them all on vanilla forward fog was tried and
+**measured worse in-game than not having it**, and it changed nothing about the Death Mountain /
+barrier difference it was meant to explain. It backfires because the deferred quad still fogs those
+pixels — they are in the depth buffer like anything else — so a blended surface that keeps its
+forward fog is simply fogged **twice**. Fixing that proper needs a per-pixel "no deferred fog" mark
+in the ID buffer, not a suppression exemption. Do not reintroduce the exemption on its own.
 
 ## The Ganon barrier, and what its signature must NOT match
 
@@ -295,7 +296,6 @@ fog itself at range (unnatural darkening on distant fog-washed terrain). Tools:
 | `fogEnabled` | on | master toggle (off = vanilla forward fog) |
 | `fogMixedMode` | 1 (Exact) | mixed-scene handling: 0 = Vanilla (revert to forward fog), 1 = Exact (per-pixel config-ID replay). Exact is the default because most outdoor scenes mix configs, and Vanilla hands those back to forward fog — which is exact, but puts AO on top of the fog again in precisely the scenes the mod exists for |
 | `fogDebug` | 0 | 1 = deferred fog factor as grayscale, 2 = config IDs (exact mode, mixed frames) |
-| `fogBlendedVanilla` | on | leave blended draws in the opaque lists on the game's own forward fog (see "Blended draws...") |
 | `fogLogConfigs` | off | dump the frame's captured fog-config table to the log whenever it changes |
 
 These are the names `register_var` is actually called with; an earlier revision of this table
