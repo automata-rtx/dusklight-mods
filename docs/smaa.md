@@ -109,7 +109,7 @@ live has no rebuild or pipeline cost.
 |---|---|---|
 | `effectEnabled` | on | master toggle |
 | `blendStrength` | 100 | overall edge-blend strength, ×0.01 (0–150). Lower keeps edges crisper; higher smooths harder (and softens slightly) |
-| `edgeThreshold` | 10 | luma edge threshold, ×0.01 (0.05–0.20). Lower catches more edges (softer, can blur texture); higher is more selective |
+| `edgeThreshold` | 20 | luma edge threshold, ×0.01 (0.05–0.20). Lower catches more edges (softer, can blur texture); higher is more selective. The reference SMAA default is 10, tuned for high-contrast modern rendering; against TP's flatter art that treated ordinary texture detail as an edge, and geometric edges from the authored normals now cover the silhouettes and creases a low luma threshold was compensating for |
 | `localContrast` | 200 | local-contrast adaptation factor, ×0.01 (SMAA default 2.0). Suppresses an edge dwarfed by a parallel neighbour gradient |
 | `useNormalEdges` | on | union the geometric (normal/depth) detector with luma. No effect where the scene normals are unavailable (compatibility renderers) |
 | `normalThreshold` | 5 | geometric edge: `1 - dot(normals)` threshold, ×0.01 (0.05 ≈ an 18° crease). Was 10 when the normal was reconstructed from depth and every facet boundary registered as a step; authored normals are smooth, so 5 is safe. Raise it if creases you consider shading are being antialiased |

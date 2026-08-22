@@ -468,7 +468,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.screen_size[1] = static_cast<float>(resolved.height);
     uniforms.inv_screen_size[0] = 1.0f / uniforms.screen_size[0];
     uniforms.inv_screen_size[1] = 1.0f / uniforms.screen_size[1];
-    uniforms.threshold = scaled(g_cvarEdgeThreshold, 10, 5, 20, 0.01f);
+    uniforms.threshold = scaled(g_cvarEdgeThreshold, 20, 5, 20, 0.01f);
     uniforms.normal_threshold = scaled(g_cvarNormalThreshold, 5, 2, 50, 0.01f);
     uniforms.depth_threshold = scaled(g_cvarDepthThreshold, 20, 1, 200, 0.001f);
     uniforms.max_search_steps =
@@ -564,7 +564,10 @@ ModResult build_controls_tab(
     svc_ui->pane_add_section(mod_ctx, left, "Edge Detection");
     add_number(left, "Luma Threshold", g_cvarEdgeThreshold,
         "Contrast an edge must exceed to be antialiased. Lower catches more (softer overall, can "
-        "blur texture detail); higher is more selective.",
+        "blur texture detail); higher is more selective.<br/>The default is 20%, well above the "
+        "reference SMAA 10%: that value is tuned for high-contrast modern rendering, and against "
+        "this game's flatter art it treated ordinary texture detail as edges. Geometric Edges "
+        "below picks up the silhouettes and creases a low luma threshold used to be needed for.",
         5, 20, 1, nullptr);
     add_number(left, "Local Contrast", g_cvarLocalContrast,
         "Suppresses an edge when a much stronger parallel gradient sits next to it (stops doubled "
@@ -690,7 +693,13 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         int64_t defaultValue;
         ConfigVarHandle* handle;
     } intOptions[] = {
-        {"edgeThreshold", 10, &g_cvarEdgeThreshold},
+        // DEFAULT 20 (= 0.20 luma contrast), the top of the range. The reference SMAA default is
+        // 0.10, tuned for modern high-contrast rendering; TP's flat, low-contrast art lit that up
+        // far more than it needed to and softened texture detail. Geometric edges from the authored
+        // normals now catch the silhouettes and creases a lower luma threshold used to be needed
+        // for, so the luma detector only has to cover what has real contrast. Keep this in step
+        // with the fallback in the uniform fill.
+        {"edgeThreshold", 20, &g_cvarEdgeThreshold},
         {"normalThreshold", 5, &g_cvarNormalThreshold},
         {"depthThreshold", 20, &g_cvarDepthThreshold},
         {"maxSearchSteps", 16, &g_cvarMaxSearchSteps},

@@ -60,7 +60,9 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   game's own authored normals** (`get_scene_normals`; normal-angle + relative-depth discontinuity —
   catches silhouettes and creases where luma contrast is weak). Since those normals are smooth
   rather than per-triangle flat, `normalThreshold` defaults to 5% (~18°) where the reconstruction
-  era needed 10% to mask facet noise. The expensive blend-weight pass uses **CMAA2-style compute
+  era needed 10% to mask facet noise. `edgeThreshold` (luma) defaults to **20%**, double the SMAA
+  reference: 10% is tuned for high-contrast modern rendering and lit up ordinary texture detail on
+  TP's flatter art, and the geometric detector now covers what it was compensating for. The expensive blend-weight pass uses **CMAA2-style compute
   compaction** (Intel 2018): edge pixels in each 16×16 workgroup are packed into contiguous threads
   via a groupshared list so sparse edges run in fully-occupied warps. Composites at
   `SCENE_AFTER_OPAQUE` (before bloom/translucency, so the game's post effects operate on
@@ -72,7 +74,7 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
 - **`mods/deferred_fog/`** — "Deferred Fog": suppresses the game's per-draw fog during the opaque
   world lists and re-applies it (bit-exact aurora fog math, `src/fog_math.h`) as a fullscreen pass at
   `FRAME_BEFORE_HUD`, so AO/shadows darken surfaces *under* the fog instead of darkening the fog
-  itself. Mixed fog configs auto-revert to vanilla (default) or take an exact per-pixel replay.
+  itself. Mixed fog configs take an exact per-pixel replay (default) or auto-revert to vanilla.
   It reproduces **fog range adjustment** ("XFog"), the per-column multiplier GX applies to the fog
   term because screen-edge pixels are further from the eye than their Z says: TP enables it globally
   (`d_kankyo.cpp:1257`) and aurora implements it, so omitting it flattened a horizontal gradient
@@ -93,8 +95,17 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   room palette's range) on the water family and `MA20`, double-fogging them in any room with a
   distant palette fog. **TP has no near-fog/distant-scenery-fog split**: every
   config in a frame carries the same near/far from the one live view, so the old `widest_far_index()`
-  (ranked by far plane) was a long way of writing `return 0`; the uncovered-pixel fallback now ranks
-  by `endZ`. What TP widens for distant scenery is the CPU clipper, which never touches fog.
+  (ranked by far plane) was a long way of writing `return 0`. What TP widens for distant scenery is
+  the CPU clipper, which never touches fog.
+  **The uncovered-pixel fallback is the config the SELF-DRAWING packets used.** Grass
+  (`dGrass_packet_c`) and flowers (`dFlower_packet_c`) emit raw GX batches after replaying their own
+  material lists, so the replay's flat-ID override structurally cannot reach them and every grass
+  pixel lands on the fallback; a bracket hook on those two draws records the config their own fog
+  setter resolved to. Ranking the fallback by widest `endZ` instead — briefly, on this branch — is
+  the *weakest* fog at any depth, so grass stopped darkening with distance and read as lit right
+  next to the camera. Widest-`endZ` now resolves only the barrier dome.
+  Mixed-scene mode defaults to **Exact**: most outdoor scenes mix configs, and Vanilla hands those
+  back to forward fog, i.e. AO on top of the fog again in exactly the scenes the mod exists for.
   Diagnostic: `fogLogConfigs` dumps the frame's captured fog-config table; the Status line reports
   how many shared-DL materials carried live fog. **Game-linked** + webgpu.
   Docs: `docs/deferred_fog.md`.

@@ -31,6 +31,8 @@
 
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
 #include "JSystem/J3DGraphBase/J3DShape.h"
+#include "d/actor/d_flower.h"
+#include "d/actor/d_grass.h"
 #include "d/d_bg_parts.h"
 #include "d/d_com_inf_game.h"
 #include "dolphin/gf/GFPixel.h"
@@ -83,6 +85,9 @@ DEFINE_HOOK(&J3DShape::drawFast, ShapeDrawFast);
 // on_material_shared_dl_post. drawSimple brackets the window; one loadSharedDL hook per material
 // class the loader can produce.
 DEFINE_HOOK(&dBgp_c::modelMaterial_c::drawSimple, BgpDrawSimple);
+// The self-drawing opaque packets — see g_selfDrawnIndex.
+DEFINE_HOOK(&dGrass_packet_c::draw, GrassPacketDraw);
+DEFINE_HOOK(&dFlower_packet_c::draw, FlowerPacketDraw);
 DEFINE_HOOK(&J3DMaterial::loadSharedDL, MaterialSharedDL);
 DEFINE_HOOK(&J3DPatchedMaterial::loadSharedDL, PatchedMaterialSharedDL);
 DEFINE_HOOK(&J3DLockedMaterial::loadSharedDL, LockedMaterialSharedDL);
@@ -374,7 +379,14 @@ bool is_barrier_fog(const FogConfig& c) {
         c.endZ == 250000.0f;
 }
 
-// Fallback config for pixels the ID replay leaves uncovered.
+// The config whose fog reaches furthest this frame. Used for ONE thing: resolving the Ganon
+// barrier dome, which is excluded from the config table but still rasterizes (solid) in the replay,
+// so its pixels have to be given some config and the castle behind it is what they mostly show.
+//
+// IT IS NOT THE UNCOVERED-PIXEL FALLBACK ANY MORE — see g_selfDrawnIndex for that. Using it there
+// was a regression: grass and flowers land on the fallback by construction, and this picks the
+// config with the LARGEST endZ, i.e. the weakest fog at any given depth, so grass stopped darkening
+// with distance and read as if it were lit right next to the camera.
 //
 // THIS USED TO RANK BY PROJECTION FAR PLANE, modelling a "distant scenery fog" that TP does not
 // have. Every fog config in a frame is stamped with the SAME near/far, read from the one live view
@@ -386,9 +398,7 @@ bool is_barrier_fog(const FogConfig& c) {
 // d_bg_parts.cpp:681 changeFar(100000)), decided at list-build time by hide()/show() - which the
 // replay reproduces on its own and which never touches fog.
 //
-// Ranking by endZ is the honest version of the original intent: of the configs this frame, use the
-// one whose fog reaches furthest, since an uncovered pixel is most often distant geometry the
-// replay could not rasterize.
+// Ranking by endZ is the honest version of what the name always claimed.
 uint32_t widest_fog_index() {
     uint32_t idx = 0;
     float widest = g_frameConfigCount > 0 ? g_frameConfigs[0].endZ : 0.0f;
@@ -401,10 +411,11 @@ uint32_t widest_fog_index() {
     return idx;
 }
 
-// The fallback here MUST be the value fogMixedMode is registered with (0 = Vanilla). It used to be
-// 1, so a failed config read would silently run Exact while the UI still showed Vanilla.
+// The fallback here MUST be the value fogMixedMode is registered with (1 = Exact). The two
+// disagreed once already, which meant a failed config read silently ran the mode the UI was not
+// showing; keep them in step.
 bool exact_mode() {
-    return get_int_option(g_cvarFogMixed, 0) == 1;
+    return get_int_option(g_cvarFogMixed, 1) == 1;
 }
 
 uint32_t register_frame_config(const FogConfig& config) {
@@ -579,6 +590,36 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
 bool g_inBgpMaterial = false;
 uint32_t g_sharedDlFogCount = 0;
 
+// THE UNCOVERED-PIXEL FALLBACK: the config the SELF-DRAWING opaque packets used this frame.
+//
+// Field/tall grass (dGrass_packet_c) and flowers (dFlower_packet_c) do not draw through J3D at all.
+// They call the room's fog setter, replay their own static material display lists, and then emit
+// raw GX batches — so the replay's per-draw flat-ID override cannot reach them: the material list
+// re-programs TEV after anything we could set, and the geometry is not a J3DShape. They therefore
+// rasterize REAL LIT COLOURS into the ID buffer, the shader's green/blue guard correctly rejects
+// those, and every grass and flower pixel lands on the fallback. That makes the fallback's value
+// the fog those two packets get, which is worth measuring rather than assuming.
+//
+// So bracket their draws and record the config index their own fog setter resolved to. It is the
+// room's environment fog — the same one the terrain under them uses. If the hooks do not resolve,
+// the value stays 0, the frame's reference config, which is that same room fog in an ordinary
+// frame; the degradation is invisible.
+//
+// (This also catches MSAA silhouette fringes and any other stray unstamped pixel. Giving those the
+// room fog is right for the same reason.)
+bool g_inSelfDrawnPacket = false;
+bool g_selfDrawnIndexValid = false;
+uint32_t g_selfDrawnIndex = 0;
+
+HookAction on_self_drawn_packet_pre(ModContext*, void*, void*, void*) {
+    g_inSelfDrawnPacket = true;
+    return HOOK_CONTINUE;
+}
+
+void on_self_drawn_packet_post(ModContext*, void*, void*, void*) {
+    g_inSelfDrawnPacket = false;
+}
+
 HookAction on_bgp_draw_simple_pre(ModContext*, void*, void*, void*) {
     g_inBgpMaterial = true;
     return HOOK_CONTINUE;
@@ -628,7 +669,16 @@ HookAction on_set_fog_pre(ModContext*, void* args, void*, void*) {
     if (is_barrier_fog(config)) {
         return HOOK_CONTINUE;  // leave the Ganon barrier on its own forward fog (see is_barrier_fog)
     }
-    if (vote_config(config)) {
+    const bool suppress = vote_config(config);
+    // Grass and flowers set their fog from inside their own packet draw, and this is the only place
+    // we ever see it. Remember the config it resolved to — those packets' pixels all land on the
+    // uncovered-pixel fallback. First one in the frame wins; per-room palette differences within the
+    // config-match tolerance collapse to the same index anyway.
+    if (g_inSelfDrawnPacket && !g_selfDrawnIndexValid) {
+        g_selfDrawnIndex = lookup_frame_config(config);
+        g_selfDrawnIndexValid = true;
+    }
+    if (suppress) {
         mods::arg_ref<GXFogType>(args, 0) = GX_FOG_NONE;
     }
     return HOOK_CONTINUE;
@@ -729,9 +779,9 @@ void push_fog_quad() {
                 break;
             }
         }
-        // Pixels the config-ID replay could not stamp fall back to this config. See
-        // widest_fog_index() for why it ranks by endZ and not by the projection far plane.
-        uniforms.fallback_index = widest_fog_index();
+        // Pixels the config-ID replay could not stamp fall back to this config — in practice grass
+        // and flowers, which cannot be stamped at all. See g_selfDrawnIndex.
+        uniforms.fallback_index = g_selfDrawnIndexValid ? g_selfDrawnIndex : 0;
         GfxRange uniformRange{0, 0};
         if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &uniformRange) !=
             MOD_OK)
@@ -884,6 +934,9 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
     g_configIdView = nullptr;
     g_quadArmed = false;
     g_inBgpMaterial = false;
+    g_inSelfDrawnPacket = false;
+    g_selfDrawnIndexValid = false;
+    g_selfDrawnIndex = 0;
     g_scopeActive = effect_enabled();
     if (!g_scopeActive) {
         g_suppressAllowed = false;
@@ -1049,11 +1102,12 @@ ModResult build_controls_tab(
     control.kind = UI_CONTROL_SELECT;
     control.label = "Mixed Scenes";
     control.help_rml =
-        "How scenes that draw with several fog configurations are handled.<br/><b>Vanilla</b> "
-        "(default, recommended): in a multi-config scene, revert that scene to the game's own "
-        "forward fog - exactly vanilla - while still deferring in the common single-config scenes "
-        "(so the AO/shadow benefit is kept where it works). Best for matching vanilla.<br/>"
-        "<b>Exact (replay)</b>: always defer, replaying the opaque geometry into a per-pixel "
+        "How scenes that draw with several fog configurations are handled.<br/><b>Vanilla</b>: in a "
+        "multi-config scene, revert that scene to the game's own forward fog - exactly vanilla - "
+        "while still deferring in the common single-config scenes. Safe, but gives up the "
+        "AO-under-fog benefit in most outdoor scenes, which mix configs.<br/>"
+        "<b>Exact (replay)</b> (default): always defer, replaying the opaque geometry into a "
+        "per-pixel "
         "config-ID buffer so each pixel gets the fog its own draw used. Costs one extra opaque "
         "geometry pass on mixed frames. Pixels the replay cannot rasterize faithfully - "
         "translucent surfaces drawn in the opaque lists, notably the Ganon barrier dome - fall "
@@ -1201,14 +1255,15 @@ ModResult init(ModError* error) {
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogEnabled) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
-    // DEFAULT: mixed-scene mode = Vanilla revert (0). 1 = Exact replay. Vanilla matches the game's
-    // fog exactly in a multi-config scene by simply not deferring it, at the cost of losing the
-    // AO-under-fog benefit there; Exact keeps deferring and reconstructs the per-pixel config.
-    // Keep exact_mode()'s fallback in step with this value.
+    // DEFAULT: mixed-scene mode = Exact replay (1). 0 = Vanilla revert. Exact keeps deferring in a
+    // multi-config scene and reconstructs each pixel's own config from a replayed ID buffer, so the
+    // AO-under-fog benefit survives scenes that mix configs — which is most outdoor scenes. Vanilla
+    // gives those scenes back to the game's forward fog instead, exact but with AO on top of the
+    // fog again. Keep exact_mode()'s fallback in step with this value.
     cvarDesc = CONFIG_VAR_DESC_INIT;
     cvarDesc.name = "fogMixedMode";
     cvarDesc.type = CONFIG_VAR_INT;
-    cvarDesc.default_int = 0;
+    cvarDesc.default_int = 1;
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogMixed) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
@@ -1288,6 +1343,18 @@ ModResult init(ModError* error) {
             MOD_OK) &
         (mods::hook_add_post<LockedMaterialSharedDL>(svc_hook, on_material_shared_dl_post) ==
             MOD_OK);
+    // Bracket the self-drawing opaque packets so the uncovered-pixel fallback is measured rather
+    // than assumed (see g_selfDrawnIndex). Failure degrades to the reference config, so it warns.
+    const bool selfDrawnOk =
+        (mods::hook_add_pre<GrassPacketDraw>(svc_hook, on_self_drawn_packet_pre) == MOD_OK) &
+        (mods::hook_add_post<GrassPacketDraw>(svc_hook, on_self_drawn_packet_post) == MOD_OK) &
+        (mods::hook_add_pre<FlowerPacketDraw>(svc_hook, on_self_drawn_packet_pre) == MOD_OK) &
+        (mods::hook_add_post<FlowerPacketDraw>(svc_hook, on_self_drawn_packet_post) == MOD_OK);
+    if (!selfDrawnOk) {
+        svc_log->warn(mod_ctx,
+            "failed to hook the grass/flower packet draws; in exact mode their pixels fall back "
+            "to the frame's reference fog config instead of the one they actually drew with");
+    }
     if (!sharedDlOk) {
         svc_log->warn(mod_ctx,
             "failed to hook the dBgp_c shared-display-list path (drawSimple / loadSharedDL); "
@@ -1326,7 +1393,8 @@ void shutdown() {
     g_scopeActive = g_quadArmed = g_suppressAllowed = g_shapeHookOk = g_wasSuppressing = false;
     g_lastFrameDeferred = false;
     g_fogReplayActive = g_wasMixed = g_warnedReplayFailure = false;
-    g_inBgpMaterial = false;
+    g_inBgpMaterial = g_inSelfDrawnPacket = g_selfDrawnIndexValid = false;
+    g_selfDrawnIndex = 0;
     g_reference = FogConfig{};
     g_firstDeviant = FogConfig{};
     g_suppressedCount = g_deviantCount = 0;

@@ -155,19 +155,36 @@ and cannot land on both literals, so the exact test cannot collide with it.
 
 ## What an uncovered pixel falls back to
 
-Pixels the ID replay does not cover fall back to the config with the **widest `endZ`** of the
-frame. This used to rank by the projection **far plane**, modelling a "distant scenery fog
-drawn with a wider projection" that TP does not have: every fog config in a frame is stamped
-with the same near/far, read from the one live view (`d_kankyo.cpp:4461-4463` for every BG
-material, `:9394`/`:9429`/`:9451` for the three direct setters), the world lists draw under a
-single perspective projection (`m_Do_graphic.cpp:2338`), and nothing sets another one inside the
-suppression window.
-So the old strict `farZ >` scan from index 0 never fired and the function was a long way of
-writing `return 0` — the *near* fog, which is why uncovered distant geometry read as
-over-fogged. What TP actually widens for distant scenery is the CPU **clipper**
-(`d_a_bg.cpp:298` `changeFar(1000000)`, `d_bg_parts.cpp:681` `changeFar(100000)`), decided at
-list-build time by `hide()`/`show()` — which the replay reproduces on its own and which never
-touches fog.
+Pixels the ID replay cannot stamp fall back to **the config the self-drawing opaque packets
+used** — grass and flowers, which are almost all of the uncovered area.
+
+Field/tall grass (`dGrass_packet_c`) and flowers (`dFlower_packet_c`) do not draw through J3D at
+all: they set the room's fog, replay their own static material display lists, and emit raw GX
+batches. The replay's per-draw flat-ID override cannot reach them — the material list re-programs
+TEV after anything we could set, and the geometry is not a `J3DShape` — so they rasterize real
+lit colours into the ID buffer, the shader's green/blue guard correctly rejects those, and every
+grass and flower pixel lands on the fallback by construction. Bracketing those two packet draws
+and recording the config their own fog setter resolved to makes the fallback the config they
+actually drew with, rather than a guess. If the bracket hooks do not resolve it degrades to
+config 0 — the frame's reference config, which is that same room fog in an ordinary frame.
+
+**This briefly ranked by the widest `endZ` instead, and that was a regression** — the config with
+the largest `endZ` is the one with the *weakest* fog at any given depth, so grass and flowers
+stopped darkening with distance and read as if they were lit right next to the camera, most
+obviously in heavy fog. The widest-`endZ` config is still used for one thing: resolving the Ganon
+barrier dome, which is excluded from the config table but rasterizes solid in the replay, so its
+pixels have to be given the fog the castle behind it uses.
+
+Before that it ranked by the projection **far plane**, modelling a "distant scenery fog drawn
+with a wider projection" that TP does not have: every fog config in a frame is stamped with the
+same near/far, read from the one live view (`d_kankyo.cpp:4461-4463` for every BG material,
+`:9394`/`:9429`/`:9451` for the three direct setters), the world lists draw under a single
+perspective projection (`m_Do_graphic.cpp:2338`), and nothing sets another one inside the
+suppression window. So the strict `farZ >` scan from index 0 never fired and the function was a
+long way of writing `return 0`. What TP actually widens for distant scenery is the CPU
+**clipper** (`d_a_bg.cpp:298` `changeFar(1000000)`, `d_bg_parts.cpp:681` `changeFar(100000)`),
+decided at list-build time by `hide()`/`show()` — which the replay reproduces on its own and
+which never touches fog.
 
 ## Mixed fog configurations
 
@@ -176,7 +193,7 @@ differences (Δcolor ≤ 6, Δstart/end ≤ 2% of the fog span); anything beyond
 distinct configuration. Many areas mix several (rooms lagging the stage's palette blend,
 special-fog materials), and the two modes handle that differently (`mixedMode`):
 
-- **Exact (replay)**: every fogged draw is suppressed and its configuration
+- **Exact (replay), the default**: every fogged draw is suppressed and its configuration
   captured into a per-frame table (up to 8 distinct). A uniform frame takes the ordinary
   single-quad path at no extra cost. A mixed frame replays the opaque draw lists once into
   a mod-owned offscreen pass — same save-replay-resolve bracket as the shadow mod's
@@ -195,14 +212,14 @@ special-fog materials), and the two modes handle that differently (`mixedMode`):
   - Grass/flower/waterfall packets draw their own geometry (not `J3DShape::drawFast`), so the
     replay can't force them to a flat ID color — they rasterize real lit colors into the ID
     buffer. The override writes the ID as `(id, 0, 0)` (red only), so the shader rejects any
-    pixel with non-zero green/blue — i.e. all such packets, in any lighting — back to config 0
-    (the reference). Their fog is the room's environment fog, which the GFSetFog hook now
-    captures as config 0, so this is the correct config for them. (Before the green/blue guard,
+    pixel with non-zero green/blue — i.e. all such packets, in any lighting — back to the
+    fallback, which is recorded from those packets' own fog setter (see "What an uncovered pixel
+    falls back to"), so it is the config they actually drew with. (Before the green/blue guard,
     a blade's shaded red channel could land in another config's decode window and flicker
     between configs as the lighting changed — the day/night grass artifact.) Residual: a
     genuinely pure-red bypassed surface could still alias, but none occurs in practice.
   - MSAA silhouettes may resolve to an invalid ID on 1-px fringes → reference config.
-- **Vanilla, the default**: the original behavior — only draws matching the frame's reference config
+- **Vanilla**: the original behavior — only draws matching the frame's reference config
   are suppressed; any deviant reverts the scene to forward fog from the next frame until
   it is uniform again. Twilight black fog (type 7 → linear black), wolf-senses white fog
   (type 6), and room transitions all take the vanilla path in this mode.
@@ -232,15 +249,14 @@ fog itself at range (unnatural darkening on distant fog-washed terrain). Tools:
 | Var | Default | Meaning |
 |---|---|---|
 | `fogEnabled` | on | master toggle (off = vanilla forward fog) |
-| `fogMixedMode` | 0 (Vanilla) | mixed-scene handling: 0 = Vanilla (revert to forward fog), 1 = Exact (per-pixel config-ID replay) |
+| `fogMixedMode` | 1 (Exact) | mixed-scene handling: 0 = Vanilla (revert to forward fog), 1 = Exact (per-pixel config-ID replay). Exact is the default because most outdoor scenes mix configs, and Vanilla hands those back to forward fog — which is exact, but puts AO on top of the fog again in precisely the scenes the mod exists for |
 | `fogDebug` | 0 | 1 = deferred fog factor as grayscale, 2 = config IDs (exact mode, mixed frames) |
 | `fogLogConfigs` | off | dump the frame's captured fog-config table to the log whenever it changes |
 
 These are the names `register_var` is actually called with; an earlier revision of this table
-listed `effectEnabled` / `mixedMode` / `debugView`, which the mod has never registered, and gave
-the wrong default for the mixed mode. `exact_mode()`'s read fallback must stay equal to
-`fogMixedMode`'s registered default — it was 1 against a default of 0, so a failed config read
-would silently have run Exact while the UI showed Vanilla.
+listed `effectEnabled` / `mixedMode` / `debugView`, which the mod has never registered.
+`exact_mode()`'s read fallback must stay equal to `fogMixedMode`'s registered default — the two
+disagreed once, so a failed config read would have silently run the mode the UI was not showing.
 
 The mods panel shows the **Enabled** toggle, a read-only **Status** line (see "Diagnosing
 fog issues"), and an **Open Controls** button; `fogMixedMode` and `fogDebug` are SELECT
