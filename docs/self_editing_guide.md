@@ -48,7 +48,7 @@ Defaults are set where each option is **registered**, in the mod's `mod_initiali
 ### Shape 1: a `ConfigVarDesc` block
 
 Search the file for the option name (the `.name = "..."` line) and change the `default_*` line just
-below it. Example — **Graphics Hub**, make Deferred Fog **off** by default (it ships on):
+below it. Example — **Deferred Fog**, make it **off** by default (it ships on):
 
 ```cpp
     ConfigVarDesc cvarDesc = CONFIG_VAR_DESC_INIT;
@@ -178,9 +178,12 @@ the mod manager that you installed a newer build.
 
 ## Where each option lives (quick index)
 
-- **Graphics Hub** — `mods/graphics_hub/src/mod.cpp`
-  - Depth to Normal: namespace `hub_dtn`, option `normalsDebug`.
-  - Deferred Fog: namespace `hub_fog`, options `fogEnabled`, `fogMixedMode`, `fogDebug`.
+- **Deferred Fog** — `mods/deferred_fog/src/mod.cpp`, options `fogEnabled`, `fogMixedMode`,
+  `fogDebug`, `fogSkipUnfogged`, `fogLogConfigs`. (This used to live inside a combined "Graphics
+  Hub" mod as namespace `hub_fog`, alongside a Depth to Normal provider; Graphics Hub is retired
+  and the provider is gone — mods get the game's authored normals straight from the gfx service.)
+- **SMAA** — `mods/smaa/src/mod.cpp`, options `edgeThreshold`, `normalThreshold`, `depthThreshold`,
+  `maxSearchSteps`, `blendStrength`, `localContrast`, `debugMode`.
 - **Effect Remover** — `mods/effect_remover/src/mod.cpp`
   - Haze Removal (formerly "Projected Shadow Removal"): namespace `er_psr`, options `psrEnabled`, `psrLogMode`,
     `psrSuppress0`…`psrSuppress11`.
@@ -190,6 +193,6 @@ the mod manager that you installed a newer build.
 - **VBAO** — `mods/vbao/src/mod.cpp`; **SSILVB** — `mods/ssilvb/src/mod.cpp`; **Realtime Sun
   Shadows** — `mods/realtime_sun_shadows/src/mod.cpp` (same `ConfigVarDesc` / `default_*` pattern).
 
-In **Graphics Hub** and **Effect Remover**, the defaults are marked in the code with a `// DEFAULT`
+In **Deferred Fog** and **Effect Remover**, the defaults are marked in the code with a `// DEFAULT`
 comment next to the value — search the file for `DEFAULT` to jump straight to them. The other mods
 use the same `default_bool` / `default_int` pattern; search for the option name to find its block.

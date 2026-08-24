@@ -173,13 +173,16 @@ Verified in the pinned tree; none has been evaluated in game.
 | :-- | :-- | :-- |
 | `MA02`, `MA10` | Builds a **camera-projected texture matrix** (`C_MTXLightPerspective`) and routes the material to the Invisisble list — a screen-locked projected overlay | `d_kankyo.cpp:11424-11450` |
 | `MA11` | In the Twilight (`dKy_darkworld_check`) re-routes to `setListDarkBG` and forces a purple TEV colour — the twilight mist tint | `d_kankyo.cpp:11479-11490` |
-| `MA20` | Forces fog type 7 (black), takes its colour from the `ウソFog` layer, and builds a `cMtx_lookAt` projection anchored to **the player's position** — a mask that follows Link | `d_kankyo.cpp:11582-11620` |
+| `MA20` | Forces fog type 7 (black); takes TEV colour 1 from `bg_amb_col[3]`'s **rgb** while forcing `a = 255` (`:11595`), i.e. it uses that palette slot's colour but **discards** the `ウソFog` amount, which is the slot's *alpha*; and builds a `cMtx_lookAt` projection anchored to **the player's position** — a mask that follows Link | `d_kankyo.cpp:11582-11620` |
 | `MA13`, `MA14`, `MA16` | Written the authors' own **`ウソFog`** ("fake fog") ambient term as a TEV constant; `MA14` additionally receives the real fog colour | `d_kankyo.cpp:11622-11652` |
 
-The last row matters for Graphics Hub's Deferred Fog: because `ウソFog` is a TEV constant baked
-into the material rather than a `GXSetFog` call, **Deferred Fog can neither suppress nor defer
-it**. On those materials a fog-coloured tint is part of the surface before any mod composites over
-it. See `docs/japanese-naming.md` §5.
+The last row matters for **Deferred Fog** (a standalone mod — Graphics Hub, which used to host it,
+is retired): because `ウソFog` is a TEV constant baked into the material rather than a `GXSetFog`
+call, **Deferred Fog can neither suppress nor defer it**. On those materials a fog-coloured tint is
+part of the surface before any mod composites over it. Note this also means it **cannot be the
+cause of a deferred-vs-vanilla difference**: a TEV constant changes the fragment colour before the
+fog stage in both paths identically, so it cancels. Only the fog block and the blend equation can
+diverge — see `docs/deferred_fog.md`, "the `K` factor". See also `docs/japanese-naming.md` §5.
 
 ---
 

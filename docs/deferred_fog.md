@@ -5,6 +5,54 @@
 > game's authored normals directly, so the provider had nothing left to do — and Deferred Fog is a
 > standalone mod again, which is what this document already described.
 
+## STATUS — read this first if you are picking the mod up cold
+
+**Confirmed in-game by the user:** the mod overall ("mostly been a success"), and specifically the
+grass/flower uncovered-pixel fix — grass darkens with distance again.
+
+**Shipped but NOT separately confirmed in-game** — do not describe these as verified: fog range
+adjustment, the `dBgp_c` map-unit path, the exact-literal Ganon-barrier signature, Exact-as-default,
+the quad-anchor readout, and the fog-off / additive counters. They are verified against the *game
+source*, which is a different claim.
+
+**ONE OPEN QUESTION, and it is unresolved.** Distant landmarks — the user reports Death Mountain
+specifically, and the Ganon barrier — read **brighter with Deferred Fog OFF** than with it on, with
+no other mods enabled. In the user's words: *"chunks of the far off Death Mountain geometry appear
+to overpower the fog so you can see the light from the incredibly far distance"*, and the mod
+*"seems to be drawing on top of Death Mountain's glow"*.
+
+Two mechanisms are **established from the game source** (both documented in full below). Which one
+is at work **cannot be settled from source**: the fetched `dusklight/` tree carries no stage
+archives, so no material's authored `J3DBlendInfo` or `J3DFogInfo` is readable.
+
+1. **The `K` factor** — a fullscreen pass cannot reproduce a pixel vanilla built from an
+   over-unity blend. See "What a fullscreen pass can and cannot reproduce".
+2. **Fog switched off per material** (`mType == 0`) — vanilla applies literally zero fog, the quad
+   fogs it anyway. See "Geometry the game draws with no fog at all".
+
+**Two fixes have already shipped for this and both were wrong.** They are recorded below so they
+are not re-attempted: a *blended draws keep vanilla fog* exemption (measured worse in-game than not
+having it, and it changed nothing about the symptom), and *the quad lands after bloom* (refuted by
+the user — the view does contain translucent geometry, so the translucent anchor fires). Both were
+reasoned from a plausible mechanism with no per-view measurement behind them. **Do not add a third
+without reading the counters first.**
+
+### How to resolve it — the decision table
+
+The Status line was built for exactly this. Stand in the view that looks wrong and read it.
+
+| Reading | What it means | What to do |
+| :-- | :-- | :-- |
+| anchor is **not** `[at translucents]` | placement, not fog maths | stop and fix the anchor; see "Where in the frame the fog quad lands" |
+| `fog-off` > 0 | mechanism 2 is present in this view | turn on **Skip Unfogged Geometry** and re-compare |
+| `additive` > 0, `no-Z` < `additive` | mechanism 1 is present and some of it owns its depth | the same sentinel can be extended to it — see "If the counters say this is the mechanism" |
+| `additive` > 0, `no-Z` == `additive` | mechanism 1, but none of it owns its depth | **stop.** Marking those pixels would blank the fog on the terrain behind them. Say so rather than shipping it |
+| both counters 0 | both mechanisms refuted for this view | start again; do not guess |
+
+**Fog Factor** view discriminates the two directly: unfogged geometry is a *silhouette* difference
+(the landmark shows its own texture through the haze); an over-unity blend is a *fog-coloured*
+difference (the landmark shows **more haze than the haze**).
+
 ## The exported service is for ORDERING, not data
 
 Deferred Fog exports `dev.automata.deferred_fog` (`include/deferred_fog_service.h`) with a single
@@ -13,8 +61,10 @@ need the **import**, because the mod API has no priority field on a stage hook. 
 registration order, registration happens in `mod_initialize`, and the loader initializes in
 dependency order — so importing a mod's service is the only way to say "initialize that one first".
 
-Which matters only for one case. The fog quad draws at `FRAME_BEFORE_HUD`; the
-`SCENE_AFTER_OPAQUE` hook merely arms it. So:
+Which matters only for one case. The `SCENE_AFTER_OPAQUE` hook only *arms* the quad; the quad
+itself is pushed later — normally at the first translucent J3D packet, and at worst at
+`FRAME_BEFORE_HUD` (see "Where in the frame the fog quad lands"). Either way it is after the stage.
+So:
 
 - A mod compositing at `SCENE_AFTER_OPAQUE` is **already** ordered before the fog by stage
   separation, and needs no import. That is the main path and the whole point of the mod.
@@ -46,8 +96,9 @@ Any screen-space effect composited after the opaque scene therefore multiplies o
 
 ## Architecture
 
-1. **Suppression scope** opens at `GFX_STAGE_SCENE_BEGIN` (the sky lists draw earlier and
-   keep their fog) and closes at the first translucent list draw.
+1. **Suppression scope** opens at `GFX_STAGE_SCENE_BEGIN` (`m_Do_graphic.cpp:2361`; the sky lists
+   draw earlier and keep their fog) and closes at `GFX_STAGE_SCENE_AFTER_OPAQUE` (`:2426`), which
+   the game runs one line before the first translucent list.
 2. **J3D interception** (`J3DShape::drawFast` pre-hook, the same pattern as the shadow mod's
    two-sided casters): the material display list has already executed when a shape draws, so
    an immediate `GXSetFog(GX_FOG_NONE)` overrides its fog for that shape's geometry. The
@@ -62,14 +113,15 @@ Any screen-space effect composited after the opaque scene therefore multiplies o
    unaffected).
 3. **Re-apply** as a fullscreen alpha-blended pass over the resolved opaque depth, pushed at
    the first `J3DShape::drawFast` after `SCENE_AFTER_OPAQUE` — i.e. right before the first
-   translucent geometry (water included) rasterizes — with a `FRAME_BEFORE_HUD` fallback for
-   frames with no translucent J3D at all. That lands after *every* mod's
+   translucent geometry (water included) rasterizes. That lands after *every* mod's
    `SCENE_AFTER_OPAQUE` stage callbacks regardless of mod load order, and before water,
-   particles, DOF, and bloom, which keep their native forward fog (the painter's dedicated
-   particle-fog passes included). Do NOT anchor this on the painter's own list functions
-   (`dDlst_list_c::drawXluDrawList` etc.): they inline into their callsites, so a detour
-   fires at some unrelated later call — the original implementation did exactly that and the
-   fog landed after bloom.
+   particles, DOF and bloom, which keep their native forward fog (the painter's dedicated
+   particle-fog passes included). **This anchor is not a fixed point in the frame and the
+   fallbacks behind it are materially worse** — the whole story, including which anchor a frame
+   actually used, is in "Where in the frame the fog quad lands" below. Do NOT anchor this on the
+   painter's own list functions (`dDlst_list_c::drawXluDrawList` etc.): they inline into their
+   callsites, so a detour fires at some unrelated later call — the original implementation did
+   exactly that and the fog landed after bloom.
 4. **Exactness**: aurora's only per-fragment fog input is the raw depth value — the same
    value in the depth snapshot — and `src/fog_math.h` mirrors the full `J3DGDSetFog` BP
    encode → aurora command-processor decode round trip (11-bit mantissa truncation
@@ -207,7 +259,23 @@ fullscreen pass cannot reproduce such a pixel in principle.
 
 Note the narrow test this implies: the question is **not** "is this draw blended", it is "is the
 destination factor something other than `1 − src`". `material_over_unity_blend()` tests exactly
-that.
+that, and the Status line's `additive` counter is how many such materials a frame contains.
+
+### If the counters say this is the mechanism
+
+Two honest options, neither yet implemented. Gate both on `additive > 0` **and**
+`no-Z < additive`; if every over-unity material has depth-write off, marking its pixels would blank
+the fog on the terrain behind it and the correct answer is "cannot be done with one pass", not
+"not done yet".
+
+- **(a) Hand those pixels back to vanilla entirely** — do not suppress the material's fog, *and*
+  stamp the no-deferred-fog sentinel so the quad skips them. This is **exact** when what lies behind
+  the surface is sky (which the quad never fogs), and wrong by the background's own fog term when
+  the surface sits over deferred-fogged world geometry. For a distant silhouette against sky the
+  error is zero, which is the case that prompted this.
+- **(b) Carry the extra dose** — stamp `Σα` into a second channel and add `k·f·F` in a second quad
+  draw. Correct in general, but it needs a second replay pass (GX has one blend state per draw, and
+  the flat-ID override throws α away) and a second pipeline. Do not build this speculatively.
 
 ## Geometry the game draws with no fog at all
 
@@ -263,8 +331,11 @@ A rule that detected blended materials and left them all on vanilla forward fog 
 **measured worse in-game than not having it**, and it changed nothing about the Death Mountain /
 barrier difference it was meant to explain. It backfires because the deferred quad still fogs those
 pixels — they are in the depth buffer like anything else — so a blended surface that keeps its
-forward fog is simply fogged **twice**. Fixing that proper needs a per-pixel "no deferred fog" mark
-in the ID buffer, not a suppression exemption. Do not reintroduce the exemption on its own.
+forward fog is simply fogged **twice**. Fixing it properly needs a per-pixel "no deferred fog" mark
+in the ID buffer, not a suppression exemption. **That mark now exists** — see "Geometry the game
+draws with no fog at all" — but it is keyed on `mType == 0`, *not* on blending, and extending it to
+over-unity blends is option (a) under the `K` factor, gated on the `additive`/`no-Z` counters. Do
+not reintroduce the suppression exemption on its own.
 
 ## The Ganon barrier, and what its signature must NOT match
 
@@ -276,9 +347,10 @@ config-ID replay rasterizes the dome **solid** and stamps its black fog onto the
 trees inside it, and the dome's own fog-then-blend compositing is lost. So the mod recognises
 that one signature and leaves the barrier entirely on its vanilla forward fog — never
 suppressed, never registered as a frame config — and in the replay lets it write no colour, so
-its pixels keep the config of the castle and hills behind it. That is the same treatment every
-blended draw now gets (see above); the signature survives as a second trigger in case a
-material's blend state cannot be read.
+its pixels keep the config of the castle and hills behind it. **The barrier is the only draw that
+gets this treatment.** A rule that generalised it to every blended draw was tried and reverted (see
+"Blended draws" above); the barrier keeps the exemption because its own fog is pure black over a
+1000..250000 range and putting *that* in the config table is worse than the double-fog residual.
 
 The match is the **exact literal triple**. It used to be `black && endZ > 100000`, which
 matched a whole material class rather than an actor: `mType = 7` is the game's own black-fog
@@ -295,9 +367,9 @@ and cannot land on both literals, so the exact test cannot collide with it.
 ## What an uncovered pixel falls back to
 
 Pixels the ID replay cannot stamp fall back to **the config the self-drawing opaque packets
-used** — grass and flowers, which are almost all of the uncovered area. (Blended draws are *not*
-in this category: they write no colour in the replay, so their pixels carry the config of whatever
-is behind them rather than falling back.)
+used** — grass and flowers, which are almost all of the uncovered area. (The Ganon barrier is *not*
+in this category: it writes no colour in the replay, so its pixels carry the config of whatever
+is behind it rather than falling back — it is the only draw treated that way.)
 
 Field/tall grass (`dGrass_packet_c`) and flowers (`dFlower_packet_c`) do not draw through J3D at
 all: they set the room's fog, replay their own static material display lists, and emit raw GX
@@ -313,7 +385,7 @@ config 0 — the frame's reference config, which is that same room fog in an ord
 the largest `endZ` is the one with the *weakest* fog at any given depth, so grass and flowers
 stopped darkening with distance and read as if they were lit right next to the camera, most
 obviously in heavy fog. That helper is gone entirely: its other caller, the barrier dome, now gets
-the config of the geometry behind it like every other blended draw.
+the config of the geometry behind it instead of a ranking.
 
 Before that it ranked by the projection **far plane**, modelling a "distant scenery fog drawn
 with a wider projection" that TP does not have: every fog config in a frame is stamped with the
@@ -334,8 +406,11 @@ distinct configuration. Many areas mix several (rooms lagging the stage's palett
 special-fog materials), and the two modes handle that differently (`mixedMode`):
 
 - **Exact (replay), the default**: every fogged draw is suppressed and its configuration
-  captured into a per-frame table (up to 8 distinct). A uniform frame takes the ordinary
-  single-quad path at no extra cost. A mixed frame replays the opaque draw lists once into
+  captured into a per-frame table (up to 8 distinct; slot 8 / red byte 216 is reserved as the
+  no-deferred-fog sentinel and can never be a config). A uniform frame takes the ordinary
+  single-quad path at no extra cost — *unless* `fogSkipUnfogged` is on and the frame contains
+  fog-off geometry, which forces the replay. Both gates live in one `needs_id_buffer()`. A frame
+  that needs the buffer replays the opaque draw lists once into
   a mod-owned offscreen pass — same save-replay-resolve bracket as the shadow mod's
   cascades, but with the game's own camera — with each shape's output forced to a flat
   sparse-encoded index color (`(index+1)·24` in red; the material display list has already
@@ -346,9 +421,10 @@ special-fog materials), and the two modes handle that differently (`mixedMode`):
     is a framerate cost rather than the overflow risk it once was — see the shadow doc's
     budget section, which is now historical.
   - Alpha-tested cutouts (foliage holes) replay solid, so a hole resolves to its tree's
-    config; pixels not covered by the shape override (rare non-J3D direct drawers) decode
-    as invalid and fall back to config 0 (the frame's reference) — exactly what the
-    single-config quad applied to them before.
+    config; pixels not covered by the shape override decode as invalid and fall back to the
+    config the self-drawing packets used (see "What an uncovered pixel falls back to"). The solid
+    replay of a cutout is also why the no-deferred-fog mark refuses to touch an alpha-tested
+    material.
   - Grass/flower/waterfall packets draw their own geometry (not `J3DShape::drawFast`), so the
     replay can't force them to a flat ID color — they rasterize real lit colors into the ID
     buffer. The override writes the ID as `(id, 0, 0)` (red only), so the shader rejects any
@@ -374,10 +450,16 @@ special config in its table like any other.
 The symptom of fog NOT being deferred is distinctive: screen-space AO/shadows darken the
 fog itself at range (unnatural darkening on distant fog-washed terrain). Tools:
 
-- The mod panel's **Status** line: "Deferring fog (exact: N draws, K configs)" is the
-  working state in exact mode ("... replay failed" indicates the ID replay could not run
-  and mixed pixels got the reference config); "REVERTED: mixed fog configs" appears only
-  in Vanilla mode.
+- The mod panel's **Status** line. In exact mode it reads
+
+  ```
+  Deferring fog (exact: N draws, K configs; A shared-DL, B fog-off, C additive/D no-Z) [anchor]
+  ```
+
+  `"... replay failed"` means the ID replay could not run and mixed pixels got the fallback
+  config; `"REVERTED: mixed fog configs"` appears only in Vanilla mode. The five measurements are
+  the point — see the decision table in **STATUS** at the top of this document, and the field
+  table under "Where in the frame the fog quad lands".
 - Transitions are **logged**: mixed↔uniform in exact mode, revert/re-engage (with both
   configs' type/range/color) in Vanilla mode.
 - Debug views: **Fog Factor** (the deferred term as grayscale — black while the scene is
@@ -391,7 +473,7 @@ fog itself at range (unnatural darkening on distant fog-washed terrain). Tools:
 | `fogEnabled` | on | master toggle (off = vanilla forward fog) |
 | `fogMixedMode` | 1 (Exact) | mixed-scene handling: 0 = Vanilla (revert to forward fog), 1 = Exact (per-pixel config-ID replay). Exact is the default because most outdoor scenes mix configs, and Vanilla hands those back to forward fog — which is exact, but puts AO on top of the fog again in precisely the scenes the mod exists for |
 | `fogDebug` | 0 | 1 = deferred fog factor as grayscale, 2 = config IDs (exact mode, mixed frames) |
-| `fogSkipUnfogged` | off | mark pixels the game drew with fog switched off so the quad leaves them alone (see above); forces the ID replay |
+| `fogSkipUnfogged` | off | mark pixels the game drew with fog switched off so the quad leaves them alone (see "Geometry the game draws with no fog at all"); forces the ID replay, and needs `fogMixedMode` = Exact to do anything |
 | `fogLogConfigs` | off | dump the frame's captured fog-config table to the log whenever it changes |
 
 These are the names `register_var` is actually called with; an earlier revision of this table
@@ -402,14 +484,20 @@ disagreed once, so a failed config read would have silently run the mode the UI 
 The mods panel shows the **Enabled** toggle, a read-only **Status** line (see "Diagnosing
 fog issues"), and an **Open Controls** button; `fogMixedMode` and `fogDebug` are SELECT
 controls, which the UI only renders inside a window tab (not the flat panel), so they live in
-the Open Controls window.
+the Open Controls window, along with `fogSkipUnfogged` and `fogLogConfigs`.
 
 ## Known caveats
 
 - Translucents (water, particles) blend over the *fogged* opaque scene and then receive
-  their own forward fog — matching vanilla layering.
+  their own forward fog — matching vanilla layering. That holds while the quad anchors
+  `[at translucents]`; on either fallback anchor they blend over an *unfogged* scene and are then
+  fogged a second time by the quad.
 - If the `J3DShape::drawFast` by-name hook cannot resolve (e.g. the game's embedded symbol
-  manifest is unavailable), the mod loads but stays inert (vanilla fog) and logs a warning.
+  manifest is unavailable), the mod loads but stays inert (vanilla fog) and logs a warning. Every
+  other hook degrades to a coverage loss and warns: the `dBgp_c` bracket (`drawSimple` +
+  `loadSharedDL` × 3) leaves map-unit material fog uninspected, the grass/flower packet bracket
+  leaves the uncovered-pixel fallback at config 0, and the bloom pre-hook leaves the last-resort
+  anchor at `FRAME_BEFORE_HUD`.
 - Degenerate fog ranges (start == end) produce a zero fog term with a 0/0 singularity in
   vanilla; the deferred pass skips the quad entirely for those.
 - ABI-coupled: rebuild against the new `windows-amd64.lib` import library after any re-platform.

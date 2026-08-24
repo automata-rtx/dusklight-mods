@@ -374,7 +374,8 @@ a content classification the game already made.
 
 ### 4.5 The game already runs a per-material fog override, keyed on the same codes
 
-Found while reading §4.1's neighbourhood, and it lands on Graphics Hub's Deferred Fog.
+Found while reading §4.1's neighbourhood, and it lands on Deferred Fog (a standalone mod —
+Graphics Hub, which used to host it, is retired).
 
 `setLightTevColorType_MAJI_sub` (`d_kankyo.cpp:4231`) is the per-material light/TEV/fog
 setup every BG material goes through. Its fog block (`:4432-4487`) does not simply apply
@@ -497,9 +498,11 @@ or **still open**, so nothing here reads as coverage it does not have.
   Field keeps its drifting shadows" is wrong twice over.
 - **Deferred Fog vs the game's other fog.** `ウソFog` does reach terrain, but **not as
   fog**: it is written as a TEV constant into `MA13`/`MA14`/`MA16`/`MA20`
-  (`d_kankyo.cpp:11588-11652`). `hub_fog` only intercepts `GXSetFog`/`GFSetFog`, so it can
-  neither suppress nor defer this term — on those materials a fog-coloured tint is baked
-  into the surface before any mod composites over it. `bg_amb_col[1].a` (水面α) and
+  (`d_kankyo.cpp:11588-11652`). Deferred Fog intercepts `GXSetFog`, `GFSetFog` and the J3D
+  material fog block, none of which this is, so it can neither suppress nor defer this term — on
+  those materials a fog-coloured tint is baked into the surface before any mod composites over it.
+  It is also, for the same reason, **not** a candidate explanation for a deferred-vs-vanilla
+  difference: a TEV constant is applied before the fog stage in both paths and cancels. `bg_amb_col[1].a` (水面α) and
   `bg_amb_col[2]` (補佐) are likewise consumed by the water polygon codes in
   `dKy_bg_MAxx_proc`, not applied globally.
 - **VBAO / SSILVB and the ambient layers — the framing was wrong.** These are not four

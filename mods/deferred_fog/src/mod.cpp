@@ -174,12 +174,11 @@ bool g_quadArmed = false;
 // translucent J3D packet. When a frame HAS one, that is exactly the right place.
 //
 // When a frame has none, the quad used to fall all the way through to FRAME_BEFORE_HUD, which the
-// game runs at :2795. THAT SUCH A FRAME EXISTS IS AN ASSUMPTION, NOT A MEASUREMENT: an open field
-// view plausibly contains no translucent J3D (the trees are alpha-tested opaque, the grass and
-// flowers are self-drawing packets rather than J3DShapes, the particles are JPA), but nothing here
-// proves it. That is what the Status line's anchor readout is for — if it never reads anything but
-// "at translucents", this whole fallback is dead code and the brightness difference is something
-// else. :2795 is
+// game runs at :2795. IT IS NOT ESTABLISHED THAT SUCH A FRAME OCCURS — and the in-game evidence is
+// against it: the user reports the open field view DOES contain translucent geometry, so the
+// translucent anchor should be firing there and this fallback is probably dead code. The Status
+// line's anchor readout is how to check rather than assume. Keep the fallback anyway; it costs
+// nothing when it does not fire, and where it DOES fire the alternative is much worse. :2795 is
 // AFTER every particle pass and, the one that matters, BLOOM (:2663). Fog applied after bloom is
 // fog the bloom never saw, so the bright distant things vanilla blooms hard — Death Mountain, the
 // Ganon barrier — come out dimmer and sharper, which is the reported symptom. A pre-hook on the
@@ -542,9 +541,14 @@ void push_fog_quad();
 // nothing about the Death Mountain / barrier brightness difference it was meant to explain. The
 // reason it backfires: the deferred quad still fogs those pixels (they are in the depth buffer
 // like anything else), so a blended surface that keeps its forward fog is simply fogged TWICE.
-// Fixing that needs a per-pixel "no deferred fog" mark, not a suppression exemption. Do not
-// reintroduce the exemption on its own. Only the barrier keeps the exemption, because its own fog
-// is pure black over a huge range and stamping it into the config table is worse still.
+// Fixing it properly needs a per-pixel "no deferred fog" mark, not a suppression exemption. THAT
+// MARK NOW EXISTS — see kNoFogSlot and skip_unfogged_geometry() — but it is keyed on mType == 0,
+// not on blending. Extending it to over-unity blends is possible in principle and is gated on the
+// g_overUnityCount / g_noDepthOverUnityCount measurements: if every such material has depth-write
+// off, marking its pixels would blank the fog on the terrain behind it and the answer is "cannot
+// be done", not "not done yet". Do not reintroduce the suppression exemption on its own.
+// Only the barrier keeps an exemption, because its own fog is pure black over a huge range and
+// stamping it into the config table is worse still.
 
 // THE THREE STATES A MATERIAL'S FOG CAN BE IN, kept apart on purpose.
 //
@@ -1313,11 +1317,9 @@ ModResult build_controls_tab(
         "while still deferring in the common single-config scenes. Safe, but gives up the "
         "AO-under-fog benefit in most outdoor scenes, which mix configs.<br/>"
         "<b>Exact (replay)</b> (default): always defer, replaying the opaque geometry into a "
-        "per-pixel "
-        "config-ID buffer so each pixel gets the fog its own draw used. Costs one extra opaque "
-        "geometry pass on mixed frames. Pixels the replay cannot rasterize faithfully - "
-        "translucent surfaces drawn in the opaque lists, notably the Ganon barrier dome - fall "
-        "back to the frame's widest fog rather than their own.";
+        "per-pixel config-ID buffer so each pixel gets the fog its own draw used. Costs one extra "
+        "opaque geometry pass on mixed frames. Pixels the replay cannot label - grass and flowers, "
+        "which draw their own geometry - take the fog those packets themselves set.";
     control.binding = UI_BINDING_CONFIG_VAR;
     control.config_var = g_cvarFogMixed;
     control.options = kMixedOptions;

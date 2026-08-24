@@ -29,11 +29,17 @@ from that single fact:
 
 | Site | Behaviour when there is no normal attachment |
 |---|---|
-| Graphics Hub, init | `g_authoredAvailable = false`. |
-| Graphics Hub, per frame | Never sets `GfxResolveDesc::normal`, so no snapshot is requested and no cost is paid. |
-| Graphics Hub, compute | Binds `g_dummyAuthoredView` (a 1×1 texture created at init) so the bind group stays valid, and passes `use_authored = 0` — the shader takes the 5-tap depth reconstruction for **every** pixel. |
-| Graphics Hub, UI | "Use Authored Normals" greys out; the status line names the fix — *"Reconstructed — turn on Video > Rendering > Scene Normal Buffer and restart (unavailable in compatibility mode)"*. |
-| All six scene-pass pipelines | The layout reports one colour target, so they declare one. |
+| A normal consumer, init | `get_scene_normals` returns no view; the mod records that it has no normals. |
+| A normal consumer, per frame | No snapshot is requested and no cost is paid. |
+| A normal consumer, compute | Binds a 1×1 dummy view so the bind group stays valid, and takes whatever fallback it has — for VBAO and SMAA that means the normal-driven half of the effect disables itself and the UI says so. |
+| Every scene-pass pipeline | The layout reports one colour target, so they declare one. |
+
+> **NAMING NOTE.** The rows above used to name **Graphics Hub**, the provider mod that took the
+> snapshot, reconstructed normals from depth where it had none, and republished them as
+> `dev.automata.depth_to_normal`. That mod and that service are retired: GfxService 1.3's
+> `get_scene_normals` hands the authored normals to each mod directly, so there is no provider and
+> no depth-reconstruction fallback to fall back *to*. Anything else in this document that names
+> Graphics Hub is describing that era.
 
 This used to read `GfxDeviceInfo::normal_format == WGPUTextureFormat_Undefined`. **That field no
 longer exists in any SDK** — see §2.1.
@@ -230,7 +236,8 @@ for it. The §9.5 argument is not theoretical.
    stubs must come from the same build as the game. (Upstream's `sdk` release is one fixed,
    version-independent tag; a fork's is per-release.)
 2. Build. It should just work; if it does not, the failure is in the shim, not in the mods.
-3. If the new base has no normal buffer, expect Graphics Hub to say so and normals to be faceted.
+3. If the new base has no normal buffer, expect the normal consumers (VBAO, SMAA) to disable their
+   normal-driven half and say so in their status lines.
    That is correct.
 4. Re-verify the **game-linked** mods in-game (Realtime Sun Shadows, Deferred Fog, Effect Remover,
    Celestial Orbit) — they hook specific game functions **by symbol, resolved at load**, so a decomp

@@ -506,8 +506,8 @@ its old advice was actively wrong once the platform changed.
 
 **1. Faceted normals — conditional, not inherent.** The old text said "this platform has no
 authored surface normals". That was true of the upstream base the tree briefly retreated to, and is
-**not** true now: the platform is `automata-rtx/dusklight-ao` with GfxService 1.3, and Graphics Hub
-consumes the game's own authored vertex normals. Faceting therefore only appears on the
+**not** true now: the platform is `automata-rtx/dusklight-ao` with GfxService 1.3, which hands
+every mod the game's own authored vertex normals. Faceting therefore only appears on the
 **reconstruction fallback** — when the user has not turned on *Video → Rendering → Scene Normal
 Buffer*, in compatibility mode (D3D11 / OpenGL ES), or per pixel where a draw supplied no normal.
 That is expected there, not a defect.

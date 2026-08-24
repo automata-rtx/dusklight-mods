@@ -14,10 +14,19 @@ drove most of §8 are confirmed resolved (see §0). The platform side is done, m
 
 The game's forward renderer can write its own **authored, interpolated vertex normals** into a
 second RGB10A2 color attachment on the scene (EFB) pass, and the mod API exposes a per-frame
-snapshot of it. **Graphics Hub / Depth to Normal** consumes that snapshot instead of reconstructing
-normals from the depth buffer, and because every other mod reads normals through the
-`dev.automata.depth_to_normal` service, all of them (VBAO, SSILVB, Realtime Sun Shadows, SMAA)
-inherit it with **zero changes of their own**.
+snapshot of it, which **every consumer reads directly** through GfxService 1.3's
+`get_scene_normals`.
+
+> **NAMING NOTE — parts of this document predate the current shape and still say "Graphics Hub".**
+> When it was written, a provider mod (Graphics Hub's *Depth to Normal* half) took the snapshot,
+> reconstructed a normal from depth where the snapshot had none, and republished the result as the
+> `dev.automata.depth_to_normal` service, which every other mod imported. **That mod, that service
+> and that A/B switch are all retired.** GfxService 1.3 hands the authored normals to any mod that
+> asks, so VBAO and SMAA call `get_scene_normals` themselves and there is no provider, no
+> per-mod "Use Authored Normals" toggle, and no Authored/Reconstructed/Difference debug view.
+> Graphics Hub's other half lives on as `mods/deferred_fog`. The *reasoning* below — encoding,
+> validity, the two-normals doctrine, the ABI history — is all still current; only the plumbing and
+> the UI instructions are historical. Read anything naming Graphics Hub as "how it worked then".
 
 **It is off by default.** The game ships the buffer switched off — **Video → Rendering → Scene
 Normal Buffer**, applied on the next launch — because it costs a render target and a write per
@@ -122,18 +131,27 @@ merged**. What remains fork-local is 1.3's `GfxResolveDesc::normal` → `GfxReso
 
 ### Debug views — which question each answers
 
+**The first two rows are HISTORICAL** — they belonged to the retired provider mod and no longer
+exist in any build (see the naming note at the top). The shadow-mod rows are current.
+
 | View | Where | Answers |
 |---|---|---|
-| **Coverage** | Graphics Hub → Normal Controls | Does this pixel have an authored normal at all? (green/red) |
-| **Authored / Reconstructed / Difference** | Graphics Hub | What do the two sources look like, and where do they disagree? |
+| **Coverage** *(retired)* | Graphics Hub → Normal Controls | Does this pixel have an authored normal at all? (green/red) |
+| **Authored / Reconstructed / Difference** *(retired)* | Graphics Hub | What do the two sources look like, and where do they disagree? |
 | **Receiver Normal** (13) | Shadow mod | The normal the shadow bias *actually* uses this frame, as bound. |
 | **Shadow Terms** (15) | Shadow mod | **Which term is shadowing each pixel.** Red = shadow map, green = attached `n·L`, yellow = both, **black = neither, i.e. reported fully lit**. This is the view that separates "the map missed an occluder" from "`n·L` misread the surface" — two bugs with identical symptoms. |
 | **Shadow Factor** (2) | Shadow mod | The combined result only. **Cannot** distinguish the two failure modes; do not diagnose from it alone (§8.7). |
 
 
-## 1. The A/B, in one switch
+## 1. The A/B, in one switch — HISTORICAL
 
-Everything below is live at runtime — no rebuild, no restart, no game-build swap.
+> **This whole section describes the retired provider mod's UI and does not exist in any current
+> build.** There is no "Use Authored Normals" toggle and no reconstruction path to switch to: each
+> mod calls `get_scene_normals` and, where the platform has no normal buffer, disables its
+> normal-driven half instead. Kept because the *questions* it lists are still the right ones to ask
+> when A/B-ing a normals change, and because it records what the A/B showed.
+
+Everything below was live at runtime — no rebuild, no restart, no game-build swap.
 
 **Mods panel → Graphics Hub → Depth to Normal:**
 
@@ -376,8 +394,8 @@ exempt stage.
 the SDK's inline `gfx_init_color_target_states` turns that into a `WGPUColorTargetState[]` with
 every attachment the mod does not own already write-masked off. All six sites go through
 `gfx_compat::scene_pass_layout` (see `docs/normal_buffer_portability.md` §3): VBAO and SSILVB
-composites (blend + debug), SMAA neighborhood blend, Graphics Hub's normal debug overlay and
-deferred fog fullscreen, Realtime Sun Shadows composite. The WGSL is unchanged — a fragment shader
+composites (blend + debug), SMAA neighborhood blend, Deferred Fog's fullscreen quad (and, in the
+provider era, Graphics Hub's normal debug overlay), Realtime Sun Shadows composite. The WGSL is unchanged — a fragment shader
 returning a single `@location(0)` value is valid against a pipeline whose other targets are masked.
 
 Two earlier versions of this section are worth remembering, because each shipped a silent failure.
@@ -884,8 +902,8 @@ The plumbing all exists on our side already:
   entry points are hookable **and** callable from a mod (`dolphin/gx/GXLighting.h` declares the
   whole lighting API, and aurora implements it in `lib/dolphin/gx/GXLighting.cpp`).
 - The injection point is a **pre-hook on `J3DShape::drawFast`** — after the material has loaded its
-  GX state, before the shape streams vertices. Graphics Hub already holds that hook for Deferred Fog
-  and Realtime Sun Shadows already holds `J3DMatPacket::draw`.
+  GX state, before the shape streams vertices. Deferred Fog already holds that hook, and Realtime
+  Sun Shadows already holds `J3DMatPacket::draw`.
 - The replay itself is the shadow mod's existing mechanism: `create_pass(w, h)` at render resolution
   with the main camera, then `dComIfGd_drawOpaListBG/DarkBG/Middle/…()`, then `resolve_pass(color)`.
 - Validity needs no extra channel: a unit normal can never encode to `(0,0,0)` (that would be

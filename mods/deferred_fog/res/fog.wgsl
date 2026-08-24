@@ -50,9 +50,9 @@ struct FogUniforms {
 // Mixed-configuration mode (fs_mixed): a per-pixel config-ID buffer, produced by replaying the
 // opaque draw lists with each shape's output forced to a flat index color, selects which of up
 // to 8 captured fog configurations applies to each pixel. IDs are encoded sparsely as
-// (index + 1) * 24 in the red channel so colors written by geometry outside the ID override
-// (rare non-J3D drawers) decode as invalid and fall back to config 0 - the frame's reference
-// config, i.e. exactly what the single-config path would have applied to them.
+// (index + 1) * 24 in the red channel, so configs 0..7 occupy 24..192 and colors written by
+// geometry outside the ID override decode as invalid and take mixed.fallback_index. Slot 8
+// (red 216) is reserved as the "no deferred fog" sentinel — see config_index_at.
 struct MixedFogEntry {
     color: vec4f,
     a: f32,
@@ -163,20 +163,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     return vec4f(uniforms.color.rgb, fog_z);
 }
 
-// Decode the sparse config ID at this pixel; 0 = invalid/uncovered -> config 0 (reference).
+// Returns the fog-config index for a pixel from the ID buffer, or NO_FOG_INDEX.
 //
 // The replay's flat-ID override outputs (id, 0, 0): the index in red, green and blue forced to
 // zero. Geometry that bypassed the override - self-drawing packets (field/tall grass, flowers,
 // waterfalls) and any direct GX drawers - rasterizes real LIT colors instead, which vary with
 // the time of day and almost always carry non-zero green/blue. Requiring green and blue to be
-// ~0 rejects all of that so it falls back to config 0 (the reference config, which is the
-// correct room fog for grass anyway) instead of a per-pixel config that flickers with the
-// lighting. (Pure-red bypassed geometry could still alias, but none occurs in practice.)
-// Returns the fog-config index for a pixel from the ID buffer. Pixels the replay could not stamp
-// (translucent surfaces drawn in the opaque lists, notably the Ganon barrier dome, and any
-// remaining non-J3D drawer) decode as invalid and fall back to mixed.fallback_index — the config
-// whose fog reaches furthest this frame, since an uncovered pixel is most often distant geometry —
-// rather than to config 0.
+// ~0 rejects all of that, so those pixels take mixed.fallback_index, which the mod records from
+// the grass/flower packets' OWN fog setter — the config they actually drew with — instead of a
+// per-pixel config that would flicker with the lighting. (Before the green/blue guard, a blade's
+// shaded red channel could land in another config's decode window and flicker between configs as
+// the lighting changed. Pure-red bypassed geometry could still alias, but none occurs in practice.)
+//
+// The Ganon barrier dome is NOT in that category: it writes no colour at all in the replay, so its
+// pixels carry the config of the castle and hills behind it.
 // Slot 9 (red byte 216) is the "this pixel had no fog in vanilla" sentinel — see kNoFogSlot in
 // mod.cpp. It is checked BEFORE the `slot <= count` guard, which would otherwise reject it, and it
 // can never collide with a real config: those occupy slots 1..8, red 24..192.

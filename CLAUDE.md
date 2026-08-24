@@ -72,9 +72,15 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   The SMAA algorithm is reimplemented from the MIT reference (iryoku/smaa) — Marty's proprietary
   iMMERSE port was studied for the optimization ideas only, never copied. Docs: `docs/smaa.md`.
 - **`mods/deferred_fog/`** — "Deferred Fog": suppresses the game's per-draw fog during the opaque
-  world lists and re-applies it (bit-exact aurora fog math, `src/fog_math.h`) as a fullscreen pass at
-  `FRAME_BEFORE_HUD`, so AO/shadows darken surfaces *under* the fog instead of darkening the fog
-  itself. Mixed fog configs take an exact per-pixel replay (default) or auto-revert to vanilla.
+  world lists and re-applies it (bit-exact aurora fog math, `src/fog_math.h`) as one fullscreen pass
+  right before the translucent lists, so AO/shadows darken surfaces *under* the fog instead of
+  darkening the fog itself. Mixed fog configs take an exact per-pixel replay (default) or
+  auto-revert to vanilla.
+  **THERE IS ONE OPEN BUG AND IT IS THE FIRST THING TO READ**: distant landmarks (Death Mountain,
+  the Ganon barrier) are brighter with the mod OFF. Two mechanisms are established from source and
+  neither can be distinguished without an in-game reading; the mod carries the measurements and a
+  decision table for them. **`docs/deferred_fog.md` opens with a STATUS section — start there**,
+  and note that three hypotheses have already been wrong, two of which shipped and were reverted.
   It reproduces **fog range adjustment** ("XFog"), the per-column multiplier GX applies to the fog
   term because screen-edge pixels are further from the eye than their Z says: TP enables it globally
   (`d_kankyo.cpp:1257`) and aurora implements it, so omitting it flattened a horizontal gradient
@@ -92,15 +98,18 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   mod's `SCENE_AFTER_OPAQUE` composite and before the translucent lists (`m_Do_graphic.cpp:2426`,
   one line before `dComIfGd_drawXluListBG`) — but there is no stage hook there and every list entry
   point inlines, so the mod anchors on the first `J3DShape::drawFast` after the stage closes. A view
-  with **no translucent J3D at all** (open field: alpha-tested trees, self-drawing grass packets,
-  JPA particles) used to fall through to `FRAME_BEFORE_HUD` (`:2795`) — after every particle pass
+  with **no translucent J3D at all** would fall through to `FRAME_BEFORE_HUD` (`:2795`) — after
+  every particle pass
   and **bloom** (`:2663`, on by default). Fog applied after bloom is fog the bloom never saw, so the
   bright distant subjects vanilla blooms hardest come out dimmer. (`motionBlure` at `:2483` is
   **not** motion blur — it is a previous-frame blend gated off in ordinary play — and `drawDepth2`
   is DOF, gated on auto-focus. Neither belongs in that list; reading the symbol name as a
   description is exactly what `docs/japanese-naming.md` warns about.) A pre-hook on
   `mDoGph_gInf_c::bloom_c::draw` is now the fallback; the Status line reports which anchor fired
-  (`[at translucents]` / `[before bloom]` / `[AFTER BLOOM]`).
+  (`[at translucents]` / `[before bloom]` / `[AFTER BLOOM]`). **The premise that an open field view
+  contains no translucent J3D is contradicted by in-game testimony** — the user reports the field
+  does have translucencies — so the fallback is probably dead code there and the anchor readout is
+  how you check rather than assume.
   **The `K` factor is the exact statement of what a fullscreen pass can reproduce.** Aurora fogs the
   fragment *source* inside the fragment shader (`shader.cpp:1579`) and the GX blend is a pipeline
   blend state applied after (`gx.cpp:332-338`), so for layers with GX factors `(sᵢ, dᵢ)` the two

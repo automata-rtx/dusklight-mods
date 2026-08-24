@@ -2,8 +2,9 @@
 
 Status: **investigated and designed, intentionally not built.** The user asked to shelve it
 after the design was validated but before shipping. This note captures everything needed to
-resume. Nothing in this doc is wired into the mod; `deferred_fog` on `main`/the branch is at
-1.3.1 with no underwater code.
+resume. Nothing in this doc is wired into the mod; `mods/deferred_fog` has no underwater code.
+(The "1.3.1" this note used to quote was a Graphics Hub version; Deferred Fog is a standalone mod
+again and its `mod.json` restarted at 1.0.0.)
 
 ## The problem
 
