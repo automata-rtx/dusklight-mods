@@ -104,7 +104,7 @@ fog, worst exactly where the fog term is largest.
 
 - **Grass / flowers** program fog through `GFSetFog`; that hook covers them.
 - **Map units** (`dBgp_c`, "bg parts" — the shared, instanced pieces a stage is assembled
-  from, which in the field is most of the distant scenery) draw themselves:
+  from) draw themselves:
   `dBgp_c::modelMaterial_c::drawSimple` (`d_bg_parts.cpp:20`) calls
   `mpMaterial->loadSharedDL()` and then walks the shape's matrix groups calling
   `J3DShapeDraw::draw()` directly. The packet-level fog it sets first *is* caught (that is a
@@ -161,6 +161,88 @@ after. That was reading a symbol name as a description — the exact failure mod
 
 The Status line reports which anchor the frame used: `[at translucents]` is the good one,
 `[before bloom]` is the fallback, `[AFTER BLOOM]` means even the fallback did not fire.
+
+**Read the anchor before diagnosing anything else.** If it is not `[at translucents]`, the
+explanation for a fog difference is anchor placement, not fog maths.
+
+Alongside it the Status line carries per-frame measurements, which exist because this mod has
+already absorbed two fixes built on a plausible mechanism with no per-view measurement behind them:
+
+| Field | Means |
+|---|---|
+| `N shared-DL` | materials drawn through `loadSharedDL` (the `dBgp_c` map-unit path) that carried live fog |
+| `N fog-off` | materials in scope that vanilla draws with **no fog at all** (`mType == 0`) |
+| `N additive/M no-Z` | materials whose blend makes `K ≠ 1` (see below), and how many of those do not write depth |
+
+## What a fullscreen pass can and cannot reproduce — the `K` factor
+
+This is the arithmetic the whole "distant landmark looks dimmer" question turns on, and it is worth
+having exactly rather than approximately.
+
+**Aurora fogs the fragment source, inside the fragment shader, before the hardware blend.**
+`shader.cpp:1579` emits `prev = mix(prev.rgb, fog.color.rgb, fogZ)` into the *fragment function*,
+while the GX blend equation is a WebGPU pipeline blend state applied afterwards
+(`gx.cpp:332-338`). The deferred pass instead fogs the already-composited framebuffer. For layers
+drawn with GX factors `(sᵢ, dᵢ)` over an accumulator, with `F` the fog colour and `f` the fog factor:
+
+```
+vanilla:   Cᵢ = sᵢ·mix(xᵢ, F, f) + dᵢ·Cᵢ₋₁
+deferred:  Dᵢ = sᵢ·xᵢ            + dᵢ·Dᵢ₋₁ ,  then  out = mix(Dₙ, F, f)
+
+⇒ divergence = f · F · (K − 1),   K = Σᵢ ( sᵢ · Π_{j>i} dⱼ )
+```
+
+- **Ordinary alpha blend** (`s = α`, `d = 1 − α`) over an opaque base: `K = α + (1 − α) = 1`.
+  **Divergence zero — the deferred result is bit-exact.** This is why the blanket "blended draws
+  keep vanilla fog" experiment measured worse: it exempted a pile of draws that were *already
+  exact*, and got them fogged twice for the trouble.
+- **Additive** (`d = GX_BL_ONE`): `K = 1 + α`, so vanilla is brighter by `α·f·F` — a whole extra
+  dose of fog colour. `GX_BM_SUBTRACT` likewise maps to ReverseSubtract One/One (`gx.cpp:129-136`).
+
+And the part that matters at extreme distance: **`mix(scene, F, f)` is bounded by `max(scene, F)`
+and converges to exactly `F` as `f → 1`, while vanilla converges to `K·F`.** So the quad clamps
+every far pixel to precisely the haze colour, while vanilla can be a *multiple* of it. That is what
+"chunks of the far-off geometry overpower the fog" looks like in arithmetic, and it is why a single
+fullscreen pass cannot reproduce such a pixel in principle.
+
+Note the narrow test this implies: the question is **not** "is this draw blended", it is "is the
+destination factor something other than `1 − src`". `material_over_unity_blend()` tests exactly
+that.
+
+## Geometry the game draws with no fog at all
+
+Separately from blending, a material's fog block can simply be **off**. `J3DFog::load()` issues
+`J3DGDSetFog(GXFogType(mType), …)` unconditionally (`J3DMatBlock.h:1525`), so `mType == 0` programs
+a real `GX_FOG_NONE`; and `setLightTevColorType_MAJI_sub` refuses to overwrite such a block — the
+whole fog section is guarded by `if (fog_info->mType != 0)` (`d_kankyo.cpp:4434-4487`). It is an
+artist-facing per-material opt-out that TP honours, and it is how a distant landmark can stay at
+full brightness however far away it is.
+
+It is invisible to this mod's `GXSetFog` / `GFSetFog` hooks, because `J3DGDSetFog` writes raw BP
+commands into the FIFO (`J3DGD.cpp:581-585`) rather than calling GX. The quad, meanwhile, fogs
+**every** pixel whose depth is greater than zero. So such geometry gets fog the game never applied.
+
+The **Skip Unfogged Geometry** toggle (`fogSkipUnfogged`, default **off**) marks those pixels in the
+config-ID buffer with a sentinel the shader leaves alone. Three restrictions, each of which is a
+failure mode if dropped:
+
+- **Only a material that owns its depth may be marked** (`getCompareEnable() && getUpdateEnable()`).
+  The quad's fog factor comes from the depth buffer, so only the draw that owns the depth at a pixel
+  may decide that pixel's fog. A fog-off overlay that does not write depth sits over geometry whose
+  depth is what the quad reads; marking it would blank the fog on everything behind it.
+- **Only a material whose alpha test passes everything may be marked.** `stamp_replay_id` forces
+  `GXSetAlphaCompare(GX_ALWAYS, …)` and binds no texture, so an alpha-*tested* material stamps its
+  whole quad rather than its cutout. Harmless today (every stamped ID is the same room fog); with a
+  differing mark it would punch a rectangular hole in the fog.
+- **`mType == 0` is kept distinct from "no fog block at all".** In retail TP the latter cannot
+  happen — `J3DMaterial::createPEBlock` only picks the fog-less Opa/TexEdge/Xlu blocks when its
+  flags argument is 0 (`J3DMaterial.cpp:68-83`) and every retail model load masks to `0x10000000`
+  (`d_resorce.cpp:228`/`:378`/`:412`/`:437`, `d_file_select.cpp:5948`, `d_menu_collect.cpp:2805`) —
+  but keeping them apart means a future change makes the mark stop firing rather than fire on
+  geometry that does have fog.
+
+Turning it on **forces the config-ID replay** in frames that were uniform before, which is a real
+framerate cost. The Status line's `fog-off` counter says in advance whether it would do anything.
 
 ## Blended draws: why there is no "keep vanilla fog" rule
 
@@ -309,6 +391,7 @@ fog itself at range (unnatural darkening on distant fog-washed terrain). Tools:
 | `fogEnabled` | on | master toggle (off = vanilla forward fog) |
 | `fogMixedMode` | 1 (Exact) | mixed-scene handling: 0 = Vanilla (revert to forward fog), 1 = Exact (per-pixel config-ID replay). Exact is the default because most outdoor scenes mix configs, and Vanilla hands those back to forward fog — which is exact, but puts AO on top of the fog again in precisely the scenes the mod exists for |
 | `fogDebug` | 0 | 1 = deferred fog factor as grayscale, 2 = config IDs (exact mode, mixed frames) |
+| `fogSkipUnfogged` | off | mark pixels the game drew with fog switched off so the quad leaves them alone (see above); forces the ID replay |
 | `fogLogConfigs` | off | dump the frame's captured fog-config table to the log whenever it changes |
 
 These are the names `register_var` is actually called with; an earlier revision of this table

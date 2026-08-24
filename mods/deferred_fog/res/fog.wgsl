@@ -177,6 +177,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
 // remaining non-J3D drawer) decode as invalid and fall back to mixed.fallback_index — the config
 // whose fog reaches furthest this frame, since an uncovered pixel is most often distant geometry —
 // rather than to config 0.
+// Slot 9 (red byte 216) is the "this pixel had no fog in vanilla" sentinel — see kNoFogSlot in
+// mod.cpp. It is checked BEFORE the `slot <= count` guard, which would otherwise reject it, and it
+// can never collide with a real config: those occupy slots 1..8, red 24..192.
+const NO_FOG_INDEX: u32 = 0xFFFFFFFFu;
+
 fn config_index_at(uv: vec2f) -> u32 {
     let size = vec2<i32>(textureDimensions(config_ids));
     let texel = clamp(vec2<i32>(uv * vec2f(size)), vec2<i32>(0i), size - 1i);
@@ -186,6 +191,9 @@ fn config_index_at(uv: vec2f) -> u32 {
     }
     let v = i32(round(c.r * 255.0));
     let slot = (v + 12i) / 24i;
+    if slot == 9i && abs(v - 216i) <= 4i {
+        return NO_FOG_INDEX;
+    }
     if slot >= 1i && u32(slot) <= mixed.count && abs(v - slot * 24i) <= 4i {
         return u32(slot) - 1u;
     }
@@ -203,6 +211,14 @@ fn fs_mixed(in: VertexOutput) -> @location(0) vec4f {
     }
 
     let index = config_index_at(in.uv);
+    // Checked before the config-ID visualization below: otherwise the sentinel renders as
+    // (9 + 1) / count, clips to white, and reads as "the highest config".
+    if index == NO_FOG_INDEX {
+        if mixed.debug_mode != 0u {
+            return vec4f(1.0, 0.0, 0.0, 1.0);  // red = this pixel is left unfogged
+        }
+        return vec4f(0.0);
+    }
     if mixed.debug_mode == 2u {
         // Config-ID visualization: distinct gray band per config.
         let value = (f32(index) + 1.0) / max(f32(mixed.count), 1.0);

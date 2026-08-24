@@ -80,8 +80,9 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   (`d_kankyo.cpp:1257`) and aurora implements it, so omitting it flattened a horizontal gradient
   vanilla has — small for near fog, double-digit percentage points for the narrow far-*starting*
   bands distant haze uses. `docs/deferred_fog.md` used to claim aurora ignored it; that was false.
-  **Not every draw goes through `J3DShape::drawFast`.** `dBgp_c` map units (most of the field's
-  distant scenery) call `loadSharedDL()` and then `J3DShapeDraw::draw()` directly, so the material
+  **Not every draw goes through `J3DShape::drawFast`.** `dBgp_c` map units (the shared, instanced
+  pieces a stage is assembled from — how much of the field's distance they account for is NOT
+  established) call `loadSharedDL()` and then `J3DShapeDraw::draw()` directly, so the material
   display list re-issues `J3DGDSetFog` after the packet's `GXSetFog` was suppressed — double fog,
   and unstamped geometry in the replay. A post-hook on `loadSharedDL`, **bracketed to `dBgp_c` by a
   `drawSimple` hook**, closes it; the bracket is required, because every other `loadSharedDL` caller
@@ -100,11 +101,25 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   description is exactly what `docs/japanese-naming.md` warns about.) A pre-hook on
   `mDoGph_gInf_c::bloom_c::draw` is now the fallback; the Status line reports which anchor fired
   (`[at translucents]` / `[before bloom]` / `[AFTER BLOOM]`).
-  **A "blended draws keep vanilla fog" rule was tried and reverted** — it measured worse in-game and
-  did not explain the barrier/Death Mountain difference. The premise is right (GX fogs before the
-  blend, and TP draws water and the Ganon barrier see-through inside the opaque lists), but the
-  exemption backfires: the quad still fogs those pixels, so the surface is fogged twice. That needs a
-  per-pixel "no deferred fog" mark in the ID buffer, not a suppression exemption.
+  **The `K` factor is the exact statement of what a fullscreen pass can reproduce.** Aurora fogs the
+  fragment *source* inside the fragment shader (`shader.cpp:1579`) and the GX blend is a pipeline
+  blend state applied after (`gx.cpp:332-338`), so for layers with GX factors `(sᵢ, dᵢ)` the two
+  orders differ by `f·F·(K−1)`, `K = Σᵢ(sᵢ·Π_{j>i}dⱼ)`. An ordinary alpha blend over an opaque base
+  has **K = 1 — bit-exact**; only a destination factor other than `1−src` (additive, or
+  `GX_BM_SUBTRACT` → ReverseSubtract One/One) gives `K ≠ 1`. And `mix(scene,F,f)` converges to
+  exactly `F` as `f→1` while vanilla converges to `K·F`, so at extreme range the quad clamps every
+  pixel to the haze colour while vanilla can be a *multiple* of it — which is what "distant geometry
+  overpowers the fog" means arithmetically. **A "blended draws keep vanilla fog" rule was tried and
+  reverted**: it exempted the `K = 1` draws that were already exact and got them fogged twice.
+  **Separately, a material's fog can simply be OFF** (`mType == 0`): `J3DFog::load()` programs a real
+  `GX_FOG_NONE` and `setLightTevColorType_MAJI_sub` refuses to overwrite such a block
+  (`d_kankyo.cpp:4434`), so vanilla applies literally zero fog however distant — and it is invisible
+  to the `GXSetFog` hooks because `J3DGDSetFog` writes raw BP commands. `fogSkipUnfogged` (default
+  **off**) marks those pixels with a config-ID sentinel the shader skips; it may only mark a material
+  that **owns its depth** and whose **alpha test is trivial**, and it forces the ID replay.
+  **Measure before theorising**: the Status line carries per-frame `fog-off`, `additive/no-Z` and
+  `shared-DL` counts plus the quad anchor, precisely because two fixes here were built on plausible
+  mechanisms with no per-view measurement behind them.
   `is_barrier_fog` keeps its exemption because black fog over 1000..250000 in the config table is
   worse still: That test matches the **exact literal triple** the actor
   writes (black, `startZ 1000`, `endZ 250000`) — it used to be `black && endZ > 100000`, which also

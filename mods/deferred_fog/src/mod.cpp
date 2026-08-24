@@ -98,6 +98,7 @@ DEFINE_HOOK(&J3DLockedMaterial::loadSharedDL, LockedMaterialSharedDL);
 ConfigVarHandle g_cvarFogEnabled = 0;    // DEFAULT below in init()
 ConfigVarHandle g_cvarFogMixed = 0;      // DEFAULT below in init()
 ConfigVarHandle g_cvarFogDebug = 0;      // DEFAULT below in init()
+ConfigVarHandle g_cvarFogSkipUnfogged = 0;  // DEFAULT below in init()
 
 UiWindowHandle g_controlsWindow = 0;
 GfxDrawTypeHandle g_drawType = 0;
@@ -214,9 +215,21 @@ uint32_t g_deviantCount = 0;
 
 bool g_wasSuppressing = false;
 FogConfig g_firstDeviant;
-char g_statusText[160] = "Waiting for first fogged frame";
+char g_statusText[224] = "Waiting for first fogged frame";
 
 constexpr uint32_t kMaxFogConfigs = 8;
+
+// The config-ID buffer's "this pixel had no fog in vanilla — leave it alone" mark. stamp_replay_id
+// writes (index + 1) * 24 into the red channel, so real configs 0..7 occupy 24..192 and slot 8
+// takes 216, which can never collide. 216 round-trips exactly through the 8-bit channel
+// (216/255 = 0.847058..., round(0.847058... * 255) = 216): the ID pass is single-sample, the shader
+// reads it with textureLoad (no filtering), and aurora forces a non-sRGB surface format
+// (best_surface_format -> to_linear), which the offscreen target inherits — so nothing can move the
+// byte. The decode in fog.wgsl already resolves 216 to slot 9 exactly; only the `slot <= count`
+// guard rejects it today.
+constexpr uint32_t kNoFogSlot = 8;
+static_assert(kNoFogSlot >= kMaxFogConfigs, "the sentinel must not collide with a real config");
+static_assert((kNoFogSlot + 1) * 24 <= 255, "the sentinel must fit in the red channel");
 FogConfig g_frameConfigs[kMaxFogConfigs];
 uint32_t g_frameConfigCount = 0;
 bool g_fogReplayActive = false;
@@ -435,9 +448,30 @@ bool is_barrier_fog(const FogConfig& c) {
 // The fallback here MUST be the value fogMixedMode is registered with (1 = Exact). The two
 // disagreed once already, which meant a failed config read silently ran the mode the UI was not
 // showing; keep them in step.
+// DEFAULT OFF, deliberately. Vanilla applies literally zero fog to a material whose fog block has
+// mType 0, so the quad must apply zero fog there — that part is not a judgement call. What IS a
+// judgement call is whether that geometry exists in the view being complained about, and what it
+// costs: switching this on forces the config-ID replay (a whole extra opaque geometry pass) in
+// frames that were uniform before. The Status line's "fog-off" counter answers both questions
+// BEFORE anything changes, which is the step the two previous attempts at this bug skipped.
+bool g_skipUnfogged = false;
+
+bool read_skip_unfogged() {
+    return get_bool_option(g_cvarFogSkipUnfogged, false);
+}
+
+bool skip_unfogged_geometry() {
+    return g_skipUnfogged;
+}
+
 bool exact_mode() {
     return get_int_option(g_cvarFogMixed, 1) == 1;
 }
+
+// ONE gate, two call sites — the frame that builds the ID buffer and the frame that uses it. They
+// were separate booleans and this file already records one drift of exactly that shape, so they are
+// factored here and must stay factored.
+bool needs_id_buffer();
 
 uint32_t register_frame_config(const FogConfig& config) {
     for (uint32_t i = 0; i < g_frameConfigCount; ++i) {
@@ -512,15 +546,34 @@ void push_fog_quad();
 // reintroduce the exemption on its own. Only the barrier keeps the exemption, because its own fog
 // is pure black over a huge range and stamping it into the config table is worse still.
 
-// The fog a material's own PE block carries, if it has one. Only J3DPEBlockFull carries fog at all
-// — J3DPEBlockOpa / TexEdge / Xlu / FogOff all return NULL from getFog() and their display lists
-// leave the fog registers alone, so those materials simply inherit whatever the last GXSetFog put
-// there (which the GXSetFog hook has already dealt with).
-bool material_fog_config(J3DMaterial* material, FogConfig& out) {
+// THE THREE STATES A MATERIAL'S FOG CAN BE IN, kept apart on purpose.
+//
+// `Off` is NOT the same as `NoBlock`, even though both mean "we have no config to register". A
+// material with a fog block whose mType is 0 is an ARTIST-FACING PER-MATERIAL OPT-OUT that the game
+// honours: J3DFog::load() issues J3DGDSetFog(GXFogType(mType), ...) unconditionally
+// (J3DMatBlock.h:1525), so mType 0 programs a real GX_FOG_NONE, and setLightTevColorType_MAJI_sub
+// refuses to overwrite such a block — `if (fog_info->mType != 0)` guards its whole fog section
+// (d_kankyo.cpp:4434-4487). Vanilla therefore applies LITERALLY ZERO FOG to that geometry, however
+// far away it is. It is also invisible to this mod's GXSetFog/GFSetFog hooks, because J3DGDSetFog
+// writes raw BP commands into the FIFO (J3DGD.cpp:581-585) rather than calling GX.
+//
+// `NoBlock` means the material inherits whatever the last GXSetFog left, which the GXSetFog hook
+// has already dealt with. In RETAIL TP this case does not arise: J3DMaterial::createPEBlock only
+// picks the fog-less Opa/TexEdge/Xlu blocks when its flags argument is 0 (J3DMaterial.cpp:68-83),
+// and every retail model load masks to 0x10000000 (d_resorce.cpp:228/:378/:412/:437,
+// d_file_select.cpp:5948, d_menu_collect.cpp:2805), so every world material is a J3DPEBlockFull.
+// The distinction is kept anyway: if that ever changes, a mark keyed on `Off` stops firing rather
+// than firing on geometry that does have fog.
+enum class MaterialFog : uint8_t { NoBlock, Off, Live };
+
+MaterialFog material_fog_state(J3DMaterial* material, FogConfig& out) {
     J3DPEBlock* peBlock = material != nullptr ? material->getPEBlock() : nullptr;
     J3DFog* fog = peBlock != nullptr ? peBlock->getFog() : nullptr;
-    if (fog == nullptr || fog->mType == 0) {
-        return false;
+    if (fog == nullptr) {
+        return MaterialFog::NoBlock;
+    }
+    if (fog->mType == 0) {
+        return MaterialFog::Off;
     }
     out.type = fog->mType;
     out.startZ = fog->mStartZ;
@@ -529,7 +582,81 @@ bool material_fog_config(J3DMaterial* material, FogConfig& out) {
     out.farZ = fog->mFarZ;
     out.color = fog->mColor;
     capture_adj_from_material(*fog, out);
-    return true;
+    return MaterialFog::Live;
+}
+
+// WHY A BLEND WITH dst == ONE IS THE ONE THAT MATTERS, AND "IS IT BLENDED" IS NOT.
+//
+// Aurora fogs the fragment SOURCE, inside the fragment shader, before the hardware blend:
+// shader.cpp:1579 emits `prev = mix(prev.rgb, fog.color.rgb, fogZ)` into the fragment function,
+// while the GX blend equation is a WebGPU pipeline blend state applied afterwards (gx.cpp:332-338).
+// For layers drawn with GX factors (s_i, d_i) over an accumulator, the two orders differ by
+//
+//     divergence = f * F * (K - 1),   K = SUM_i ( s_i * PRODUCT_{j>i} d_j )
+//
+// with F the fog colour and f the fog factor. For an ordinary alpha blend (s = a, d = 1 - a) over
+// an opaque base K = a + (1 - a) = 1 and the deferred result is BIT-EXACT — which is why the
+// blanket "blended draws keep vanilla fog" experiment measured worse: it exempted a pile of draws
+// that were already exact, and got them fogged twice for the trouble.
+//
+// K != 1 only when the destination factor is not (1 - src): an ADDITIVE blend (dst == GX_BL_ONE)
+// gives K = 1 + a, and GX_BM_SUBTRACT maps to ReverseSubtract One/One (gx.cpp:129-136). And this is
+// the part that matters at Death Mountain range: mix(scene, F, f) is bounded by max(scene, F) and
+// converges to exactly F as f -> 1, so the quad clamps every distant pixel to precisely the haze
+// colour, while vanilla converges to K * F and can be a MULTIPLE of it. That is what "chunks of the
+// far off geometry overpower the fog" looks like in arithmetic.
+bool material_over_unity_blend(J3DMaterial* material) {
+    J3DPEBlock* peBlock = material != nullptr ? material->getPEBlock() : nullptr;
+    const J3DBlend* blend = peBlock != nullptr ? peBlock->getBlend() : nullptr;
+    if (blend == nullptr) {
+        return false;
+    }
+    const GXBlendMode mode = blend->getBlendMode();
+    if (mode == GX_BM_SUBTRACT) {
+        return true;
+    }
+    return mode == GX_BM_BLEND && blend->getDstFactor() == GX_BL_ONE;
+}
+
+// THE OTHER RESTRICTION ON MARKING A PIXEL. stamp_replay_id forces
+// GXSetAlphaCompare(GX_ALWAYS, ...) and binds no texture, so an alpha-TESTED material stamps its
+// whole quad in the replay rather than its cutout shape. That is invisible today because every
+// stamped ID resolves to the same room fog, but a mark that DIFFERS would punch a rectangular hole
+// in the fog around every such surface. So only mark materials whose alpha test passes everything
+// anyway. calcAlphaCmpID packs (comp0 << 5) + (op << 3) + comp1 (J3DMatBlock.h:1531) and GX_ALWAYS
+// is 7, so the default 0x00E7 is "always AND always".
+bool material_alpha_test_trivial(J3DMaterial* material) {
+    J3DPEBlock* peBlock = material != nullptr ? material->getPEBlock() : nullptr;
+    const J3DAlphaComp* comp = peBlock != nullptr ? peBlock->getAlphaComp() : nullptr;
+    if (comp == nullptr) {
+        return false;
+    }
+    constexpr uint16_t kAlways = 7;
+    return ((comp->mID >> 5) & 7) == kAlways && (comp->mID & 7) == kAlways;
+}
+
+// THE SAFETY INVARIANT FOR ANY PER-PIXEL FOG MARK: the quad's fog factor comes from the depth
+// buffer, so only the draw that OWNS the depth at a pixel may decide that pixel's fog. A fog-off
+// overlay that does not write depth sits over geometry whose depth is what the quad reads; marking
+// it would blank the fog on everything behind it.
+bool material_owns_depth(J3DMaterial* material) {
+    J3DPEBlock* peBlock = material != nullptr ? material->getPEBlock() : nullptr;
+    const J3DZMode* zMode = peBlock != nullptr ? peBlock->getZMode() : nullptr;
+    return zMode != nullptr && zMode->getCompareEnable() != 0 && zMode->getUpdateEnable() != 0;
+}
+
+// Per-frame measurements. These exist because this bug has already absorbed two fixes built on a
+// plausible mechanism with no per-view measurement behind it. Read them in the view that looks
+// wrong before changing anything.
+uint32_t g_fogOffCount = 0;            // materials in scope that vanilla draws with NO fog
+uint32_t g_overUnityCount = 0;         // ... whose blend makes K != 1 (additive / subtract)
+uint32_t g_noDepthOverUnityCount = 0;  // ... of those, how many do not own their depth
+
+bool needs_id_buffer() {
+    if (!exact_mode()) {
+        return false;
+    }
+    return g_frameConfigCount > 1 || (g_skipUnfogged && g_fogOffCount > 0);
 }
 
 // Replay mode: force everything this draw emits to a flat config-ID colour, and no fog.
@@ -550,23 +677,39 @@ void stamp_replay_id(uint32_t index) {
 
 void replay_stamp_material(J3DMaterial* material) {
     FogConfig config;
-    const bool hasFog = material_fog_config(material, config);
-    if (hasFog && is_barrier_fog(config)) {
+    const MaterialFog state = material_fog_state(material, config);
+    if (state == MaterialFog::Live && is_barrier_fog(config)) {
         // Write no colour, so the config of whatever is behind this surface survives in the ID
         // buffer — that is the config the deferred quad should use for these pixels. stamp_replay_id
         // turns colour writes back on for the next ordinary draw, and replay_config_ids restores
-        // them at the end of the pass.
+        // them at the end of the pass. Tested BEFORE the fog-off mark below, never replaced by it.
         GXSetColorUpdate(GX_FALSE);
         return;
     }
-    stamp_replay_id(hasFog ? lookup_frame_config(config) : 0u);
+    if (state == MaterialFog::Off && skip_unfogged_geometry() && material_owns_depth(material) &&
+        material_alpha_test_trivial(material))
+    {
+        stamp_replay_id(kNoFogSlot);
+        return;
+    }
+    stamp_replay_id(state == MaterialFog::Live ? lookup_frame_config(config) : 0u);
 }
 
 // Capture mode: register the material's own fog and suppress it if we are deferring it. Returns
 // whether the material carried live fog at all (for the shared-DL diagnostic).
 bool suppress_material_fog(J3DMaterial* material) {
     FogConfig config;
-    if (!material_fog_config(material, config)) {
+    const MaterialFog state = material_fog_state(material, config);
+    if (material_over_unity_blend(material)) {
+        ++g_overUnityCount;
+        if (!material_owns_depth(material)) {
+            ++g_noDepthOverUnityCount;
+        }
+    }
+    if (state == MaterialFog::Off) {
+        ++g_fogOffCount;
+    }
+    if (state != MaterialFog::Live) {
         return false;
     }
     if (is_barrier_fog(config)) {
@@ -601,7 +744,8 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
 // THE SHARED-DISPLAY-LIST PATH DOES NOT GO THROUGH J3DShape::drawFast.
 //
 // dBgp_c ("bg parts" — the shared, instanced MAP UNITS a stage is assembled from, which in the
-// field is most of the distant scenery) draws its geometry itself:
+// field is a good deal of the middle and far distance, though HOW MUCH is not established from
+// source — the Status line's shared-DL counter is the measurement) draws its geometry itself:
 // dBgp_c::modelMaterial_c::drawSimple (d_bg_parts.cpp:20) calls mpMaterial->loadSharedDL() and then
 // walks the shape's matrix groups calling J3DShapeDraw::draw() directly — never
 // J3DShape::drawFast. d_model.cpp, d_particle.cpp and the chain actors use the same shape. The
@@ -788,7 +932,7 @@ void push_fog_quad() {
     const auto debugMode =
         static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarFogDebug, 0), 0, 2));
 
-    if (exact_mode() && g_frameConfigCount > 1 && g_configIdView != nullptr) {
+    if (needs_id_buffer() && g_configIdView != nullptr) {
         MixedFogUniforms uniforms{};
         for (uint32_t i = 0; i < g_frameConfigCount; ++i) {
             const FogConfig& config = g_frameConfigs[i];
@@ -975,6 +1119,8 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
     g_deviantCount = 0;
     g_frameConfigCount = 0;
     g_sharedDlFogCount = 0;
+    g_fogOffCount = g_overUnityCount = g_noDepthOverUnityCount = 0;
+    g_skipUnfogged = read_skip_unfogged();
     g_quadAnchor = QuadAnchor::None;
     g_configIdView = nullptr;
     g_quadArmed = false;
@@ -1007,7 +1153,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
     g_lastFrameDeferred = g_quadArmed;
     g_suppressAllowed = exact ? effect_enabled() : (g_deviantCount == 0 && effect_enabled());
 
-    if (exact && g_frameConfigCount > 1 && g_quadArmed) {
+    if (needs_id_buffer() && g_quadArmed) {
         bool ok = false;
         if (draw_lists_ready()) {
             GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
@@ -1069,19 +1215,22 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
         std::snprintf(g_statusText, sizeof(g_statusText), "No fogged draws this frame");
     } else if (exact) {
         std::snprintf(g_statusText, sizeof(g_statusText),
-            "Deferring fog (exact: %u draws, %u config%s%s; %u shared-DL) [%s]",
+            "Deferring fog (exact: %u draws, %u config%s%s; %u shared-DL, %u fog-off, "
+            "%u additive/%u no-Z) [%s]",
             g_suppressedCount + g_deviantCount, g_frameConfigCount,
             g_frameConfigCount == 1 ? "" : "s",
-            g_frameConfigCount > 1 && g_configIdView == nullptr ? ", replay failed" : "",
-            g_sharedDlFogCount, quad_anchor_name());
+            needs_id_buffer() && g_configIdView == nullptr ? ", replay failed" : "",
+            g_sharedDlFogCount, g_fogOffCount, g_overUnityCount, g_noDepthOverUnityCount,
+            quad_anchor_name());
     } else if (g_deviantCount > 0) {
         std::snprintf(g_statusText, sizeof(g_statusText),
             "REVERTED: mixed fog configs (%u matching / %u deviant)", g_suppressedCount,
             g_deviantCount);
     } else {
         std::snprintf(g_statusText, sizeof(g_statusText),
-            "Deferring fog (%u draws this frame; %u shared-DL) [%s]", g_suppressedCount,
-            g_sharedDlFogCount, quad_anchor_name());
+            "Deferring fog (%u draws; %u shared-DL, %u fog-off, %u additive/%u no-Z) [%s]",
+            g_suppressedCount, g_sharedDlFogCount, g_fogOffCount, g_overUnityCount,
+            g_noDepthOverUnityCount, quad_anchor_name());
     }
 
     log_fog_configs();
@@ -1173,6 +1322,22 @@ ModResult build_controls_tab(
     control.config_var = g_cvarFogMixed;
     control.options = kMixedOptions;
     control.option_count = 2;
+    add_control(left, control);
+
+    control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_TOGGLE;
+    control.label = "Skip Unfogged Geometry (experimental)";
+    control.help_rml =
+        "Some surfaces are drawn by the game with fog switched off entirely, so they stay at full "
+        "brightness however far away they are - that is how distant landmarks punch through the "
+        "haze. The deferred pass has no way to know that on its own and fogs them like everything "
+        "else. With this on, those surfaces are marked in the per-pixel buffer and the fog pass "
+        "leaves them alone.<br/><b>Check the Status line first.</b> If its <i>fog-off</i> count is "
+        "0 in the view you care about, this will do nothing at all. It also forces the per-pixel "
+        "replay - one extra pass over the world's geometry - in scenes that did not need it, so "
+        "there is a framerate cost. Requires Mixed Scenes = Exact.";
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = g_cvarFogSkipUnfogged;
     add_control(left, control);
 
     static const char* kDebugOptions[] = {"Off", "Fog Factor", "Config IDs"};
@@ -1324,6 +1489,15 @@ ModResult init(ModError* error) {
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogMixed) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
+    // DEFAULT OFF. See g_skipUnfogged — this forces the config-ID replay in frames that were
+    // uniform before, so it is opt-in until the Status line's fog-off counter says it applies.
+    cvarDesc = CONFIG_VAR_DESC_INIT;
+    cvarDesc.name = "fogSkipUnfogged";
+    cvarDesc.type = CONFIG_VAR_BOOL;
+    cvarDesc.default_bool = false;
+    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogSkipUnfogged) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register fog option");
+    }
     // DEFAULT: fog debug view off (0).
     cvarDesc = CONFIG_VAR_DESC_INIT;
     cvarDesc.name = "fogDebug";
@@ -1449,6 +1623,7 @@ void shutdown() {
     releaseLayout(g_mixedLayout);
     releaseLayout(g_mixedDebugLayout);
     g_cvarFogEnabled = g_cvarFogMixed = g_cvarFogDebug = g_cvarFogLog = 0;
+    g_cvarFogSkipUnfogged = 0;
     g_lastFogLogSig[0] = '\0';
     g_controlsWindow = 0;
     g_drawType = g_sceneBeginHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;
@@ -1463,6 +1638,8 @@ void shutdown() {
     g_suppressedCount = g_deviantCount = 0;
     g_frameConfigCount = 0;
     g_sharedDlFogCount = 0;
+    g_fogOffCount = g_overUnityCount = g_noDepthOverUnityCount = 0;
+    g_skipUnfogged = false;
     g_configIdView = nullptr;
     std::snprintf(g_statusText, sizeof(g_statusText), "Waiting for first fogged frame");
 }
