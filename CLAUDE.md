@@ -92,9 +92,12 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   one line before `dComIfGd_drawXluListBG`) — but there is no stage hook there and every list entry
   point inlines, so the mod anchors on the first `J3DShape::drawFast` after the stage closes. A view
   with **no translucent J3D at all** (open field: alpha-tested trees, self-drawing grass packets,
-  JPA particles) used to fall through to `FRAME_BEFORE_HUD` (`:2795`) — after motion blur, DOF, all
-  particles and **bloom** (`:2663`). Fog applied after bloom is fog the bloom never saw, so the
-  bright distant subjects vanilla blooms hardest come out dimmer. A pre-hook on
+  JPA particles) used to fall through to `FRAME_BEFORE_HUD` (`:2795`) — after every particle pass
+  and **bloom** (`:2663`, on by default). Fog applied after bloom is fog the bloom never saw, so the
+  bright distant subjects vanilla blooms hardest come out dimmer. (`motionBlure` at `:2483` is
+  **not** motion blur — it is a previous-frame blend gated off in ordinary play — and `drawDepth2`
+  is DOF, gated on auto-focus. Neither belongs in that list; reading the symbol name as a
+  description is exactly what `docs/japanese-naming.md` warns about.) A pre-hook on
   `mDoGph_gInf_c::bloom_c::draw` is now the fallback; the Status line reports which anchor fired
   (`[at translucents]` / `[before bloom]` / `[AFTER BLOOM]`).
   **A "blended draws keep vanilla fog" rule was tried and reverted** — it measured worse in-game and

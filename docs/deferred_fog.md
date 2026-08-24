@@ -137,14 +137,27 @@ the way in is `inline` (`dComIfGd_drawXluListBG` → `dDlst_list_c::drawXluListB
 frame has one, that is exactly the right place.
 
 **When a frame has none, the anchor used to fall all the way to `FRAME_BEFORE_HUD`, and that is a
-long way further on.** An open field view can genuinely contain no translucent J3D at all: the trees
-are alpha-tested opaque, the grass and flowers are self-drawing packets (not `J3DShape`), the
-particles are JPA. The game runs `FRAME_BEFORE_HUD` at `:2795`, which is after motion blur (`:2483`),
-depth of field (`:2492`), every particle pass, and **bloom** (`:2663`). Fog applied after bloom is
-fog the bloom never saw, so the bright distant subjects vanilla blooms hardest — Death Mountain, the
-Ganon barrier — come out dimmer and sharper than vanilla. A **pre-hook on the bloom draw**
+long way further on.** That such a frame exists is an **assumption, not a measurement**: an open
+field view plausibly contains no translucent J3D — the trees are alpha-tested opaque, the grass and
+flowers are self-drawing packets (not `J3DShape`), the particles are JPA — but nothing in the source
+proves it. The Status line's anchor readout is what tests it; if it never reads anything but
+`[at translucents]`, this fallback is dead code and the brightness difference is something else.
+The game runs `FRAME_BEFORE_HUD` at `:2795`, which is after every particle pass
+and — the one that matters — **bloom** (`:2663`). Fog applied after bloom is fog the bloom never
+saw, so the bright distant subjects vanilla blooms hardest — Death Mountain, the Ganon barrier —
+come out dimmer and sharper than vanilla. A **pre-hook on the bloom draw**
 (`mDoGph_gInf_c::bloom_c::draw`, out-of-line and called unconditionally) is a much closer fallback,
 and it only fires when the translucent anchor did not.
+
+Bloom is the load-bearing pass here because it is **on by default**: `bloomMode` defaults to
+`BloomMode::Dusk` (`dusk/settings.cpp:68`) and `bloom_c::draw2` runs whenever the area's own bloom
+is enabled. The other two full-screen passes in that window are not comparable and should not be
+cited alongside it — `drawDepth2` (`:2492`) is depth of field, gated on auto-focus, and
+`motionBlure` (`:2483`) is **not motion blur**: it blends the *previous* frame's captured
+framebuffer over the current one at `getBlureRate()` alpha, gated on `g_env_light.is_blure`, which
+ordinary play leaves off. (An earlier revision of this document listed both as things the fog lands
+after. That was reading a symbol name as a description — the exact failure mode
+`docs/japanese-naming.md` exists to prevent.)
 
 The Status line reports which anchor the frame used: `[at translucents]` is the good one,
 `[before bloom]` is the fallback, `[AFTER BLOOM]` means even the fallback did not fire.

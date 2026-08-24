@@ -172,13 +172,25 @@ bool g_quadArmed = false;
 // the mod anchors on the first J3DShape::drawFast AFTER the stage closes, which is the first
 // translucent J3D packet. When a frame HAS one, that is exactly the right place.
 //
-// When a frame has none — an open field view can genuinely contain no translucent J3D at all; the
-// trees are alpha-tested opaque, the grass is a self-drawing packet, the particles are JPA — the
-// quad used to fall all the way through to FRAME_BEFORE_HUD, which the game runs at :2795. That is
-// AFTER motion blur (:2483), depth of field (:2492), every particle pass, and BLOOM (:2663). Fog
-// applied after bloom is fog the bloom never saw, so the bright distant things vanilla blooms hard
-// — Death Mountain, the Ganon barrier — come out dimmer and sharper, which is the reported symptom.
-// A pre-hook on the bloom draw is therefore a much closer fallback than the end of the frame.
+// When a frame has none, the quad used to fall all the way through to FRAME_BEFORE_HUD, which the
+// game runs at :2795. THAT SUCH A FRAME EXISTS IS AN ASSUMPTION, NOT A MEASUREMENT: an open field
+// view plausibly contains no translucent J3D (the trees are alpha-tested opaque, the grass and
+// flowers are self-drawing packets rather than J3DShapes, the particles are JPA), but nothing here
+// proves it. That is what the Status line's anchor readout is for — if it never reads anything but
+// "at translucents", this whole fallback is dead code and the brightness difference is something
+// else. :2795 is
+// AFTER every particle pass and, the one that matters, BLOOM (:2663). Fog applied after bloom is
+// fog the bloom never saw, so the bright distant things vanilla blooms hard — Death Mountain, the
+// Ganon barrier — come out dimmer and sharper, which is the reported symptom. A pre-hook on the
+// bloom draw is therefore a much closer fallback than the end of the frame.
+//
+// Bloom is the load-bearing one because it is ON by default and ungated by the mod: bloomMode
+// defaults to BloomMode::Dusk (dusk/settings.cpp:68), and bloom_c::draw2 runs whenever the area's
+// own bloom is enabled. The other two full-screen passes in that window are NOT: drawDepth2
+// (:2492) is depth of field, gated on auto-focus, and motionBlure (:2483) — despite the name — is
+// not motion blur at all but a blend of the PREVIOUS frame's captured framebuffer over this one,
+// gated on g_env_light.is_blure, which ordinary play leaves off. Do not cite either as something
+// the fog normally lands after.
 enum class QuadAnchor : uint8_t { None, Translucent, BeforeBloom, FrameEnd };
 QuadAnchor g_quadAnchor = QuadAnchor::None;
 
