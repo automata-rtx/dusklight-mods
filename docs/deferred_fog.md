@@ -37,6 +37,32 @@ the user — the view does contain translucent geometry, so the translucent anch
 reasoned from a plausible mechanism with no per-view measurement behind them. **Do not add a third
 without reading the counters first.**
 
+### The reading from the Death Mountain view — MECHANISM 2, measured
+
+```
+Deferring fog (exact: 75 draws, 2 configs; 0 shared-DL, 3 fog-off, 0 additive/0 no-Z) [not pushed]
+```
+
+- **`3 fog-off`** — mechanism 2 is present. Three materials in that view are drawn by the game with
+  no fog at all, and the quad was fogging them.
+- **`0 additive`** — **mechanism 1 is refuted for this view.** No material in the opaque scope uses
+  an over-unity blend.
+- **`0 shared-DL`** — Death Mountain is not reaching the screen through the `dBgp_c` map-unit path
+  here, so none of that work bears on this.
+- **`[not pushed]`** — **a bug in the diagnostic, not a real state.** The status string is built in
+  `on_scene_after_opaque` and every anchor writes its value *after* that, so the line reported the
+  value `on_scene_begin` had just cleared, in every frame. It now reports the **previous** frame's
+  anchor. (If the quad genuinely had not been pushed the scene would be unfogged, and it is
+  over-fogged, so this never described reality.)
+
+The side-by-side screenshots agree independently: with the mod off the mountain shows **its own
+orange and rock colours**, crisply; with it on the same geometry is washed to the haze colour. That
+is the *silhouette* difference mechanism 2 predicts, not the *fog-coloured* difference mechanism 1
+predicts. Two independent lines of evidence, same answer.
+
+**So the fix is `fogSkipUnfogged`** — provided the mark can actually fire on those three materials,
+which is what the `markable / no-Z / alpha` breakdown now reports.
+
 ### How to resolve it — the decision table
 
 The Status line was built for exactly this. Stand in the view that looks wrong and read it.
@@ -44,7 +70,9 @@ The Status line was built for exactly this. Stand in the view that looks wrong a
 | Reading | What it means | What to do |
 | :-- | :-- | :-- |
 | anchor is **not** `[at translucents]` | placement, not fog maths | stop and fix the anchor; see "Where in the frame the fog quad lands" |
-| `fog-off` > 0 | mechanism 2 is present in this view | turn on **Skip Unfogged Geometry** and re-compare |
+| `fog-off` > 0, `markable` > 0 | mechanism 2 is present and the mark can fire | turn on **Skip Unfogged Geometry** and re-compare |
+| `fog-off` > 0, `markable` == 0, `alpha` > 0 | the geometry is alpha-**tested**, so marking it would stamp its whole quad | the mark needs to carry the material's own alpha instead of forcing `GX_ALWAYS`; see "Geometry the game draws with no fog at all" |
+| `fog-off` > 0, `markable` == 0, `no-Z` > 0 | the geometry does not own its depth | **stop.** Marking it would blank the fog on everything behind it |
 | `additive` > 0, `no-Z` < `additive` | mechanism 1 is present and some of it owns its depth | the same sentinel can be extended to it — see "If the counters say this is the mechanism" |
 | `additive` > 0, `no-Z` == `additive` | mechanism 1, but none of it owns its depth | **stop.** Marking those pixels would blank the fog on the terrain behind them. Say so rather than shipping it |
 | both counters 0 | both mechanisms refuted for this view | start again; do not guess |
@@ -223,8 +251,9 @@ already absorbed two fixes built on a plausible mechanism with no per-view measu
 | Field | Means |
 |---|---|
 | `N shared-DL` | materials drawn through `loadSharedDL` (the `dBgp_c` map-unit path) that carried live fog |
-| `N fog-off` | materials in scope that vanilla draws with **no fog at all** (`mType == 0`) |
+| `N fog-off (M markable/Z no-Z/T alpha)` | materials in scope that vanilla draws with **no fog at all** (`mType == 0`), and of those how many `fogSkipUnfogged` can actually mark, how many are rejected for not owning their depth, and how many for being alpha-**tested**. `markable = fog-off − no-Z − alpha` |
 | `N additive/M no-Z` | materials whose blend makes `K ≠ 1` (see below), and how many of those do not write depth |
+| `[anchor]` | which anchor the quad used **on the previous frame** — see the note under `g_lastQuadAnchor`; it cannot be the current frame's, because the status string is built before any anchor fires |
 
 ## What a fullscreen pass can and cannot reproduce — the `K` factor
 
@@ -310,7 +339,15 @@ failure mode if dropped:
   geometry that does have fog.
 
 Turning it on **forces the config-ID replay** in frames that were uniform before, which is a real
-framerate cost. The Status line's `fog-off` counter says in advance whether it would do anything.
+framerate cost. The Status line's `fog-off` counter says in advance whether it would do anything,
+and its `markable / no-Z / alpha` breakdown says whether the two restrictions above let it fire.
+
+If the blocker turns out to be `alpha`, the way out is to stop `stamp_replay_id` forcing
+`GXSetAlphaCompare(GX_ALWAYS, …)` for the sentinel and instead carry the material's own alpha —
+bind its texture and take TEV alpha from `GX_CA_TEXA`, leaving the alpha compare the material's
+display list already set. That is untested and assumes the material samples `GX_TEXMAP0` /
+`GX_TEXCOORD0`, which is usual for a cutout but not guaranteed; do not build it until the counter
+says it is needed.
 
 ## Blended draws: why there is no "keep vanilla fog" rule
 
@@ -453,7 +490,8 @@ fog itself at range (unnatural darkening on distant fog-washed terrain). Tools:
 - The mod panel's **Status** line. In exact mode it reads
 
   ```
-  Deferring fog (exact: N draws, K configs; A shared-DL, B fog-off, C additive/D no-Z) [anchor]
+  Deferring fog (exact: N draws, K configs; A shared-DL,
+                 B fog-off (M markable/Z no-Z/T alpha), C additive/D no-Z) [anchor]
   ```
 
   `"... replay failed"` means the ID replay could not run and mixed pixels got the fallback

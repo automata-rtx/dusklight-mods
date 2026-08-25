@@ -76,11 +76,15 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   right before the translucent lists, so AO/shadows darken surfaces *under* the fog instead of
   darkening the fog itself. Mixed fog configs take an exact per-pixel replay (default) or
   auto-revert to vanilla.
-  **THERE IS ONE OPEN BUG AND IT IS THE FIRST THING TO READ**: distant landmarks (Death Mountain,
-  the Ganon barrier) are brighter with the mod OFF. Two mechanisms are established from source and
-  neither can be distinguished without an in-game reading; the mod carries the measurements and a
-  decision table for them. **`docs/deferred_fog.md` opens with a STATUS section — start there**,
-  and note that three hypotheses have already been wrong, two of which shipped and were reverted.
+  **ONE OPEN BUG, AND IT IS THE FIRST THING TO READ**: distant landmarks (Death Mountain, the Ganon
+  barrier) are brighter with the mod OFF. **Measured in-game and now diagnosed**: the Death Mountain
+  view reads `3 fog-off, 0 additive`, so it is geometry the game draws with fog switched OFF being
+  fogged by the quad — not the `K`-factor blend mechanism, which that reading refutes there. The
+  screenshots agree (the mountain keeps its own colours in vanilla, washes to the haze colour with
+  the mod: a silhouette difference, not a fog-coloured one). The fix is `fogSkipUnfogged`, gated on
+  whether its depth-ownership and alpha-test restrictions let the mark fire — the Status line's
+  `markable / no-Z / alpha` breakdown says which. **`docs/deferred_fog.md` opens with a STATUS
+  section — start there**; two earlier fixes for this shipped and were wrong.
   It reproduces **fog range adjustment** ("XFog"), the per-column multiplier GX applies to the fog
   term because screen-edge pixels are further from the eye than their Z says: TP enables it globally
   (`d_kankyo.cpp:1257`) and aurora implements it, so omitting it flattened a horizontal gradient

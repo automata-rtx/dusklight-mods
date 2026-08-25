@@ -194,8 +194,16 @@ bool g_quadArmed = false;
 enum class QuadAnchor : uint8_t { None, Translucent, BeforeBloom, FrameEnd };
 QuadAnchor g_quadAnchor = QuadAnchor::None;
 
+// THE ONE THE STATUS LINE REPORTS, and it is the PREVIOUS frame's. The status string is built in
+// on_scene_after_opaque, and every anchor writes g_quadAnchor after that — the translucent anchor
+// during the translucent lists, the bloom pre-hook later still, FRAME_BEFORE_HUD last. Reading
+// g_quadAnchor there always found the value on_scene_begin had just cleared, so the line read
+// "not pushed" in every frame however well the quad was landing. One frame of lag is nothing in a
+// static view; reporting the wrong thing entirely is not.
+QuadAnchor g_lastQuadAnchor = QuadAnchor::None;
+
 const char* quad_anchor_name() {
-    switch (g_quadAnchor) {
+    switch (g_lastQuadAnchor) {
     case QuadAnchor::Translucent: return "at translucents";
     case QuadAnchor::BeforeBloom: return "before bloom";
     case QuadAnchor::FrameEnd: return "AFTER BLOOM";
@@ -653,8 +661,19 @@ bool material_owns_depth(J3DMaterial* material) {
 // plausible mechanism with no per-view measurement behind it. Read them in the view that looks
 // wrong before changing anything.
 uint32_t g_fogOffCount = 0;            // materials in scope that vanilla draws with NO fog
-uint32_t g_overUnityCount = 0;         // ... whose blend makes K != 1 (additive / subtract)
+uint32_t g_fogOffNoDepth = 0;          // ... of those, how many do not own their depth
+uint32_t g_fogOffAlphaTested = 0;      // ... and how many own depth but are alpha-TESTED
+uint32_t g_overUnityCount = 0;         // materials whose blend makes K != 1 (additive / subtract)
 uint32_t g_noDepthOverUnityCount = 0;  // ... of those, how many do not own their depth
+
+// A fog-off material is MARKABLE only if it survives both restrictions, so
+// markable = g_fogOffCount - g_fogOffNoDepth - g_fogOffAlphaTested. Reporting the two rejection
+// reasons separately is the difference between "the fix did not fire" and "the fix cannot fire for
+// this geometry, and here is which restriction blocked it" — the second is actionable, the first
+// costs a round trip.
+uint32_t fog_off_markable() {
+    return g_fogOffCount - g_fogOffNoDepth - g_fogOffAlphaTested;
+}
 
 bool needs_id_buffer() {
     if (!exact_mode()) {
@@ -712,6 +731,11 @@ bool suppress_material_fog(J3DMaterial* material) {
     }
     if (state == MaterialFog::Off) {
         ++g_fogOffCount;
+        if (!material_owns_depth(material)) {
+            ++g_fogOffNoDepth;
+        } else if (!material_alpha_test_trivial(material)) {
+            ++g_fogOffAlphaTested;
+        }
     }
     if (state != MaterialFog::Live) {
         return false;
@@ -1123,8 +1147,10 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
     g_deviantCount = 0;
     g_frameConfigCount = 0;
     g_sharedDlFogCount = 0;
-    g_fogOffCount = g_overUnityCount = g_noDepthOverUnityCount = 0;
+    g_fogOffCount = g_fogOffNoDepth = g_fogOffAlphaTested = 0;
+    g_overUnityCount = g_noDepthOverUnityCount = 0;
     g_skipUnfogged = read_skip_unfogged();
+    g_lastQuadAnchor = g_quadAnchor;
     g_quadAnchor = QuadAnchor::None;
     g_configIdView = nullptr;
     g_quadArmed = false;
@@ -1219,22 +1245,24 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
         std::snprintf(g_statusText, sizeof(g_statusText), "No fogged draws this frame");
     } else if (exact) {
         std::snprintf(g_statusText, sizeof(g_statusText),
-            "Deferring fog (exact: %u draws, %u config%s%s; %u shared-DL, %u fog-off, "
-            "%u additive/%u no-Z) [%s]",
+            "Deferring fog (exact: %u draws, %u config%s%s; %u shared-DL, %u fog-off "
+            "(%u markable/%u no-Z/%u alpha), %u additive/%u no-Z) [%s]",
             g_suppressedCount + g_deviantCount, g_frameConfigCount,
             g_frameConfigCount == 1 ? "" : "s",
             needs_id_buffer() && g_configIdView == nullptr ? ", replay failed" : "",
-            g_sharedDlFogCount, g_fogOffCount, g_overUnityCount, g_noDepthOverUnityCount,
-            quad_anchor_name());
+            g_sharedDlFogCount, g_fogOffCount, fog_off_markable(), g_fogOffNoDepth,
+            g_fogOffAlphaTested, g_overUnityCount, g_noDepthOverUnityCount, quad_anchor_name());
     } else if (g_deviantCount > 0) {
         std::snprintf(g_statusText, sizeof(g_statusText),
             "REVERTED: mixed fog configs (%u matching / %u deviant)", g_suppressedCount,
             g_deviantCount);
     } else {
         std::snprintf(g_statusText, sizeof(g_statusText),
-            "Deferring fog (%u draws; %u shared-DL, %u fog-off, %u additive/%u no-Z) [%s]",
-            g_suppressedCount, g_sharedDlFogCount, g_fogOffCount, g_overUnityCount,
-            g_noDepthOverUnityCount, quad_anchor_name());
+            "Deferring fog (%u draws; %u shared-DL, %u fog-off (%u markable/%u no-Z/%u alpha), "
+            "%u additive/%u no-Z) [%s]",
+            g_suppressedCount, g_sharedDlFogCount, g_fogOffCount, fog_off_markable(),
+            g_fogOffNoDepth, g_fogOffAlphaTested, g_overUnityCount, g_noDepthOverUnityCount,
+            quad_anchor_name());
     }
 
     log_fog_configs();
@@ -1630,7 +1658,7 @@ void shutdown() {
     g_controlsWindow = 0;
     g_drawType = g_sceneBeginHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;
     g_scopeActive = g_quadArmed = g_suppressAllowed = g_shapeHookOk = g_wasSuppressing = false;
-    g_quadAnchor = QuadAnchor::None;
+    g_quadAnchor = g_lastQuadAnchor = QuadAnchor::None;
     g_lastFrameDeferred = false;
     g_fogReplayActive = g_wasMixed = g_warnedReplayFailure = false;
     g_inBgpMaterial = g_inSelfDrawnPacket = g_selfDrawnIndexValid = false;
@@ -1640,7 +1668,8 @@ void shutdown() {
     g_suppressedCount = g_deviantCount = 0;
     g_frameConfigCount = 0;
     g_sharedDlFogCount = 0;
-    g_fogOffCount = g_overUnityCount = g_noDepthOverUnityCount = 0;
+    g_fogOffCount = g_fogOffNoDepth = g_fogOffAlphaTested = 0;
+    g_overUnityCount = g_noDepthOverUnityCount = 0;
     g_skipUnfogged = false;
     g_configIdView = nullptr;
     std::snprintf(g_statusText, sizeof(g_statusText), "Waiting for first fogged frame");
