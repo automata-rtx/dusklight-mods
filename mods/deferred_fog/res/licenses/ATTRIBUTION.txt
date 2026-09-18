@@ -1,0 +1,29 @@
+Deferred Fog for Dusklight - provenance
+=======================================
+
+This mod contains no third-party code. It does, deliberately, reproduce the
+behaviour of two pieces of software it has to match exactly, and this notice
+records that.
+
+Aurora
+------
+https://github.com/encounter/aurora  -  Copyright (c) 2022 Luke Street, MIT.
+Aurora is the renderer Dusklight draws through, and it is vendored in the game
+tree, not here.
+
+src/fog_math.h reimplements aurora's fog pipeline in C++: the GX fog coefficient
+setup, the quantization the hardware applies when those coefficients pass
+through the BP registers, and the per-column fog range adjustment. This is a
+behavioural reimplementation written from reading the code and the hardware
+documentation - the point of the mod is that fog re-applied later in the frame
+is bit-identical to fog applied during it, which is only possible by matching
+aurora's arithmetic exactly. No aurora source is copied or distributed here.
+Aurora's MIT license is at the URL above.
+
+Nintendo / the GameCube GX pipeline
+-----------------------------------
+The fog model being reproduced (GX_FOG_PERSP_LIN and friends, the start/end Z
+bias, the 10-entry range-adjustment table) is the original console hardware's,
+as documented publicly and as recovered by the Twilight Princess decompilation
+project. Facts about how hardware behaves are not anyone's copyright. No game
+code or game asset is included in this mod.

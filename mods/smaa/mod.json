@@ -1,7 +1,7 @@
 {
   "id": "dev.automata.smaa",
   "name": "SMAA",
-  "version": "1.1.0",
+  "version": "1.0.0",
   "author": "automata-rtx",
-  "description": "SMAA (subpixel morphological antialiasing), standalone. Detects edges from scene luma unioned with the game's own authored surface normals and depth (so geometric silhouettes and creases are caught even where luma contrast is weak), then reconstructs and blends the aliased edges. The expensive blend-weight pass uses CMAA2-style compute compaction: edge pixels in each workgroup are packed into contiguous threads so sparse edges run in fully-occupied warps. Applies before bloom/translucency so the game's post effects operate on antialiased geometry. Geometric edges need a D3D12/Vulkan/Metal device; on the compatibility renderers SMAA falls back to luma-only edges. Spatial (SMAA 1x); orthogonal patterns in this first version."
+  "description": "Smooths the jagged, stair-stepped edges the game renders, without the blur a post-process filter usually costs you. Edges are detected, the shape behind each one is reconstructed from its pixel coverage, and only those pixels are blended - silhouettes, railings and distant geometry clean up while textures stay sharp. Beyond the usual brightness-based detection it also reads the game's authored surface normals and depth, catching silhouettes and creases where there is almost no contrast to see. Runs before the game's bloom and translucency, so those work on already-antialiased geometry. Works on every renderer. The geometric edge detector additionally needs antialiasing set to NONE and a D3D12, Vulkan or Metal renderer; without those it falls back to brightness-only edges and logs which applies - still working, just catching less. Largely redundant if you already run MSAA. Spatial SMAA 1x; this first version handles orthogonal edge patterns, not diagonals or corners."
 }

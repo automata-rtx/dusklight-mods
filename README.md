@@ -79,6 +79,11 @@ cmake -B build          # fetches the SDK + link stub on first run
 cmake --build build     # -> build/mods/*.dusk
 ```
 
+**Changing a default, hiding an option, or editing a description?**
+`docs/editing-options.md` — each is a one-line edit, and it covers the three non-obvious traps
+(newlines collapse in mod descriptions, the list view shows two lines, and an option named
+`enabled` silently kills the mod).
+
 Three checkers guard things a build cannot catch, all skipping cleanly when the game tree is absent:
 
 ```sh

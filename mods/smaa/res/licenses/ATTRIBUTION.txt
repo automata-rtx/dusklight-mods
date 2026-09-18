@@ -1,0 +1,37 @@
+SMAA for Dusklight - provenance
+===============================
+
+This mod contains no third-party code. The techniques it implements are public,
+and the implementation is our own. This notice records where the ideas came from
+and, just as importantly, where they did not.
+
+SMAA (Enhanced Subpixel Morphological Antialiasing)
+---------------------------------------------------
+Jorge Jimenez, Jose I. Echevarria, Tiago Sousa, Diego Gutierrez, et al.
+Reference implementation: https://github.com/iryoku/smaa  (MIT licensed)
+
+The edge detection, orthogonal pattern search and neighborhood blending in
+res/*.wgsl are reimplemented in WGSL from the published algorithm and the MIT
+reference. No source from that project is included or translated line by line.
+The MIT license of the reference is reproduced at the URL above; because nothing
+from it is distributed here, its notice requirements do not attach to this mod.
+
+This is SMAA 1x - spatial only, no temporal or multisampling component - and the
+first version implements orthogonal patterns; diagonal and corner handling are
+not yet present.
+
+CMAA2 (Conservative Morphological Anti-Aliasing 2)
+--------------------------------------------------
+Filip Strugar, Intel, 2018. Public technical description.
+
+The blend-weight pass packs each workgroup's edge pixels into contiguous threads
+through a groupshared list, so sparse edges execute in fully occupied warps.
+That compaction idea is taken from Intel's published description of CMAA2. The
+implementation is ours.
+
+What was NOT used
+-----------------
+Pascal Gilcher's iMMERSE SMAA port is proprietary ("All rights reserved"). It was
+read only to confirm that combining the two public techniques above is sound. No
+code, no data and no shader text from it appears in this mod. Techniques are not
+copyrightable; that specific implementation is, and it was not used.

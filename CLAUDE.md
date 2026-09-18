@@ -237,7 +237,9 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   into fixes yourself. Full statement: `docs/ssilvb_plan.md` §0.
 
 Each mod is `src/mod.cpp` (host code: pipelines, config vars, UI panel) plus `res/*.wgsl`
-(shaders). Deep documentation: `docs/vbao.md`, `docs/realtime_sun_shadows.md`,
+(shaders). **For tuning rather than building — changing a default, hiding a control, editing a
+front-facing description, adding an icon or banner — `docs/editing-options.md` is the short
+answer to all of them, written for someone who does not want to read the rest of the codebase.** Deep documentation: `docs/vbao.md`, `docs/realtime_sun_shadows.md`,
 `docs/deferred_fog.md`, `docs/celestial_orbit.md`, and `docs/mod-api-notes.md` (pitfalls — read
 before touching uniforms or render code).
 
