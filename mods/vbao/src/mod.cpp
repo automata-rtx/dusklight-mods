@@ -1356,7 +1356,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"effectEnabled", true, &g_cvarEnabled},
         {"temporal", true, &g_cvarTemporal},
         {"distanceFade", false, &g_cvarDistanceFade},
-        {"halfRes", false, &g_cvarHalfRes},
+        {"halfRes", true, &g_cvarHalfRes},
     };
     for (const auto& opt : boolOptions) {
         result = register_bool_option(opt.name, opt.defaultValue, *opt.handle, error);
@@ -1383,9 +1383,9 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"thickness", 150, &g_cvarThickness},
         {"thickFade", 150, &g_cvarThickFade},
         {"thickDist", 60, &g_cvarThickDist},
-        {"depthBias", 4, &g_cvarDepthBias},
+        {"depthBias", 1, &g_cvarDepthBias},
         {"debugDepthRange", 3300, &g_cvarDebugDepthRange},
-        {"temporalFrames", 5, &g_cvarTemporalFrames},
+        {"temporalFrames", 8, &g_cvarTemporalFrames},
         {"temporalClamp", 200, &g_cvarTemporalClamp},
         {"motionResponse", 10, &g_cvarMotionResponse},
         {"contentThresh", 100, &g_cvarContentThresh},
