@@ -7,8 +7,25 @@
 
 ## STATUS — read this first if you are picking the mod up cold
 
-**Confirmed in-game by the user:** the mod overall ("mostly been a success"), and specifically the
-grass/flower uncovered-pixel fix — grass darkens with distance again.
+> **PLATFORM: this mod was ported to upstream Dusklight 2.0 and is back in the build, but has NOT
+> been re-verified in-game on it.** Everything below marked "confirmed in-game" was confirmed on the
+> retired fork platform, against a different game build. The port itself is done and mechanical —
+> all ten hook targets re-checked by symbol in the fetched tree, the four scene-pass pipelines moved
+> onto the layout-key rebuild (see below), and 21 drifted source-line citations corrected — but a
+> game-linked mod is only actually working once someone runs it. **The open question below is the
+> thing to re-measure first**, and its measurements were all taken on the old pin.
+>
+> **Its pipelines are the most latch-exposed in the repo, and not because of anything it does.**
+> The scene pass gains a second colour attachment the frame after any mod first asks for authored
+> normals, and a pipeline built against the one-attachment pass is silently rejected from then on.
+> Deferred Fog never asks for normals — **VBAO does**, and this document tells users to install the
+> two together. So the pass changes shape under it, driven by a different mod. `ensure_fog_pipelines()`
+> rebuilds on `GfxDrawContext::layout.key`; if the fog quad ever vanishes only when VBAO is also
+> enabled, that is the first thing to check.
+
+**Confirmed in-game by the user (on the RETIRED fork platform):** the mod overall ("mostly been a
+success"), and specifically the grass/flower uncovered-pixel fix — grass darkens with distance
+again.
 
 **Shipped but NOT separately confirmed in-game** — do not describe these as verified: fog range
 adjustment, the `dBgp_c` map-unit path, the exact-literal Ganon-barrier signature, Exact-as-default,
@@ -209,7 +226,7 @@ fog, worst exactly where the fog term is largest.
 ## Where in the frame the fog quad lands — and why it matters
 
 The quad wants to go in **immediately after every mod's `SCENE_AFTER_OPAQUE` composite and before
-the translucent lists**. The game runs that stage hook at `m_Do_graphic.cpp:2426`, one line before
+the translucent lists**. The game runs that stage hook at `m_Do_graphic.cpp:2404`, one line before
 `dComIfGd_drawXluListBG`. There is no stage hook at that exact point and every list entry point on
 the way in is `inline` (`dComIfGd_drawXluListBG` → `dDlst_list_c::drawXluListBG` →
 `drawXluDrawList`), so nothing there can be hooked by symbol. The mod therefore anchors on the
@@ -261,7 +278,7 @@ This is the arithmetic the whole "distant landmark looks dimmer" question turns 
 having exactly rather than approximately.
 
 **Aurora fogs the fragment source, inside the fragment shader, before the hardware blend.**
-`shader.cpp:1579` emits `prev = mix(prev.rgb, fog.color.rgb, fogZ)` into the *fragment function*,
+`shader.cpp:1543` emits `prev = mix(prev.rgb, fog.color.rgb, fogZ)` into the *fragment function*,
 while the GX blend equation is a WebGPU pipeline blend state applied afterwards
 (`gx.cpp:332-338`). The deferred pass instead fogs the already-composited framebuffer. For layers
 drawn with GX factors `(sᵢ, dᵢ)` over an accumulator, with `F` the fog colour and `f` the fog factor:
@@ -311,7 +328,7 @@ the fog on the terrain behind it and the correct answer is "cannot be done with 
 Separately from blending, a material's fog block can simply be **off**. `J3DFog::load()` issues
 `J3DGDSetFog(GXFogType(mType), …)` unconditionally (`J3DMatBlock.h:1525`), so `mType == 0` programs
 a real `GX_FOG_NONE`; and `setLightTevColorType_MAJI_sub` refuses to overwrite such a block — the
-whole fog section is guarded by `if (fog_info->mType != 0)` (`d_kankyo.cpp:4434-4487`). It is an
+whole fog section is guarded by `if (fog_info->mType != 0)` (`d_kankyo.cpp:4429-4487`). It is an
 artist-facing per-material opt-out that TP honours, and it is how a distant landmark can stay at
 full brightness however far away it is.
 

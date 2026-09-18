@@ -29,8 +29,8 @@ and looked poor).
 
 2. **The engine's only "underwater" treatment is gated on the CAMERA being submerged**, not on
    the geometry. `dKy_camera_water_in_status_check()` / `g_env_light.camera_water_in_status`
-   (set in `d_camera.cpp:1303-1310`; getter/setter `d_kankyo.cpp:10525-10532`;
-   field `d_kankyo.h:449`) drives a palette/fog swap (`d_kankyo.cpp:1937-1958`), an underwater
+   (set in `d_camera.cpp:1303-1310`; getter/setter `d_kankyo.cpp:7344-7346`;
+   field `d_kankyo.h:854`) drives a palette/fog swap (`d_kankyo.cpp:7344-7346`), an underwater
    color multiply (`water_in_col_ratio_*`, `water_in_light_col`, gated at 2300-2307), and the
    full-screen distortion overlay (`dKy_undwater_filter_draw`, `d_kankyo.cpp:8125-8177`). All of
    it is skipped in the above-water-looking-down case.

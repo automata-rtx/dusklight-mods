@@ -552,7 +552,7 @@ symptoms otherwise, and Shadow Factor alone cannot tell them apart.
   the shadow map was active. `drawCloudShadow` is **not a shadow routine** — the name is
   romanized-Japanese shorthand, and it draws the whole *moya* (靄, mist/haze) packet: the
   drifting haze, mist and steam, and at `mMoyaMode >= 50` the framebuffer heat-shimmer and
-  wolf-senses distortion (`d_kankyo_rain.cpp:4549` splits the two branches). The handler had no
+  wolf-senses distortion (`d_kankyo_rain.cpp:4668` splits the two branches). The handler had no
   mode check, so turning on the shadow map deleted all of it.
 
   That explains every symptom that was recorded here, including the one that misled the

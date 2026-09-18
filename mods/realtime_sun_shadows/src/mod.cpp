@@ -3289,7 +3289,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     //
     // drawCloudShadow used to be skipped here too, and that was a bug born of reading its name
     // as English. It is NOT a shadow routine: it draws the whole moya (mist/haze) packet —
-    // camera-facing haze cards with the depth test disabled (d_kankyo_rain.cpp:4594), five of
+    // camera-facing haze cards with the depth test disabled (d_kankyo_rain.cpp:4748), five of
     // whose twelve modes blend additively and so can only BRIGHTEN (:4587) — and, at
     // mMoyaMode >= 50, the framebuffer heat-shimmer / wolf-senses distortion, which is the same
     // function's other branch (:4549). Nothing it draws is a projected shadow this mod replaces.

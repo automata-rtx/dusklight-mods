@@ -116,6 +116,24 @@ WGPUBindGroupLayout g_fogDebugLayout = nullptr;
 WGPUBindGroupLayout g_mixedLayout = nullptr;
 WGPUBindGroupLayout g_mixedDebugLayout = nullptr;
 
+// THE SCENE PASS CHANGES SHAPE MID-SESSION, SO THESE FOUR PIPELINES CANNOT BE BUILT AT INIT.
+//
+// The renderer adds the authored-normal attachment on demand: the first resolve_pass anywhere that
+// asks for normals enables it from the NEXT frame on. A pipeline that described a one-attachment
+// pass is rejected from that point, and WebGPU's rejection is silent - the fog quad simply stops
+// drawing, which looks exactly like the mod being off.
+//
+// THIS MOD IS THE ONE MOST EXPOSED TO IT, because the request need not be its own. Deferred Fog
+// never asks for normals; VBAO and SMAA do, and the docs tell the user to install Deferred Fog
+// ALONGSIDE VBAO. So the pass gains its second attachment a frame or two into the session, driven
+// by a different mod entirely, and fog built at init would die with no log line and no way to
+// connect the symptom to the cause. Rebuilding on the layout key removes the coupling: whatever
+// shape the pass is, the pipeline recorded into it was built for that shape.
+uint64_t g_sceneLayoutKey = 0;
+bool g_sceneLayoutValid = false;
+bool ensure_fog_pipelines(const GfxDrawContext& ctx);
+void release_fog_pipelines();
+
 // GX FOG RANGE ADJUSTMENT — the game's own name for it is XFog.
 //
 // GX fog is computed from the fragment's Z, but Z is the distance along the view AXIS, not to the
@@ -168,7 +186,7 @@ bool g_quadArmed = false;
 // a fixed point in the frame, and the difference between the anchors is large.
 //
 // The quad wants to go in immediately after every mod's SCENE_AFTER_OPAQUE composite and before the
-// translucent lists — the game runs the stage hook at m_Do_graphic.cpp:2426, one line before
+// translucent lists — the game runs the stage hook at m_Do_graphic.cpp:2404, one line before
 // dComIfGd_drawXluListBG. There is no stage hook there and the list entry points are all inline, so
 // the mod anchors on the first J3DShape::drawFast AFTER the stage closes, which is the first
 // translucent J3D packet. When a frame HAS one, that is exactly the right place.
@@ -565,7 +583,7 @@ void push_fog_quad();
 // honours: J3DFog::load() issues J3DGDSetFog(GXFogType(mType), ...) unconditionally
 // (J3DMatBlock.h:1525), so mType 0 programs a real GX_FOG_NONE, and setLightTevColorType_MAJI_sub
 // refuses to overwrite such a block — `if (fog_info->mType != 0)` guards its whole fog section
-// (d_kankyo.cpp:4434-4487). Vanilla therefore applies LITERALLY ZERO FOG to that geometry, however
+// (d_kankyo.cpp:4429-4487). Vanilla therefore applies LITERALLY ZERO FOG to that geometry, however
 // far away it is. It is also invisible to this mod's GXSetFog/GFSetFog hooks, because J3DGDSetFog
 // writes raw BP commands into the FIFO (J3DGD.cpp:581-585) rather than calling GX.
 //
@@ -600,7 +618,7 @@ MaterialFog material_fog_state(J3DMaterial* material, FogConfig& out) {
 // WHY A BLEND WITH dst == ONE IS THE ONE THAT MATTERS, AND "IS IT BLENDED" IS NOT.
 //
 // Aurora fogs the fragment SOURCE, inside the fragment shader, before the hardware blend:
-// shader.cpp:1579 emits `prev = mix(prev.rgb, fog.color.rgb, fogZ)` into the fragment function,
+// shader.cpp:1543 emits `prev = mix(prev.rgb, fog.color.rgb, fogZ)` into the fragment function,
 // while the GX blend equation is a WebGPU pipeline blend state applied afterwards (gx.cpp:332-338).
 // For layers drawn with GX factors (s_i, d_i) over an accumulator, the two orders differ by
 //
@@ -898,7 +916,9 @@ HookAction on_set_fog_pre(ModContext*, void* args, void*, void*) {
 
 void on_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
-    if (payloadSize != sizeof(DrawPayload)) {
+    // ensure_fog_pipelines() has to run before anything reads g_fogPipeline & co: they do not exist
+    // until the first draw, and they are rebuilt whenever the scene pass changes shape.
+    if (payloadSize != sizeof(DrawPayload) || ctx == nullptr || !ensure_fog_pipelines(*ctx)) {
         return;
     }
     DrawPayload data;
@@ -1268,7 +1288,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
     log_fog_configs();
 }
 
-// Fires at m_Do_graphic.cpp:2663, before the game's bloom reads the framebuffer. Only does anything
+// Fires at m_Do_graphic.cpp:2632, before the game's bloom reads the framebuffer. Only does anything
 // when the frame had no translucent J3D packet to anchor on; see g_quadAnchor.
 HookAction on_bloom_draw_pre(ModContext*, void*, void*, void*) {
     if (g_quadArmed) {
@@ -1431,8 +1451,8 @@ void build_section(UiElementHandle panel) {
     add_control(panel, control);
 }
 
-bool build_fog_pipeline(bool blend, const char* entryPoint, WGPURenderPipeline& outPipeline,
-    WGPUBindGroupLayout& outLayout) {
+bool build_fog_pipeline(const gfx_compat::ScenePassLayout& sceneLayout, bool blend,
+    const char* entryPoint, WGPURenderPipeline& outPipeline, WGPUBindGroupLayout& outLayout) {
     WGPUShaderSourceWGSL wgsl = WGPU_SHADER_SOURCE_WGSL_INIT;
     wgsl.code = {static_cast<const char*>(g_shaderSource.data), g_shaderSource.size};
     WGPUShaderModuleDescriptor moduleDesc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
@@ -1451,18 +1471,13 @@ bool build_fog_pipeline(bool blend, const char* entryPoint, WGPURenderPipeline& 
             .srcFactor = WGPUBlendFactor_Zero,
             .dstFactor = WGPUBlendFactor_One},
     };
-    // The pipeline has to describe the scene pass's attachments, whatever they currently are: with
-    // a device that carries the scene normals, the pass has a second, renderer-owned colour target,
-    // and a one-target pipeline is rejected outright. Asking the service beats rebuilding the
-    // layout from GfxDeviceInfo, which is a copy of the renderer's logic that goes silently wrong
-    // whenever the pass gains an attachment. The extra target comes back write-masked off, so the
-    // fog leaves the game's authored normals untouched - correct in itself, since fog changes what
-    // a surface looks like and not which way it faces.
-    gfx_compat::ScenePassLayout layout;
-    if (!gfx_compat::scene_pass_layout(mod_ctx, svc_gfx, g_deviceInfo, layout)) {
-        wgpuShaderModuleRelease(module);
-        return false;
-    }
+    // `sceneLayout` is the pass the host is about to record this draw into, read from the live
+    // GfxDrawContext by the caller - never rebuilt from GfxDeviceInfo, which is a copy of the
+    // renderer's logic that goes silently wrong the moment the pass gains an attachment. Any
+    // attachment the mod does not own comes back write-masked off, so the fog leaves the game's
+    // authored normals untouched. That is correct in itself: fog changes what a surface looks
+    // like, not which way it faces.
+    gfx_compat::ScenePassLayout layout = sceneLayout;
     if (blend) {
         layout.color_targets[0].blend = &blendState;
     }
@@ -1491,6 +1506,61 @@ bool build_fog_pipeline(bool blend, const char* entryPoint, WGPURenderPipeline& 
     }
     outLayout = wgpuRenderPipelineGetBindGroupLayout(outPipeline, 0);
     return outLayout != nullptr;
+}
+
+void release_fog_pipelines() {
+    const auto releasePipeline = [](WGPURenderPipeline& pipeline) {
+        if (pipeline != nullptr) {
+            wgpuRenderPipelineRelease(pipeline);
+            pipeline = nullptr;
+        }
+    };
+    const auto releaseLayout = [](WGPUBindGroupLayout& layout) {
+        if (layout != nullptr) {
+            wgpuBindGroupLayoutRelease(layout);
+            layout = nullptr;
+        }
+    };
+    releasePipeline(g_fogPipeline);
+    releasePipeline(g_fogDebugPipeline);
+    releasePipeline(g_mixedPipeline);
+    releasePipeline(g_mixedDebugPipeline);
+    releaseLayout(g_fogLayout);
+    releaseLayout(g_fogDebugLayout);
+    releaseLayout(g_mixedLayout);
+    releaseLayout(g_mixedDebugLayout);
+    g_sceneLayoutValid = false;
+    g_sceneLayoutKey = 0;
+}
+
+/// Builds all four pipelines against the pass this draw is being recorded into, and rebuilds them
+/// if that pass has changed shape since. Called from the draw callback on the render worker, where
+/// the layout is a fact rather than a prediction. Either all four exist for the current key or none
+/// do, so the caller only has to check the one it wants.
+bool ensure_fog_pipelines(const GfxDrawContext& ctx) {
+    const uint64_t key = gfx_compat::scene_pass_layout_key(ctx);
+    if (g_sceneLayoutValid && g_sceneLayoutKey == key && g_fogPipeline != nullptr &&
+        g_fogDebugPipeline != nullptr && g_mixedPipeline != nullptr &&
+        g_mixedDebugPipeline != nullptr)
+    {
+        return true;
+    }
+    release_fog_pipelines();
+    gfx_compat::ScenePassLayout layout;
+    if (!gfx_compat::scene_pass_layout_for_draw(ctx, g_deviceInfo, layout)) {
+        return false;
+    }
+    if (!build_fog_pipeline(layout, true, "fs_main", g_fogPipeline, g_fogLayout) ||
+        !build_fog_pipeline(layout, false, "fs_main", g_fogDebugPipeline, g_fogDebugLayout) ||
+        !build_fog_pipeline(layout, true, "fs_mixed", g_mixedPipeline, g_mixedLayout) ||
+        !build_fog_pipeline(layout, false, "fs_mixed", g_mixedDebugPipeline, g_mixedDebugLayout))
+    {
+        release_fog_pipelines();
+        return false;
+    }
+    g_sceneLayoutKey = key;
+    g_sceneLayoutValid = true;
+    return true;
 }
 
 ModResult init(ModError* error) {
@@ -1548,13 +1618,9 @@ ModResult init(ModError* error) {
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to query device info");
     }
-    if (!build_fog_pipeline(true, "fs_main", g_fogPipeline, g_fogLayout) ||
-        !build_fog_pipeline(false, "fs_main", g_fogDebugPipeline, g_fogDebugLayout) ||
-        !build_fog_pipeline(true, "fs_mixed", g_mixedPipeline, g_mixedLayout) ||
-        !build_fog_pipeline(false, "fs_mixed", g_mixedDebugPipeline, g_mixedDebugLayout))
-    {
-        return mods::set_error(error, MOD_ERROR, "failed to create fog pipeline");
-    }
+    // The four pipelines are NOT built here. They describe the scene pass, and the scene pass gains
+    // its normal attachment partway through a session - see g_sceneLayoutKey. ensure_pipelines()
+    // builds them on the first draw and rebuilds them whenever the pass changes shape.
 
     GfxDrawTypeDesc drawDesc = GFX_DRAW_TYPE_DESC_INIT;
     drawDesc.label = "deferred fog";
@@ -1632,26 +1698,7 @@ ModResult init(ModError* error) {
 
 void shutdown() {
     svc_resource->free(mod_ctx, &g_shaderSource);
-    const auto releasePipeline = [](WGPURenderPipeline& pipeline) {
-        if (pipeline != nullptr) {
-            wgpuRenderPipelineRelease(pipeline);
-            pipeline = nullptr;
-        }
-    };
-    const auto releaseLayout = [](WGPUBindGroupLayout& layout) {
-        if (layout != nullptr) {
-            wgpuBindGroupLayoutRelease(layout);
-            layout = nullptr;
-        }
-    };
-    releasePipeline(g_fogPipeline);
-    releasePipeline(g_fogDebugPipeline);
-    releasePipeline(g_mixedPipeline);
-    releasePipeline(g_mixedDebugPipeline);
-    releaseLayout(g_fogLayout);
-    releaseLayout(g_fogDebugLayout);
-    releaseLayout(g_mixedLayout);
-    releaseLayout(g_mixedDebugLayout);
+    release_fog_pipelines();
     g_cvarFogEnabled = g_cvarFogMixed = g_cvarFogDebug = g_cvarFogLog = 0;
     g_cvarFogSkipUnfogged = 0;
     g_lastFogLogSig[0] = '\0';

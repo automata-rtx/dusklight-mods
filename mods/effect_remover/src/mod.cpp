@@ -126,7 +126,7 @@ HookAction on_cloud_shadow_pre(ModContext*, void*, void*, void*) {
 }
 
 // Labels for the modes whose source of assignment has been verified in the game tree. Modes
-// 3, 4, 6, 10 and 11 take an additive blend (d_kankyo_rain.cpp:4587), so they can only ever
+// 3, 4, 6, 10 and 11 take an additive blend (d_kankyo_rain.cpp:4742), so they can only ever
 // BRIGHTEN the frame - they are glare/dust/storm haze, never shadows. Unlabelled modes fall
 // through to a bare number rather than guessing.
 const char* mode_label(int mode) {
@@ -319,10 +319,10 @@ int shadow_code_index(const char* name) {
 // KColor on the terrain materials; the shadow TEV stage treats KColor register 1's red channel as
 // a WASH-OUT amount (0 = full shadow, max = washed out). The value the game puts there is
 // g_env_light.mFogDensity, which despite its decompiled name is NOT fog density: the authors'
-// own slider labels it 雲影の濃さ, "cloud shadow density" (d_kankyo.cpp:5003), and it is loaded
+// own slider labels it 雲影の濃さ, "cloud shadow density" (d_kankyo.cpp:4999), and it is loaded
 // from a palette column named cloud_shadow_density (d_stage.h:150). 255 is the engine's own
 // "no cloud shadow" value — the game itself forces mFogDensity = -1 (read as 255) in the wolf's
-// enhanced-senses state (d_kankyo.cpp:2427), where it deliberately flattens the look.
+// enhanced-senses state (d_kankyo.cpp:2423), where it deliberately flattens the look.
 // Pinning it to 255 feeds white into the shadow stage so it stops darkening the ground; the base
 // ground texture (stage 0) is untouched, so this does not hole the floor.
 // Background: docs/japanese-naming.md §4.1.

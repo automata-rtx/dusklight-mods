@@ -96,7 +96,7 @@ surfaces carry the credit:
   > buffer and publishes it as a service other mods can consume (ambient occlusion, shadows,
   > reflections, outlines). The depth→normal reconstruction (atyuwen's 5-tap method) is adapted
   > from Encounter's ao_mod demo; see res/licenses."
-- **The mods panel** (`build_panel`), using `pane_add_section` + `pane_add_text` (ui.h:219-221)
+- **The mods panel** (`build_panel`), using `pane_add_section` + `pane_add_text` (`ui.h:363`)
   for a static blurb, e.g.:
   > Section: "About"
   > Text: "Reconstructs a world-space surface normal from the depth buffer once per frame and
@@ -252,7 +252,7 @@ measurements say otherwise.
 
 ### 1. `resolve_pass` is a pass break, and it does not dedupe
 
-`aurora/lib/gfx/recording.cpp:921` — every call drains the GX FIFO, **seals the current EFB render
+`aurora/lib/gfx/recording.cpp:1010` — every call drains the GX FIFO, **seals the current EFB render
 pass and resumes a new one that loads the previous contents**, and takes a *fresh* pool entry
 (`acquire_pass_snapshot`: `pool.entries[pool.used++]`). There is no per-frame caching: N callers
 asking for the normal is N snapshot textures and N full-target copies, not one shared.

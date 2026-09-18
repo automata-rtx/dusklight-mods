@@ -1,0 +1,27 @@
+# Citations checked BY HAND against the fetched tree, which check_source_citations.py would
+# otherwise keep reporting as DRIFT.
+#
+# The checker guesses what a citation is evidence for by taking the nearest backticked identifier.
+# In a glossary table or a dense paragraph that guess is often an identifier from the neighbouring
+# row, so it reports a real citation as drifted. An advisory checker whose output is mostly
+# false positives gets ignored, which is the exact failure it exists to prevent - so anything
+# verified by reading the source goes here.
+#
+# Format:  <file>:<line>  <pin>  <what is actually at that line>
+# The pin matters: this file records that someone looked, and at WHICH tree. After a
+# DUSKLIGHT_VERSION bump these are stale claims, not permanent exemptions. The checker says so.
+#
+# To re-verify after a pin bump: for each line, grep the tree for the described construct and
+# confirm the number, then update the pin column. Do not simply bump the pin.
+
+d_kankyo.cpp:2423            c83ce89  mFogDensity = -1 in the wolf's enhanced-senses state
+d_kankyo.cpp:4461            c83ce89  if (fog_info->mType == 7) { mType = 2 }
+d_kankyo.cpp:4968-4969       c83ce89  genLabel("...ポリゴンコードによる設定...")
+d_kankyo.cpp:4999            c83ce89  genSlider("雲影の濃さ ", &g_env_light.mFogDensity, 0, 0xff)
+d_kankyo.cpp:5181            c83ce89  genLabel("（ライト０）―えせポイントライト")
+d_kankyo.cpp:7728            c83ce89  genLabel("■ 月の調整パラメータ")
+d_kankyo.cpp:7738            c83ce89  genLabel("■ 太陽の調整パラメータ")
+d_kankyo.cpp:7749            c83ce89  genLabel("■ 胞子の調整パラメータ")
+d_a_obj_ganonwall2.cpp:112-116  c83ce89  the barrier actor's literal fog triple
+ui.h:363                     c83ce89  pane_add_text
+d_kankyo.cpp:1257            c83ce89  g_env_light.mFogAdjEnable = true (XFog enabled globally; the GXSetFogRangeAdj CALL is at 9459, which is what makes the checker flag this)

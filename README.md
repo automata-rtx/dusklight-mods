@@ -6,7 +6,7 @@ PC/mobile port), built on the official [Dusklight mod template](https://github.c
 | Mod | Package | What it does |
 |---|---|---|
 | VBAO | `vbao.dusk` | Visibility-bitmask ambient occlusion with temporal accumulation, edge-aware denoise, and a large tuning surface. Reads the game's authored surface normals from the graphics service |
-| Deferred Fog | `deferred_fog.dusk` | Re-applies the game's fog after screen-space effects, so AO darkens the world *under* the fog instead of darkening the fog itself. Install alongside VBAO. Not currently built — awaiting hook re-verification against the new game build |
+| Deferred Fog | `deferred_fog.dusk` | Re-applies the game's fog after screen-space effects, so AO darkens the world *under* the fog instead of darkening the fog itself. Install alongside VBAO |
 | SMAA | `smaa.dusk` | Subpixel morphological antialiasing (SMAA 1x). Luma edges unioned with geometric edges from the authored normals + depth |
 | Realtime Sun Shadows | `realtime_sun_shadows.dusk` | Real-geometry sun/moon cascaded shadow maps with PCF, slope-scaled bias, contact (screen-space) shadows, and indoor auto-disable |
 | SSILVB | `ssilvb.dusk` | Screen-space indirect lighting with visibility bitmask (Therrien et al. 2023): one-bounce colored light gathered through the same 32-sector bitmask VBAO uses; with the bounce disabled it acts as a standalone directional AO. Not currently built — awaiting the normal-service port |
@@ -25,14 +25,18 @@ toggle for exactly this).
 Each `.dusk` is a **single cross-platform bundle** (Windows x64/arm64, macOS arm64/x64,
 Linux x64/arm64, Android arm64) produced by CI.
 
-> **Two mods are built right now: VBAO and SMAA.** The platform moved to **upstream Dusklight 2.0**,
-> which supplies surface normals through GfxService 1.3's resolve pair (`GfxResolveDesc::normal` →
-> `GfxResolvedTargets::normal`, resolved alongside depth); these two are ported to it. A test drop is
-> exactly these rather than a mix of mods at different stages. The rest are still in the tree and come
-> back a mod at a time — the four game-linked mods need their hook symbols re-verified against the new
-> game build first, and SSILVB and Realtime Sun Shadows need the same normal-API port. See the note in
-> `CMakeLists.txt`. Graphics Hub is retired — its Depth to Normal half is obsolete now the service
-> provides normals directly, and its Deferred Fog half is the standalone mod above.
+> **Three mods are built right now: VBAO, SMAA and Deferred Fog.** The platform moved to **upstream
+> Dusklight 2.0**, which supplies surface normals through GfxService 1.3's resolve pair
+> (`GfxResolveDesc::normal` → `GfxResolvedTargets::normal`, resolved alongside depth); these three are
+> ported to it. A test drop is exactly these rather than a mix of mods at different stages. The rest
+> are still in the tree and come back a mod at a time — Celestial Orbit and Effect Remover need their
+> hook symbols re-verified against the new game build, and SSILVB and Realtime Sun Shadows need the
+> same normal-API port. See the note in `CMakeLists.txt`. Graphics Hub is retired — its Depth to
+> Normal half is obsolete now the service provides normals directly, and its Deferred Fog half is the
+> standalone mod above.
+>
+> Deferred Fog is **ported but not yet re-verified in-game** on this platform; it is game-linked, so
+> that is a real distinction. See `docs/deferred_fog.md` STATUS.
 
 ## Installing
 
@@ -73,6 +77,14 @@ no `--recursive`, no manual link libraries, no compiler override. Only the mod s
 git clone <this repo>
 cmake -B build          # fetches the SDK + link stub on first run
 cmake --build build     # -> build/mods/*.dusk
+```
+
+Three checkers guard things a build cannot catch, all skipping cleanly when the game tree is absent:
+
+```sh
+python3 tools/check_reserved_config_names.py   # a config var the host reserves (silent load failure)
+python3 tools/check_japanese_naming.py         # game symbols our docs name still exist
+python3 tools/check_source_citations.py        # `file.cpp:LINE` citations still point where claimed
 ```
 
 That's it, on any platform — including Windows (plain MSVC). **No local overrides are needed.**

@@ -39,8 +39,9 @@ unresolved, that is meant literally — do not build on it without checking.
 2. **Never rename or "correct" a game symbol.** The tree also contains English
    spelled by ear, and it is load-bearing: `wether` (weather), `Schejule`,
    `Sord`, `parcent`, `resorce`, `tresure` — and, in the draw-list header our shadow
-   mod replays, `dComIfGd_setListInvisisble` (`d_com_inf_game.h:4671`) sitting 189
-   lines above the correctly-spelled `dComIfGd_drawOpaListInvisible` (`:4860`).
+   mod replays, `dComIfGd_setListInvisisble` (`d_com_inf_game.h:2146`) declared a few
+   lines above the correctly-spelled `dComIfGd_drawOpaListInvisible` (`:2185`) — the
+   misspelling and the correct spelling side by side in one header.
    Renaming breaks the match with `zeldaret/tp` and every grep anyone runs.
 3. **Search in both romanizations.** The tree mixes kunrei-shiki (`si`, `tu`, `ti`,
    `sya`, `zi`) with Hepburn (`shi`, `tsu`, `chi`, `sha`, `ji`) *for the same word*.
@@ -179,13 +180,13 @@ Glossed because these are the names in `mods/effect_remover/src/mod.cpp`,
 | vrkumo | VR box + 雲 | the drifting skybox cloud packet | `mpVrkumoPacket` — its translation is what scrolls the terrain shadow overlay `er_tsr` removes |
 | kasumi | 霞 | horizon haze band | `vrbox_kasumi_*_col`; **`outer` is the near band, `inner` is the far one** — the opposite of the English |
 | kage | 影 | shadow | the game's own word; 雲影 cloud shadow, リアル影 "real shadow" |
-| ese | えせ | **fake, phoney** | the game's own label for its fake point lights (`d_kankyo.cpp:5185`) |
-| nama | 生 | **raw, live** | the game's own label for its placed lights (`d_kankyo.cpp:5165`) |
+| ese | えせ | **fake, phoney** | the game's own label for its fake point lights (`d_kankyo.cpp:5181`) |
+| nama | 生 | **raw, live** | the game's own label for its placed lights (`d_kankyo.cpp:5161`) |
 | wether | *(English by ear)* | weather | `dKyw_wether_move` — do not "fix" |
 | sibuki / shibuki | 飛沫 | spray, splash | `dKyr_drawSibuki`; the grep-trap example |
-| housi / houshi | 胞子 | spore | `dKyr_housi_init` — drifting motes; the authors' own panel heading 「胞子の調整パラメータ」 sits directly above its sliders (`d_kankyo.cpp:7753`) |
-| taiyou | 太陽 | sun | 「太陽の調整パラメータ」 (`d_kankyo.cpp:7742`); `setSunpos` writes `sun_pos` |
-| tsuki | 月 | moon | 「月の調整パラメータ」 (`d_kankyo.cpp:7732`); `setSunpos` also writes `moon_pos` |
+| housi / houshi | 胞子 | spore | `dKyr_housi_init` — drifting motes; the authors' own panel heading 「胞子の調整パラメータ」 sits directly above its sliders (`d_kankyo.cpp:7749`) |
+| taiyou | 太陽 | sun | 「太陽の調整パラメータ」 (`d_kankyo.cpp:7738`); `setSunpos` writes `sun_pos` |
+| tsuki | 月 | moon | 「月の調整パラメータ」 (`d_kankyo.cpp:7728`); `setSunpos` also writes `moon_pos` |
 | vectle | *(English by ear)* | **vector** | `dKyr_get_vectle_calc` — do not "fix" |
 | Schejule | *(English by ear)* | **schedule** | do not "fix" |
 
@@ -195,12 +196,12 @@ both `sun_pos` and `moon_pos`. The trap: **`dKyr_drawSun` draws the moon as well
 sun** — `d_kankyo_wether.cpp:61` calls it with the moon's own texture resource
 (`&mpResMoon`) — so it is the shared celestial-billboard drawer, not a sun-only routine.
 `dKyr_drawStar` is a separate function for the starfield, and `dKyr_draw_rev_moon`
-(`d_kankyo_rain.cpp:2082`) is a third, distinct path that reads `moon_pos` directly.
+(`d_kankyo_rain.cpp:2212`) is a third, distinct path that reads `moon_pos` directly.
 Reading `drawSun` as "the sun's drawing code" will send you to the wrong function.
 
 ### Terrain material vocabulary — the `MAnn` codes
 
-The game calls these **`ポリゴンコード`, "polygon codes"** (`d_kankyo.cpp:4972-4973`).
+The game calls these **`ポリゴンコード`, "polygon codes"** (`d_kankyo.cpp:4968-4969`).
 We have been calling them "material codes"; both are fine, but the game's term is
 the one to grep for.
 
@@ -244,9 +245,9 @@ the `er_tsr` bullet in `CLAUDE.md`).
 The game says otherwise, three independent ways:
 
 ```
-d_kankyo.cpp:5003    genSlider("雲影の濃さ ", &g_env_light.mFogDensity, 0, 0xff);
+d_kankyo.cpp:4999    genSlider("雲影の濃さ ", &g_env_light.mFogDensity, 0, 0xff);
                                  ^ "cloud shadow density"      ^ the decomp called it mFogDensity
-d_kankyo.cpp:4511    k_color.r = g_env_light.mFogDensity & 0xFF;   // dKy_cloudshadow_scroll, MA00 only
+d_kankyo.cpp:4507    k_color.r = g_env_light.mFogDensity & 0xFF;   // dKy_cloudshadow_scroll, MA00 only
 d_kankyo.cpp:11456   sp5C.r = (u8)g_env_light.mFogDensity;         // dKy_bg_MAxx_proc, MA00/01/04/16
 ```
 
@@ -269,7 +270,7 @@ between them:
 ```
 d_stage.h:150        u8 cloud_shadow_density;      // the palette column mFogDensity loads from
 d_kankyo.cpp:2423    mFogDensity = kankyo_color_ratio_set(..., cloud_shadow_density, ...)
-d_kankyo.cpp:2427    if (daPy_py_c::checkNowWolfPowerUp()) { mFogDensity = -1; }
+d_kankyo.cpp:2423    if (daPy_py_c::checkNowWolfPowerUp()) { mFogDensity = -1; }
 ```
 
 Two things follow. First, the value is loaded straight out of a palette column the
@@ -418,7 +419,7 @@ sites (e.g. `d_a_obj_groundwater.cpp:265-269`).
 
 Two consequences worth having straight:
 
-- The `7 → 2` rewrite at `d_kankyo.cpp:4467` **never reaches the GPU for these materials**.
+- The `7 → 2` rewrite at `d_kankyo.cpp:4461` **never reaches the GPU for these materials**.
   Its colour side-effect (black) persists, but the type is re-stamped to `7` before the
   draw, so water is drawn with GX fog type 7 (and `MA09` with 6), not type 2. Any reasoning
   that starts "type 7 becomes linear fog" is wrong for the terrain water family.

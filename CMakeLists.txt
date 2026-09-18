@@ -79,30 +79,41 @@ add_subdirectory("${DUSKLIGHT_DIR}/sdk" dusklight-sdk EXCLUDE_FROM_ALL)
 # Order does not matter: no mod in this set imports another.
 add_subdirectory(mods/vbao)
 add_subdirectory(mods/smaa)
+add_subdirectory(mods/deferred_fog)
+
+# deferred_fog is GAME-LINKED and came back onto this pin DELIBERATELY, not by compiling clean. It
+# compiled clean immediately, which on a new base proves nothing; what putting it back actually took
+# was: re-checking all ten hook targets by symbol in the fetched tree (GXSetFog, GFSetFog,
+# J3DShape::drawFast, J3DMaterial/J3DPatchedMaterial/J3DLockedMaterial::loadSharedDL,
+# dBgp_c::modelMaterial_c::drawSimple, dGrass_packet_c::draw, dFlower_packet_c::draw,
+# mDoGph_gInf_c::bloom_c::draw), moving its four scene-pass pipelines onto the layout-key rebuild,
+# and re-verifying the source line citations its reasoning rests on - 21 of which had drifted.
+#
+# ITS PIPELINES ARE THE MOST EXPOSED IN THE REPO to the latch, and for a reason worth remembering:
+# deferred_fog never asks for normals, so the attachment that invalidates its pipelines is added by
+# a DIFFERENT mod. VBAO's request changes the pass under it, and the docs tell users to install the
+# two together. Built at init, the fog quad would die a frame into every session with VBAO on, with
+# no log line and nothing connecting the symptom to the cause.
+#
+# `python3 tools/check_source_citations.py` is what catches the citation rot; run it after any pin
+# bump.
 
 # The rest stay out of the build until they are ported to this platform. Two separate jobs:
 #
 #   mods/ssilvb              still imports the retired dev.automata.depth_to_normal PROVIDER
 #                            service, which no longer exists in any form. Needs the same conversion
-#                            VBAO got: gfx_compat::request_normal / resolved_normal. May be retired
-#                            instead; not yet decided.
+#                            VBAO got: gfx_compat::request_normal / resolved_normal, plus the
+#                            layout-key pipeline rebuild. May be retired instead; not yet decided.
 #   mods/realtime_sun_shadows
-#                            same conversion, plus it wants BOTH normals — the authored one for
+#                            same conversion, plus it wants BOTH normals - the authored one for
 #                            n.L, a depth-derived face normal for the bias. See
 #                            docs/authored_normals.md 8.6.
-#   mods/deferred_fog        GAME-LINKED, and this pin is a different game build with a bumped
-#                            GameService major. It hooks GXSetFog / GFSetFog / J3DShape::drawFast /
-#                            J3DMaterial::loadSharedDL / dBgp_c::modelMaterial_c::drawSimple /
-#                            dGrass_packet_c::draw / dFlower_packet_c::draw /
-#                            mDoGph_gInf_c::bloom_c::draw, every one resolved BY SYMBOL at load, so
-#                            it needs re-verifying against this tree before it goes back in the
-#                            build. It also has an open in-game investigation whose measurements
-#                            were all taken on the old pin — see docs/deferred_fog.md STATUS.
 #   mods/celestial_orbit, mods/effect_remover
-#                            game-linked; same re-verification, no normal use.
+#                            GAME-LINKED; same hook re-verification deferred_fog just had, and no
+#                            normal use. effect_remover's line citations were updated with the rest,
+#                            but its hook targets have NOT been re-checked.
 #
 # Re-enable them a mod at a time, not all at once.
-# add_subdirectory(mods/deferred_fog)
 # add_subdirectory(mods/celestial_orbit)
 # add_subdirectory(mods/ssilvb)
 # add_subdirectory(mods/realtime_sun_shadows)

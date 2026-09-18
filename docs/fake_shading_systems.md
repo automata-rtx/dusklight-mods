@@ -26,13 +26,13 @@ logger) matters.
 > projected onto anything. Verified in the pinned tree:
 >
 > - The quads are built from the **inverse of the view rotation** — `MTXInverse(dComIfGd_getView()
->   ->viewMtxNoTrans, camMtx)` (`d_kankyo_rain.cpp:4543`, inside `drawCloudShadow` which begins at
+>   ->viewMtxNoTrans, camMtx)` (`d_kankyo_rain.cpp:4742`, inside `drawCloudShadow` which begins at
 >   `:4514`) — i.e. camera-facing billboards that follow the camera, not geometry on the ground.
 > - They are drawn with the **depth test and depth write both disabled**:
->   `GXSetZMode(GX_DISABLE, GX_LEQUAL, GX_DISABLE)` (`d_kankyo_rain.cpp:4594`). A surface-projected
+>   `GXSetZMode(GX_DISABLE, GX_LEQUAL, GX_DISABLE)` (`d_kankyo_rain.cpp:4748`). A surface-projected
 >   shadow cannot be depth-independent; this is an overlay.
 > - **Five of the twelve modes blend additively** — modes 3, 4, 6, 10 and 11 take
->   `GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_ONE, ...)` (`d_kankyo_rain.cpp:4587`), whose
+>   `GXSetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_ONE, ...)` (`d_kankyo_rain.cpp:4742`), whose
 >   destination factor is `ONE`. Those modes can only ever *brighten* the frame. They are glare,
 >   dust and storm haze — they are not shadows of any kind.
 >
@@ -90,8 +90,8 @@ texture (the "two textures interacting" the ground shows).
   `MA00`/`MA01`/`MA04`/`MA16` materials. **This red channel is the shadow's wash-out control.**
 
   **`mFogDensity` is not fog density.** The name is a decompilation reconstruction; the original
-  team's own slider calls the field **雲影の濃さ — "cloud shadow density"** (`d_kankyo.cpp:5003`),
-  and its only other consumer is `dKy_cloudshadow_scroll` (`d_kankyo.cpp:4511`), the function that
+  team's own slider calls the field **雲影の濃さ — "cloud shadow density"** (`d_kankyo.cpp:4999`),
+  and its only other consumer is `dKy_cloudshadow_scroll` (`d_kankyo.cpp:4507`), the function that
   scrolls this same overlay. So this feature is not fighting an incidental fog term that happens to
   land on terrain — **it is overriding the game's own cloud-shadow strength control.** See
   `docs/japanese-naming.md` §4.1.
@@ -103,7 +103,7 @@ Forcing it to **0** makes the shade **darker**; **maximum** washes it out. So re
 **Polarity — corroborated by the game itself.** 濃さ means density/darkness, so a naive reading
 predicts 255 = darker, and our in-game test found the opposite. The game settles the direction: in
 the wolf's enhanced-senses state it forces `mFogDensity = -1`, which the terrain pass reads as
-`255` (`d_kankyo.cpp:2427`, consumed at `:11456`) — i.e. the engine drives this value to maximum
+`255` (`d_kankyo.cpp:2423`, consumed at `:11456`) — i.e. the engine drives this value to maximum
 exactly when it wants the cloud shadow gone. **255 is the engine's own "no cloud shadow" value**,
 which is what `er_tsr` pins. The TEV equation in the `.bmd` is still unread and would explain
 *why* 濃さ runs this way, but cannot change what 255 does. See `docs/japanese-naming.md` §4.1.

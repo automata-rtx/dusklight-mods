@@ -77,8 +77,16 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   right before the translucent lists, so AO/shadows darken surfaces *under* the fog instead of
   darkening the fog itself. Mixed fog configs take an exact per-pixel replay (default) or
   auto-revert to vanilla.
-  **ONE OPEN BUG, AND IT IS THE FIRST THING TO READ**: distant landmarks (Death Mountain, the Ganon
-  barrier) are brighter with the mod OFF. **Measured in-game and now diagnosed**: the Death Mountain
+  **PORTED TO UPSTREAM 2.0 AND BACK IN THE BUILD, BUT NOT RE-VERIFIED IN-GAME.** It compiled clean
+  against the new base with no source change, which proves nothing for a game-linked mod; what the
+  port took was re-checking all ten hook targets by symbol, moving its four scene-pass pipelines onto
+  the `layout.key` rebuild, and correcting the drifted source-line citations. **Its pipelines are the
+  most latch-exposed in the repo and not through anything it does**: it never asks for normals, VBAO
+  does, and the pass changes shape under it — so if the quad ever vanishes only when VBAO is also on,
+  check `ensure_fog_pipelines()` first. Everything below marked confirmed in-game was confirmed on
+  the retired fork platform.
+  **ONE OPEN BUG, AND IT IS THE FIRST THING TO READ** (measured on the OLD pin; re-measure):
+  distant landmarks (Death Mountain, the Ganon barrier) are brighter with the mod OFF. **Measured in-game and now diagnosed**: the Death Mountain
   view reads `3 fog-off, 0 additive`, so it is geometry the game draws with fog switched OFF being
   fogged by the quad — not the `K`-factor blend mechanism, which that reading refutes there. The
   screenshots agree (the mountain keeps its own colours in vanilla, washes to the haze colour with
@@ -100,7 +108,7 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   sets its fog *after* the display list, so registering that fog would invent a config vanilla never
   draws with.
   **WHERE THE QUAD LANDS IS NOT A FIXED POINT IN THE FRAME.** It wants to go in right after every
-  mod's `SCENE_AFTER_OPAQUE` composite and before the translucent lists (`m_Do_graphic.cpp:2426`,
+  mod's `SCENE_AFTER_OPAQUE` composite and before the translucent lists (`m_Do_graphic.cpp:2404`,
   one line before `dComIfGd_drawXluListBG`) — but there is no stage hook there and every list entry
   point inlines, so the mod anchors on the first `J3DShape::drawFast` after the stage closes. A view
   with **no translucent J3D at all** would fall through to `FRAME_BEFORE_HUD` (`:2795`) — after
@@ -116,7 +124,7 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   does have translucencies — so the fallback is probably dead code there and the anchor readout is
   how you check rather than assume.
   **The `K` factor is the exact statement of what a fullscreen pass can reproduce.** Aurora fogs the
-  fragment *source* inside the fragment shader (`shader.cpp:1579`) and the GX blend is a pipeline
+  fragment *source* inside the fragment shader (`shader.cpp:1543`) and the GX blend is a pipeline
   blend state applied after (`gx.cpp:332-338`), so for layers with GX factors `(sᵢ, dᵢ)` the two
   orders differ by `f·F·(K−1)`, `K = Σᵢ(sᵢ·Π_{j>i}dⱼ)`. An ordinary alpha blend over an opaque base
   has **K = 1 — bit-exact**; only a destination factor other than `1−src` (additive, or
@@ -127,7 +135,7 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   reverted**: it exempted the `K = 1` draws that were already exact and got them fogged twice.
   **Separately, a material's fog can simply be OFF** (`mType == 0`): `J3DFog::load()` programs a real
   `GX_FOG_NONE` and `setLightTevColorType_MAJI_sub` refuses to overwrite such a block
-  (`d_kankyo.cpp:4434`), so vanilla applies literally zero fog however distant — and it is invisible
+  (`d_kankyo.cpp:4429`), so vanilla applies literally zero fog however distant — and it is invisible
   to the `GXSetFog` hooks because `J3DGDSetFog` writes raw BP commands. `fogSkipUnfogged` (default
   **off**) marks those pixels with a config-ID sentinel the shader skips; it may only mark a material
   that **owns its depth** and whose **alpha test is trivial**, and it forces the ID replay.
@@ -181,7 +189,7 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
     survive the rename): pre-hooks `drawCloudShadow` and cancels it **per
     `mMoyaMode`**. **Despite the feature's name, moya (靄, mist/haze) is not a projected ground
     shade**: it is camera-facing haze billboards drawn with the depth test disabled
-    (`d_kankyo_rain.cpp:4594`), and five of its twelve modes blend additively so they can only
+    (`d_kankyo_rain.cpp:4748`), and five of its twelve modes blend additively so they can only
     brighten (`:4587`). The dappled forest floor is a *different* system — the terrain TEV stage
     `er_tsr` targets. Mode assignment is in **code**, not map data: mode 4 comes only from
     `d_a_kytag02`, and **Hyrule Field's haze is mode 7** (`d_kankyo_wether.cpp:1111`), so the UI's
@@ -199,7 +207,7 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
     and pins KColor 1's red to **255** — white into the shadow stage, base ground (stage 0)
     untouched, so it **does not hole the floor**. The polarity is **corroborated by the engine's
     own usage**: the game forces `mFogDensity = -1` (read as 255) in the wolf's enhanced-senses
-    state (`d_kankyo.cpp:2427`), where it deliberately flattens the look — so 255 is the engine's
+    state (`d_kankyo.cpp:2423`), where it deliberately flattens the look — so 255 is the engine's
     own "no cloud shadow" value. The TEV equation in the `.bmd` is still unread but cannot change
     what 255 does. **`MA04` is the confirmed Faron forest-floor shade.** Note the hook fires on
     **seven** actors, not just room terrain (two of them water) — see `docs/fake_shading_systems.md`
@@ -261,6 +269,17 @@ mod session attaches only `dusklight-mods`. Four things to internalise now:
 Run `python3 tools/check_japanese_naming.py` after editing that document — it verifies
 every game symbol it names still exists in the fetched tree, and skips cleanly when the
 tree is not present.
+
+**And run `python3 tools/check_source_citations.py` after any pin bump.** Our documentation
+argues from the game's and aurora's source and cites line numbers as evidence — ``d_kankyo.cpp:1257``
+— and a re-platform invalidates them silently. The move to upstream 2.0 broke **21 of 153**,
+including several this file leaned on. The checker guesses what each citation is evidence for
+(the nearest backticked identifier) and reports `DRIFT` with the nearest real line. That guess is
+**advisory**: check each before editing — on this pin it wrongly flagged `d_kankyo.cpp:1257`, which
+was correct all along, because 9459 is where `GXSetFogRangeAdj` is *called* and 1257 is where the
+flag is *set*. Citations confirmed by reading the source go in
+`tools/source_citations_verified.txt` **with the pin they were checked against**, and the checker
+re-reports them as `STALE` once the pin moves rather than treating them as permanent exemptions.
 
 ## Build model (official mod template)
 
@@ -473,10 +492,11 @@ The user typically does not build locally. Iteration loop:
     Cascade count and coverage are framerate choices now, not stability ones — see
     `docs/realtime_sun_shadows.md`.
   - **Which mods actually build on this pin is a SHORT LIST — see the comment block in
-    `CMakeLists.txt`.** Today it is `mods/vbao` and `mods/smaa` only. The five others are commented
-    out with a per-mod reason: `ssilvb` and `realtime_sun_shadows` still need the resolve-based
-    normal conversion, and the four game-linked mods need their hook symbols re-verified against
-    this game build first (§ Re-platforming step 3). Re-enable them one at a time.
+    `CMakeLists.txt`.** Today it is `mods/vbao`, `mods/smaa` and `mods/deferred_fog`. The four
+    others are commented out with a per-mod reason: `ssilvb` and `realtime_sun_shadows` still need
+    the resolve-based normal conversion plus the layout-key rebuild, and `celestial_orbit` /
+    `effect_remover` need their hook symbols re-verified against this game build (§ Re-platforming
+    step 3 — Deferred Fog is the worked example of what that takes). Re-enable them one at a time.
 
 ## Re-platforming (moving to a newer base game)
 
@@ -491,13 +511,17 @@ The user typically does not build locally. Iteration loop:
    files were run on an upstream build). The **game service major version** is a second, blunter
    version of the same trap — a bump there refuses every mod built against the older SDK regardless
    of hooks.
-3. **Re-verify the game-linked mods in-game** — Deferred Fog, Realtime Sun Shadows,
-   Effect Remover, Celestial Orbit. They hook specific game functions and a decomp delta can move or
-   rename what they hook. The service-only mods (VBAO, SSILVB, SMAA) need no re-verification.
-   On **this** pin that work is still outstanding: all four are out of the build in `CMakeLists.txt`
-   until each is checked. `python3 tools/check_japanese_naming.py` is a cheap first pass (it
-   confirms every game symbol our docs name still exists in the fetched tree) but it does **not**
-   cover the hook targets themselves — read them out of the mod source and grep the tree.
+3. **Re-verify the game-linked mods** — Deferred Fog, Realtime Sun Shadows, Effect Remover,
+   Celestial Orbit. They hook specific game functions and a decomp delta can move or rename what
+   they hook. The service-only mods (VBAO, SSILVB, SMAA) need no re-verification.
+   **A clean compile is not the check.** Deferred Fog built against upstream 2.0 with zero source
+   changes, and that said nothing: `DEFINE_HOOK` takes a member-function pointer, so the compiler
+   verifies the *signature* while the symbol is resolved by name at **load**. Pull the hook list out
+   of the mod's `DEFINE_HOOK` lines and grep the tree for each one, then still run it in-game.
+   On **this** pin, Deferred Fog has had the grep pass and is back in the build (not yet run
+   in-game); Celestial Orbit and Effect Remover have had neither and stay out.
+   `tools/check_japanese_naming.py` is a cheap first pass over the symbols our *docs* name, but it
+   does **not** cover hook targets.
 4. **Read the new SDK header. A green build proves nothing.** Two separate silent failures came out
    of assuming otherwise: a renamed scene-layout API that left `#if`-guarded code compiling to the
    wrong thing, and an appended field whose offset collided with someone else's. `gfx_scene_pass.h`

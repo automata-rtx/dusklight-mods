@@ -526,12 +526,24 @@ Coverage is exactly the depth buffer's: a draw writes a normal if and only if it
 normal snapshot and a depth snapshot always describe the same surface, and effects that only blend
 over the scene (particle billboards, the game's projected shadow quads) cannot contaminate it.
 
-### MSAA silhouettes — resolved by rejecting blended texels
+### MSAA silhouettes — HISTORICAL; the case cannot arise on this platform
 
-The renderer resolves the normal target with a **hardware MSAA resolve** (`g_normalBufferResolved`,
-`aurora-ao/lib/webgpu/gpu.cpp:1116`, wired at `common.cpp:473`), which *averages* samples. For an
-encoded normal that is not a harmless approximation — it produces directions that correspond to no
-surface at all:
+> **This entire subsection described the retired fork's renderer, and upstream made it
+> unreachable.** The fork resolved the normal target through a hardware MSAA resolve
+> (`g_normalBufferResolved`), so blended silhouette texels were a real hazard and `reconstruct.wgsl`
+> grew a decoded-length test to reject them. Upstream aurora never creates the normal buffer unless
+> `msaaSamples == 1` (`lib/webgpu/gpu.cpp` `enable_normal_buffer()`), so **MSAA and authored normals
+> are mutually exclusive by construction**: there is no resolve, no averaging, and no blended texel
+> to reject. There is also no `g_normalBufferResolved` and no `reconstruct.wgsl` — both went with
+> the fork and the provider mod.
+>
+> Kept because the *analysis* below is the clearest statement of why an encoded normal must never be
+> averaged, which is worth having if anyone ever proposes resolving one. Treat every line reference
+> in it as pointing at code that no longer exists.
+
+The fork's renderer resolved the normal target with a **hardware MSAA resolve**
+(`g_normalBufferResolved`), which *averages* samples. For an encoded normal that is not a harmless
+approximation — it produces directions that correspond to no surface at all:
 
 | case | decoded value | length |
 |---|---|---|
@@ -554,7 +566,7 @@ practice it was neither slight nor confined to appearance:
 still reads valid, and a two-surface pixel reads a fully confident `1.0`. That is why Coverage
 showed green across the whole screen while the normals were wrong.
 
-`reconstruct.wgsl` now uses the **decoded length as a confidence signal**: a texel written by one
+`reconstruct.wgsl` used the **decoded length as a confidence signal**: a texel written by one
 surface decodes to unit length (10-bit quantization moves it well under 0.01), so anything below **0.92**
 is a resolve average and is handed to the depth reconstruction instead, which is built for
 silhouettes. Genuine curvature is untouched — adjacent samples a few degrees apart still measure
