@@ -2,6 +2,6 @@
   "id": "dev.automata.vbao",
   "name": "VBAO",
   "version": "1.0.0",
-  "author": "automata-rtx",
-  "description": "Adds the soft contact shading Twilight Princess never had - the darkening where surfaces meet, under grass and foliage, in corners, and where objects sit on the ground. A visibility-bitmask estimator tracks what each direction around a pixel can actually see rather than averaging samples, so thin geometry like grass and railings occludes about as much as it really should instead of turning to mush. Accumulated across frames and denoised, with controls for radius, strength, thickness and contrast, and a half-resolution mode for the framerate. Shading follows the game's own authored surface normals, so it curves the way the artists modelled rather than faceting along triangles. REQUIRES antialiasing set to NONE - the renderer cannot produce the surface-normal buffer while MSAA is on, and VBAO will switch itself off and say so in the log. Needs a D3D12, Vulkan or Metal renderer; the compatibility renderers cannot carry that buffer. Standalone. Deferred Fog is worth installing with it, so distant occlusion sits in the world rather than on top of the haze."
+  "author": "automata.",
+  "description": "Visibility Bitmask Ambient Occlusion. Built using Encounter's demo ambient occlusion mod as a base, this increases the quality by making use of visibility bitmasks. This is as close to RTAO a screenspace AO effect can get. Inspired by iMMerse's MXAO Reshade filter."
 }
