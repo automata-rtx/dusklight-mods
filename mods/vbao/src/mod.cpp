@@ -1379,7 +1379,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"radiusMax", 40, &g_cvarRadiusMax},
         {"intensity", 150, &g_cvarIntensity},
         {"contrast", 150, &g_cvarContrast},
-        {"blackPoint", 3, &g_cvarBlackPoint},
+        {"blackPoint", 1, &g_cvarBlackPoint},
         {"thickness", 150, &g_cvarThickness},
         {"thickFade", 150, &g_cvarThickFade},
         {"thickDist", 60, &g_cvarThickDist},
