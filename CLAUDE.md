@@ -85,15 +85,21 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   does, and the pass changes shape under it — so if the quad ever vanishes only when VBAO is also on,
   check `ensure_fog_pipelines()` first. Everything below marked confirmed in-game was confirmed on
   the retired fork platform.
-  **ONE OPEN BUG, AND IT IS THE FIRST THING TO READ** (measured on the OLD pin; re-measure):
-  distant landmarks (Death Mountain, the Ganon barrier) are brighter with the mod OFF. **Measured in-game and now diagnosed**: the Death Mountain
-  view reads `3 fog-off, 0 additive`, so it is geometry the game draws with fog switched OFF being
-  fogged by the quad — not the `K`-factor blend mechanism, which that reading refutes there. The
-  screenshots agree (the mountain keeps its own colours in vanilla, washes to the haze colour with
-  the mod: a silhouette difference, not a fog-coloured one). The fix is `fogSkipUnfogged`, gated on
-  whether its depth-ownership and alpha-test restrictions let the mark fire — the Status line's
-  `markable / no-Z / alpha` breakdown says which. **`docs/deferred_fog.md` opens with a STATUS
-  section — start there**; two earlier fixes for this shipped and were wrong.
+  **ONE KNOWN-UNFIXED BUG, PARKED BY THE USER — AND THE FIRST THING TO READ.** Distant landmarks
+  (Death Mountain, the Ganon barrier) are brighter with the mod OFF. **Three fixes have shipped for
+  this and all three failed**; the user has accepted the mod as-is for now, so nobody is working it.
+  The live trap is that the evidence still reads forward convincingly to fix #3: the Death Mountain
+  view measures `3 fog-off, 0 additive`, which says geometry the game draws with fog switched OFF is
+  being fogged by the quad and refutes the `K`-factor mechanism *for that view*, and the screenshots
+  agree independently (the mountain keeps its own colours in vanilla and washes to the haze colour
+  with the mod — a silhouette difference, not a fog-coloured one). That reasoning produced
+  `fogSkipUnfogged`. **The user turned it on and Death Mountain did not change.** It is still in the
+  build, default-off, as a diagnostic. The negative result disproves the *fix*, not mechanism 2 — the
+  reading that separates those, the Status line's `markable / no-Z / alpha` breakdown, was never
+  captured for that view. **Do not propose a fourth mechanism from an aggregate counter**: twice now
+  a per-frame measurement has correctly identified a mechanism *present* in the view without
+  identifying what the view actually looks like. That needs per-pixel evidence (the Fog Factor view).
+  **`docs/deferred_fog.md` opens with a STATUS section — start there.**
   It reproduces **fog range adjustment** ("XFog"), the per-column multiplier GX applies to the fog
   term because screen-edge pixels are further from the eye than their Z says: TP enables it globally
   (`d_kankyo.cpp:1257`) and aurora implements it, so omitting it flattened a horizontal gradient
@@ -138,7 +144,9 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   (`d_kankyo.cpp:4429`), so vanilla applies literally zero fog however distant — and it is invisible
   to the `GXSetFog` hooks because `J3DGDSetFog` writes raw BP commands. `fogSkipUnfogged` (default
   **off**) marks those pixels with a config-ID sentinel the shader skips; it may only mark a material
-  that **owns its depth** and whose **alpha test is trivial**, and it forces the ID replay.
+  that **owns its depth** and whose **alpha test is trivial**, and it forces the ID replay. **This is
+  fix #3 above and it did not resolve Death Mountain in-game** — the mechanism is real in the game
+  source and the option is sound; it is simply not the answer to the open bug.
   **Measure before theorising**: the Status line carries per-frame `fog-off`, `additive/no-Z` and
   `shared-DL` counts plus the quad anchor, precisely because two fixes here were built on plausible
   mechanisms with no per-view measurement behind them.

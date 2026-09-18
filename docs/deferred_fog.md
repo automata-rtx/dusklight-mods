@@ -32,11 +32,29 @@ adjustment, the `dBgp_c` map-unit path, the exact-literal Ganon-barrier signatur
 the quad-anchor readout, and the fog-off / additive counters. They are verified against the *game
 source*, which is a different claim.
 
-**ONE OPEN QUESTION, and it is unresolved.** Distant landmarks — the user reports Death Mountain
-specifically, and the Ganon barrier — read **brighter with Deferred Fog OFF** than with it on, with
-no other mods enabled. In the user's words: *"chunks of the far off Death Mountain geometry appear
-to overpower the fog so you can see the light from the incredibly far distance"*, and the mod
-*"seems to be drawing on top of Death Mountain's glow"*.
+**ONE OPEN QUESTION — PARKED BY THE USER, UNRESOLVED, AFTER THREE FAILED FIXES.** Distant
+landmarks — the user reports Death Mountain specifically, and the Ganon barrier — read **brighter
+with Deferred Fog OFF** than with it on, with no other mods enabled. In the user's words:
+*"chunks of the far off Death Mountain geometry appear to overpower the fog so you can see the light
+from the incredibly far distance"*, and the mod *"seems to be drawing on top of Death Mountain's
+glow"*.
+
+> **`fogSkipUnfogged` DID NOT FIX IT.** The user tested it in-game: *"the fog over death mountain did
+> not go away / death mountain didn't become any more visible"*, and decided to **accept the mod
+> as-is for now**. That is the current state — the mod ships with this behaviour, and nobody is
+> working the problem.
+>
+> **Do not re-derive `fogSkipUnfogged` as the answer.** The reasoning that produced it is still below
+> and still internally sound, which is exactly why it needs this warning attached: reading the
+> evidence forward leads straight back to a fix that has already been tried and did not work.
+>
+> **What the negative result does and does not prove.** It disproves *the fix*. It does **not**
+> disprove *mechanism 2*, because the one reading that separates the two cases was never captured:
+> `fog-off (M markable / Z no-Z / T alpha)`. If `markable` was 0 in that view, the sentinel never
+> fired and the mechanism is untested rather than refuted. If `markable` was 3 and the picture still
+> did not change, mechanism 2 is genuinely wrong for Death Mountain and the `3 fog-off` reading is a
+> true but irrelevant fact about that view. **Anyone resuming this starts by standing in that view
+> with the option ON and reading that breakdown** — not by proposing a fourth mechanism.
 
 Two mechanisms are **established from the game source** (both documented in full below). Which one
 is at work **cannot be settled from source**: the fetched `dusklight/` tree carries no stage
@@ -47,12 +65,22 @@ archives, so no material's authored `J3DBlendInfo` or `J3DFogInfo` is readable.
 2. **Fog switched off per material** (`mType == 0`) — vanilla applies literally zero fog, the quad
    fogs it anyway. See "Geometry the game draws with no fog at all".
 
-**Two fixes have already shipped for this and both were wrong.** They are recorded below so they
-are not re-attempted: a *blended draws keep vanilla fog* exemption (measured worse in-game than not
-having it, and it changed nothing about the symptom), and *the quad lands after bloom* (refuted by
-the user — the view does contain translucent geometry, so the translucent anchor fires). Both were
-reasoned from a plausible mechanism with no per-view measurement behind them. **Do not add a third
-without reading the counters first.**
+**Three fixes have now shipped for this and all three failed.** Recorded here so they are not
+re-attempted:
+
+| # | Fix | How it failed |
+| :-- | :-- | :-- |
+| 1 | *Blended draws keep vanilla fog* | Measured **worse** in-game than not having it, and changed nothing about the symptom. It exempted the `K = 1` draws that were already exact and got them fogged twice. Reverted. |
+| 2 | *The quad lands after bloom* | Refuted by the user — the view **does** contain translucent geometry, so the translucent anchor fires and the bloom fallback is dead code there. |
+| 3 | **`fogSkipUnfogged`** | Shipped default-off; user turned it on and **Death Mountain did not change**. Left in the build as a diagnostic, still default-off. |
+
+The first two were reasoned from a plausible mechanism with **no per-view measurement**. The third
+was not — it came from an actual counter reading (`3 fog-off, 0 additive`) — and it *still* failed.
+That is the more important lesson: on this problem, a measurement that identifies a mechanism has
+twice now failed to identify **the** mechanism. The `3 fog-off` draws are real; whether they are the
+draws that make up Death Mountain's silhouette was never established, and a per-frame counter cannot
+tell you that. **A fourth attempt needs per-PIXEL evidence** — the Fog Factor debug view, or the
+config-ID buffer visualised — not another aggregate.
 
 ### The reading from the Death Mountain view — MECHANISM 2, measured
 
@@ -77,17 +105,23 @@ orange and rock colours**, crisply; with it on the same geometry is washed to th
 is the *silhouette* difference mechanism 2 predicts, not the *fog-coloured* difference mechanism 1
 predicts. Two independent lines of evidence, same answer.
 
-**So the fix is `fogSkipUnfogged`** — provided the mark can actually fire on those three materials,
-which is what the `markable / no-Z / alpha` breakdown now reports.
+**This reasoning concluded that `fogSkipUnfogged` was the fix** — provided the mark could actually
+fire on those three materials, which is what the `markable / no-Z / alpha` breakdown reports.
+**It was tried, and it did not work** (see the table above). The analysis is kept because the two
+independent lines of evidence above are still sound and still worth knowing; what it shows is that
+*identifying a mechanism present in a view* is not the same as *identifying the cause of what that
+view looks like*. The three unfogged draws are really there. Whether they are Death Mountain is the
+step that was skipped.
 
-### How to resolve it — the decision table
+### The decision table — still the right procedure, now with a known dead end
 
-The Status line was built for exactly this. Stand in the view that looks wrong and read it.
+The Status line was built for exactly this. Stand in the view that looks wrong and read it. Note the
+second row is the one that has already been walked to its end.
 
 | Reading | What it means | What to do |
 | :-- | :-- | :-- |
 | anchor is **not** `[at translucents]` | placement, not fog maths | stop and fix the anchor; see "Where in the frame the fog quad lands" |
-| `fog-off` > 0, `markable` > 0 | mechanism 2 is present and the mark can fire | turn on **Skip Unfogged Geometry** and re-compare |
+| `fog-off` > 0, `markable` > 0 | mechanism 2 is present and the mark can fire | turn on **Skip Unfogged Geometry** and re-compare. **On Death Mountain this has been done and it changed nothing** — so if this is your reading there, the next step is the Fog Factor view per-pixel, not this option |
 | `fog-off` > 0, `markable` == 0, `alpha` > 0 | the geometry is alpha-**tested**, so marking it would stamp its whole quad | the mark needs to carry the material's own alpha instead of forcing `GX_ALWAYS`; see "Geometry the game draws with no fog at all" |
 | `fog-off` > 0, `markable` == 0, `no-Z` > 0 | the geometry does not own its depth | **stop.** Marking it would blank the fog on everything behind it |
 | `additive` > 0, `no-Z` < `additive` | mechanism 1 is present and some of it owns its depth | the same sentinel can be extended to it — see "If the counters say this is the mechanism" |

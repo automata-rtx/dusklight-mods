@@ -1377,15 +1377,22 @@ ModResult build_controls_tab(
     control = UI_CONTROL_DESC_INIT;
     control.kind = UI_CONTROL_TOGGLE;
     control.label = "Skip Unfogged Geometry (experimental)";
+    // The help text used to promise this fixed distant landmarks. It was built for exactly that
+    // and tested in-game on Death Mountain, where it changed nothing - so saying so would send
+    // every user who has that symptom to the wrong switch. See docs/deferred_fog.md STATUS.
     control.help_rml =
         "Some surfaces are drawn by the game with fog switched off entirely, so they stay at full "
-        "brightness however far away they are - that is how distant landmarks punch through the "
-        "haze. The deferred pass has no way to know that on its own and fogs them like everything "
-        "else. With this on, those surfaces are marked in the per-pixel buffer and the fog pass "
-        "leaves them alone.<br/><b>Check the Status line first.</b> If its <i>fog-off</i> count is "
-        "0 in the view you care about, this will do nothing at all. It also forces the per-pixel "
-        "replay - one extra pass over the world's geometry - in scenes that did not need it, so "
-        "there is a framerate cost. Requires Mixed Scenes = Exact.";
+        "brightness however far away they are. The deferred pass has no way to know that on its "
+        "own and fogs them like everything else. With this on, those surfaces are marked in the "
+        "per-pixel buffer and the fog pass leaves them alone."
+        "<br/><b>This did not fix the known case.</b> It was written for the distant-landmark "
+        "problem (Death Mountain looking washed out compared to the mod being off) and tested "
+        "there, and it made no difference - so if that is your symptom, this is probably not it. "
+        "Left in because the effect it describes is real and it doubles as a diagnostic."
+        "<br/><b>Check the Status line first.</b> If its <i>fog-off</i> count is 0 in the view you "
+        "care about, this will do nothing at all. It also forces the per-pixel replay - one extra "
+        "pass over the world's geometry - in scenes that did not need it, so there is a framerate "
+        "cost. Requires Mixed Scenes = Exact.";
     control.binding = UI_BINDING_CONFIG_VAR;
     control.config_var = g_cvarFogSkipUnfogged;
     add_control(left, control);
