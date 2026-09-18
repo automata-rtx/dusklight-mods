@@ -1,7 +1,7 @@
 # Depth to Normal — plan (scoped input mod)
 
 > **RETIRED — historical.** The Depth to Normal provider mod this document designs no longer exists.
-> GfxService 1.3 (`get_scene_normals`) supersedes it: the host snapshots the game's *authored* normals
+> GfxService 1.3's resolve pair supersedes it: the host snapshots the game's *authored* normals
 > once per frame and hands the same texture to every mod that asks, so there is nothing left for a
 > provider mod to reconstruct or publish. Graphics Hub, which hosted it, is retired; its other half
 > lives on as `mods/deferred_fog`. Kept for the reasoning about per-frame cost and the normal
@@ -264,7 +264,8 @@ expensive.
 
 ### 2. The fallback is the real work, and it is 4× in the default configuration
 
-The buffer ships **off** (Video → Rendering → Scene Normal Buffer). In that state *every* pixel
+The buffer ships **off** (Video → Rendering → Scene Normal Buffer — *historical: that setting was
+the retired fork's; upstream creates the buffer on demand instead*). In that state *every* pixel
 takes the 5-tap reconstruction: 8 depth taps plus 2 unprojections. The provider pays that once for
 four consumers. Without it, four mods pay it independently, every pixel, in the configuration most
 users are in on first launch. Even with the buffer on, the same applies to every uncovered pixel

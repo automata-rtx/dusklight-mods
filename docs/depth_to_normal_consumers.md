@@ -2,7 +2,8 @@
 
 > **RETIRED — historical.** The `dev.automata.depth_to_normal` service this document is the integration
 > guide for no longer exists, and neither does its provider mod. Consume normals with GfxService's
-> `get_scene_normals` instead — see `docs/authored_normals.md`, and `mods/vbao` or `mods/smaa` for a
+> `GfxResolveDesc::normal` / `GfxResolvedTargets::normal` instead — see `docs/authored_normals.md`,
+> and `mods/vbao` or `mods/smaa` for a
 > worked consumer. The menu of *effects* below is still a useful list of what the normals enable.
 > **Do not copy the integration boilerplate.**
 

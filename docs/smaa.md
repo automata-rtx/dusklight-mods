@@ -6,7 +6,8 @@ Spatial SMAA 1x — no camera jitter, no motion vectors, no temporal component (
 inject a jittered projection or expose a velocity buffer, so the temporal SMAA variants aren't
 reachable service-only; see "Scope / why 1x").
 
-**Geometric edges come from the gfx service** (`get_scene_normals`, GfxService 1.3) plus a depth
+**Geometric edges come from the gfx service** (GfxService 1.3 — `GfxResolveDesc::normal` →
+`GfxResolvedTargets::normal`, resolved alongside colour and depth) plus a depth
 snapshot. Edge detection unions the luma detector with a normal-angle + relative-depth discontinuity
 test, so silhouettes and creases are caught even where two flat-shaded TP surfaces have almost no
 brightness contrast.
@@ -26,9 +27,18 @@ Three things about that normal are worth stating precisely:
   texels being valid — a zero-vector normal would `normalize()` to NaN and compare false, silently
   losing the edge. Those boundaries are depth discontinuities anyway, which the depth half catches.
 
-If the scene normals are unavailable — the D3D11 and OpenGL ES compatibility renderers cannot carry
-the attachment — geometric edges turn themselves off and the mod does luma-only SMAA, which is the
-reference SMAA behaviour. Same with "Geometric Edges" unticked.
+If the scene normals are unavailable, geometric edges turn themselves off and the mod does luma-only
+SMAA, which is the reference SMAA behaviour. Same with "Geometric Edges" unticked. Two things cause
+it, and SMAA logs one INFO line naming which:
+
+- **MSAA is on.** The renderer refuses to create the normal buffer unless antialiasing is off, and
+  does not even record the request otherwise. This one the user can fix.
+- **A compatibility renderer** (D3D11 / OpenGL ES) cannot carry the attachment at all.
+
+A third case is **not** reported and must not be: the snapshot *latches*, so the first resolve that
+asks returns null and enables normals from the next frame. SMAA waits `kNormalLatchGraceFrames`
+before saying anything, and needs no other handling — it simply runs luma-only for those frames and
+picks the normals up by itself.
 
 ## Where it runs, and why
 
@@ -149,8 +159,11 @@ on ultra-sparse edges for speed; left out so v1 never drops AA on isolated edges
 profiling asks for it.
 
 If `GfxDeviceInfo.sample_count > 1` (the scene pass already runs MSAA), SMAA is partly redundant on
-silhouettes; TP's forward port is expected to be single-sample, which is exactly why post-process AA
-is worth having.
+silhouettes; TP's forward port is single-sample by default — Dusklight never assigns
+`AuroraConfig::msaa` and aurora normalises `0 → 1` — which is exactly why post-process AA is worth
+having. **MSAA is also mutually exclusive with the scene normal buffer**, so on the rare build where
+it is on, SMAA loses its geometric detector at the same time as gaining hardware silhouette AA. The
+two cancel out more than they stack.
 
 ## Provenance / licensing
 

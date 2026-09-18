@@ -3,7 +3,11 @@
 Mod id `dev.automata.vbao` (directory `mods/vbao/`). Service-only (no game code): stages + snapshots from the
 gfx service, matrices from the camera service.
 
-**Normals come from the gfx service** (`get_scene_normals`, GfxService 1.3) as of 1.6.0. The game's
+**Normals come from the gfx service** (GfxService 1.3), resolved alongside depth —
+`GfxResolveDesc::normal` → `GfxResolvedTargets::normal`, reached through
+`common/gfx_normal_compat.h`. (Until the move to upstream Dusklight this was a separate
+`get_scene_normals` call on our own fork; upstream implements the same feature through the resolve
+instead, and there is no such call in the upstream vtable.) The game's
 renderer writes the artist-authored vertex normal into a second colour attachment on the scene pass,
 and the HOST snapshots it once per frame — immediately after the opaque lists, before any
 `SCENE_AFTER_OPAQUE` hook — then hands the same texture to every mod that asks. VBAO just asks.
@@ -34,9 +38,16 @@ Two consequences worth knowing:
   that because sky is depth-discontinuous and the depth gate already rejected it, but an alpha-0
   *surface* is depth-continuous with everything around it. Debug view 2 doubles as the coverage
   map: it paints those pixels black.
-- **The compatibility renderers cannot provide it.** On the D3D11 and OpenGL ES backends the
-  snapshot is unavailable and VBAO disables itself with a one-time log line saying so. It needs a
-  core-features device (D3D12 / Vulkan / Metal).
+- **Two things make it permanently unavailable, and the first is a SETTING.**
+  - **MSAA.** The renderer will not create the normal buffer unless antialiasing is off
+    (`msaaSamples == 1`); with MSAA on it does not even record the request. So a perfectly capable
+    GPU gets no normals, and VBAO disables itself. The log line **names MSAA** in that case — it
+    re-queries `GfxDeviceInfo::sample_count` at the moment it warns, rather than trusting the value
+    cached at init, because the user can change MSAA mid-session. Telling them their GPU is at fault
+    when the fix is one setting would be the worst kind of wrong diagnostic.
+  - **The compatibility renderers.** On D3D11 and OpenGL ES the attachment cannot exist at all
+    (no WebGPU core features). VBAO disables itself with a one-time log line saying so; it needs a
+    D3D12 / Vulkan / Metal device.
 
 The stored direction carries the sign the game gave it and is **never** flipped toward the camera —
 see `docs/authored_normals.md` §2a for the three separate places that guard had to be deleted from.
@@ -54,10 +65,15 @@ See `docs/deferred_fog.md`.
 
 ## Pipeline (per frame, at `GFX_STAGE_SCENE_AFTER_OPAQUE`)
 
-1. `get_scene_normals` returns the host's per-frame normal snapshot (taken before this stage), and
-   `resolve_pass` snapshots depth (R32Float, reversed-Z, single-sample). Colour is **not** resolved —
-   the composite blends over the live target. Without either input VBAO disables itself for the
-   frame.
+1. One `resolve_pass` snapshots **both** depth (R32Float, reversed-Z, single-sample) and the
+   scene normal (RGB10A2Unorm, view space). Colour is **not** resolved — the composite blends over
+   the live target. Without either input VBAO disables itself for the frame.
+
+   **The normal snapshot latches on.** The first resolve that asks for it enables the attachment
+   for the *next* frame and returns null for this one, so an early null means "not yet", not
+   "never". VBAO counts consecutive null frames (`kNormalLatchGraceFrames`) and only reports the
+   device as unable once the count is past the handful the latch can plausibly take — otherwise the
+   "compatibility renderer" warning would fire on every cold start.
 2. **`preprocess_depth.wgsl`** — builds a 5-level MIP depth chain (XeGTAO-style weighted
    downsample) so distant AO samples read small MIPs instead of thrashing bandwidth.
 3. **`vbao.wgsl`** — the occlusion estimator. Per pixel: unproject the view position, read the

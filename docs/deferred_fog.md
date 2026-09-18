@@ -1,7 +1,7 @@
 # Deferred Fog
 
 > **History:** this was folded into a combined "Graphics Hub" mod for a while, alongside a Depth to
-> Normal provider. Graphics Hub is retired — GfxService 1.3's `get_scene_normals` gives every mod the
+> Normal provider. Graphics Hub is retired — GfxService 1.3's resolve pair gives every mod the
 > game's authored normals directly, so the provider had nothing left to do — and Deferred Fog is a
 > standalone mod again, which is what this document already described.
 

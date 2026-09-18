@@ -104,9 +104,12 @@ Upstream reference: the fetched `dusklight/docs/modding.md` and `dusklight/sdk/i
   fetched by `cmake/FetchDusklight.cmake` (pinned by `DUSKLIGHT_VERSION`) — nothing from the game
   compiles in this repo.
 - On **Windows/macOS/Android**, a mod using `FEATURES game|webgpu` (all of ours) links against a
-  per-arch stub the SDK **auto-downloads** from `DUSKLIGHT_SDK_STUB_URL` (import library on Windows,
-  `bundle_loader`/`.so` stub on macOS/Android) — no manual `DUSK_GAME_EXE` needed (set it to override
-  the download). **Linux needs nothing** — game symbols resolve at load (`-Wl,--allow-shlib-undefined`).
+  per-arch stub the SDK **auto-downloads** (import library on Windows, `bundle_loader`/`.so` stub on
+  macOS/Android) — no manual `DUSK_GAME_EXE` needed (set it to override the download). The URL comes
+  from `DUSKLIGHT_SDK_STUB_URL`, which we **do not set**: upstream's default is a single
+  version-independent `sdk` release (`dusklight/cmake/ModSDK.cmake:5`). Only a fork base would need
+  it overridden, because a fork's stubs are per-release. **Linux needs nothing** — game symbols
+  resolve at load (`-Wl,--allow-shlib-undefined`).
 - Windows builds with plain MSVC (`cl`); no clang-cl override. The base game's `modmeta` parser
   tolerates linker padding, so `DEFINE_HOOK` records register under `cl`.
 - `.dusk` = zip of {`lib/<platform>/mod.{dll,so}`, mod.json, res/}. CI builds one per platform and
@@ -127,7 +130,9 @@ try to infer the faulting code from the mod's source.** The platform release shi
 exact function, source file and line are always available:
 
 ```sh
-# 1. The Windows build for the pinned platform, from DUSKLIGHT_SDK_STUB_URL's release.
+# 1. The Windows build for the pinned platform, from the release that matches DUSKLIGHT_VERSION.
+#    (The URL below is the RETIRED fork's and is kept only to show the shape; the platform is now
+#    upstream TwilitRealm/dusklight, so take the win32-msvc-x86_64 archive from its release.)
 curl -sSL -o dusk.zip \
   "https://github.com/automata-rtx/dusklight-ao/releases/download/platform-normals-test/dusklight-UNKNOWN-VERSION-win32-msvc-x86_64.zip"
 unzip -q dusk.zip -d dusk

@@ -11,7 +11,7 @@
 //
 // It was previously a sub-feature of the combined "Graphics Hub" mod. Graphics Hub is retired: its
 // other half (Depth to Normal) reconstructed a surface normal from depth and published it as a mod
-// service, which GfxService 1.3's get_scene_normals supersedes entirely — the game now hands mods
+// service, which GfxService 1.3's resolve pair supersedes entirely — the game now hands mods
 // the artist's authored normal directly, so there is nothing left for a provider mod to do. What
 // remains is this, which is a genuine game-behaviour change and can only live in a game-linked mod.
 //

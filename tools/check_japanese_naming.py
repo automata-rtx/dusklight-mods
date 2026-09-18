@@ -16,12 +16,12 @@ state of a fresh clone; failing there would just train people to ignore it.
     python3 tools/check_japanese_naming.py
     DUSKLIGHT_DIR=/path/to/dusklight python3 tools/check_japanese_naming.py
 
-The tree comes from automata-rtx/dusklight-ao at DUSKLIGHT_VERSION - the platform the mods
-are actually built against, NOT stock upstream TwilitRealm/dusklight. Its game code is
-upstream (the fork delta is renderer + SDK only), so the glossary checks out either way, but
-the pinned SHA only resolves against the fork. Pointing DUSKLIGHT_DIR at a checkout of a
-different base would check the glossary against source the mods are not built against, which
-is worse than skipping. docs/japanese-naming.md 2.1 has the exact clone commands.
+The tree comes from TwilitRealm/dusklight at DUSKLIGHT_VERSION - upstream, and the platform
+the mods are actually built against. (It used to come from the automata-rtx/dusklight-ao
+fork; that fork is retired, and since its delta was renderer + SDK only, the glossary reads
+the same either way.) Pointing DUSKLIGHT_DIR at a checkout of a different base would check
+the glossary against source the mods are not built against, which is worse than skipping.
+docs/japanese-naming.md 2.1 has the exact clone commands.
 """
 
 from __future__ import annotations

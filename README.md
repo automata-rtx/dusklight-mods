@@ -6,7 +6,7 @@ PC/mobile port), built on the official [Dusklight mod template](https://github.c
 | Mod | Package | What it does |
 |---|---|---|
 | VBAO | `vbao.dusk` | Visibility-bitmask ambient occlusion with temporal accumulation, edge-aware denoise, and a large tuning surface. Reads the game's authored surface normals from the graphics service |
-| Deferred Fog | `deferred_fog.dusk` | Re-applies the game's fog after screen-space effects, so AO darkens the world *under* the fog instead of darkening the fog itself. Install alongside VBAO |
+| Deferred Fog | `deferred_fog.dusk` | Re-applies the game's fog after screen-space effects, so AO darkens the world *under* the fog instead of darkening the fog itself. Install alongside VBAO. Not currently built — awaiting hook re-verification against the new game build |
 | SMAA | `smaa.dusk` | Subpixel morphological antialiasing (SMAA 1x). Luma edges unioned with geometric edges from the authored normals + depth |
 | Realtime Sun Shadows | `realtime_sun_shadows.dusk` | Real-geometry sun/moon cascaded shadow maps with PCF, slope-scaled bias, contact (screen-space) shadows, and indoor auto-disable |
 | SSILVB | `ssilvb.dusk` | Screen-space indirect lighting with visibility bitmask (Therrien et al. 2023): one-bounce colored light gathered through the same 32-sector bitmask VBAO uses; with the bounce disabled it acts as a standalone directional AO. Not currently built — awaiting the normal-service port |
@@ -25,35 +25,39 @@ toggle for exactly this).
 Each `.dusk` is a **single cross-platform bundle** (Windows x64/arm64, macOS arm64/x64,
 Linux x64/arm64, Android arm64) produced by CI.
 
-> **Three mods are built right now: VBAO, Deferred Fog and SMAA.** The graphics service changed how
-> mods get surface normals (GfxService 1.3 `get_scene_normals`) and these are the ones ported to it,
-> so a test drop is exactly these three rather than a mix of mods at different stages. The rest are
-> still in the tree and come back a mod at a time; see the note in `CMakeLists.txt`. Graphics Hub is
-> retired — its Depth to Normal half is obsolete now the service provides normals directly, and its
-> Deferred Fog half is the standalone mod above.
+> **Two mods are built right now: VBAO and SMAA.** The platform moved to **upstream Dusklight 2.0**,
+> which supplies surface normals through GfxService 1.3's resolve pair (`GfxResolveDesc::normal` →
+> `GfxResolvedTargets::normal`, resolved alongside depth); these two are ported to it. A test drop is
+> exactly these rather than a mix of mods at different stages. The rest are still in the tree and come
+> back a mod at a time — the four game-linked mods need their hook symbols re-verified against the new
+> game build first, and SSILVB and Realtime Sun Shadows need the same normal-API port. See the note in
+> `CMakeLists.txt`. Graphics Hub is retired — its Depth to Normal half is obsolete now the service
+> provides normals directly, and its Deferred Fog half is the standalone mod above.
 
 ## Installing
 
-1. Install the matching game build: the `win32-msvc-x86_64` archive from the
-   **`platform-normals-test`** release of [`automata-rtx/dusklight-ao`](https://github.com/automata-rtx/dusklight-ao/releases/tag/platform-normals-test).
-   The mods are built against that build, not stock upstream Dusklight — see the matched-pair note
-   below.
+1. Install the matching game build: **upstream Dusklight** at the commit pinned as
+   `DUSKLIGHT_VERSION` in `CMakeLists.txt` (currently `c83ce89`, which is GameService 2.0). Our
+   fork is retired — these are built against stock upstream now. See the matched-pair note below.
 2. Download the latest `mods-combined` artifact from this repo's Actions page.
 3. Copy the `.dusk` files into the game's mods folder:
    - Windows: `%APPDATA%\TwilitRealm\Dusklight\mods`
    - Linux: `~/.local/share/TwilitRealm/Dusklight/mods`
    - macOS: `~/Library/Application Support/TwilitRealm/Dusklight/mods`
 4. In game: Mods menu → enable them. Settings live in each mod's detail pane.
-5. Nothing to enable for surface normals: the platform always carries them and the graphics
-   service hands them to any mod that asks. They are unavailable only on the **compatibility
-   renderers** (D3D11 / OpenGL ES), where VBAO disables itself and says so in the log — it
-   needs a D3D12 / Vulkan / Metal device.
+5. Nothing to enable for surface normals: the graphics service creates the normal buffer the first
+   time a mod asks for it (one frame later — the first request always comes back empty, which is
+   normal and not reported). Two things prevent it entirely:
+   - **MSAA.** The renderer will not create the normal buffer unless antialiasing is off. If VBAO
+     says AO is disabled and names MSAA, that is the fix — set antialiasing to none.
+   - **The compatibility renderers** (D3D11 / OpenGL ES), which cannot carry the extra buffer at
+     all. VBAO disables itself and says so in the log; it needs a D3D12 / Vulkan / Metal device.
+     SMAA keeps working either way, on luma edges only.
 
-The game-linked mods resolve their hook targets by symbol at load, so a `.dusk` and the game build
-it was compiled against are a matched pair. These are built against `automata-rtx/dusklight-ao` at
-the commit pinned as `DUSKLIGHT_VERSION` in `CMakeLists.txt` — the scene-normal-buffer platform, not
-stock upstream; if a mod fails to load or loads and does nothing, that pin and your game build have
-diverged.
+A `.dusk` and the game build it was compiled against are a matched pair, for two reasons: the
+game-linked mods resolve their hook targets **by symbol at load**, and the host refuses any mod built
+against an older **game service major version** outright — which this pin bumped to 2.0. If a mod
+fails to load, or loads and does nothing, that pin and your game build have diverged.
 
 After replacing a `.dusk` with a newer build, the in-game **Reload** button picks it up without
 restarting.
@@ -71,12 +75,12 @@ cmake -B build          # fetches the SDK + link stub on first run
 cmake --build build     # -> build/mods/*.dusk
 ```
 
-That's it, on any platform — including Windows (plain MSVC). Two knobs point the stock template at
-our platform: `DUSKLIGHT_REPOSITORY` (`automata-rtx/dusklight-ao`, which carries the scene normal
-buffer) and `DUSKLIGHT_SDK_STUB_URL` (that fork's `platform-normals-test` release, which publishes
-the per-arch link stubs). `DUSKLIGHT_AURORA_VERSION` stays unset — the recorded `extern/aurora` pin
-resolves on its own. Note a fork release's stubs are **per-build**, unlike upstream's
-version-independent `sdk` tag, so the stub URL moves whenever `DUSKLIGHT_VERSION` does.
+That's it, on any platform — including Windows (plain MSVC). **No local overrides are needed.**
+`DUSKLIGHT_REPOSITORY` is upstream `TwilitRealm/dusklight`, and the SDK downloads its per-arch link
+stubs from upstream's own **version-independent** `sdk` release, so there is no stub URL to keep in
+sync with the pin. (The fork-era `DUSKLIGHT_SDK_STUB_URL` and `DUSKLIGHT_AURORA_VERSION` knobs are
+gone; if a future base is ever a fork again, remember a fork release's stubs *are* per-build and the
+URL has to move with `DUSKLIGHT_VERSION`.)
 
 CI (`.github/workflows/build.yml`) is the template's build + combine pipeline: it builds every mod on
 all seven platforms and merges each into one cross-platform `.dusk` via `tools/merge_mod.py`

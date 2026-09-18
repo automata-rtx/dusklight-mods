@@ -1,8 +1,10 @@
 # Authored normals (scene normal buffer) — consuming them, and how to A/B them
 
 **Status:** landed in the mods and **verified in-game** — the back-lit-character artefacts that
-drove most of §8 are confirmed resolved (see §0). The platform side is done, merged and published
-(`platform-normals-test`).
+drove most of §8 are confirmed resolved (see §0). **The platform side is now UPSTREAM**: Dusklight
+2.0 (GameService 2.0 / GfxService 1.3) ships the normal snapshot itself, with the attachment in
+upstream aurora, and our fork is retired. Upstream's API is **not** the one our fork had — see §0
+and §7 before assuming anything written here about "how a mod asks" still applies verbatim.
 
 > **Cold-start readers:** read §0 first. It is the state of play — what is done, what is confirmed
 > in-game, what is still open, and which debug views answer which question. §8 is the list of
@@ -14,26 +16,45 @@ drove most of §8 are confirmed resolved (see §0). The platform side is done, m
 
 The game's forward renderer can write its own **authored, interpolated vertex normals** into a
 second RGB10A2 color attachment on the scene (EFB) pass, and the mod API exposes a per-frame
-snapshot of it, which **every consumer reads directly** through GfxService 1.3's
-`get_scene_normals`.
+snapshot of it, which **every consumer reads directly** through GfxService 1.3's resolve pair —
+set `GfxResolveDesc::normal`, read `GfxResolvedTargets::normal` (§7).
 
 > **NAMING NOTE — parts of this document predate the current shape and still say "Graphics Hub".**
 > When it was written, a provider mod (Graphics Hub's *Depth to Normal* half) took the snapshot,
 > reconstructed a normal from depth where the snapshot had none, and republished the result as the
 > `dev.automata.depth_to_normal` service, which every other mod imported. **That mod, that service
 > and that A/B switch are all retired.** GfxService 1.3 hands the authored normals to any mod that
-> asks, so VBAO and SMAA call `get_scene_normals` themselves and there is no provider, no
+> asks, so VBAO and SMAA resolve the normals themselves and there is no provider, no
 > per-mod "Use Authored Normals" toggle, and no Authored/Reconstructed/Difference debug view.
 > Graphics Hub's other half lives on as `mods/deferred_fog`. The *reasoning* below — encoding,
 > validity, the two-normals doctrine, the ABI history — is all still current; only the plumbing and
 > the UI instructions are historical. Read anything naming Graphics Hub as "how it worked then".
+>
+> **A second thing is historical: the Video setting.** The fork gated the attachment on a
+> user-facing **Video → Rendering → Scene Normal Buffer** switch, applied on the next launch.
+> **Upstream has no such setting.** The buffer is created *on demand* the first time any mod asks
+> for it, and is never turned off again for the life of the device. Anywhere below that tells you to
+> flip that setting, or calls the buffer "off by default", is describing the fork.
 
-**It is off by default.** The game ships the buffer switched off — **Video → Rendering → Scene
-Normal Buffer**, applied on the next launch — because it costs a render target and a write per
-covered fragment and nothing reads it unless a mod does. Until it is on, every mod here behaves
-exactly as it did before: the provider reconstructs from depth for every pixel and says so in its
-status line. It is also unavailable in compatibility mode (the D3D11 and OpenGL ES fallbacks),
-where the renderer disables it whatever the setting says.
+**Nothing switches it on but a mod asking for it — and asking has a one-frame delay.** The first
+`resolve_pass` that sets `GfxResolveDesc::normal` records the request; aurora creates the attachment
+at the start of the *next* frame and that resolve returns `NULL`. From then on it stays on until the
+device is torn down (`enable_normal_buffer()` sets `g_graphicsConfig.normalBuffer`, and
+`resize_swapchain` re-creates the texture at the new size). So a null view means "not yet" at least
+as often as it means "never", and a consumer must not treat the first one as a hard failure.
+
+**Two things make it "never", and the first is a SETTING, not a hardware limit:**
+
+| Blocker | Where | Can the user fix it? |
+|---|---|---|
+| **MSAA is on** (`msaaSamples != 1`) | `aurora/lib/webgpu/gpu.cpp` `enable_normal_buffer()`, and `lib/gfx/recording.cpp` `resolve_pass`, which does not even *record* the request | **Yes** — set antialiasing to none |
+| Adapter lacks WebGPU `CoreFeaturesAndLimits` (`g_hasCoreFeatures`) — the D3D11 / OpenGL ES compatibility renderers | same two sites | No |
+
+MSAA matters more than it looks: today Dusklight never assigns `AuroraConfig::msaa` and aurora
+normalises `0 → 1` (`lib/aurora.cpp:123`), so it is 1 in practice — but that is a default, not a
+guarantee, and if the game ever exposes the setting, turning it on silently kills every normal
+consumer. VBAO and SMAA therefore **name MSAA in their log line** when the sample count is >1
+rather than blaming the renderer; see `kNormalLatchGraceFrames` in either mod.
 
 Why it matters: a depth-gradient normal is a cross product of screen-space position deltas, i.e.
 the flat face normal of each rasterized triangle — faceting is inherent to the method. Authored
@@ -44,22 +65,29 @@ it away afterwards. See `dusklight-ao/docs/thin-gbuffer-normals.md` for the rend
 
 ## 0. State of play (read first)
 
-**Platform:** `DUSKLIGHT_VERSION = 5ded001`, `DUSKLIGHT_REPOSITORY` → `automata-rtx/dusklight-ao`,
-`DUSKLIGHT_SDK_STUB_URL` → `platform-normals-test`. The user must run the `win32-msvc-x86_64` build
-from that release; game build and `.dusk` files are always a matched pair, in both directions (see
-§6 for rollback). **Then turn on Video → Rendering → Scene Normal Buffer and restart** — nothing in
-this document is observable until that is done.
+**Platform: UPSTREAM.** `DUSKLIGHT_VERSION = c83ce89` (2026-09-18) in `TwilitRealm/dusklight` —
+**GameService 2.0 / GfxService 1.3**, over upstream aurora `34dadd3c`, which carries the normal
+attachment itself. No `DUSKLIGHT_SDK_STUB_URL` override: upstream's stub release is
+version-independent and the SDK defaults to it. Game build and `.dusk` files are still always a
+matched pair, in both directions (see §6). **There is nothing to switch on** — the buffer appears
+the frame after a mod first asks for it (see the header).
 
-That pin is upstream `c880d46f` plus **GfxService 1.3**, over aurora `cf3ffc9` plus the normal
-attachment. Note the release tag `platform-normals-test` is republished on every push to the
-platform branch, so the *URL* is stable while its assets are not.
+**The fork is retired, and upstream's normal API is a DIFFERENT SHAPE than the one this document
+was originally written against.** Same service version, three differences that matter:
 
-**The fork delta is now two fields wide.** Upstream shipped its own scene-target-layout API in
-#2305 (GfxService 1.2 — `GfxRenderTargetLayout`, `get_scene_target_layout`,
-`gfx_init_color_target_states`, `GfxDrawContext::layout`, and the `GfxAttachmentSemantic` tags), so
-the hand-rolled `GfxPassTargets` vocabulary our fork used to carry was **deleted rather than
-merged**. What remains fork-local is 1.3's `GfxResolveDesc::normal` → `GfxResolvedTargets::normal`.
-`GfxDeviceInfo::normal_format` is gone entirely — see §7.
+| | fork (retired) | upstream (now) |
+|---|---|---|
+| how a mod asks | `svc_gfx->get_scene_normals(ctx, &GfxSceneNormals)` — its own vtable call | `GfxResolveDesc::normal` → `GfxResolvedTargets::normal`, through `resolve_pass` |
+| when it snapshots | host-side every frame, whether or not anyone asked | on demand, and it **latches**: first ask enables it for the *next* frame |
+| `sizeof(GfxResolveDesc)` | **unchanged** — a `bool` in the struct's tail padding | **8 → 12** — a `uint32_t` appended, *"not a bool to avoid using the previous padding"* |
+
+**`get_scene_normals` does not exist upstream** — the vtable ends at `get_scene_target_layout`. And
+the size growth means the incompatibility is **silent**: the host reads
+`desc->struct_size >= sizeof(GfxResolveDesc) ? desc->normal : 0`, so a fork-built mod simply gets no
+normals and disables itself. Rebuild every normal consumer against the current pin.
+
+The rest of §0's history below predates this move; the *reasoning* in §2–§8 is unaffected, because
+none of it depends on how the snapshot is requested.
 
 ### What landed, in order
 
@@ -84,7 +112,8 @@ merged**. What remains fork-local is 1.3's `GfxResolveDesc::normal` → `GfxReso
 | `ca6b73a` | **Every camera-facing flip on an authored normal deleted** — provider (was 0.5) and VBAO/SSILVB (were −0.15). Re-pinned to the rebased platform, which also drops aurora's enlarged streaming buffers — harmless, upstream had already raised its own (§2a). |
 | `3cbab91`–`8cc46b9` | AO occlusion hemisphere built from geometry, not the shading normal; the rejection plane made a 4-tap ±1 in both mods (§8.11, §8.11a). |
 | `b426c4d` | Shadow map and `n·L` terms combined by multiplying visibilities instead of `max` — fixes the terminator glint (§8.12). |
-| *(this change)* | Re-pinned to **GfxService 1.3** on rebased upstream. Our scene-layout fork deleted in favour of upstream's; `normal_format` accessor removed; `has_normal_attachment` is the new "does this build have authored normals" (§5, §7). |
+| `(earlier)` | Re-pinned to the fork's **GfxService 1.3**. Our scene-layout fork deleted in favour of upstream's; `normal_format` accessor removed; `has_normal_attachment` is the new "does this build have authored normals" (§5, §7). |
+| *(this change)* | **Re-platformed onto UPSTREAM Dusklight 2.0** (`c83ce89`), which ships its own GfxService 1.3 normal snapshot — a *different shape* from the fork's, and binary-incompatible with it (§0, §7). The fork is retired and both fork knobs are gone from `CMakeLists.txt`. VBAO and SMAA ported to the resolve pair, given lazy `layout.key`-keyed pipelines for the latch, and taught to name MSAA as the blocker it usually is. Build scoped to those two mods; the other five await porting or hook re-verification. |
 
 ### Confirmed in-game by the user
 
@@ -116,18 +145,21 @@ merged**. What remains fork-local is 1.3's `GfxResolveDesc::normal` → `GfxReso
    acne control since Normal Smoothing is gone. Needs a screenshot-driven pass, not guessed values.
 2. If flat sunlit ground shows acne, `rpdb_max` (currently `0.02`) is the knob; the fractional cap
    `kMaxFractionalBias` (`0.001`) is deliberately tight.
-3. MSAA handling if MSAA is ever enabled (§8.5). *(Normal-target precision is done — the buffer is
+3. ~~MSAA handling if MSAA is ever enabled~~ — **closed, and not by us.** Upstream makes MSAA and
+   the normal buffer mutually exclusive: with `msaaSamples != 1` the buffer is never created, so
+   there is no resolve to handle. All that remained was to stop *blaming the renderer* when MSAA is
+   the reason a consumer sees no normals, which VBAO and SMAA now do. See §8.5. *(Normal-target precision is done — the buffer is
    `RGB10A2Unorm`, ten bits per axis, so the RGBA8 banding this item was raised against cannot
    occur.)*
-4. **Everything in §0 "Confirmed in-game" was confirmed on the retired `platform-gbuffer-test`
-   platform**, whose buffer was RGBA8 and whose renderer was a different fork. The findings should
-   carry — the encoding, coverage rule and basis are the same — but the first run on
-   `platform-normals-test` is a re-confirmation, not a regression check. Start with Coverage (is it
-   still green everywhere?) and Difference (§2), in that order.
-5. **SMAA's `Normal Threshold` default (10%) was tuned against faceted normals**, where a low value
-   lights up every facet boundary on curved low-poly geometry. With authored normals those interior
-   steps are gone, so lower values should now be usable and catch real creases this default misses.
-   Worth a screenshot pass; the control is live, so no rebuild is needed to explore it.
+4. **Everything in §0 "Confirmed in-game" was confirmed on a retired fork platform** — first
+   `platform-gbuffer-test` (RGBA8), then `platform-normals-test` (RGB10A2). The findings should
+   carry, since the encoding, coverage rule and basis are unchanged in upstream's version, but the
+   first run on **upstream** is a re-confirmation, not a regression check. What is genuinely new
+   upstream is the **latch** and the consequent pipeline rebuild (§7), so watch for a composite that
+   never appears rather than one that appears wrong.
+5. ~~**SMAA's `Normal Threshold` default (10%) was tuned against faceted normals**~~ — **done.**
+   The default is now **5%** (~18°) precisely because authored normals have no interior facet steps
+   to mask. The control is still live, so further exploration needs no rebuild.
 
 ### Debug views — which question each answers
 
@@ -147,8 +179,8 @@ exist in any build (see the naming note at the top). The shadow-mod rows are cur
 
 > **This whole section describes the retired provider mod's UI and does not exist in any current
 > build.** There is no "Use Authored Normals" toggle and no reconstruction path to switch to: each
-> mod calls `get_scene_normals` and, where the platform has no normal buffer, disables its
-> normal-driven half instead. Kept because the *questions* it lists are still the right ones to ask
+> mod asks for the normals in its own `resolve_pass` and, where the platform has no normal buffer,
+> disables its normal-driven half instead. Kept because the *questions* it lists are still the right ones to ask
 > when A/B-ing a normals change, and because it records what the A/B showed.
 
 Everything below was live at runtime — no rebuild, no restart, no game-build swap.
@@ -270,17 +302,22 @@ should be seamless, not a visible seam.
 
 ## 4. Verification order
 
-1. **Prereq.** Install the `platform-normals-test` game build **and** fresh `.dusk` files as a
-   matched pair. Start with **Video → Rendering → Scene Normal Buffer OFF** — the shipping default.
-   Everything must look exactly as it did before and the log must be clean; Graphics Hub's status
-   line should tell you to turn the buffer on. This step alone confirms the re-platform, since the
-   symptom it replaces was mods failing to load outright.
-2. **Buffer on.** Turn on the Video setting, **restart**, and confirm "Use Authored Normals" is no
-   longer greyed out. Leave it **off** for one more pass: everything must still look unchanged. Any
-   missing or corrupted composite *here* — with the pass now carrying two attachments — means a mod
-   pipeline is not following `gfx_compat::scene_pass_layout` (see §5). This is the step that catches it.
-3. **Basis.** Turn the toggle on, Show Normals on, Debug View = Difference. Expect dark with bright
-   creases; see §2 if not.
+> **Steps 1–3 describe the fork's Video-setting A/B and are HISTORICAL.** Upstream has no such
+> setting: the buffer turns itself on the frame after a mod asks, and there is no way to take it
+> away short of changing platform. The upstream equivalent of step 1–2 is below.
+
+1. **Prereq.** Install the pinned upstream game build **and** fresh `.dusk` files as a matched pair.
+   Mods failing to load outright is the symptom of getting this wrong — the GameService 2.0 major
+   bump refuses mismatched builds before any of this is observable.
+2. **First frames.** Load a scene and watch the log. Nothing should warn about missing normals: the
+   first resolve legitimately returns null and both mods wait out `kNormalLatchGraceFrames` before
+   saying anything. A warning here means either MSAA is on or the renderer has no core features —
+   the message says which.
+   **Then check the composites are still drawing.** This is the step that catches a pipeline built
+   against the one-attachment pass and not rebuilt when the normal attachment latched on (§5, §7);
+   the failure is silent in-game and looks like the mod doing nothing.
+3. **Basis.** *(Historical — needs the retired provider's Difference view.)* Expect dark with bright
+   creases; see §2 for how to read it if an equivalent view is ever rebuilt.
 4. **Coverage.** Debug View = Coverage. Confirm the fallback regions are the expected ones.
 5. **The payoff.** Overlay off, VBAO/SSILVB on a low-poly rock face or a character: the faceting
    the reconstruction produced should be gone, with no blur pass involved.
@@ -416,40 +453,50 @@ current pass.
 
 ## 6. Platform pin and rollback
 
-`CMakeLists.txt` pins `DUSKLIGHT_VERSION = 5ded001…` (tip of
-`claude/dusklight-thin-gbuffer-normals-l4l9dc` in `dusklight-ao`), `DUSKLIGHT_REPOSITORY` at that
-fork and `DUSKLIGHT_SDK_STUB_URL` at the `platform-normals-test` release. The base game code is
-upstream Dusklight `c880d46f`; the renderer change and the SDK header additions sit on top of it.
+`CMakeLists.txt` pins `DUSKLIGHT_VERSION = c83ce89…` at **upstream `TwilitRealm/dusklight`**. There
+is no `DUSKLIGHT_SDK_STUB_URL` and no `DUSKLIGHT_AURORA_VERSION`; both were fork knobs and both are
+gone. `cmake/FetchDusklight.cmake` is the stock template's, byte for byte.
 
-**Rolling back to upstream is not free any more.** The base carries an upstream **game-service
-major-version bump**, so a mod built against the older `0fc05028` SDK is refused by this host and a
-mod built against this SDK is refused by that one. Rollback therefore means moving the pin *and*
-rebuilding *and* installing the matching game build — the same matched-pair rule as always, but with
-no overlap window where one set of `.dusk` files works on both. No **source** change is needed
-either way: every authored-normal path degrades through `common/gfx_normal_compat.h`, and the
-"is there a normal buffer" question is answered by the scene layout's semantic tags, which simply
-list no `GFX_ATTACHMENT_NORMAL` on a base without one.
+**Moving off this pin in either direction is a matched-pair operation.** The base carries the
+**GameService 2.0** major bump, so a mod built against a 1.x SDK is refused by this host and a mod
+built against this SDK is refused by a 1.x one. Changing platform means moving the pin *and*
+rebuilding *and* installing the matching game build, with no overlap window where one set of `.dusk`
+files works on both. No **source** change is needed either way: every authored-normal path goes
+through `common/gfx_normal_compat.h` (which detects the two fields by member name) and the "is there
+a normal buffer" question is answered by the scene layout's semantic tags, which simply list no
+`GFX_ATTACHMENT_NORMAL` on a base without one.
 
-Note also that turning the buffer off in Video settings is a much cheaper A/B than rolling the
-platform back, and it is the one to reach for first when deciding whether authored normals are the
-cause of something.
+**The cheap A/B is per-mod, not per-platform.** The fork had a Video setting for the buffer;
+upstream does not (see the header), so to decide whether authored normals are the cause of
+something, turn the *consumer* off — SMAA's `useNormalEdges`, or VBAO entirely — rather than trying
+to take the buffer away.
 
 ## 7. API surface used
 
-Two groups, and the distinction matters when re-platforming: **upstream** (GfxService 1.2, present
-on any current base) and **fork-local** (GfxService 1.3, the entire remaining delta).
+**All of it is upstream now** — GfxService 1.2 for the layout, 1.3 for the snapshot. Nothing here
+is fork-local any more.
 
 ```c
-/* upstream 1.2 — scene pass layout, for building pipelines */
+/* 1.2 — scene pass layout, for building pipelines */
 GfxService::get_scene_target_layout   /* -> GfxRenderTargetLayout */
 GfxRenderTargetLayout::color_attachments[i].semantic   /* GFX_ATTACHMENT_NORMAL lives here */
+GfxRenderTargetLayout::key            /* CHANGES when the pass shape does — rebuild on it */
 gfx_init_color_target_states          /* inline SDK helper; write-masks off what you don't own */
-GfxDrawContext::layout                /* the same layout, inside a draw callback */
+GfxDrawContext::layout                /* the live layout, inside a draw callback */
 
-/* fork-local 1.3 — the normal snapshot */
-GfxResolveDesc::normal                /* request the per-frame normal snapshot */
+/* 1.3 — the normal snapshot */
+GfxResolveDesc::normal                /* uint32_t 0/1; request the per-frame normal snapshot */
 GfxResolvedTargets::normal            /* single-sample snapshot, frame-valid, may be NULL */
 ```
+
+**`layout.key` is not decoration.** Because the attachment latches on at runtime, the scene pass a
+mod saw during `mod_initialize` is a *one*-target pass and the one it is recorded into a frame later
+is a *two*-target pass. WebGPU rejects any pipeline whose target count disagrees with the pass, and
+the rejection is silent in-game — the composite just stops appearing. Build scene-pass pipelines
+lazily and rebuild them when the key changes: `gfx_compat::scene_pass_layout_for_draw()` and
+`gfx_compat::scene_pass_layout_key()`, used by `ensure_composite_pipelines()` in `mods/vbao` and
+`ensure_neighborhood_pipeline()` in `mods/smaa`. Upstream's own `mods/ao_mod` does the same thing
+under the name `ensure_pipelines(ctx->layout)`, and it is the reference to copy.
 
 **To ask whether this build has authored normals, scan the layout for a `GFX_ATTACHMENT_NORMAL`
 semantic** — `gfx_compat::ScenePassLayout::has_normal_attachment` does exactly that. There is no
@@ -458,12 +505,14 @@ silent failure: an offset collision with upstream's `WGPUInstance`, and a per-dr
 compared a compile-time-absent field against a live value and disabled every composite. See
 `docs/normal_buffer_portability.md` §2.1.
 
-`GfxResolveDesc::normal` is the one field `struct_size` cannot police: it landed in the struct's
-existing tail padding, so `sizeof(GfxResolveDesc)` is **unchanged** between 1.2 and 1.3 and the flag
-is invisible to the usual check. The host therefore honours it only for callers that also pass a
-1.3-sized `GfxResolvedTargets` to receive the view in — so a 1.2 mod's uninitialised padding can
-never request a snapshot it has nowhere to put. Initialising both from their `GFX_*_INIT` macros, as
-the provider does, satisfies that automatically.
+**`GfxResolveDesc::normal` is `struct_size`-policed, and that is the opposite of what our fork
+did.** Upstream *appended* it as a `uint32_t` — its comment says "not a bool to avoid using the
+previous padding" — so `sizeof(GfxResolveDesc)` grows 8 → 12 and the host can simply check
+`desc->struct_size >= sizeof(GfxResolveDesc)` before reading the flag. Our fork instead hid a `bool`
+in the existing tail padding so `sizeof` was unchanged, and gated the request on the *reply* struct
+being 1.3-sized. Both are sound; they are not interchangeable, and a mod built against one gets no
+normals on the other **without any error**. Initialise both structs from their `GFX_*_INIT` macros
+and the current rule is satisfied automatically.
 
 Snapshot contents: `rgb` = `normalize(mv_nrm) * 0.5 + 0.5`, the **view-space** authored normal;
 `a` = 1.0 when the draw supplied a normal attribute, 0.0 otherwise. Ten bits per axis, which is what
@@ -590,13 +639,22 @@ is indoors that early; a mod stage hook does, on the first frame the window appe
 **A fault address under ~0x100 is a null dereference at that struct offset.** Match it against the
 header's field offsets to identify the object immediately.
 
-### 8.5 MSAA is OFF — do not build theories on it
+### 8.5 MSAA is OFF — do not build theories on it (and if it were ON there would be no buffer)
 
 A silhouette rim artifact was attributed to hardware MSAA resolve averaging normals. **Wrong.**
-Dusklight never assigns `AuroraConfig::msaa`, and `aurora-ao/lib/aurora.cpp:116` defaults `0` → `1`.
-`g_normalBufferResolved` is therefore never created. The length-based rejection added for it
-(`reconstruct.wgsl`, threshold 0.92) is **inert** and kept only as a cheap robustness guard should
-MSAA ever be enabled.
+Dusklight never assigns `AuroraConfig::msaa`, and aurora defaults `0` → `1`
+(`lib/aurora.cpp:123-124` on the current pin). No resolved normal texture is ever created. The
+length-based rejection added for it lived in the retired provider's `reconstruct.wgsl` and went with
+it.
+
+**Since the move to upstream this is stronger than "MSAA happens to be off".** Aurora will not
+create the normal buffer at all unless `msaaSamples == 1`, and `resolve_pass` does not even record
+the request otherwise (`lib/webgpu/gpu.cpp` `enable_normal_buffer()`, `lib/gfx/recording.cpp`). So
+MSAA and authored normals are mutually exclusive by construction: the moment MSAA is on there is no
+normal texture to average. A normal-resolve artifact is therefore not merely unlikely — it is
+unreachable. What MSAA *can* do is make a normal consumer look broken, which is why VBAO and SMAA
+name it explicitly in their log line rather than blaming the renderer (see the header's blocker
+table).
 
 The distinguishing evidence was the user's: the artifact's **extent changed with camera position and
 aim**. An MSAA resolve artifact would be a fixed ~1px rim. A view-dependent band is the signature of
@@ -958,18 +1016,29 @@ cascade replays are running on stock sizes again; see CLAUDE.md's ABI pin.
 
 ### 9.5 The plan: upstream the delta, then move the pin
 
-**This is the intended endgame, not a hypothetical.** We run our own fork today because it is the
-only build that provides authored normals; the plan is to offer the change upstream and, once a
-compatible equivalent lands there, move `DUSKLIGHT_VERSION` to upstream and stop carrying a fork at
-all. (This document is ours and is not part of that PR — what gets offered upstream is the platform
-change, not these notes.)
+> **DONE — and not by us.** This section is kept because the *prediction* it made is worth
+> checking against what happened. Upstream shipped its own equivalent (GfxService 1.3's resolve
+> pair, plus the attachment in upstream aurora), `DUSKLIGHT_VERSION` moved to
+> `TwilitRealm/dusklight`, and the fork is retired. Two halves of the prediction to grade:
+>
+> - **"Moving costs one line" — RIGHT about the shims, WRONG about the total.** The pin bump really
+>   was free: `gfx_normal_compat.h` detects by member name, so it never noticed that upstream's
+>   `normal` is an appended `uint32_t` where ours was a `bool` in tail padding, and
+>   `gfx_scene_pass.h` reads the live layout either way. But upstream's snapshot **latches**, and no
+>   compile-time shim can absorb a runtime behaviour change: every scene-pass pipeline had to become
+>   lazy and keyed on `layout.key`. **That is the lesson to carry forward** — a compatibility layer
+>   protects you from a changed *declaration*, not from changed *behaviour*.
+> - **"A compatible equivalent lands there" — yes, but not a merge of ours.** Upstream solved the
+>   same problem a different way, and the two are binary-incompatible in the silent direction (§0).
+>   Do not assume a future upstream feature that matches ours by name matches it by shape.
 
-**Moving costs one line when it happens.** `common/gfx_normal_compat.h` detects the resolve fields
-by member name and `common/gfx_scene_pass.h` reads the real scene layout, so no mod source changes
-whichever base supplies them — that is exactly what those two shims are for, and it has already been
-exercised in both directions (`docs/normal_buffer_portability.md` §4).
+**The original plan, as written:** we ran our own fork because it was the only build that provided
+authored normals; the plan was to offer the change upstream and, once a compatible equivalent landed
+there, move `DUSKLIGHT_VERSION` to upstream and stop carrying a fork at all. (This document is ours
+and was never part of that PR — what would have been offered upstream is the platform change, not
+these notes.)
 
-The change is small, additive, off by default, and useful to any aurora consumer:
+The change was small, additive, off by default, and useful to any aurora consumer:
 
 - **aurora** (`encounter/aurora`): `AuroraConfig::enableNormalBuffer` → optional second colour target
   + the `@location(1)` write. Documented end to end in `dusklight/docs/thin-gbuffer-normals.md`.
@@ -987,7 +1056,9 @@ Checked while investigating; relevant whenever we re-platform.
 
 *(Hashes in the two bullets below are from the ORIGINAL investigation, against base `76b56cd8` and
 upstream HEAD `4504e5009`. They are kept because the lessons are live; the platform has since moved
-to `5ded001` — upstream `c880d46f` plus GfxService 1.3 — so do not treat them as current pins.)*
+all the way to **upstream `c83ce89`** — so do not treat any hash here as a current pin. "Drift since
+our base" is also a question that no longer has a fork in it: we ARE on upstream now, and the
+equivalent question at each re-platform is just "read the new SDK header".)*
 
 - **The ABI collision that ended the first fork — and what NOT to do about it now.** Upstream
   appended `WGPUInstance instance; WGPUAdapter adapter;` to `GfxDeviceInfo`, in the same slot where
@@ -997,11 +1068,16 @@ to `5ded001` — upstream `c880d46f` plus GfxService 1.3 — so do not treat the
   **Do NOT resolve this by re-appending `normal_format` after upstream's fields.** An earlier
   revision of this section said exactly that, and it is the wrong lesson: the field is now **gone in
   every form**, and nothing should bring it back. Presence of the buffer is detected by finding a
-  `GFX_ATTACHMENT_NORMAL` semantic in `get_scene_target_layout` — see §7. The one surviving
-  fork-local pair (`GfxResolveDesc::normal` → `GfxResolvedTargets::normal`) is safe because `normal`
-  occupies `GfxResolveDesc`'s existing **tail padding**, so `sizeof` is unchanged, and the host
-  honours it only when `GfxResolvedTargets` is large enough to carry the result back. Copy *that*
-  pattern if the fork ever needs a third field; do not append to `GfxDeviceInfo`.
+  `GFX_ATTACHMENT_NORMAL` semantic in `get_scene_target_layout` — see §7.
+
+  **Upstream's own answer to the same problem is different from the fork's, and is now the one that
+  matters.** The fork tucked `normal` into `GfxResolveDesc`'s existing **tail padding** so `sizeof`
+  was unchanged, and gated the request on `GfxResolvedTargets` being large enough to carry the
+  result back. Upstream instead *appended* a `uint32_t` — "not a bool to avoid using the previous
+  padding" — growing `sizeof(GfxResolveDesc)` 8 → 12 so an ordinary `struct_size` check polices it.
+  Both are sound; they are not interchangeable, and a mod built against one silently gets no normals
+  on the other. If a struct ever needs extending again, upstream's is the pattern to follow — and
+  still do not append to `GfxDeviceInfo`, which is the struct that collided.
 - **SDK source renames that touch our three game-linked mods** (`7305ef09b`):
   `mods/hook.hpp` → `mods/svc/hook.hpp`, and `mods::hook_add_pre/add_post/replace(svc_hook, fn)` →
   `mods::hook::add_pre/add_post/replace(fn)` (the service argument is now an optional overload).

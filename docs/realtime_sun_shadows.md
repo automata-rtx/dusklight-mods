@@ -506,11 +506,14 @@ its old advice was actively wrong once the platform changed.
 
 **1. Faceted normals — conditional, not inherent.** The old text said "this platform has no
 authored surface normals". That was true of the upstream base the tree briefly retreated to, and is
-**not** true now: the platform is `automata-rtx/dusklight-ao` with GfxService 1.3, which hands
-every mod the game's own authored vertex normals. Faceting therefore only appears on the
-**reconstruction fallback** — when the user has not turned on *Video → Rendering → Scene Normal
-Buffer*, in compatibility mode (D3D11 / OpenGL ES), or per pixel where a draw supplied no normal.
-That is expected there, not a defect.
+**not** true now: the platform is **upstream `TwilitRealm/dusklight`** with GfxService 1.3, which
+hands every mod the game's own authored vertex normals through `GfxResolveDesc::normal` →
+`GfxResolvedTargets::normal`. (Earlier revisions named the `automata-rtx/dusklight-ao` fork here;
+upstream shipped the feature itself and the fork is retired.) Faceting therefore only appears on the
+**reconstruction fallback** — with MSAA on, in compatibility mode (D3D11 / OpenGL ES), or per pixel
+where a draw supplied no normal. That is expected there, not a defect.
+**There is no longer a Video setting to blame**: the fork gated the buffer on
+*Video → Rendering → Scene Normal Buffer*, and upstream creates it on demand instead.
 
 > **Do not "fix" it by reintroducing `normalSmooth`.** The old route 1 suggested exactly that, with
 > a caveat about smoothing only `n` and not `n_geom`. The pass is deleted and stays deleted: it

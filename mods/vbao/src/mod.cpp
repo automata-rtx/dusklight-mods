@@ -11,13 +11,13 @@
 //    disabled the spatial denoiser alone remains as the single-frame fallback;
 //  - a depth-aware composite upscale (no AO bleed across silhouettes at half resolution);
 //  - thickness and contrast controls, and a depth-proportional sampling radius;
-//  - AUTHORED NORMALS: the shading normal comes from GfxService's per-frame scene normal snapshot
-//    (get_scene_normals), i.e. the vertex normal the artist authored, so the occlusion hemisphere
-//    follows smooth curvature instead of the flat per-triangle facets a depth gradient returns by
-//    construction. No reconstructed SHADING normal remains (the depth-derived geometric plane
-//    that rejects below-surface samples is a different thing and stays). It needs a core-features
-//    device: the D3D11 and OpenGL ES backends cannot carry the attachment, and VBAO disables
-//    itself there with a one-time log line.
+//  - AUTHORED NORMALS: the shading normal is the game's own view-space vertex normal, resolved
+//    alongside depth (GfxResolveDesc::normal -> GfxResolvedTargets::normal), so the occlusion
+//    hemisphere follows smooth curvature instead of the flat per-triangle facets a depth gradient
+//    returns by construction. No reconstructed SHADING normal remains (the depth-derived geometric
+//    plane that rejects below-surface samples is a different thing and stays). It needs a
+//    core-features device: the D3D11 and OpenGL ES backends cannot carry the attachment, and VBAO
+//    disables itself there with a one-time log line.
 //
 // The framework WGSL in res/ derives from Bevy Engine's SSAO (MIT OR Apache-2.0) and Intel
 // XeGTAO (MIT); see res/licenses/ and the headers of each shader.
@@ -28,6 +28,7 @@
 #include "mods/svc/config.h"
 #include "mods/svc/gfx.h"
 
+#include "gfx_normal_compat.h"
 #include "gfx_scene_pass.h"
 #include "mods/svc/log.h"
 #include "mods/svc/resource.h"
@@ -109,6 +110,9 @@ WGPUBindGroupLayout g_vbaoLayout = nullptr;
 WGPUBindGroupLayout g_denoiseLayout = nullptr;
 WGPUBindGroupLayout g_temporalLayout = nullptr;
 WGPURenderPipeline g_compositePipeline = nullptr;
+// Identity of the scene pass the composite pipelines were built for; see ensure_composite_pipelines.
+uint64_t g_sceneLayoutKey = 0;
+bool g_sceneLayoutValid = false;
 WGPURenderPipeline g_compositeDebugPipeline = nullptr;
 WGPUBindGroupLayout g_compositeLayout = nullptr;
 WGPUBindGroupLayout g_compositeDebugLayout = nullptr;
@@ -151,6 +155,37 @@ bool g_prevCameraValid = false;
 float g_prevProjFromWorld[16] = {};
 
 bool g_warnedNoInputs = false;
+
+// THE NORMAL SNAPSHOT LATCHES ON, so an early null means "not yet", not "never".
+//
+// Asking for normals through GfxResolveDesc::normal enables the attachment for the NEXT frame; the
+// resolve that first asks returns a null view. Upstream's own reference consumer says so and simply
+// returns (mods/ao_mod/src/mod.cpp, "The first request enables normals next frame; unsupported
+// devices keep returning null"). The retired fork API had no latch — the host snapshotted every
+// frame whether or not anyone asked — so this is new behaviour, and treating the first null as a
+// hard failure would fire the "device cannot do this" warning on every cold start and on every
+// return from a menu that tore the pass down.
+//
+// A device that genuinely cannot carry the attachment keeps returning null forever, and that is
+// worth one log line. So: count consecutive frames of asking-and-getting-null, and only warn once
+// the count is past the handful of frames the latch could plausibly take.
+//
+// TWO THINGS BLOCK THE LATCH PERMANENTLY, and the first is a SETTING, not a device limit:
+//
+//   MSAA on          aurora refuses to create the normal buffer unless msaaSamples == 1, and
+//                    resolve_pass does not even record the request in that case (see
+//                    aurora lib/webgpu/gpu.cpp enable_normal_buffer() and
+//                    lib/gfx/recording.cpp resolve_pass). So with MSAA enabled the view is null
+//                    forever on hardware that is otherwise perfectly capable.
+//   no core features the adapter lacks WebGPU's CoreFeaturesAndLimits (the compatibility
+//                    renderers), so the attachment cannot exist at all.
+//
+// The message must separate those: "your GPU can't" is wrong and unactionable when the real answer
+// is "turn MSAA off". GfxDeviceInfo::sample_count reports the live scene-pass sample count, so we
+// re-query it at warn time rather than trusting the copy cached at init - the user can change MSAA
+// mid-session.
+constexpr uint32_t kNormalLatchGraceFrames = 8;
+uint32_t g_normalWaitFrames = 0;
 bool g_loggedChain = false;
 float g_loggedFarPlane = 1.0f;  // last far plane reported to the log (world-unit calibration)
 std::atomic g_chainExecuted{false};
@@ -329,8 +364,8 @@ bool build_compute_pipeline(const char* label, const ResourceBuffer& source, con
     return outLayout != nullptr;
 }
 
-bool build_composite_pipeline(
-    bool blend, WGPURenderPipeline& outPipeline, WGPUBindGroupLayout& outLayout) {
+bool build_composite_pipeline(const gfx_compat::ScenePassLayout& sceneLayout, bool blend,
+    WGPURenderPipeline& outPipeline, WGPUBindGroupLayout& outLayout) {
     WGPUShaderModule module = create_shader_module("Enhanced AO composite", g_compositeSource);
     if (module == nullptr) {
         return false;
@@ -354,15 +389,11 @@ bool build_composite_pipeline(
     // The pipeline has to describe the scene pass's attachments, whatever they currently are. On a
     // device that carries the scene normals the pass has a SECOND, renderer-owned colour target,
     // and a one-target pipeline is rejected outright; on the compatibility renderers it has one.
-    // Asking the service beats rebuilding the layout from GfxDeviceInfo, which is a copy of the
-    // renderer's logic that goes silently wrong whenever the pass changes shape. Every target the
-    // mod does not own comes back write-masked off, so this composite writes scene colour only and
-    // leaves the game's normals untouched.
-    gfx_compat::ScenePassLayout layout;
-    if (!gfx_compat::scene_pass_layout(mod_ctx, svc_gfx, g_deviceInfo, layout)) {
-        wgpuShaderModuleRelease(module);
-        return false;
-    }
+    // The layout is handed in from the DRAW CONTEXT rather than queried here, because the pass can
+    // change shape mid-run — see ensure_composite_pipelines. Every target the mod does not own
+    // comes back write-masked off, so this composite writes scene colour only and leaves the game's
+    // normals untouched.
+    gfx_compat::ScenePassLayout layout = sceneLayout;
     if (blend) {
         layout.color_targets[0].blend = &blendState;
     }
@@ -698,10 +729,69 @@ void on_compute(
     g_chainExecuted.store(true, std::memory_order_release);
 }
 
+void release_composite_pipelines() {
+    for (auto* pipeline : {&g_compositePipeline, &g_compositeDebugPipeline}) {
+        if (*pipeline != nullptr) {
+            wgpuRenderPipelineRelease(*pipeline);
+            *pipeline = nullptr;
+        }
+    }
+    for (auto* layout : {&g_compositeLayout, &g_compositeDebugLayout}) {
+        if (*layout != nullptr) {
+            wgpuBindGroupLayoutRelease(*layout);
+            *layout = nullptr;
+        }
+    }
+    g_sceneLayoutKey = 0;
+    g_sceneLayoutValid = false;
+}
+
+// THE SCENE PASS CHANGES SHAPE WHILE THE GAME RUNS, so the composite pipelines cannot be built once
+// at init and kept.
+//
+// Asking for the authored normals does not take effect immediately: the renderer notes the request
+// and turns the normal attachment on ONE FRAME LATER (aurora lib/gfx/recording.cpp — the request
+// sets a flag, and the following frame's pass creation honours it). From that frame on the scene
+// pass has a second colour attachment, and a pipeline built against the one-target layout is
+// rejected by WebGPU. Nothing logs; the composite simply stops appearing. This mod builds its
+// pipelines here instead, keyed on GfxDrawContext::layout.key, which is what the SDK header means
+// by "rebuild pipelines if GfxDrawContext.layout key changes" — and it is what upstream's own
+// reference consumer (mods/ao_mod) does, building no scene pipeline at init at all.
+//
+// The key only moves when the pass genuinely changes, so the steady state is one comparison per
+// draw. If a future stage ever records into a DIFFERENTLY shaped pass, this would rebuild twice a
+// frame rather than misbehave — visible as a framerate cliff, and the fix would be a small
+// per-key cache rather than a redesign.
+bool ensure_composite_pipelines(const GfxDrawContext& ctx) {
+    const uint64_t key = gfx_compat::scene_pass_layout_key(ctx);
+    if (g_sceneLayoutValid && key == g_sceneLayoutKey && g_compositePipeline != nullptr &&
+        g_compositeDebugPipeline != nullptr)
+    {
+        return true;
+    }
+    release_composite_pipelines();
+    gfx_compat::ScenePassLayout sceneLayout;
+    if (!gfx_compat::scene_pass_layout_for_draw(ctx, g_deviceInfo, sceneLayout)) {
+        return false;
+    }
+    if (!build_composite_pipeline(sceneLayout, true, g_compositePipeline, g_compositeLayout) ||
+        !build_composite_pipeline(
+            sceneLayout, false, g_compositeDebugPipeline, g_compositeDebugLayout))
+    {
+        release_composite_pipelines();
+        return false;
+    }
+    g_sceneLayoutKey = key;
+    g_sceneLayoutValid = true;
+    return true;
+}
+
 // Render worker thread: composite the AO over the scene (or show it, in debug view).
 void on_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
-    if (payloadSize != sizeof(CompositePayload)) {
+    if (payloadSize != sizeof(CompositePayload) || ctx == nullptr ||
+        !ensure_composite_pipelines(*ctx))
+    {
         return;
     }
     CompositePayload data;
@@ -766,22 +856,44 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
     resolveDesc.color = false;
     resolveDesc.depth = true;
+    // The game's authored view-space normals come back alongside depth from the same resolve.
+    // Both go through common/gfx_normal_compat.h rather than touching GfxResolveDesc::normal and
+    // GfxResolvedTargets::normal directly: the shim detects them by member name, so an SDK without
+    // them degrades to "this build has no normal buffer" instead of failing to compile.
+    gfx_compat::request_normal(resolveDesc, true);
     GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
-    // The scene normals are snapshotted by the HOST, once per frame, immediately after the opaque
-    // lists and before any SCENE_AFTER_OPAQUE hook runs - so by the time this stage callback is
-    // invoked the view is already there, and every mod that asks gets the same texture. Valid for
-    // this frame only. `view` is null on the compatibility renderers (D3D11 / OpenGL ES), which
-    // cannot carry the attachment at all.
-    GfxSceneNormals sceneNormals = GFX_SCENE_NORMALS_INIT;
-    svc_gfx->get_scene_normals(mod_ctx, &sceneNormals);
-    if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) != MOD_OK ||
-        resolved.depth == nullptr || sceneNormals.view == nullptr)
-    {
-        if (!g_warnedNoInputs) {
+    const bool resolveOk = svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) == MOD_OK;
+    const WGPUTextureView sceneNormalView =
+        resolveOk ? gfx_compat::resolved_normal(resolved) : nullptr;
+    if (!resolveOk || resolved.depth == nullptr || sceneNormalView == nullptr) {
+        // See kNormalLatchGraceFrames: the first frames after asking legitimately have no normal
+        // view, so only a run of them means the device cannot supply one.
+        if (resolveOk && resolved.depth != nullptr) {
+            ++g_normalWaitFrames;
+        }
+        if (!g_warnedNoInputs &&
+            (g_normalWaitFrames > kNormalLatchGraceFrames || !resolveOk ||
+                resolved.depth == nullptr))
+        {
             g_warnedNoInputs = true;
-            svc_log->warn(mod_ctx,
-                "scene depth or normals unavailable; AO disabled (the D3D11 and OpenGL ES "
-                "compatibility renderers cannot provide scene normals)");
+            GfxDeviceInfo live = GFX_DEVICE_INFO_INIT;
+            const uint32_t samples =
+                svc_gfx->get_device_info(mod_ctx, &live) == MOD_OK ? live.sample_count : 1u;
+            if (sceneNormalView == nullptr && resolveOk && resolved.depth != nullptr &&
+                samples > 1u)
+            {
+                char msg[192];
+                std::snprintf(msg, sizeof(msg),
+                    "scene normals unavailable; AO disabled. MSAA is on (%ux) and the scene normal "
+                    "buffer requires MSAA off - set antialiasing to none in the game's video "
+                    "settings.",
+                    samples);
+                svc_log->warn(mod_ctx, msg);
+            } else {
+                svc_log->warn(mod_ctx,
+                    "scene depth or normals unavailable; AO disabled (the D3D11 and OpenGL ES "
+                    "compatibility renderers cannot provide scene normals)");
+            }
         }
         // Invalidate the temporal state exactly as the disabled path does. On a device without
         // scene normals this branch is taken EVERY frame, so leaving a stale history and camera
@@ -791,6 +903,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         g_prevCameraValid = false;
         return;
     }
+    g_normalWaitFrames = 0;
 
     const bool halfRes = get_bool_option(g_cvarHalfRes, false);
     const uint32_t divisor = halfRes ? 2 : 1;
@@ -923,7 +1036,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     computePayload.fullSize = (resolved.width << 16) | resolved.height;
     computePayload.run_temporal = temporal ? 1u : 0u;
     computePayload.denoise_passes = denoisePasses;
-    computePayload.sceneNormal = sceneNormals.view;
+    computePayload.sceneNormal = sceneNormalView;
     if (svc_gfx->push_compute(mod_ctx, g_computeType, &computePayload, sizeof(computePayload)) !=
         MOD_OK)
     {
@@ -1306,11 +1419,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     {
         return mods::set_error(error, MOD_ERROR, "failed to create AO compute pipelines");
     }
-    if (!build_composite_pipeline(true, g_compositePipeline, g_compositeLayout) ||
-        !build_composite_pipeline(false, g_compositeDebugPipeline, g_compositeDebugLayout))
-    {
-        return mods::set_error(error, MOD_ERROR, "failed to create AO composite pipeline");
-    }
+    // The composite pipelines are deliberately NOT built here. They depend on the scene pass's
+    // attachment layout, which changes at runtime once this mod's own normal request takes effect,
+    // so they are built on first draw and rebuilt whenever the layout key moves — see
+    // ensure_composite_pipelines.
     if (!build_hilbert_lut()) {
         return mods::set_error(error, MOD_ERROR, "failed to create AO noise LUT");
     }
@@ -1392,16 +1504,9 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     releaseLayout(g_vbaoLayout);
     releaseLayout(g_denoiseLayout);
     releaseLayout(g_temporalLayout);
-    if (g_compositePipeline != nullptr) {
-        wgpuRenderPipelineRelease(g_compositePipeline);
-        g_compositePipeline = nullptr;
-    }
-    if (g_compositeDebugPipeline != nullptr) {
-        wgpuRenderPipelineRelease(g_compositeDebugPipeline);
-        g_compositeDebugPipeline = nullptr;
-    }
-    releaseLayout(g_compositeLayout);
-    releaseLayout(g_compositeDebugLayout);
+    // Also clears the cached scene-layout key, so a reload rebuilds against whatever shape the pass
+    // has then rather than trusting a key from the previous run.
+    release_composite_pipelines();
     if (g_hilbertLutView != nullptr) {
         wgpuTextureViewRelease(g_hilbertLutView);
         g_hilbertLutView = nullptr;
@@ -1427,6 +1532,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_historyWriteIndex = 0;
     g_historyValid = false;
     g_prevCameraValid = false;
+    g_normalWaitFrames = 0;
+    g_warnedNoInputs = false;
     g_loggedFarPlane = 1.0f;
     return MOD_OK;
 }

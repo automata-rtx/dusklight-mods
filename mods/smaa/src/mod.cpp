@@ -21,6 +21,7 @@
 #include "mods/svc/config.h"
 #include "mods/svc/gfx.h"
 
+#include "gfx_normal_compat.h"
 #include "gfx_scene_pass.h"
 #include "mods/svc/log.h"
 #include "mods/svc/resource.h"
@@ -29,6 +30,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <initializer_list>
 #include <type_traits>
@@ -42,7 +44,7 @@ IMPORT_SERVICE(ConfigService, svc_config);
 IMPORT_SERVICE(ResourceService, svc_resource);
 IMPORT_SERVICE(UiService, svc_ui);
 IMPORT_SERVICE(GfxService, svc_gfx);
-// No optional service imports: the scene normals come straight from GfxService (get_scene_normals),
+// No optional service imports: the scene normals are resolved alongside depth and colour,
 // so SMAA depends on no other mod. Where they are unavailable - the D3D11 and OpenGL ES
 // compatibility renderers cannot carry the attachment - geometric edge detection turns itself off
 // and SMAA runs on its luma detector alone, which is the reference SMAA behaviour.
@@ -71,6 +73,10 @@ ResourceBuffer g_neighborhoodSource = RESOURCE_BUFFER_INIT;
 GfxDeviceInfo g_deviceInfo = GFX_DEVICE_INFO_INIT;
 WGPUComputePipeline g_edgePipeline = nullptr;
 WGPUComputePipeline g_blendPipeline = nullptr;
+// Identity of the scene pass the neighborhood pipeline was built for; see
+// ensure_neighborhood_pipeline.
+uint64_t g_sceneLayoutKey = 0;
+bool g_sceneLayoutValid = false;
 WGPUBindGroupLayout g_edgeLayout = nullptr;
 WGPUBindGroupLayout g_blendLayout = nullptr;
 WGPURenderPipeline g_neighborhoodPipeline = nullptr;
@@ -80,6 +86,21 @@ WGPUSampler g_linearSampler = nullptr;
 std::atomic<bool> g_chainExecuted{false};
 bool g_loggedChain = false;
 bool g_warnedNoColor = false;
+
+// Geometric edges are optional here, so their absence is an INFO line, not a warning - but it does
+// need a line. Falling back to luma-only is invisible in-game except as "SMAA looks weaker than the
+// docs say", and the most likely cause is a setting the user can change: aurora refuses to create
+// the scene normal buffer unless msaaSamples == 1, and with MSAA on it never even records the
+// request (lib/webgpu/gpu.cpp enable_normal_buffer(), lib/gfx/recording.cpp resolve_pass). The
+// other cause is an adapter without WebGPU core features - the compatibility renderers - which the
+// user cannot do anything about. Say which.
+//
+// The count exists because the snapshot LATCHES: the first resolve that asks returns null and
+// enables normals for the next frame, so a handful of null frames on startup is normal and must not
+// be reported.
+constexpr uint32_t kNormalLatchGraceFrames = 8;
+uint32_t g_normalWaitFrames = 0;
+bool g_loggedNoNormals = false;
 
 // EdgesTex / BlendTex, recreated when the render size changes. Old sets are retired for a few
 // frames rather than freed immediately: a payload embedding their views may still be in flight on
@@ -189,7 +210,7 @@ bool build_compute_pipeline(const char* label, const ResourceBuffer& source, con
     return outLayout != nullptr;
 }
 
-bool build_neighborhood_pipeline() {
+bool build_neighborhood_pipeline(const gfx_compat::ScenePassLayout& sceneLayout) {
     WGPUShaderModule module = create_shader_module("SMAA neighborhood blend", g_neighborhoodSource);
     if (module == nullptr) {
         return false;
@@ -203,11 +224,11 @@ bool build_neighborhood_pipeline() {
     // SMAA rewrites edge pixels' colour, and stamping a blended normal over them would corrupt the
     // very silhouettes every other consumer relies on. (Target 0 stays an opaque replace; non-edge
     // pixels discard.)
-    gfx_compat::ScenePassLayout layout;
-    if (!gfx_compat::scene_pass_layout(mod_ctx, svc_gfx, g_deviceInfo, layout)) {
-        wgpuShaderModuleRelease(module);
-        return false;
-    }
+    //
+    // The layout is handed in from the DRAW CONTEXT, not queried here: the pass gains that second
+    // attachment one frame after this mod first asks for normals, and a pipeline built before then
+    // is silently rejected from that point on. See ensure_neighborhood_pipeline.
+    const gfx_compat::ScenePassLayout& layout = sceneLayout;
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = module;
     fragment.entryPoint = {"fs_main", WGPU_STRLEN};
@@ -381,9 +402,46 @@ void on_compute(
 }
 
 // Render worker: composite the antialiased edges into the live scene target.
+void release_neighborhood_pipeline() {
+    if (g_neighborhoodPipeline != nullptr) {
+        wgpuRenderPipelineRelease(g_neighborhoodPipeline);
+        g_neighborhoodPipeline = nullptr;
+    }
+    if (g_neighborhoodLayout != nullptr) {
+        wgpuBindGroupLayoutRelease(g_neighborhoodLayout);
+        g_neighborhoodLayout = nullptr;
+    }
+    g_sceneLayoutKey = 0;
+    g_sceneLayoutValid = false;
+}
+
+// See VBAO's ensure_composite_pipelines for the full story: asking for the authored normals turns
+// the scene pass's second colour attachment on ONE FRAME LATER, and a pipeline built against the
+// one-target layout is rejected from then on with nothing logged. Keyed rebuild, as the SDK header
+// and upstream's mods/ao_mod both do.
+bool ensure_neighborhood_pipeline(const GfxDrawContext& ctx) {
+    const uint64_t key = gfx_compat::scene_pass_layout_key(ctx);
+    if (g_sceneLayoutValid && key == g_sceneLayoutKey && g_neighborhoodPipeline != nullptr) {
+        return true;
+    }
+    release_neighborhood_pipeline();
+    gfx_compat::ScenePassLayout sceneLayout;
+    if (!gfx_compat::scene_pass_layout_for_draw(ctx, g_deviceInfo, sceneLayout) ||
+        !build_neighborhood_pipeline(sceneLayout))
+    {
+        release_neighborhood_pipeline();
+        return false;
+    }
+    g_sceneLayoutKey = key;
+    g_sceneLayoutValid = true;
+    return true;
+}
+
 void on_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
-    if (payloadSize != sizeof(DrawPayload)) {
+    if (payloadSize != sizeof(DrawPayload) || ctx == nullptr ||
+        !ensure_neighborhood_pipeline(*ctx))
+    {
         return;
     }
     DrawPayload data;
@@ -434,6 +492,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
     resolveDesc.color = true;
     resolveDesc.depth = true;
+    gfx_compat::request_normal(resolveDesc, true);
     GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
     if (svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) != MOD_OK ||
         resolved.color == nullptr) {
@@ -449,13 +508,35 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     }
 
     // Geometric edges need BOTH the scene normals (creases) and raw depth (silhouettes). The old
-    // provider packed depth into the normal texture's alpha; the service uses that alpha for
+    // provider packed depth into the normal texture's alpha; the buffer uses that alpha for
     // VALIDITY, so depth is resolved separately above. Either being absent just turns geometric
-    // edges off - SMAA still runs on its luma detector, which is the reference behaviour.
-    GfxSceneNormals sceneNormals = GFX_SCENE_NORMALS_INIT;
-    svc_gfx->get_scene_normals(mod_ctx, &sceneNormals);
-    const bool haveGeometry = sceneNormals.view != nullptr && resolved.depth != nullptr;
+    // edges off - SMAA still runs on its luma detector, which is the reference behaviour. That is
+    // also why the snapshot's LATCH needs no special handling here, unlike in VBAO: the first
+    // resolve that asks for normals returns null and enables them for the next frame, so SMAA
+    // spends those frames luma-only and then picks the normals up by itself.
+    const WGPUTextureView sceneNormalView = gfx_compat::resolved_normal(resolved);
+    const bool haveGeometry = sceneNormalView != nullptr && resolved.depth != nullptr;
     const bool useNormalEdges = haveGeometry && get_bool_option(g_cvarUseNormalEdges, true);
+    if (haveGeometry) {
+        g_normalWaitFrames = 0;
+    } else if (!g_loggedNoNormals && ++g_normalWaitFrames > kNormalLatchGraceFrames) {
+        g_loggedNoNormals = true;
+        GfxDeviceInfo live = GFX_DEVICE_INFO_INIT;
+        const uint32_t samples =
+            svc_gfx->get_device_info(mod_ctx, &live) == MOD_OK ? live.sample_count : 1u;
+        if (sceneNormalView == nullptr && samples > 1u) {
+            char msg[192];
+            std::snprintf(msg, sizeof(msg),
+                "geometric edge detection off: MSAA is on (%ux) and the scene normal buffer "
+                "requires MSAA off. SMAA is running on luma edges only.",
+                samples);
+            svc_log->info(mod_ctx, msg);
+        } else {
+            svc_log->info(mod_ctx,
+                "geometric edge detection off: this renderer provides no scene normals. SMAA is "
+                "running on luma edges only.");
+        }
+    }
 
     const auto scaled = [](ConfigVarHandle cvar, int64_t fallback, int64_t lo, int64_t hi,
                             float scale) {
@@ -490,7 +571,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     computePayload.sceneColor = resolved.color;
     // The edge shader samples bindings 1 and 5 only when flags bit 0 is set; stand in with the
     // colour snapshot (also a texture_2d<f32>) otherwise so the bind group is always complete.
-    computePayload.normal = useNormalEdges ? sceneNormals.view : resolved.color;
+    computePayload.normal = useNormalEdges ? sceneNormalView : resolved.color;
     computePayload.depth = useNormalEdges ? resolved.depth : resolved.color;
     computePayload.edges = g_targets.edgesView;
     computePayload.blend = g_targets.blendView;
@@ -722,9 +803,10 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
             "SMAA blend weights", g_blendSource, "blend_weights", g_blendPipeline, g_blendLayout)) {
         return mods::set_error(error, MOD_ERROR, "failed to create SMAA compute pipelines");
     }
-    if (!build_neighborhood_pipeline()) {
-        return mods::set_error(error, MOD_ERROR, "failed to create SMAA neighborhood pipeline");
-    }
+    // The neighborhood-blend pipeline is deliberately NOT built here: it depends on the scene
+    // pass's attachment layout, which changes at runtime once this mod's own normal request takes
+    // effect. It is built on first draw and rebuilt when the layout key moves — see
+    // ensure_neighborhood_pipeline.
 
     WGPUSamplerDescriptor samplerDesc = WGPU_SAMPLER_DESCRIPTOR_INIT;
     samplerDesc.label = {"SMAA linear clamp", WGPU_STRLEN};
@@ -802,14 +884,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
         wgpuBindGroupLayoutRelease(g_blendLayout);
         g_blendLayout = nullptr;
     }
-    if (g_neighborhoodPipeline != nullptr) {
-        wgpuRenderPipelineRelease(g_neighborhoodPipeline);
-        g_neighborhoodPipeline = nullptr;
-    }
-    if (g_neighborhoodLayout != nullptr) {
-        wgpuBindGroupLayoutRelease(g_neighborhoodLayout);
-        g_neighborhoodLayout = nullptr;
-    }
+    // Also clears the cached scene-layout key, so a reload rebuilds against the pass's shape then.
+    release_neighborhood_pipeline();
     if (g_linearSampler != nullptr) {
         wgpuSamplerRelease(g_linearSampler);
         g_linearSampler = nullptr;
@@ -823,6 +899,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_controlsWindow = 0;
     g_loggedChain = false;
     g_warnedNoColor = false;
+    g_normalWaitFrames = 0;
+    g_loggedNoNormals = false;
     g_chainExecuted.store(false, std::memory_order_release);
     return MOD_OK;
 }

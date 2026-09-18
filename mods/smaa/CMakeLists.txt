@@ -2,7 +2,8 @@
 # no game headers or hooks. The mod SDK is configured once by the top-level CMakeLists.
 #
 # Its geometric edge detector reads the game's authored surface normals straight from GfxService
-# (get_scene_normals), so it depends on no other mod.
+# (GfxResolveDesc::normal -> GfxResolvedTargets::normal, via common/gfx_normal_compat.h), so it
+# depends on no other mod.
 add_mod(smaa
     FEATURES webgpu
     SOURCES  src/mod.cpp

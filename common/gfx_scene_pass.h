@@ -14,17 +14,41 @@
 // already write-masked off. This header is a thin wrapper over those two so the call sites stay
 // short and identical across SDK versions.
 //
-// Usage at a pipeline build site (unchanged from the previous SDK):
+// THE SCENE PASS CHANGES SHAPE AT RUNTIME, SO READ THE LAYOUT FROM THE DRAW CONTEXT.
 //
-//     gfx_compat::ScenePassLayout layout;
-//     if (!gfx_compat::scene_pass_layout(mod_ctx, svc_gfx, g_deviceInfo, layout)) {
-//         return false;
+// The normal attachment is created on demand — the first `resolve_pass` that asks for normals adds
+// it to the pass from the NEXT frame on. A pipeline built during `mod_initialize` therefore
+// describes a one-attachment pass and stops matching the moment that happens, and WebGPU's
+// rejection is silent: the composite just never appears again. Build lazily inside the draw
+// callback and rebuild when the pass's key changes:
+//
+//     // in the draw callback, before recording anything
+//     if (!ensure_pipelines(*ctx)) { return; }
+//
+//     bool ensure_pipelines(const GfxDrawContext& ctx) {
+//         const uint64_t key = gfx_compat::scene_pass_layout_key(ctx);
+//         if (g_pipeline != nullptr && g_layoutValid && g_layoutKey == key) { return true; }
+//         release_pipelines();
+//         gfx_compat::ScenePassLayout layout;
+//         if (!gfx_compat::scene_pass_layout_for_draw(ctx, g_deviceInfo, layout)) { return false; }
+//         ...build from `layout` as below...
+//         g_layoutKey = key; g_layoutValid = true;
+//         return true;
 //     }
+//
+// Filling the descriptor is the same either way:
+//
 //     layout.color_targets[0].blend = &myBlendState;  // blend state is the caller's
 //     fragment.targetCount = layout.color_target_count;
 //     fragment.targets = layout.color_targets;
 //     depthStencil.format = layout.depth_format;
 //     pipelineDesc.multisample.count = layout.sample_count;
+//
+// `scene_pass_layout(mod_ctx, svc_gfx, g_deviceInfo, out)` asks the service the same question
+// outside a draw callback. It is correct for a one-shot inspection, and WRONG as the basis for a
+// pipeline you then cache — it answers for the pass as it is now, with no key to notice it change.
+// The mods still calling it that way (`ssilvb`, `realtime_sun_shadows`, `deferred_fog`) are out of
+// the build and must move to the draw-context form before they go back in.
 //
 // `color_targets[0]` is the scene colour (`GFX_SCENE_COLOR_ATTACHMENT_INDEX`) and is the only one
 // the caller may write; everything past it is renderer-owned and comes back write-masked, so a
@@ -96,9 +120,18 @@ struct ScenePassLayout {
     uint32_t color_target_count = 0;
     WGPUTextureFormat depth_format = WGPUTextureFormat_Undefined;
     uint32_t sample_count = 1;
-    /// True when the pass carries a `GFX_ATTACHMENT_NORMAL` attachment, i.e. this game build is
-    /// actually producing authored normals right now. Always false on a base without the feature
-    /// and while the user has the game's own Scene Normal Buffer setting switched off.
+    /// True when the pass carries a `GFX_ATTACHMENT_NORMAL` attachment, i.e. the renderer is
+    /// actually producing authored normals right now.
+    ///
+    /// This is a LIVE, CHANGING fact, not a property of the build. The attachment is created on
+    /// demand: it is false until some mod's `resolve_pass` first asks for normals, and true from
+    /// the following frame on. It stays false forever on a base without the feature, on an adapter
+    /// without WebGPU core features (the D3D11/OpenGL ES compatibility renderers), and whenever
+    /// MSAA is on -- aurora refuses to create the buffer unless `msaaSamples == 1`.
+    ///
+    /// Because it flips at runtime, a pipeline built while it was false does NOT match the pass
+    /// afterwards, and WebGPU rejects the draw silently. Build scene-pass pipelines lazily and
+    /// rebuild them when `scene_pass_layout_key()` changes.
     bool has_normal_attachment = false;
 };
 
@@ -147,6 +180,68 @@ inline bool scene_pass_layout(
     out.depth_format = info.depth_format;
     out.sample_count = info.sample_count;
     return true;
+#endif
+}
+
+/// Fills `out` from a layout the caller ALREADY HOLDS — `GfxDrawContext::layout`, inside a draw
+/// callback — rather than asking the service for it. Two reasons to prefer this in `on_draw`:
+///
+///  1. It is the layout of the pass this draw is actually being recorded into, which is the only
+///     one a pipeline has to match.
+///  2. **The scene pass can change shape while the game is running, and a pipeline built against
+///     the old shape is silently rejected.** Requesting the authored normals (GfxService 1.3)
+///     enables the normal attachment one frame later, so a mod that builds its scene-pass
+///     pipelines once at init — when the pass still has a single colour target — has every
+///     composite dropped from the moment its own first request takes effect. The SDK says as much:
+///     "rebuild pipelines if GfxDrawContext.layout key changes".
+///
+/// Pair it with `scene_pass_layout_key()` and rebuild when the key moves. Upstream's own reference
+/// consumer (`mods/ao_mod`) does exactly this and builds no scene pipeline at init at all.
+template <class DrawContext, class DeviceInfo>
+inline bool scene_pass_layout_for_draw(
+    const DrawContext& ctx, const DeviceInfo& info, ScenePassLayout& out) {
+    out = ScenePassLayout{};
+#if GFX_COMPAT_HAVE_SCENE_TARGET_LAYOUT
+    (void)info;
+    const GfxRenderTargetLayout& layout = ctx.layout;
+    if (layout.color_attachment_count == 0) {
+        return false;
+    }
+    out.color_target_count =
+        gfx_init_color_target_states(&layout, out.color_targets, nullptr, WGPUColorWriteMask_All);
+    if (out.color_target_count == 0) {
+        return false;
+    }
+    out.depth_format = layout.depth_stencil_format;
+    out.sample_count = layout.sample_count;
+    for (uint32_t i = 0; i < layout.color_attachment_count && i < kMaxSceneColorTargets; ++i) {
+        if (layout.color_attachments[i].semantic == GFX_ATTACHMENT_NORMAL) {
+            out.has_normal_attachment = true;
+            break;
+        }
+    }
+    return true;
+#else
+    (void)ctx;
+    out.color_targets[0] = WGPU_COLOR_TARGET_STATE_INIT;
+    out.color_targets[0].format = info.color_format;
+    out.color_target_count = 1;
+    out.depth_format = info.depth_format;
+    out.sample_count = info.sample_count;
+    return true;
+#endif
+}
+
+/// The identity of the pass a draw is going into. Compare it against the key the current pipelines
+/// were built with; rebuild when it differs. Returns 0 on a pre-1.2 SDK, where there is no key —
+/// and no runtime layout change to detect either, so a constant is the right answer there.
+template <class DrawContext>
+inline uint64_t scene_pass_layout_key(const DrawContext& ctx) {
+#if GFX_COMPAT_HAVE_SCENE_TARGET_LAYOUT
+    return ctx.layout.key;
+#else
+    (void)ctx;
+    return 0u;
 #endif
 }
 
