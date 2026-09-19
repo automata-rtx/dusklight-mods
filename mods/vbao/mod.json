@@ -1,8 +1,9 @@
 {
   "id": "dev.automata.vbao",
   "name": "VBAO",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "automata.",
   "description": "Visibility Bitmask Ambient Occlusion. Built using Encounter's demo ambient occlusion mod as a base, this increases the quality by making use of visibility bitmasks. This is as close to RTAO a screenspace AO effect can get. Inspired by iMMerse's MXAO Reshade filter.",
-  "icon": "res/VBAO Logo.png"
+  "icon": "res/VBAO Logo.png",
+  "banner": "res/VBAO Banner.png"
 }
