@@ -1,7 +1,8 @@
 {
   "id": "dev.automata.deferred_fog",
   "name": "Deferred Fog",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "automata.",
-  "description": "Replicate's Aurora's fog rendering and applies it later in the frame as to not conflict with graphics mods."
+  "description": "Replicate's Aurora's fog rendering and applies it later in the frame as to not conflict with graphics mods.",
+  "banner": "res/Deferred Fog Banner.png"
 }
