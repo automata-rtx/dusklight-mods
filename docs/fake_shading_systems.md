@@ -202,7 +202,7 @@ diverge — see `docs/deferred_fog.md`, "the `K` factor". See also `docs/japanes
 
 Line numbers below were last re-verified against the fetched tree at a *previous* `DUSKLIGHT_VERSION`
 (upstream game code, then carried by the retired `automata-rtx/dusklight-ao` fork). **The pin has
-since moved to upstream `TwilitRealm/dusklight` `c83ce89`, and these have NOT been re-checked against
+since moved to upstream `TwilitRealm/dusklight` `v2.0.0`, and these have NOT been re-checked against
 it** — Effect Remover is out of the build for exactly that reason. Re-verify before putting it back.
 `python3 tools/check_japanese_naming.py` confirms every symbol named here still *exists* in the
 fetched tree (it passes), but it does not check line numbers.

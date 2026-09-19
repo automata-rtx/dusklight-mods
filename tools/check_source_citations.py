@@ -112,12 +112,19 @@ def anchors_near(text, start, end):
 
 
 def current_pin():
-    """DUSKLIGHT_VERSION from the top-level CMakeLists, so a stale allowlist can say so."""
+    """DUSKLIGHT_VERSION from the top-level CMakeLists, so a stale allowlist can say so.
+
+    Accepts a TAG as well as a SHA. This used to be `[0-9a-f]+`, and when the pin moved to the tag
+    `v2.0.0` it stopped matching: current_pin() returned "", the staleness comparison is guarded on
+    `if pin`, and so the allowlist quietly became unfalsifiable - it could never report STALE again.
+    The only symptom was the summary line printing `pin ?`. That is the exact failure mode this
+    repo keeps writing down: a check that degrades to silence when it cannot answer.
+    """
     try:
         text = open(os.path.join(REPO, "CMakeLists.txt"), encoding="utf-8").read()
     except OSError:
         return ""
-    match = re.search(r'set\(DUSKLIGHT_VERSION\s+"([0-9a-f]+)"', text)
+    match = re.search(r'set\(DUSKLIGHT_VERSION\s+"([^"]+)"', text)
     return match.group(1) if match else ""
 
 
@@ -294,7 +301,10 @@ def main():
         return 1
     if counts["VERIFIED"]:
         print("  %d hand-verified in tools/source_citations_verified.txt (pin %s)"
-              % (counts["VERIFIED"], pin[:7] or "?"))
+              % (counts["VERIFIED"], pin or "UNREADABLE"))
+        if not pin:
+            print("  WARNING: DUSKLIGHT_VERSION could not be read, so the allowlist's pin column\n"
+                  "  was NOT checked. Those entries are unverified, not verified.")
     if counts["STALE"]:
         print("\n%d hand-verified citation(s) were checked against a DIFFERENT tree than the one\n"
               "pinned now. Re-read each in the current tree and update its pin column in\n"

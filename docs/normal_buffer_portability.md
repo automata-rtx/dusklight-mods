@@ -206,7 +206,7 @@ It is not a formality; it has now caught two bugs that would each have shipped.
 ## 4. Three moves travelled — the shim held each time, and the third found its limit
 
 The tree went to **upstream Dusklight** (`0fc05028`, no normal buffer of any kind), back to a fork
-SDK that has one (`platform-normals-test`), and then on to **upstream Dusklight 2.0** (`c83ce89`),
+SDK that has one (`platform-normals-test`), and then on to **upstream Dusklight 2.0** (`v2.0.0`),
 which has its own. All three moves needed **zero changes to the normal-reading code**: a wiped-tree
 `cmake -B build && cmake --build build` compiled, linked and packaged every mod in the build set
 each time. Going out, every accessor took its absent-field branch; coming back, they took the

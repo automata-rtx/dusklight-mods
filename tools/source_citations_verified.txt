@@ -13,15 +13,18 @@
 #
 # To re-verify after a pin bump: for each line, grep the tree for the described construct and
 # confirm the number, then update the pin column. Do not simply bump the pin.
+#
+# Last re-verified at the c83ce89 -> v2.0.0 bump: all ten lines re-read in the new tree and
+# unchanged, which is consistent with d_kankyo.cpp not appearing in that range's diffstat.
 
-d_kankyo.cpp:2423            c83ce89  mFogDensity = -1 in the wolf's enhanced-senses state
-d_kankyo.cpp:4461            c83ce89  if (fog_info->mType == 7) { mType = 2 }
-d_kankyo.cpp:4968-4969       c83ce89  genLabel("...ポリゴンコードによる設定...")
-d_kankyo.cpp:4999            c83ce89  genSlider("雲影の濃さ ", &g_env_light.mFogDensity, 0, 0xff)
-d_kankyo.cpp:5181            c83ce89  genLabel("（ライト０）―えせポイントライト")
-d_kankyo.cpp:7728            c83ce89  genLabel("■ 月の調整パラメータ")
-d_kankyo.cpp:7738            c83ce89  genLabel("■ 太陽の調整パラメータ")
-d_kankyo.cpp:7749            c83ce89  genLabel("■ 胞子の調整パラメータ")
-d_a_obj_ganonwall2.cpp:112-116  c83ce89  the barrier actor's literal fog triple
-ui.h:363                     c83ce89  pane_add_text
-d_kankyo.cpp:1257            c83ce89  g_env_light.mFogAdjEnable = true (XFog enabled globally; the GXSetFogRangeAdj CALL is at 9459, which is what makes the checker flag this)
+d_kankyo.cpp:2423            v2.0.0  mFogDensity = -1 in the wolf's enhanced-senses state
+d_kankyo.cpp:4461            v2.0.0  if (fog_info->mType == 7) { mType = 2 }
+d_kankyo.cpp:4968-4969       v2.0.0  genLabel("...ポリゴンコードによる設定...")
+d_kankyo.cpp:4999            v2.0.0  genSlider("雲影の濃さ ", &g_env_light.mFogDensity, 0, 0xff)
+d_kankyo.cpp:5181            v2.0.0  genLabel("（ライト０）―えせポイントライト")
+d_kankyo.cpp:7728            v2.0.0  genLabel("■ 月の調整パラメータ")
+d_kankyo.cpp:7738            v2.0.0  genLabel("■ 太陽の調整パラメータ")
+d_kankyo.cpp:7749            v2.0.0  genLabel("■ 胞子の調整パラメータ")
+d_a_obj_ganonwall2.cpp:112-116  v2.0.0  the barrier actor's literal fog triple
+ui.h:363                     v2.0.0  pane_add_text
+d_kankyo.cpp:1257            v2.0.0  g_env_light.mFogAdjEnable = true (XFog enabled globally; the GXSetFogRangeAdj CALL is at 9459, which is what makes the checker flag this)

@@ -41,7 +41,8 @@ Linux x64/arm64, Android arm64) produced by CI.
 ## Installing
 
 1. Install the matching game build: **upstream Dusklight** at the commit pinned as
-   `DUSKLIGHT_VERSION` in `CMakeLists.txt` (currently `c83ce89`, which is GameService 2.0). Our
+   `DUSKLIGHT_VERSION` in `CMakeLists.txt` (currently the **`v2.0.0`** release tag, which is
+   GameService 2.0). Our
    fork is retired — these are built against stock upstream now. See the matched-pair note below.
 2. Download the latest `mods-combined` artifact from this repo's Actions page.
 3. Copy the `.dusk` files into the game's mods folder:

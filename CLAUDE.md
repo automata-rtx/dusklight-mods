@@ -316,7 +316,7 @@ local overrides at all.
 | `DUSK_VERSION_OVERRIDE` dropped from `FetchDusklight.cmake` | **Taken.** Nothing in the fetched tree ever read it. `cmake/FetchDusklight.cmake` is now byte-identical to the template again. |
 | `step-security/msvc-dev-cmd` replacing `ilammy/msvc-dev-cmd`, plus the action version bumps | **Taken.** Only exercised in CI, so a green local build proves nothing about them. |
 | `mod.json.in` + `configure_file`, version from `project(VERSION)` | **NOT taken, deliberately.** It gives a single-mod repo one source of truth for its version. We are a monorepo and our mods version *independently* — VBAO was 1.6.0 while SMAA was 1.1.0 before the 1.0.0 reset — and there is one top-level `project()`, so adopting it would force every mod to share a version. Each `mods/<name>/mod.json` stays a hand-edited literal. |
-| `DUSKLIGHT_VERSION` default of `v2.0.0` | **N/A** — that default only applies when the variable is unset, and we always pin it explicitly. Note the tag exists: `v2.0.0` is `e9b12054`, **five commits ahead of our pin**, and one of them is "Mods: Fix cross-page hook patches on macOS". Moving is a deliberate re-platform decision (§ Re-platforming), not part of tracking the template. |
+| `DUSKLIGHT_VERSION` default of `v2.0.0` | **Matched, by a separate decision.** The default itself is N/A — it only applies when the variable is unset, and we always pin explicitly — but we did then move the pin to that same tag, as a re-platform rather than as template tracking. See The ABI pin. |
 | `ios-arm64` in the CI matrix | **NOT taken.** Code mods cannot run on iOS (dlopen restriction) — see the `standalone-final` note under Related repos. |
 
 Our `build.yml` also keeps `branches: ["**"]` (GitHub's `*` does not match `/`, so the template's
@@ -454,8 +454,11 @@ The user typically does not build locally. Iteration loop:
   mod or needs an upstream service extension — don't add game includes to `vbao`.
 - **The ABI pin**: the platform is pinned by **`DUSKLIGHT_VERSION` in the top-level `CMakeLists.txt`**,
   fetched from `DUSKLIGHT_REPOSITORY`. **Both point at UPSTREAM now** — `TwilitRealm/dusklight` at
-  **`c83ce89`** (2026-09-18) — which is **GameService 2.0 / GfxService 1.3** over upstream aurora
-  `34dadd3c` (the recorded `extern/aurora` pin; the submodule URL is `encounter/aurora`). There is
+  the **`v2.0.0`** release tag (`e9b12054`, 2026-09-18) — which is **GameService 2.0 / GfxService
+  1.3** over upstream aurora `7d4484a` (the recorded `extern/aurora` pin; the submodule URL is
+  `encounter/aurora`). **Pinning a TAG rather than a SHA is deliberate**: a tag is a build users can
+  actually download, and the matched-pair rule below is only checkable if the pin names the same
+  thing the user installs. There is
   no `DUSKLIGHT_SDK_STUB_URL` override because upstream's stub release is version-independent and
   the SDK already defaults to it. **`DUSKLIGHT_VERSION` must match the game build actually being
   run.**
@@ -545,7 +548,13 @@ The user typically does not build locally. Iteration loop:
    verifies the *signature* while the symbol is resolved by name at **load**. Pull the hook list out
    of the mod's `DEFINE_HOOK` lines and grep the tree for each one, then still run it in-game.
    On **this** pin, Deferred Fog has had the grep pass and is back in the build (not yet run
-   in-game); Celestial Orbit and Effect Remover have had neither and stay out.
+   in-game); Celestial Orbit and Effect Remover have had neither and stay out. The pass was redone
+   at the `c83ce89` → `v2.0.0` bump — all ten targets still present — which took about a minute and
+   is the cost of this step in the ordinary case.
+   **Check the diffstat first; it tells you how much work this is.** `git diff --stat <old> <new>`
+   over the game tree showed that bump touched no `sdk/` file at all and no file Deferred Fog
+   hooks, which correctly predicted a no-op re-platform. A range that *does* touch `sdk/` or the
+   hooked files is the one to slow down for.
    `tools/check_japanese_naming.py` is a cheap first pass over the symbols our *docs* name, but it
    does **not** cover hook targets.
 4. **Read the new SDK header. A green build proves nothing.** Two separate silent failures came out
@@ -596,7 +605,7 @@ again, the bar is that high.
 ## Related repos
 
 - `TwilitRealm/dusklight` — **upstream, and the platform.** `DUSKLIGHT_VERSION` pins a commit here
-  (`c83ce89`, 2026-09-18) and `cmake/FetchDusklight.cmake` fetches it into `dusklight/` as a
+  (the `v2.0.0` tag = `e9b12054`, 2026-09-18) and `cmake/FetchDusklight.cmake` fetches it into `dusklight/` as a
   **depth-1 shallow checkout**, so the sources are complete but there is no history to search there.
   A mod session does **not** need it attached; attach it only to read upstream history or to look at
   `mods/ao_mod`.
@@ -605,7 +614,7 @@ again, the bar is that high.
     via `GfxResolveDesc::normal` and read `GfxResolvedTargets::normal` (its comment states the latch
     outright — *"The first request enables normals next frame; unsupported devices keep returning
     null"*), and `ensure_pipelines(ctx->layout)`, which rebuilds when `layout.key` changes.
-  - `extern/aurora` → `encounter/aurora` at `34dadd3c` — upstream aurora, which carries the optional
+  - `extern/aurora` → `encounter/aurora` at `7d4484a` — upstream aurora, which carries the optional
     normal attachment itself. Nothing in this repo builds it; it is named here so the renderer side
     of a normal question has an address.
 - `automata-rtx/dusklight-ao` — **our Dusklight fork. RETIRED as of this pin — historical only.**

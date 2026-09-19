@@ -65,8 +65,8 @@ it away afterwards. See `dusklight-ao/docs/thin-gbuffer-normals.md` for the rend
 
 ## 0. State of play (read first)
 
-**Platform: UPSTREAM.** `DUSKLIGHT_VERSION = c83ce89` (2026-09-18) in `TwilitRealm/dusklight` —
-**GameService 2.0 / GfxService 1.3**, over upstream aurora `34dadd3c`, which carries the normal
+**Platform: UPSTREAM.** `DUSKLIGHT_VERSION = v2.0.0` (`e9b12054`, 2026-09-18) in
+`TwilitRealm/dusklight` — **GameService 2.0 / GfxService 1.3**, over upstream aurora `7d4484a`, which carries the normal
 attachment itself. No `DUSKLIGHT_SDK_STUB_URL` override: upstream's stub release is
 version-independent and the SDK defaults to it. Game build and `.dusk` files are still always a
 matched pair, in both directions (see §6). **There is nothing to switch on** — the buffer appears
@@ -114,6 +114,7 @@ none of it depends on how the snapshot is requested.
 | `b426c4d` | Shadow map and `n·L` terms combined by multiplying visibilities instead of `max` — fixes the terminator glint (§8.12). |
 | `(earlier)` | Re-pinned to the fork's **GfxService 1.3**. Our scene-layout fork deleted in favour of upstream's; `normal_format` accessor removed; `has_normal_attachment` is the new "does this build have authored normals" (§5, §7). |
 | *(this change)* | **Re-platformed onto UPSTREAM Dusklight 2.0** (`c83ce89`), which ships its own GfxService 1.3 normal snapshot — a *different shape* from the fork's, and binary-incompatible with it (§0, §7). The fork is retired and both fork knobs are gone from `CMakeLists.txt`. VBAO and SMAA ported to the resolve pair, given lazy `layout.key`-keyed pipelines for the latch, and taught to name MSAA as the blocker it usually is. Build scoped to those two mods; the other five await porting or hook re-verification. |
+| *(this change)* | Pin moved from the bare SHA `c83ce89` to the **`v2.0.0` release tag** (`e9b12054`) — five commits, **no `sdk/` diff at all**, so no ABI or header movement and no mod source change. Aurora moved `34dadd3c` → `7d4484a`, two RmlUi commits, nothing near the normal attachment. Deferred Fog's ten hook targets and the ten allowlisted source citations were each re-checked in the new tree and were unchanged. |
 
 ### Confirmed in-game by the user
 
@@ -453,7 +454,7 @@ current pass.
 
 ## 6. Platform pin and rollback
 
-`CMakeLists.txt` pins `DUSKLIGHT_VERSION = c83ce89…` at **upstream `TwilitRealm/dusklight`**. There
+`CMakeLists.txt` pins `DUSKLIGHT_VERSION = v2.0.0` at **upstream `TwilitRealm/dusklight`**. There
 is no `DUSKLIGHT_SDK_STUB_URL` and no `DUSKLIGHT_AURORA_VERSION`; both were fork knobs and both are
 gone. `cmake/FetchDusklight.cmake` is the stock template's, byte for byte.
 
@@ -1068,7 +1069,7 @@ Checked while investigating; relevant whenever we re-platform.
 
 *(Hashes in the two bullets below are from the ORIGINAL investigation, against base `76b56cd8` and
 upstream HEAD `4504e5009`. They are kept because the lessons are live; the platform has since moved
-all the way to **upstream `c83ce89`** — so do not treat any hash here as a current pin. "Drift since
+all the way to **upstream `v2.0.0`** — so do not treat any hash here as a current pin. "Drift since
 our base" is also a question that no longer has a fork in it: we ARE on upstream now, and the
 equivalent question at each re-platform is just "read the new SDK header".)*
 

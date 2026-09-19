@@ -77,8 +77,13 @@ project(dusklight_mods CXX)
 # To move to a newer base game, bump DUSKLIGHT_VERSION and reconfigure. Keep the pin matched to the
 # game build actually being run — the game-linked mods resolve hook targets by symbol at load, and a
 # mod built against a different base can fail to load outright.
+#
+# THIS IS A TAG, NOT A SHA, AND THAT IS DELIBERATE. v2.0.0 is a published release users can actually
+# download; a bare main-branch SHA is not. The matched-pair rule above is only checkable when the
+# pin names the same thing the user installs, so prefer a release tag whenever one covers the build
+# being shipped. (FetchDusklight resolves either — it shallow-fetches whatever ref this names.)
 if (NOT DUSKLIGHT_VERSION)
-    set(DUSKLIGHT_VERSION "c83ce894e66d6d820a517068802c6d3179c9e08e")
+    set(DUSKLIGHT_VERSION "v2.0.0")
 endif ()
 
 if (NOT DEFINED DUSKLIGHT_REPOSITORY)
