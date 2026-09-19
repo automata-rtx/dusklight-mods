@@ -70,7 +70,4 @@ else ()
     if (NOT _dusklight_exclude_text MATCHES "(^|\n)/\\.stamp(\n|$)")
         file(APPEND "${_dusklight_exclude}" "/.stamp\n")
     endif ()
-
-    # Shallow checkouts carry no tags for `git describe`; pin the SDK's version string instead.
-    set(DUSK_VERSION_OVERRIDE "${DUSKLIGHT_VERSION}")
 endif ()

@@ -12,49 +12,9 @@ renderer writes the artist-authored vertex normal into a second colour attachmen
 and the HOST snapshots it once per frame — immediately after the opaque lists, before any
 `SCENE_AFTER_OPAQUE` hook — then hands the same texture to every mod that asks. VBAO just asks.
 
-That means **no dependency on any other mod for its INPUTS**: everything VBAO reads comes from the
-stock services (gfx, camera, config, ui, resource, log). It also means **no reconstructed *shading*
-normal** — no fallback path to maintain, and none of the faceting a depth-gradient normal has by
-construction.
-
-**It does, separately, require Deferred Fog to be installed** — see the next section. That is a
-deliberate product decision about how the effect is allowed to look, not a data dependency.
-
-## Why Deferred Fog is required
-
-VBAO composites at `SCENE_AFTER_OPAQUE`, which is *inside* the fogged frame. Without Deferred Fog
-the game has already applied fog per surface as it drew it, so the occlusion multiplies over pixels
-that are **already hazed**: distant shading stops reading as depth in the world and starts reading
-as grime on the air. That is not a milder version of the effect — it is the effect looking wrong, in
-exactly the wide outdoor views people will judge the mod by.
-
-So `mods/vbao/src/mod.cpp` takes a **required** import of `DeferredFogService`:
-
-```cpp
-IMPORT_SERVICE(DeferredFogService, svc_deferred_fog);
-```
-
-`svc_deferred_fog` is **never called, and that is correct** — VBAO wants no data from it. The import
-exists so the loader refuses to activate VBAO unless Deferred Fog is active. Three things follow,
-all handled by the mod manager rather than by us:
-
-| Deferred Fog | What the user sees |
-| :-- | :-- |
-| installed, enabled | VBAO runs. Its fog quad draws at `FRAME_BEFORE_HUD`, after this composite, so AO lands under the fog. |
-| installed, disabled | VBAO suspends; its pane reads **"Waiting on: Deferred Fog"**. Re-enabling resumes it. |
-| not installed | VBAO fails to load, naming the missing service. |
-
-Deferred Fog's own pane gains **"Disabling or reloading also restarts: VBAO"**.
-
-**Why required and not `IMPORT_OPTIONAL_SERVICE`**, which is what `deferred_fog_service.h`
-recommends: that recommendation is about **ordering**, the only reason anything had to import this
-service before. This is a different use. A required import creates a real edge in the loader's
-dependency graph — visible to the user, enforced at activation. An optional one creates nothing a
-user can see, and would leave VBAO running in the configuration this section exists to prevent.
-
-The ordering the header discusses is *already* satisfied without any import, by stage separation:
-`SCENE_AFTER_OPAQUE` runs before `FRAME_BEFORE_HUD`. Nothing about the import changes when anything
-draws.
+That means **no dependency on any other mod**: VBAO imports only the stock services (gfx, camera,
+config, ui, resource, log). It also means **no reconstructed *shading* normal** — no fallback path
+to maintain, and none of the faceting a depth-gradient normal has by construction.
 
 > **`geometric_normal_view()` in `vbao.wgsl` is still a depth-derived normal, and it stays.** It is
 > not leftover reconstruction. It is the plane used to reject occlusion samples that lie *below* the

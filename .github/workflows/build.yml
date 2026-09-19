@@ -4,8 +4,12 @@ name: Build
 # (https://github.com/TwilitRealm/mod-template), adapted only for this monorepo (the combine loops
 # over all mods) and our slashed dev-branch name. Each platform builds every mod against the pinned
 # Dusklight SDK (fetched by DUSKLIGHT_VERSION in CMakeLists.txt; the SDK auto-downloads its per-arch
-# link stub from DUSKLIGHT_SDK_STUB_URL), then `combine` merges each mod's per-platform libraries
-# into one cross-platform .dusk via tools/merge_mod.py.
+# link stub from upstream's version-independent release), then `combine` merges each mod's
+# per-platform libraries into one cross-platform .dusk via tools/merge_mod.py.
+#
+# CMAKE_BUILD_TYPE is passed explicitly rather than left to the SDK's fallback: on Windows a Release
+# link strips the DEFINE_HOOK records the game's modmeta parser scans for, and the mod then loads
+# and silently does nothing. See the comment at the top of CMakeLists.txt.
 
 on:
   push:
@@ -46,7 +50,7 @@ jobs:
             android_ndk: "29.0.14206865"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Read pinned Dusklight version
         id: dusklight
@@ -54,14 +58,14 @@ jobs:
         run: echo "version=$(sed -n 's/.*set(DUSKLIGHT_VERSION \"\([^\"]*\)\").*/\1/p' CMakeLists.txt)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Dusklight sources
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: dusklight
           key: dusklight-${{matrix.platform}}-${{steps.dusklight.outputs.version}}
 
       - name: Enable Visual Studio environment
         if: matrix.msvc_arch
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: step-security/msvc-dev-cmd@v1
         with:
           arch: ${{matrix.msvc_arch}}
 
@@ -71,14 +75,14 @@ jobs:
 
       - name: Install Android NDK
         if: matrix.android_ndk
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
         with:
           packages: ndk;${{matrix.android_ndk}}
 
       - name: Configure CMake
         shell: bash
         run: |
-          args=(${{matrix.cmake_args}})
+          args=(-DCMAKE_BUILD_TYPE=RelWithDebInfo ${{matrix.cmake_args}})
           if [ -n "${{matrix.msvc_arch}}" ]; then
             args+=(-G Ninja)
           fi
@@ -92,7 +96,7 @@ jobs:
         run: cmake --build build --parallel
 
       - name: Upload platform bundles
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mods-${{matrix.platform}}
           path: build/mods/*.dusk
@@ -103,10 +107,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download platform bundles
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: mods-*
           path: dist
@@ -132,7 +136,7 @@ jobs:
           ls -l combined
 
       - name: Upload combined bundles
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mods-combined
           path: combined/*.dusk

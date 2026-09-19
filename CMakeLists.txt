@@ -1,4 +1,22 @@
 cmake_minimum_required(VERSION 3.26)
+
+# BUILD TYPE IS SET BEFORE project(), AND THAT ORDER IS THE POINT (mod-template c79deaa).
+#
+# Windows hooks depend on the build type. The game's modmeta parser finds DEFINE_HOOK records by
+# scanning between bounds symbols, and a Release link with /OPT:REF discards records nothing
+# references, so the hooks never register - the mod loads and silently does nothing. RelWithDebInfo
+# does not strip them, which is why it is the build type everywhere.
+#
+# The SDK has its own `if (NOT CMAKE_BUILD_TYPE)` fallback to RelWithDebInfo, and on a SINGLE-config
+# generator that is enough - it is where our RelWithDebInfo comes from today. It does nothing on a
+# MULTI-config generator (Visual Studio, Ninja Multi-Config), where CMAKE_BUILD_TYPE is ignored
+# entirely and `cmake --build` with no --config defaults to Debug. Setting it here, before project()
+# so the per-config flags are initialised from it, is what makes a local Windows build match CI.
+# CI also passes -DCMAKE_BUILD_TYPE=RelWithDebInfo explicitly rather than relying on any fallback.
+if (NOT DEFINED CMAKE_BUILD_TYPE AND NOT DEFINED ENV{CMAKE_BUILD_TYPE})
+    set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING "Build type")
+endif ()
+
 project(dusklight_mods CXX)
 
 # Superproject for our Dusklight graphics mods, built on the official Dusklight mod template

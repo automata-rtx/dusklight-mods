@@ -8,13 +8,6 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   framework). **Service-only**: it uses only mod-API services (gfx, camera, config, ui,
   resource, log) — it must NOT include game headers or call game code, which is what lets it
   survive game updates without a rebuild.
-  **It REQUIRES Deferred Fog**, by a required `IMPORT_SERVICE(DeferredFogService, ...)` that is
-  deliberately never called. The import is the entire mechanism: it makes the loader refuse to
-  activate VBAO unless Deferred Fog is active, because AO composited into an already-fogged frame
-  multiplies over hazed pixels and reads as grime on the air rather than depth in the world. This is
-  a **product** decision, not a data or ordering one — VBAO already runs before the fog quad by
-  stage separation and wants nothing from the service. Service-only still holds (no game headers);
-  the mod is simply no longer standalone. See `docs/vbao.md` "Why Deferred Fog is required".
 - **`mods/realtime_sun_shadows/`** — "Realtime Sun Shadows": real-geometry sun/moon cascaded
   shadow maps (game draw-list replay into up to 3 nested light-space depth passes, plus an
   optional Link-only cascade) with PCF, receiver-plane + slope bias, sin-scaled normal-offset
@@ -180,30 +173,15 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   how many shared-DL materials carried live fog. **Game-linked** + webgpu.
   Docs: `docs/deferred_fog.md`.
 
-  **VBAO REQUIRES IT — and that is a newer decision than most of this file.** Earlier revisions
-  said "no other mod depends on it, and that is deliberate"; that is no longer true and the reason
-  is worth keeping straight, because the service exists for a different purpose than the one it is
-  now used for.
-
-  It exports `dev.automata.deferred_fog` (a one-call state query) because the mod API has no
-  priority field on a stage hook — hooks run in registration order, registration follows
-  `mod_initialize`, and the loader initializes in dependency order, so importing a service is the
-  only lever for "init that one first". **That ORDERING lever is still barely needed**: a mod
-  compositing at `SCENE_AFTER_OPAQUE` is already ahead of the fog quad (`FRAME_BEFORE_HUD`) by stage
-  separation, and VBAO's debug views moved to `FRAME_AFTER_HUD` rather than import anything. For
-  ordering, import it **optionally**.
-
-  **VBAO's import is REQUIRED, and is not about ordering at all.** It never calls `get_state()`. The
-  import exists so the loader will not activate VBAO without Deferred Fog, because AO composited
-  into an already-fogged frame looks wrong and we would rather it not run than run like that. A
-  required import is a real edge in the dependency graph, which an optional one is not: VBAO
-  suspends with **"Waiting on: Deferred Fog"** when the fog mod is disabled, fails to load naming
-  the service when it is absent, and Deferred Fog's own pane gains **"Disabling or reloading also
-  restarts: VBAO"**. All of that is the mod manager, not our code.
-
-  **Do not reach for a required import to get ordering** — it makes Deferred Fog a hard install
-  requirement for that mod's users as a side effect. See
-  `mods/deferred_fog/include/deferred_fog_service.h` and `docs/vbao.md`.
+  **No other mod depends on it, and that is deliberate.** It exports `dev.automata.deferred_fog`
+  (a one-call state query) because the mod API has no priority field on a stage hook — hooks run in
+  registration order, registration follows `mod_initialize`, and the loader initializes in
+  dependency order, so importing a service is the only lever for "init that one first". But the
+  lever is rarely needed: a mod compositing at `SCENE_AFTER_OPAQUE` is already ahead of the fog quad
+  (`FRAME_BEFORE_HUD`) by stage separation. VBAO briefly imported it so its debug views could sit on
+  top of the fog; drawing those at `FRAME_AFTER_HUD` — the last stage in the frame — achieves the
+  same thing with no coupling, which is what it does now. Reach for the import only if you need to
+  interleave *within* a stage. See `mods/deferred_fog/include/deferred_fog_service.h`.
 
   **Graphics Hub is RETIRED.** It bundled this with a "Depth to Normal" provider that reconstructed
   a world-space normal from depth and published it as a service. GfxService 1.3's normal snapshot
@@ -328,6 +306,22 @@ fork knobs any more.** `DUSKLIGHT_REPOSITORY` is upstream `TwilitRealm/dusklight
 branch leaving the recorded `extern/aurora` submodule pin dangling. The tree is now the stock
 template plus `mods/` and `common/`, so template updates apply cleanly and a fresh clone needs no
 local overrides at all.
+
+**Tracked at mod-template `c79deaa`.** What we take from it and what we deliberately do not:
+
+| Template change | Us |
+| :-- | :-- |
+| `CMAKE_BUILD_TYPE` defaulted to RelWithDebInfo **before `project()`** | **Taken.** This is the Windows one: a Release link strips the `DEFINE_HOOK` records the game's modmeta parser scans for, so hooks never register and the mod loads and does nothing. The SDK's own fallback covers single-config generators only — it does nothing under Visual Studio / Ninja Multi-Config, where `cmake --build` with no `--config` gives you Debug. |
+| CI passes `-DCMAKE_BUILD_TYPE=RelWithDebInfo` explicitly | **Taken**, same reason — no reliance on any fallback. |
+| `DUSK_VERSION_OVERRIDE` dropped from `FetchDusklight.cmake` | **Taken.** Nothing in the fetched tree ever read it. `cmake/FetchDusklight.cmake` is now byte-identical to the template again. |
+| `step-security/msvc-dev-cmd` replacing `ilammy/msvc-dev-cmd`, plus the action version bumps | **Taken.** Only exercised in CI, so a green local build proves nothing about them. |
+| `mod.json.in` + `configure_file`, version from `project(VERSION)` | **NOT taken, deliberately.** It gives a single-mod repo one source of truth for its version. We are a monorepo and our mods version *independently* — VBAO was 1.6.0 while SMAA was 1.1.0 before the 1.0.0 reset — and there is one top-level `project()`, so adopting it would force every mod to share a version. Each `mods/<name>/mod.json` stays a hand-edited literal. |
+| `DUSKLIGHT_VERSION` default of `v2.0.0` | **N/A** — that default only applies when the variable is unset, and we always pin it explicitly. Note the tag exists: `v2.0.0` is `e9b12054`, **five commits ahead of our pin**, and one of them is "Mods: Fix cross-page hook patches on macOS". Moving is a deliberate re-platform decision (§ Re-platforming), not part of tracking the template. |
+| `ios-arm64` in the CI matrix | **NOT taken.** Code mods cannot run on iOS (dlopen restriction) — see the `standalone-final` note under Related repos. |
+
+Our `build.yml` also keeps `branches: ["**"]` (GitHub's `*` does not match `/`, so the template's
+glob skips our `claude/...` branches), the `mods-*` artifact names, and the per-mod merge loop with
+`--expect-platforms`, which is our own addition to `tools/merge_mod.py` and not template drift.
 
 ## What a change does and does not require
 
