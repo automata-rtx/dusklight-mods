@@ -2,6 +2,6 @@
   "id": "dev.automata.deferred_fog",
   "name": "Deferred Fog",
   "version": "1.0.0",
-  "author": "automata-rtx",
-  "description": "Moves the game's fog so it is applied after screen-space effects instead of before them, which stops ambient occlusion from landing on top of the haze instead of in the world. On its own you will barely see it; it exists for what it does to the mods installed with it. Normally the game fogs each surface as it draws it, so anything added afterwards darkens pixels that are already fogged and distant shading reads as dirt on the air rather than depth in the scene. This suppresses that per-surface fog and re-applies it in one pass afterwards using the renderer's own fog maths, so for ordinary geometry the fog itself is unchanged. KNOWN LIMITATION, and why this is marked experimental: some distant landmarks - most clearly Death Mountain and the Ganon barrier - look washed out compared to having the mod off, losing colour that should punch through the haze. Unresolved, and shipped known rather than hidden. Everything nearer the camera is unaffected, and toggling the mod off is instant. Intended to run alongside VBAO - that combination is what it exists for."
+  "author": "automata.",
+  "description": "Replicate's Aurora's fog rendering and applies it later in the frame as to not conflict with graphics mods."
 }
