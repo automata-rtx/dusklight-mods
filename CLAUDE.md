@@ -8,6 +8,13 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   framework). **Service-only**: it uses only mod-API services (gfx, camera, config, ui,
   resource, log) — it must NOT include game headers or call game code, which is what lets it
   survive game updates without a rebuild.
+  **It REQUIRES Deferred Fog**, by a required `IMPORT_SERVICE(DeferredFogService, ...)` that is
+  deliberately never called. The import is the entire mechanism: it makes the loader refuse to
+  activate VBAO unless Deferred Fog is active, because AO composited into an already-fogged frame
+  multiplies over hazed pixels and reads as grime on the air rather than depth in the world. This is
+  a **product** decision, not a data or ordering one — VBAO already runs before the fog quad by
+  stage separation and wants nothing from the service. Service-only still holds (no game headers);
+  the mod is simply no longer standalone. See `docs/vbao.md` "Why Deferred Fog is required".
 - **`mods/realtime_sun_shadows/`** — "Realtime Sun Shadows": real-geometry sun/moon cascaded
   shadow maps (game draw-list replay into up to 3 nested light-space depth passes, plus an
   optional Link-only cascade) with PCF, receiver-plane + slope bias, sin-scaled normal-offset
@@ -173,15 +180,30 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   how many shared-DL materials carried live fog. **Game-linked** + webgpu.
   Docs: `docs/deferred_fog.md`.
 
-  **No other mod depends on it, and that is deliberate.** It exports `dev.automata.deferred_fog`
-  (a one-call state query) because the mod API has no priority field on a stage hook — hooks run in
-  registration order, registration follows `mod_initialize`, and the loader initializes in
-  dependency order, so importing a service is the only lever for "init that one first". But the
-  lever is rarely needed: a mod compositing at `SCENE_AFTER_OPAQUE` is already ahead of the fog quad
-  (`FRAME_BEFORE_HUD`) by stage separation. VBAO briefly imported it so its debug views could sit on
-  top of the fog; drawing those at `FRAME_AFTER_HUD` — the last stage in the frame — achieves the
-  same thing with no coupling, which is what it does now. Reach for the import only if you need to
-  interleave *within* a stage. See `mods/deferred_fog/include/deferred_fog_service.h`.
+  **VBAO REQUIRES IT — and that is a newer decision than most of this file.** Earlier revisions
+  said "no other mod depends on it, and that is deliberate"; that is no longer true and the reason
+  is worth keeping straight, because the service exists for a different purpose than the one it is
+  now used for.
+
+  It exports `dev.automata.deferred_fog` (a one-call state query) because the mod API has no
+  priority field on a stage hook — hooks run in registration order, registration follows
+  `mod_initialize`, and the loader initializes in dependency order, so importing a service is the
+  only lever for "init that one first". **That ORDERING lever is still barely needed**: a mod
+  compositing at `SCENE_AFTER_OPAQUE` is already ahead of the fog quad (`FRAME_BEFORE_HUD`) by stage
+  separation, and VBAO's debug views moved to `FRAME_AFTER_HUD` rather than import anything. For
+  ordering, import it **optionally**.
+
+  **VBAO's import is REQUIRED, and is not about ordering at all.** It never calls `get_state()`. The
+  import exists so the loader will not activate VBAO without Deferred Fog, because AO composited
+  into an already-fogged frame looks wrong and we would rather it not run than run like that. A
+  required import is a real edge in the dependency graph, which an optional one is not: VBAO
+  suspends with **"Waiting on: Deferred Fog"** when the fog mod is disabled, fails to load naming
+  the service when it is absent, and Deferred Fog's own pane gains **"Disabling or reloading also
+  restarts: VBAO"**. All of that is the mod manager, not our code.
+
+  **Do not reach for a required import to get ordering** — it makes Deferred Fog a hard install
+  requirement for that mod's users as a side effect. See
+  `mods/deferred_fog/include/deferred_fog_service.h` and `docs/vbao.md`.
 
   **Graphics Hub is RETIRED.** It bundled this with a "Depth to Normal" provider that reconstructed
   a world-space normal from depth and published it as a service. GfxService 1.3's normal snapshot

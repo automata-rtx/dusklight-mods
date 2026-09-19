@@ -28,6 +28,7 @@
 #include "mods/svc/config.h"
 #include "mods/svc/gfx.h"
 
+#include "deferred_fog_service.h"
 #include "gfx_normal_compat.h"
 #include "gfx_scene_pass.h"
 #include "mods/svc/log.h"
@@ -52,6 +53,31 @@ IMPORT_SERVICE(ResourceService, svc_resource);
 IMPORT_SERVICE(UiService, svc_ui);
 IMPORT_SERVICE(GfxService, svc_gfx);
 IMPORT_SERVICE(CameraService, svc_camera);
+
+// DEFERRED FOG IS A HARD DEPENDENCY, AND THIS IMPORT IS THE WHOLE MECHANISM. It is deliberately
+// never called - VBAO wants nothing from DeferredFogService, and `svc_deferred_fog` going unread
+// is correct, not an oversight. What the import buys is the loader refusing to activate VBAO
+// unless Deferred Fog is active too.
+//
+// WHY: AO composites at SCENE_AFTER_OPAQUE, inside the fogged frame. Without Deferred Fog the game
+// has already fogged each surface as it drew it, so the occlusion multiplies over pixels that are
+// already hazed and distant shading reads as grime on the air instead of depth in the world. That
+// is not a degraded version of the effect, it is the effect looking wrong, so VBAO does not ship a
+// path that allows it.
+//
+// The header next door recommends IMPORT_OPTIONAL_SERVICE, and that recommendation is about
+// ORDERING - the only reason anything had to import this before. This is a different use: a
+// required import creates a real edge in the loader's dependency graph, and an optional one
+// creates nothing a user can see. See docs/vbao.md "Why Deferred Fog is required".
+//
+// What the user actually sees, all of it handled by the mod manager rather than by us:
+//   Deferred Fog installed and enabled   VBAO runs. Fog quad draws at FRAME_BEFORE_HUD, after this
+//                                        composite, so the AO lands under the fog.
+//   Deferred Fog installed but disabled  VBAO suspends and its pane reads "Waiting on: Deferred
+//                                        Fog". Re-enabling resumes it; nothing is lost.
+//   Deferred Fog not installed           VBAO fails to load, naming the missing service.
+// Deferred Fog's own pane gains "Disabling or reloading also restarts: VBAO".
+IMPORT_SERVICE(DeferredFogService, svc_deferred_fog);
 
 namespace {
 

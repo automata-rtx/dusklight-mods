@@ -16,11 +16,17 @@ VBAO, SMAA and SSILVB are **service-only** (mod-API services only, no game code,
 game updates without a rebuild). Deferred Fog, Realtime Sun Shadows and Effect Remover are
 **game-linked** (they hook game functions, so they are coupled to the pinned game build).
 
-Surface normals come from the graphics service itself, so no mod provides them for another and the
-normal consumers install standalone. **Install Deferred Fog alongside VBAO**: without it the AO
-multiplies over already-fogged pixels and distant shading reads as grime on the haze. Running SSILVB
-and VBAO together double-darkens unless you disable one mod's AO term (SSILVB has an "Apply AO"
-toggle for exactly this).
+Surface normals come from the graphics service itself, so no mod provides them for another.
+
+**VBAO requires Deferred Fog** — it will not load without it. Without Deferred Fog the AO multiplies
+over pixels the game has already fogged and distant shading reads as grime on the haze rather than
+depth in the world, so VBAO declares it as a hard dependency rather than shipping a configuration
+that looks wrong. If Deferred Fog is installed but switched off, VBAO's pane reads "Waiting on:
+Deferred Fog" and resumes when you switch it back on. See `docs/vbao.md` "Why Deferred Fog is
+required". SMAA depends on nothing.
+
+Running SSILVB and VBAO together double-darkens unless you disable one mod's AO term (SSILVB has an
+"Apply AO" toggle for exactly this).
 
 Each `.dusk` is a **single cross-platform bundle** (Windows x64/arm64, macOS arm64/x64,
 Linux x64/arm64, Android arm64) produced by CI.

@@ -21,9 +21,23 @@
  *     all, which is what VBAO's debug views switched to; nothing in this repo imports this service
  *     for ordering today.
  *
- * Import it OPTIONALLY (IMPORT_OPTIONAL_SERVICE). Deferred Fog is a separate install, and a
- * consumer must run correctly without it — the fog is simply the game's own forward fog then, and
- * the ordering question does not arise.
+ * For that ordering use, import it OPTIONALLY (IMPORT_OPTIONAL_SERVICE): Deferred Fog is a separate
+ * install and a consumer needing only ordering must run correctly without it — the fog is simply
+ * the game's own forward fog then, and the ordering question does not arise.
+ *
+ * THERE IS A SECOND, DIFFERENT USE, AND VBAO IS IT. A *required* import
+ * (IMPORT_SERVICE(DeferredFogService, ...)) is how a mod declares that it will not run at all
+ * without Deferred Fog. That is not an ordering statement, it is a product one: VBAO composites
+ * into the fogged frame, and without the fog deferred its occlusion multiplies over already-hazed
+ * pixels and reads as grime on the air, so it refuses to run in that configuration rather than
+ * looking wrong. The loader turns the required import into a real dependency edge — VBAO suspends
+ * with "Waiting on: Deferred Fog" if this mod is disabled, and this mod's own pane gains
+ * "Disabling or reloading also restarts: VBAO". VBAO never calls get_state(); the import IS the
+ * mechanism. See docs/vbao.md "Why Deferred Fog is required".
+ *
+ * So: OPTIONAL if you only need ordering, REQUIRED if your mod genuinely should not run without
+ * this one. Do not use a required import merely to get ordering — it makes Deferred Fog a hard
+ * install requirement for your users as a side effect.
  */
 
 #ifndef DEFERRED_FOG_SERVICE_H

@@ -60,7 +60,7 @@ project(dusklight_mods CXX)
 # game build actually being run — the game-linked mods resolve hook targets by symbol at load, and a
 # mod built against a different base can fail to load outright.
 if (NOT DUSKLIGHT_VERSION)
-    set(DUSKLIGHT_VERSION "d281c34a65568ee7be2319985f3a290c0ef65abc")
+    set(DUSKLIGHT_VERSION "c83ce894e66d6d820a517068802c6d3179c9e08e")
 endif ()
 
 if (NOT DEFINED DUSKLIGHT_REPOSITORY)

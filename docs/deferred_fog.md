@@ -152,16 +152,28 @@ So:
 
 **In practice, prefer `FRAME_AFTER_HUD` to the import.** That stage runs after everything including
 the HUD, so an overlay lands on top of the fog with no dependency at all. VBAO used the import for
-its debug views and now uses the later stage instead; nothing currently imports this service. Keep
-it exported anyway — it is the only lever available if a future mod genuinely needs to interleave
-*within* `FRAME_BEFORE_HUD`. Import it **optionally** if so: Deferred Fog is a separate install.
+its debug views and now uses the later stage instead, so **nothing imports this service for
+ordering**. Keep it exported anyway — it is the only lever available if a future mod genuinely needs
+to interleave *within* `FRAME_BEFORE_HUD`. Import it **optionally** for that: Deferred Fog is a
+separate install.
+
+**VBAO imports it for a different reason, and imports it as REQUIRED.** Not ordering — VBAO already
+runs before the fog quad by stage separation, and it never calls `get_state()`. The required import
+is how VBAO declares it will not run without Deferred Fog at all, because AO composited into an
+already-fogged frame reads as grime on the haze. The loader turns that into a real dependency edge:
+VBAO suspends with "Waiting on: Deferred Fog" when this mod is disabled, and this mod's pane gains
+"Disabling or reloading also restarts: VBAO". See `docs/vbao.md` "Why Deferred Fog is required".
 
 
 Mod id `dev.automata.deferred_fog`. Game-linked: hooks game/J3D functions, so it is coupled
-to the pinned game build like the shadow mod. Standalone by design: **other mods need no
-changes and no awareness of this mod to benefit** — anything composited over the opaque
-scene at `SCENE_AFTER_OPAQUE` (Enhanced AO, Realtime Sun Shadows, third-party effects)
-automatically ends up *under* the fog.
+to the pinned game build like the shadow mod. **Other mods need no changes and no awareness of
+this mod to benefit** — anything composited over the opaque scene at `SCENE_AFTER_OPAQUE` (AO,
+Realtime Sun Shadows, third-party effects) automatically ends up *under* the fog, by stage
+separation alone.
+
+That is still true of the *mechanism*. It is no longer true that nothing depends on this mod:
+**VBAO now requires it**, by a required service import, so that VBAO cannot be run in the
+unfogged-AO configuration at all. See the service section below.
 
 ## The problem it solves
 
