@@ -8,13 +8,21 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   framework). **Service-only**: it uses only mod-API services (gfx, camera, config, ui,
   resource, log) — it must NOT include game headers or call game code, which is what lets it
   survive game updates without a rebuild.
-  **"Flickers in motion on AMD" was frame rate, not hardware.** The temporal velocity response is
-  pixels of screen motion *per frame*, so at the port's default 30 fps (frame interpolation off) any
-  ordinary pan reset the whole history every frame and showed the raw per-frame estimate. Nothing in
-  the chain is vendor-specific (checked: depth snapshot format, camera/interpolation view identity,
-  uniform staging, shader math). The term is now ceilinged by a frame-time-aware cap
-  (`kVelocityFusionFrameTime`) and the mod logs its measured frame time; see `docs/vbao.md`
-  "Motion response and frame rate" before touching it again.
+  **OPEN BUG: broken AO, overwhelmingly on AMD GPUs (two NVIDIA reports too).** Wrong at REST -
+  AO at improper angles on surfaces that should be open, with hard edges although the normal buffer
+  reads smooth - and flickering in motion on top. A first pass misread it as a frame-rate artefact
+  of the temporal velocity term; **that was wrong** (frame interpolation is on by default in the
+  shipped build, and a temporal term cannot make AO wrong at rest). What that pass did establish is
+  what is NOT the cause, all read in the pinned upstream source: depth snapshot format
+  (`Depth32Float` -> `R32Float` on every backend), normal attachment path (`RGB10A2Unorm`, no
+  blend, copied at the pass break), viewport (forced to the full logical framebuffer), camera
+  identity under interpolation (the stage hook's view is the object the interpolation rewrites),
+  uniform staging, reversed-Z (compile-time), and every shader construct with vendor-dependent
+  semantics. The frame-time cap on the velocity term (`kVelocityFusionFrameTime`) stays as a
+  bounded improvement, not as the fix. **Debug views 5-8 (Geo Normal, Normal Agreement, Raw AO,
+  Depth MIP 3) exist to localise the failing stage from an affected machine**, and the mod logs
+  the adapter/backend at init; `docs/vbao.md` "AMD report: status" is the protocol and the record.
+  Do not propose a fourth mechanism without those screenshots.
 - **`mods/realtime_sun_shadows/`** — "Realtime Sun Shadows": real-geometry sun/moon cascaded
   shadow maps (game draw-list replay into up to 3 nested light-space depth passes, plus an
   optional Link-only cascade) with PCF, receiver-plane + slope bias, sin-scaled normal-offset

@@ -202,8 +202,12 @@ float g_loggedFarPlane = 1.0f;  // last far plane reported to the log (world-uni
 // four-frame average during pans) and 30 fps ~0.12, where the term falls below the base blend
 // weight and is inert. It caps ONLY the velocity term; the disocclusion and content rejects keep
 // their full authority because they answer "is this history from the same surface", not "how
-// visible is per-frame noise". The port renders at 30 fps unless frame interpolation is on, which
-// is why this bit users whose setups happened to sit there and looked hardware-specific.
+// visible is per-frame noise".
+//
+// SCOPE: this bounds how much a full history reset can show; it is NOT the diagnosis of the
+// "broken AO on AMD" report, which is wrong at rest as well (AO at improper angles on surfaces that
+// should be open, with hard edges) and so cannot be a temporal effect. That cause is OPEN - see
+// docs/vbao.md "AMD report: status" and the debug views 5-8 that exist to localise it.
 constexpr float kVelocityFusionFrameTime = 0.004f; // seconds: 250 fps and above allow a full reset
 constexpr float kFrameDtMin = 0.001f;              // clamp for the raw interval (spikes, hitches)
 constexpr float kFrameDtMax = 0.100f;
@@ -256,6 +260,59 @@ float update_velocity_cap() {
     return cap;
 }
 std::atomic g_chainExecuted{false};
+
+// One line at init naming the GPU and backend this instance runs on, so a report can be read
+// against the hardware it came from. Resolved through get_proc_address rather than linked, because
+// the SDK link stub is only guaranteed to carry the entry points the SDK itself uses; if the host
+// does not export these two the line is simply skipped.
+void log_adapter_info() {
+    if (g_deviceInfo.adapter == nullptr) {
+        return;
+    }
+    using GetInfoFn = WGPUStatus (*)(WGPUAdapter, WGPUAdapterInfo*);
+    using FreeMembersFn = void (*)(WGPUAdapterInfo);
+    const auto getInfo =
+        reinterpret_cast<GetInfoFn>(svc_gfx->get_proc_address(mod_ctx, "wgpuAdapterGetInfo"));
+    const auto freeMembers = reinterpret_cast<FreeMembersFn>(
+        svc_gfx->get_proc_address(mod_ctx, "wgpuAdapterInfoFreeMembers"));
+    if (getInfo == nullptr) {
+        return;
+    }
+    WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
+    if (getInfo(g_deviceInfo.adapter, &info) != WGPUStatus_Success) {
+        return;
+    }
+    const auto view = [](WGPUStringView sv) {
+        struct Piece { int len; const char* data; };
+        if (sv.data == nullptr) {
+            return Piece{0, ""};
+        }
+        const size_t len = sv.length == WGPU_STRLEN ? std::strlen(sv.data) : sv.length;
+        return Piece{static_cast<int>(std::min<size_t>(len, 96)), sv.data};
+    };
+    const char* backend = "other";
+    switch (info.backendType) {
+    case WGPUBackendType_D3D11: backend = "D3D11"; break;
+    case WGPUBackendType_D3D12: backend = "D3D12"; break;
+    case WGPUBackendType_Metal: backend = "Metal"; break;
+    case WGPUBackendType_Vulkan: backend = "Vulkan"; break;
+    case WGPUBackendType_OpenGL: backend = "OpenGL"; break;
+    case WGPUBackendType_OpenGLES: backend = "OpenGLES"; break;
+    default: break;
+    }
+    const auto device = view(info.device);
+    const auto vendor = view(info.vendor);
+    const auto arch = view(info.architecture);
+    char msg[320];
+    std::snprintf(msg, sizeof(msg),
+        "adapter: %.*s (%.*s, %.*s) backend %s vendorID 0x%04x deviceID 0x%04x subgroup %u-%u",
+        device.len, device.data, vendor.len, vendor.data, arch.len, arch.data, backend,
+        info.vendorID, info.deviceID, info.subgroupMinSize, info.subgroupMaxSize);
+    svc_log->info(mod_ctx, msg);
+    if (freeMembers != nullptr) {
+        freeMembers(info);
+    }
+}
 
 // Mirror of the WGSL Uniforms struct (keep in sync with res/*.wgsl).
 struct AoUniforms {
@@ -1071,7 +1128,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         svc_log->info(mod_ctx, msg);
     }
     const uint32_t debugMode =
-        static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 4));
+        static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 8));
     uniforms.debug_view = debugMode;
     // The noise advances per frame only while accumulating; pinned otherwise (the spatial
     // denoiser alone then sees a stable pattern, matching the single-frame fallback).
@@ -1117,8 +1174,14 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const WGPUTextureView denoisedView = denoisePasses == 0
         ? g_targets.aoNoisyView
         : ((denoisePasses % 2u) != 0u ? g_targets.aoFinalView : g_targets.aoNoisyView);
+    // Debug view 7 reads the raw single-frame estimate straight out of the occlusion pass
+    // (pre-denoise, pre-accumulation); every other view and the real composite read the chain's
+    // final output.
+    const WGPUTextureView aoSourceView = debugMode == 7u
+        ? g_targets.aoNoisyView
+        : (temporal ? g_targets.historyViews[writeIdx] : denoisedView);
     const CompositePayload drawPayload{
-        temporal ? g_targets.historyViews[writeIdx] : denoisedView, g_targets.preprocessedDepthAll,
+        aoSourceView, g_targets.preprocessedDepthAll,
         resolved.depth, computePayload.sceneNormal, uniformRange.offset, uniformRange.size,
         debugMode};
     if (debugMode != 0) {
@@ -1317,7 +1380,8 @@ ModResult build_controls_tab(
         nullptr);
 
     svc_ui->pane_add_section(mod_ctx, left, "Debug");
-    static const char* kDebugOptions[] = {"Off", "AO", "Normals", "Depth", "Staircase"};
+    static const char* kDebugOptions[] = {"Off", "AO", "Normals", "Depth", "Staircase",
+        "Geo Normal", "Normal Agreement", "Raw AO", "Depth MIP 3"};
     add_select(left, "Debug View", g_cvarDebugView,
         "AO: the final shaped occlusion term as grayscale (accumulated when temporal is "
         "on).<br/>Normals: the view-space scene normals the occlusion pass consumes, black "
@@ -1325,9 +1389,18 @@ ModResult build_controls_tab(
         "fully lit.<br/>Depth: the preprocessed depth as a distance "
         "gradient.<br/>Staircase: detects quantized depth - smooth depth is "
         "near-black with thin triangle edges, quantized depth lights up across "
-        "surfaces.<br/>Debug views draw over the finished frame (after fog and bloom), so "
-        "other effects never obscure them.",
-        kDebugOptions, 5);
+        "surfaces.<br/>Geo Normal: the face normal derived from depth that the occlusion pass "
+        "rejects below-surface samples against (magenta = degenerate, black = sky).<br/>Normal "
+        "Agreement: how well the scene normal agrees with that face normal - green good, yellow "
+        "the tilt smoothed low-poly curvature is expected to have, red poor, WHITE pointing away "
+        "from the surface (a wrong-space or wrong-frame normal), blue no scene normal. Flat ground "
+        "should read green.<br/>Raw AO: the single-frame estimate before denoise and accumulation, "
+        "unshaped.<br/>Depth MIP 3: the coarse prefiltered depth the march samples at distance."
+        "<br/>Debug views draw over the finished frame (after fog and bloom), so other effects "
+        "never obscure them. When reporting broken AO, screenshots of AO, Normals, Geo Normal, "
+        "Normal Agreement and Raw AO from the same spot, standing still, pin down which stage is "
+        "wrong.",
+        kDebugOptions, 9);
     add_number(left, "Debug Depth Range", g_cvarDebugDepthRange,
         "Distance scale of the Depth debug view's gradient, in world units: the view fades "
         "toward black across roughly 3x this distance. Raise to inspect large scenes; the "
@@ -1476,6 +1549,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to query device info");
     }
+    log_adapter_info();
     if (!build_compute_pipeline("Enhanced AO preprocess depth", g_preprocessSource,
             "preprocess_depth", g_preprocessPipeline, g_preprocessLayout) ||
         !build_compute_pipeline("Enhanced AO downsample mip4", g_preprocessSource,

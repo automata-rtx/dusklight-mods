@@ -123,36 +123,66 @@ back to full resolution rather than blurred up (restores the aurora fork's check
 - At full res every pixel is trivially "covered", so this reduces to the original per-pixel
   accumulation with no behavior change. GPU-validated in `scratchpad/halfres_taau_test.py`.
 
+### AMD report: status (OPEN)
+
+**Symptom, from the user's reports:** broken AO, overwhelmingly on AMD GPUs, with two NVIDIA
+reports as well (it is not established that those are the same manifestation). It is **wrong at
+rest**: AO applied at improper angles and on surfaces that should be open, with **hard edges** even
+though the normal buffer (debug view 2) reads smooth. Moving the camera adds flicker. One AMD user
+reduced or removed the in-motion flicker by setting Motion Response to 0–1. Frame interpolation is
+**on by default in the shipped build** (the pinned *source* default is Off; the build is what
+matters).
+
+**A first pass misdiagnosed this as a frame-rate artefact of the temporal velocity term.** That was
+wrong: a temporal term cannot make AO wrong at rest, and the premise that reporters sat at 30 fps
+was false. What that pass established is the list of things that are **not** the cause — each read
+in the pinned upstream source, so they need not be re-derived:
+
+| Ruled out | Evidence |
+|---|---|
+| Depth snapshot format / precision | `Depth32Float` (compile-time in aurora) blitted to `R32Float` by a fullscreen pass on every backend (`tex_copy_conv.cpp` `snapshot_depth`) |
+| Normal attachment path | `RGB10A2Unorm`, written `unit_nrm*0.5+0.5` with alpha 1/0, **no blend state** on that target, write mask tied to depth writes, copied 1:1 at the pass break (`gx.cpp:332`, `shader.cpp:1648`, `encoding.cpp:317`) |
+| Buffer size mismatch | frame, depth and normal buffers all created at the same `(width, height)` in `resize_swapchain_internal`; snapshots copied at the pass's colour-attachment size |
+| Viewport inset | the scene viewport is forced to `(0,0,FB_WIDTH,FB_HEIGHT)` (`m_Do_graphic.cpp:2252`) and both user policies map it to the full target (`map_logical_viewport`) |
+| Camera identity under interpolation | the stage hook receives `&camera_p->view`, the same object `camera_apply_presentation()` rewrites through `dComIfGd_getView()` (`view_setup` → `dComIfGd_setView(view)`) |
+| Projection convention | camera service `e=-p22, f=-p23` matches aurora's `proj.m2 *= -1` reversed-Z conversion; reversed-Z is `constexpr` |
+| Uniform staging | mapped staging buffers copied per frame (`FrameSlotCount = 2`), aurora already clamps `minUniformBufferOffsetAlignment` for AMD (`f88a7e7`) |
+| Pipeline cache | keys are Dawn's, which hash the WGSL source |
+| Vendor-dependent shader semantics | shifts are masked, every `textureLoad` clamps, no `var<workgroup>` race in the MIP prefilter (Bevy's, re-checked), no wave ops, NaN guards negated (`!(len > eps)`) |
+| Upstream aurora after the pin | four commits, none touching rendering |
+
+**What remains unexplained is why the population skews AMD.** Static review of the mod and the
+renderer has not produced a mechanism, so the next step is measurement from an affected machine,
+which is what debug views 5–8 exist for:
+
+| View | Shows | If it is broken on the affected machine |
+|---|---|---|
+| 5 Geo Normal | the face normal `vbao.wgsl` derives from depth for its rejection plane | the depth chain / position reconstruction is wrong |
+| 6 Normal Agreement | `dot(authored, geometric)` banded: green > 0.95, yellow 0.8–0.95 (normal on smoothed low-poly curvature), red < 0.8, **white = negative** (authored normal points away from the surface), blue = no authored normal, magenta = degenerate geometry | red/white on **flat ground** with a clean view 5 means the authored normal reaches the mod in the wrong space, sign or frame |
+| 7 Raw AO | the single-frame estimate before denoise/accumulation, unshaped | wrong here = the occlusion pass itself; fine here but wrong in view 1 = denoise or temporal |
+| 8 Depth MIP 3 | the coarse prefiltered level the march samples at distance | tiles/blocks = the prefilter chain |
+
+**Protocol for the reporter:** same spot, standing still, screenshots of views 1, 2, 5, 6, 7 and 8,
+plus the mod's log lines `adapter: …` (GPU and backend) and `frame time …`. A green view 6 with a
+clean view 5 and a broken view 7 points into `vbao.wgsl`'s march; anything else points upstream of
+it. Do not propose a fourth mechanism without those.
+
+The frame-time cap on the velocity term below stays in as a bounded improvement; it is not the fix.
+
 ### Motion response and frame rate
 
-The velocity term in `temporal.wgsl` is `screen motion in pixels per FRAME × motionResponse`, and
-that "per frame" is the trap: one and the same camera pan produces twice the pixels per frame at
-30 fps as at 60, and five times as many as at 144. At the default response (0.1 per pixel) a pan of
-10 px/frame — a leisurely turn at 30–60 fps — drove the blend weight to 1.0, i.e. threw the whole
-history away every frame and displayed the raw single-frame estimate, whose R2 sampling pattern
-advances every frame. At 144 Hz the eye fuses that into a mild shimmer; at 30–60 Hz it is plain
-boiling/flicker the moment the camera moves. **The port renders at 30 fps unless frame interpolation
-is switched on** (`game.enableFrameInterpolation`, default Off), so a user on the port's defaults
-sits at the worst end of that scale.
-
-This was reported as **AMD-specific flickering in motion**, fixed by setting Motion Response to 0–1
-— which is exactly this term being switched off. The investigation found nothing vendor-specific
-anywhere in the chain: the depth snapshot is `Depth32Float` blitted to `R32Float` on every backend,
-the camera the stage hook receives is the same object the port's frame interpolation rewrites
-(`dComIfGd_setView(&camera->view)`), the uniform ring is staged and copied per frame, and the
-shader math uses nothing with vendor-dependent precision. Frame rate is the variable that the report
-correlates with; it just happened to line up with hardware in the reports we had.
-
-The fix keeps the knob and its semantics but **ceilings the velocity term by
+The velocity term in `temporal.wgsl` is `screen motion in pixels per FRAME × motionResponse`, so
+one and the same camera pan produces twice the pixels per frame at 30 fps as at 60, and five times
+as many as at 144. At the default response (0.1 per pixel) a pan of 10 px/frame drove the blend
+weight to 1.0, i.e. threw the whole history away every frame and displayed the raw single-frame
+estimate, whose R2 sampling pattern advances every frame. At 144 Hz the eye fuses that into a mild
+shimmer; at 30–60 Hz it is plain boiling. The term is now **ceilinged by
 `kVelocityFusionFrameTime / frame time`** (`update_velocity_cap()` in `mod.cpp`, 4 ms), measured on
 the stage hook itself so it stays service-only: a full reset stays available above 250 fps, 144 fps
-allows ~0.58, 60 fps ~0.24 (at least a four-frame average during pans) and 30 fps ~0.12, where the
-term drops below the base blend weight and is inert. High-frame-rate behaviour is essentially
-unchanged; low frame rates keep their history through pans, and the reprojection already
-compensates camera motion so that costs only a little softness. The disocclusion and content rejects
-are **not** capped — they decide whether the history is the same surface at all. The mod logs
+allows ~0.58, 60 fps ~0.24 and 30 fps ~0.12, where the term drops below the base blend weight and
+is inert. The disocclusion and content rejects are **not** capped. The mod logs
 `frame time X ms (Y fps): motion response ceiling Z` whenever the smoothed interval moves by more
-than 25%, so a "flickers in motion" report can be read against the frame rate it happened at.
+than 25%.
 
 ## Tunables (config vars; UI shows them in sections)
 
@@ -186,7 +216,7 @@ Ints are fixed-point (usually /100) unless noted.
 | `halfRes` | off | compute occlusion at half resolution. With temporal accumulation on, a jittered temporal upsampler reconstructs full-res detail (near-full-res look at ¼ the occlusion cost); with it off, a depth-aware bilinear upscale (softer) |
 | `distanceFade` | off | fade AO out toward the far plane |
 | `fadeStart` / `fadeEnd` | 15000 / 40000 | fade band, world units of view depth (converted from far-plane % for the same reason as the radius ramp band) |
-| `debugMode` | 0 | 0 off, 1 AO, 2 normals, 3 depth, 4 staircase |
+| `debugMode` | 0 | 0 off, 1 AO, 2 normals, 3 depth, 4 staircase, 5 geometric normal, 6 normal agreement, 7 raw AO, 8 depth MIP 3 (see "AMD report: status") |
 | `debugDepthRange` | 3300 | depth debug view gradient scale in world units (visualization only) |
 
 Debug views draw at `FRAME_BEFORE_HUD` (the normal composite stays at `SCENE_AFTER_OPAQUE`)

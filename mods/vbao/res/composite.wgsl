@@ -13,6 +13,21 @@
 //       (sky, billboards) - exactly the pixels vbao.wgsl leaves fully visible
 //   3 = the preprocessed depth input
 //   4 = depth staircase detector
+//   5 = GEOMETRIC normal: the face normal vbao.wgsl derives from depth for its rejection plane
+//       (same 4-tap +/-1 construction), RGB-encoded like view 2. Magenta = degenerate (the pass
+//       falls back to the shading normal there), black = sky.
+//   6 = NORMAL AGREEMENT: dot(authored shading normal, geometric normal) banded - green > 0.95,
+//       yellow 0.8..0.95 (expected on smoothed low-poly curvature), red < 0.8, WHITE = negative
+//       (the authored normal points away from the surface the depth describes - wrong space, wrong
+//       sign or wrong frame), blue = no authored normal, magenta = degenerate geometry, black = sky.
+//       Flat ground should read green. This is the view that separates "the authored normal is
+//       wrong" from "the depth chain is wrong": the former shows red/white on flat ground with a
+//       clean view 5, the latter shows a broken view 5.
+//   7 = RAW AO: the single-frame occlusion estimate straight out of vbao.wgsl - before the spatial
+//       denoise, before accumulation, unshaped (no black point / contrast / intensity). The host
+//       binds the noisy chain texture for this view.
+//   8 = preprocessed depth MIP 3 as the view-3 gradient: the coarse level the march samples at
+//       distance. Tile or block artefacts here mean the prefilter chain, not the occlusion pass.
 
 struct Uniforms {
     projection: mat4x4f,
@@ -131,6 +146,32 @@ fn view_position_at(pixel_coordinates: vec2<i32>) -> vec3f {
     return reconstruct_view_space_position(depth, uv);
 }
 
+// Debug views 5/6: the geometric (face) normal of the depth surface at a chain pixel - a copy of
+// vbao.wgsl's geometric_normal_view (4 MIP-0 taps at +/-1, side-selected on the smaller depth
+// step, flipped to face the camera) so the view shows the plane the occlusion pass really rejects
+// against. w = 0 where the cross product is degenerate.
+fn debug_geometric_normal(pixel_coordinates: vec2<i32>, centre: vec3f) -> vec4f {
+    let r = view_position_at(pixel_coordinates + vec2<i32>(1i, 0i));
+    let l = view_position_at(pixel_coordinates - vec2<i32>(1i, 0i));
+    let d = view_position_at(pixel_coordinates + vec2<i32>(0i, 1i));
+    let u = view_position_at(pixel_coordinates - vec2<i32>(0i, 1i));
+    let ddx = select(centre - l, r - centre, abs(r.z - centre.z) < abs(l.z - centre.z));
+    let ddy = select(centre - u, d - centre, abs(d.z - centre.z) < abs(u.z - centre.z));
+    let g = cross(ddy, ddx);
+    let len = length(g);
+    if !(len > 1.0e-12) {
+        return vec4f(0.0, 0.0, 0.0, 0.0);
+    }
+    let gn = g / len;
+    return vec4f(select(gn, -gn, dot(gn, centre) > 0.0), 1.0);
+}
+
+// Debug view 3/8 gradient: exponential distance falloff, white = near.
+fn debug_depth_gradient(view_z: f32) -> vec4f {
+    let value = exp(-max(-view_z, 0.0) * uniforms.inv_debug_depth);
+    return vec4f(value, value, value, 1.0);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     if uniforms.debug_view == 2u {
@@ -158,6 +199,66 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         let position = view_position_at(pixel);
         let value = exp(-max(-position.z, 0.0) * uniforms.inv_debug_depth);
         return vec4f(value, value, value, 1.0);
+    }
+    if uniforms.debug_view == 5u || uniforms.debug_view == 6u {
+        let pixel = vec2<i32>(in.uv * uniforms.size);
+        let sky = load_depth(pixel) <= 0.0;
+        if sky {
+            return vec4f(0.0, 0.0, 0.0, 1.0);
+        }
+        let centre = view_position_at(pixel);
+        let geo = debug_geometric_normal(pixel, centre);
+        if uniforms.debug_view == 5u {
+            if geo.w < 0.5 {
+                return vec4f(1.0, 0.0, 1.0, 1.0); // degenerate: the pass falls back to the shading normal
+            }
+            return vec4f(geo.xyz * 0.5 + 0.5, 1.0);
+        }
+        // View 6: agreement between the authored shading normal (what centres the hemisphere) and
+        // the geometric plane (what rejects below-surface samples).
+        let n_dims = vec2f(textureDimensions(scene_normal));
+        let n_texel =
+            clamp(vec2<i32>(in.uv * n_dims), vec2<i32>(0i), vec2<i32>(n_dims) - vec2<i32>(1i));
+        let scene_n = textureLoad(scene_normal, n_texel, 0i);
+        if scene_n.w < 0.5 {
+            return vec4f(0.0, 0.0, 1.0, 1.0); // no authored normal here
+        }
+        if geo.w < 0.5 {
+            return vec4f(1.0, 0.0, 1.0, 1.0); // degenerate geometry
+        }
+        let agreement = dot(normalize(scene_n.xyz * 2.0 - 1.0), geo.xyz);
+        if agreement < 0.0 {
+            return vec4f(1.0, 1.0, 1.0, 1.0); // points AWAY from the surface: wrong space/sign/frame
+        }
+        if agreement < 0.8 {
+            return vec4f(1.0, 0.0, 0.0, 1.0);
+        }
+        if agreement < 0.95 {
+            return vec4f(1.0, 1.0, 0.0, 1.0);
+        }
+        return vec4f(0.0, 1.0, 0.0, 1.0);
+    }
+    if uniforms.debug_view == 7u {
+        // Raw single-frame estimate, unshaped. The host binds the noisy chain texture here, so at
+        // full res this is a 1:1 read and at half res the depth-aware upscale.
+        let full = vec2f(textureDimensions(scene_depth_raw));
+        let reference = load_raw_depth(vec2<i32>(in.uv * full));
+        var raw: f32;
+        if all(textureDimensions(ambient_occlusion) == vec2<u32>(full)) {
+            let px = clamp(vec2<i32>(in.uv * full), vec2<i32>(0i), vec2<i32>(full) - vec2<i32>(1i));
+            raw = textureLoad(ambient_occlusion, px, 0i).r;
+        } else {
+            raw = sample_visibility(in.uv, reference);
+        }
+        return vec4f(raw, raw, raw, 1.0);
+    }
+    if uniforms.debug_view == 8u {
+        // Preprocessed depth MIP 3, as the view-3 gradient.
+        let mip_size = max(vec2<i32>(uniforms.size) >> vec2<u32>(3u), vec2<i32>(1i));
+        let pixel = clamp(vec2<i32>(in.uv * vec2f(mip_size)), vec2<i32>(0i), mip_size - 1i);
+        let depth = textureLoad(preprocessed_depth, pixel, 3i);
+        let uv = (vec2f(pixel) + 0.5) / vec2f(mip_size);
+        return debug_depth_gradient(reconstruct_view_space_position(depth.r, uv).z);
     }
     if uniforms.debug_view == 4u {
         // Staircase detector on the raw snapshot depth
