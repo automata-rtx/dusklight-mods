@@ -24,7 +24,10 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   upload at init on a host that does not enable Dawn's implicit device synchronization is the one
   path in the chain that genuinely can differ per driver, and a LUT reading as zero produces
   exactly "directional, hard-edged AO that changes every frame". A driver-level cause cannot be
-  excluded; it also cannot be proven from here. **Debug views 5-8 (Geo Normal, Normal Agreement,
+  excluded; it also cannot be proven from here. **1.0.2 result: the flicker is gone in the field**;
+  it traded for ghosting (moving-occluder trails, e.g. Link's contact shadow on ground he left),
+  answered by a σ-normalised history outlier test against the local mean plus a motion-tightened
+  clamp - not by bringing the velocity reset back. **Debug views 5-8 (Geo Normal, Normal Agreement,
   Raw AO, Depth MIP 3)** and the `adapter:` log line exist to localise it from an affected
   machine; `docs/vbao.md` "AMD report: status" is the protocol and the record.
 - **`mods/realtime_sun_shadows/`** — "Realtime Sun Shadows": real-geometry sun/moon cascaded

@@ -1284,7 +1284,8 @@ ModResult build_controls_tab(
         "Effective accumulation length. Higher is smoother but responds slower to change.",
         2, 12, 1, nullptr);
     add_number(left, "Temporal Clamp", g_cvarTemporalClamp,
-        "How far history may drift from the current frame before it is clamped. Lower is more "
+        "How far history may drift from the current frame before it is clamped (in sigmas of the "
+        "local AO distribution). Tightens automatically under screen motion. Lower is more "
         "responsive (less ghosting, more shimmer); higher accumulates more (cleaner, can ghost).",
         100, 300, 10, "%");
     add_number(left, "Motion Response", g_cvarMotionResponse,
@@ -1295,9 +1296,10 @@ ModResult build_controls_tab(
         "the camera moves.",
         0, 100, 1, "%");
     add_number(left, "Content Response", g_cvarContentThresh,
-        "Threshold for treating a history/current mismatch as real change (animated objects). "
-        "Lower reacts faster to moving objects; higher accumulates more on noisy detail like "
-        "grass.",
+        "Threshold for treating history as stale, measured in sigmas of the current local AO "
+        "distribution (100% = discard from about 1 to 2.5 sigma). This is what removes trails "
+        "left by moving occluders - Link's contact shadow on the ground he just left. Lower "
+        "reacts faster to moving objects; higher accumulates more on noisy detail like grass.",
         25, 300, 25, "%");
     add_number(left, "Disocclusion Tolerance", g_cvarDisoccTol,
         "Depth mismatch (as % of depth) before reprojected history is treated as a different "

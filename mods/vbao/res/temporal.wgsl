@@ -14,9 +14,11 @@
 //    surface and is discarded. Comparing the expected previous depth (not the current depth)
 //    keeps ordinary camera translation from tripping it.
 //  - neighborhood clamp: history is clamped into the current local AO distribution
-//    (mean +- k*sigma over 3x3), so stale values snap to the present instead of ghosting.
-//  - velocity + content response: screen-space motion and a direct |history - current| mismatch
-//    both shorten the accumulation so AO tracks geometry instead of dragging behind it.
+//    (mean +- k*sigma over 3x3, k tightened under screen motion), so stale values snap to the
+//    present instead of ghosting.
+//  - velocity + content response: screen-space motion (capped, see below) and a sigma-normalised
+//    outlier test of the history against the local mean both shorten the accumulation so AO
+//    tracks geometry instead of dragging behind it.
 //
 // THE VELOCITY TERM IS CAPPED, AND THE CAP DEPENDS ON FRAME TIME (`velocity_cap`, host-set).
 // `motion_px * velocity_scale` is pixels of screen motion PER FRAME, so for one and the same camera
@@ -236,14 +238,29 @@ fn temporal_accumulate(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 // Covered pixels accumulate the fresh sample (clamp + content-reject guard against
                 // ghosting); uncovered pixels keep history unless camera motion / disocclusion
                 // forces them toward the spatial fill.
+                //
+                // GHOSTING, with the velocity term no longer resetting history in motion, comes
+                // from occluders that moved in the WORLD: Link's contact shadow stays on the ground
+                // he just left, because that ground reprojects correctly and its stored AO is
+                // simply stale. The depth test cannot see it (same surface). Two guards handle it:
+                //  - the clamp bounds the stale value to the current local distribution, and it
+                //    tightens under screen motion (k * 0.6 at >= 16 px/frame), where stale
+                //    occluders are likeliest;
+                //  - the content reject is an OUTLIER test in sigma units against the 3x3 MEAN,
+                //    not an absolute difference against the noisy single-frame sample: a trail sits
+                //    several sigma from the unoccluded ground around it and is discarded within a
+                //    frame or two, while in-distribution history (|dev| < 1 sigma) keeps
+                //    accumulating, which is what keeps the noise averaging that removed the flicker.
+                let motion_tighten = mix(1.0, 0.6, clamp(motion_px / 16.0, 0.0, 1.0));
+                let k_eff = uniforms.temporal_clamp_k * motion_tighten;
                 let hist_used = select(hist.x,
-                    clamp(hist.x, nmean - uniforms.temporal_clamp_k * nsigma,
-                        nmean + uniforms.temporal_clamp_k * nsigma),
+                    clamp(hist.x, nmean - k_eff * nsigma, nmean + k_eff * nsigma),
                     covered);
                 let base_alpha = select(0.0, uniforms.temporal_alpha, covered);
+                let hist_dev = abs(hist.x - nmean) / max(nsigma, 0.02);
                 let content_motion = select(0.0,
-                    smoothstep(0.12 * uniforms.content_thresh, 0.35 * uniforms.content_thresh,
-                        abs(hist.x - cur)),
+                    smoothstep(1.0 * uniforms.content_thresh, 2.5 * uniforms.content_thresh,
+                        hist_dev),
                     covered);
                 // Velocity response, ceilinged by the frame-time-aware cap (see the header).
                 let velocity_alpha = min(motion_px * uniforms.velocity_scale, uniforms.velocity_cap);

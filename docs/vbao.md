@@ -172,6 +172,15 @@ need not be re-derived:
    and the change is correct either way (the procedural index is verified to be the same
    permutation the LUT held).
 
+**1.0.2 field result:** the flicker is gone on the affected machine. It traded for a meaningful
+increase in ghosting, as expected once the velocity term stopped resetting history in motion: the
+trail is Link's contact AO staying on the ground he just left (the receiver reprojects correctly,
+its stored AO is simply stale, and the depth test cannot see that). The content reject was an
+absolute `|history − current|` test against the noisy single-frame sample, so it fired on noise and
+missed trails; it is now a σ-normalised outlier test against the 3×3 mean (discard from ~1σ to
+2.5σ), and the clamp tightens to 0.6k under screen motion. In-distribution history keeps
+accumulating, so the noise averaging that removed the flicker is preserved.
+
 **Could it simply be a driver issue?** Possibly, and it cannot be proven or excluded from source.
 The paths where a driver can differ are the resource upload above (removed), Dawn's inter-dispatch
 barriers for storage textures (Dawn-managed, heavily exercised), and frame pacing (AMD's Vulkan
@@ -234,9 +243,9 @@ Ints are fixed-point (usually /100) unless noted.
 | `depthBias` | 4 | self-occlusion bias, ‰ toward camera |
 | `temporal` | on | temporal accumulation master |
 | `temporalFrames` | 5 | accumulation length → alpha = 1/frames |
-| `temporalClamp` | 200 | neighborhood clamp k ×0.01 |
+| `temporalClamp` | 200 | neighborhood clamp k ×0.01 (mean ± kσ over 3×3); tightened to 0.6k at ≥ 16 px/frame of screen motion |
 | `motionResponse` | 2 | accumulation shortening per pixel of screen motion **per frame** ×0.01 (was 10; 0–2 is the field-validated flicker-free range). Capped by a frame-time-aware ceiling — see "Motion response and frame rate" below |
-| `contentThresh` | 100 | content-mismatch response threshold ×0.01 |
+| `contentThresh` | 100 | history outlier threshold ×0.01, in **sigmas of the 3×3 local AO distribution** (100 = discard from ~1σ to 2.5σ from the local mean). Was an absolute `|history − current|` test against the noisy single-frame sample, which fired on noise and missed trails; the σ-normalised test against the mean is what removes moving-occluder ghosting now that the velocity term no longer resets history |
 | `disoccTol` | 0 | disocclusion depth tolerance, % of depth (0–20). 0 rejects most aggressively; a small fixed depth floor still admits history on matching surfaces, minimizing distant ghosting |
 | `denoisePasses` | 1 | spatial passes 0–3 (ping-pong parity is mirrored on the CPU side —
   see mod-api-notes) |
