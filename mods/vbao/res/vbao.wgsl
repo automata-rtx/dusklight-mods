@@ -56,7 +56,8 @@ struct Uniforms {
 }
 
 @group(0) @binding(0) var preprocessed_depth: texture_2d<f32>;
-@group(0) @binding(1) var hilbert_index_lut: texture_2d<u32>;
+// binding 1 used to be a 64x64 R16Uint Hilbert-index LUT uploaded at init; the index is computed
+// in-shader now (see hilbert_index) so the pass has no init-time upload to depend on.
 @group(0) @binding(2) var ambient_occlusion: texture_storage_2d<r32float, write>;
 @group(0) @binding(3) var depth_differences: texture_storage_2d<r32uint, write>;
 @group(0) @binding(4) var<uniform> uniforms: Uniforms;
@@ -82,8 +83,35 @@ fn fast_acos(in_x: f32) -> f32 {
     return select(PI - res, res, in_x >= 0.0);
 }
 
+// Hilbert curve index of a pixel within its 64x64 tile (order-6 curve, indices 0..4095) - the same
+// construction Bevy's generate_hilbert_index_lut / XeGTAO use, computed per pixel instead of read
+// from a LUT. Six iterations of integer ops; the LUT it replaces was a texture the host had to
+// upload from the game thread at init, which is exactly the kind of resource path that can differ
+// per driver, and a LUT that reads as zero turns every pixel's slice directions identical - a
+// strongly directional, hard-edged estimate that changes direction every frame.
+fn hilbert_index(px: u32, py: u32) -> u32 {
+    var x = px & 63u;
+    var y = py & 63u;
+    var index = 0u;
+    for (var level = 32u; level > 0u; level = level >> 1u) {
+        let rx = select(0u, 1u, (x & level) != 0u);
+        let ry = select(0u, 1u, (y & level) != 0u);
+        index += level * level * ((3u * rx) ^ ry);
+        if ry == 0u {
+            if rx == 1u {
+                x = 63u - x;
+                y = 63u - y;
+            }
+            let t = x;
+            x = y;
+            y = t;
+        }
+    }
+    return index;
+}
+
 fn load_noise(pixel_coordinates: vec2<i32>) -> vec2<f32> {
-    let index = textureLoad(hilbert_index_lut, pixel_coordinates % 64, 0).r;
+    let index = hilbert_index(u32(pixel_coordinates.x), u32(pixel_coordinates.y));
     // R2 sequence, advanced per frame when temporal accumulation is on so the accumulator
     // averages decorrelated samples (frame_index is pinned to 0 by the host otherwise).
     return fract(0.5 + (f32(index) + f32(uniforms.frame_index % 64u)) *

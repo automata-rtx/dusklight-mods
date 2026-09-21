@@ -125,18 +125,19 @@ back to full resolution rather than blurred up (restores the aurora fork's check
 
 ### AMD report: status (OPEN)
 
-**Symptom, from the user's reports:** broken AO, overwhelmingly on AMD GPUs, with two NVIDIA
-reports as well (it is not established that those are the same manifestation). It is **wrong at
-rest**: AO applied at improper angles and on surfaces that should be open, with **hard edges** even
-though the normal buffer (debug view 2) reads smooth. Moving the camera adds flicker. One AMD user
-reduced or removed the in-motion flicker by setting Motion Response to 0–1. Frame interpolation is
-**on by default in the shipped build** (the pinned *source* default is Off; the build is what
-matters).
+**Symptom, from the user's reports:** flickering AO, overwhelmingly on AMD GPUs, with two NVIDIA
+reports as well (not established to be the same manifestation). **It is the temporal path**:
+disabling Temporal Accumulation removes the flicker; Motion Response 0–1 with accumulation on
+almost entirely removes it. AO that looks wrong — improper angles, shading on open surfaces, hard
+edges although the normal buffer reads smooth — is most likely motion-only, which is consistent with
+the mechanism: whenever the velocity term drives the blend weight to 1 the frame displays the
+**raw single-frame estimate**, whose slice directions and step offsets advance every frame. Frame
+interpolation is **on by default in the shipped build** (the pinned *source* default is Off; the
+build is what matters).
 
-**A first pass misdiagnosed this as a frame-rate artefact of the temporal velocity term.** That was
-wrong: a temporal term cannot make AO wrong at rest, and the premise that reporters sat at 30 fps
-was false. What that pass established is the list of things that are **not** the cause — each read
-in the pinned upstream source, so they need not be re-derived:
+**A first pass misdiagnosed this as "users at 30 fps".** That was wrong. What that pass established
+is the list of things that are **not** the cause — each read in the pinned upstream source, so they
+need not be re-derived:
 
 | Ruled out | Evidence |
 |---|---|
@@ -151,9 +152,36 @@ in the pinned upstream source, so they need not be re-derived:
 | Vendor-dependent shader semantics | shifts are masked, every `textureLoad` clamps, no `var<workgroup>` race in the MIP prefilter (Bevy's, re-checked), no wave ops, NaN guards negated (`!(len > eps)`) |
 | Upstream aurora after the pin | four commits, none touching rendering |
 
-**What remains unexplained is why the population skews AMD.** Static review of the mod and the
-renderer has not produced a mechanism, so the next step is measurement from an affected machine,
-which is what debug views 5–8 exist for:
+**What changed in 1.0.2 in response (three things, all in the temporal/noise path):**
+
+1. **The velocity term is ceilinged by frame time** (`kVelocityFusionFrameTime`, next section) so a
+   full reset is only reachable when frames are short enough for per-frame noise to fuse.
+2. **Default Motion Response 10 → 2.** The history is reprojected, so camera motion alone never
+   needed a full reset; ghosting of *moving objects* is the clamp's and the content reject's job.
+   0–1 is the field-validated flicker-free range; 2 keeps a little responsiveness (a 10 px/frame
+   pan shortens the accumulation to ~5 frames instead of discarding it).
+3. **The noise LUT is gone.** `vbao.wgsl` now computes the order-6 Hilbert index per pixel
+   (`hilbert_index`, six integer iterations) instead of reading a 64×64 `R16Uint` texture the host
+   uploaded with `wgpuQueueWriteTexture` at init. That upload ran on the game thread while the
+   render worker was submitting, on a host that does **not** enable Dawn's
+   `implicit_device_synchronization` toggle, which makes it the one path in this chain that can
+   genuinely behave differently per driver. A LUT that reads as zero gives every pixel the *same*
+   slice directions — a strongly directional, hard-edged estimate that changes direction every
+   frame, invisible while the accumulator averages the 64-frame R2 cycle and glaring the moment the
+   velocity term discards the history. That is a precise match for the report; it is not proven,
+   and the change is correct either way (the procedural index is verified to be the same
+   permutation the LUT held).
+
+**Could it simply be a driver issue?** Possibly, and it cannot be proven or excluded from source.
+The paths where a driver can differ are the resource upload above (removed), Dawn's inter-dispatch
+barriers for storage textures (Dawn-managed, heavily exercised), and frame pacing (AMD's Vulkan
+driver exposes no Mailbox present mode, so frame times differ), which feeds the per-frame velocity
+term and is what the cap and the new default address.
+
+**If 1.0.2 does not clear it on an affected machine,** the next step is measurement, which is what
+debug views 5–8 exist for. View 7 (Raw AO) at rest is the first one to look at: uniform directional
+streaking there means the noise, tiles mean the prefilter, and a clean view 7 with flicker in view 1
+means the temporal pass itself.
 
 | View | Shows | If it is broken on the affected machine |
 |---|---|---|
@@ -207,7 +235,7 @@ Ints are fixed-point (usually /100) unless noted.
 | `temporal` | on | temporal accumulation master |
 | `temporalFrames` | 5 | accumulation length → alpha = 1/frames |
 | `temporalClamp` | 200 | neighborhood clamp k ×0.01 |
-| `motionResponse` | 10 | accumulation shortening per pixel of screen motion **per frame** ×0.01. Capped by a frame-time-aware ceiling — see "Motion response and frame rate" below |
+| `motionResponse` | 2 | accumulation shortening per pixel of screen motion **per frame** ×0.01 (was 10; 0–2 is the field-validated flicker-free range). Capped by a frame-time-aware ceiling — see "Motion response and frame rate" below |
 | `contentThresh` | 100 | content-mismatch response threshold ×0.01 |
 | `disoccTol` | 0 | disocclusion depth tolerance, % of depth (0–20). 0 rejects most aggressively; a small fixed depth floor still admits history on matching surfaces, minimizing distant ghosting |
 | `denoisePasses` | 1 | spatial passes 0–3 (ping-pong parity is mirrored on the CPU side —

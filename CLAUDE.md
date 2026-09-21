@@ -8,21 +8,25 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   framework). **Service-only**: it uses only mod-API services (gfx, camera, config, ui,
   resource, log) — it must NOT include game headers or call game code, which is what lets it
   survive game updates without a rebuild.
-  **OPEN BUG: broken AO, overwhelmingly on AMD GPUs (two NVIDIA reports too).** Wrong at REST -
-  AO at improper angles on surfaces that should be open, with hard edges although the normal buffer
-  reads smooth - and flickering in motion on top. A first pass misread it as a frame-rate artefact
-  of the temporal velocity term; **that was wrong** (frame interpolation is on by default in the
-  shipped build, and a temporal term cannot make AO wrong at rest). What that pass did establish is
-  what is NOT the cause, all read in the pinned upstream source: depth snapshot format
-  (`Depth32Float` -> `R32Float` on every backend), normal attachment path (`RGB10A2Unorm`, no
-  blend, copied at the pass break), viewport (forced to the full logical framebuffer), camera
-  identity under interpolation (the stage hook's view is the object the interpolation rewrites),
-  uniform staging, reversed-Z (compile-time), and every shader construct with vendor-dependent
-  semantics. The frame-time cap on the velocity term (`kVelocityFusionFrameTime`) stays as a
-  bounded improvement, not as the fix. **Debug views 5-8 (Geo Normal, Normal Agreement, Raw AO,
-  Depth MIP 3) exist to localise the failing stage from an affected machine**, and the mod logs
-  the adapter/backend at init; `docs/vbao.md` "AMD report: status" is the protocol and the record.
-  Do not propose a fourth mechanism without those screenshots.
+  **OPEN BUG: temporal flicker, overwhelmingly on AMD GPUs (two NVIDIA reports too).** The user's
+  own reading, which the evidence supports: it is the TEMPORAL path. Disabling Temporal Accumulation
+  removes the flicker; Motion Response 0-1 with accumulation on almost entirely removes it; the
+  wrong-looking AO (improper angles, hard edges) is probably motion-only, i.e. it is the raw
+  single-frame estimate being displayed whenever the velocity term drives the blend weight to 1.
+  A first pass misread it as "30 fps, frame interpolation off"; **that was wrong** (interpolation
+  is on by default in the shipped build). What is established, all read in the pinned upstream
+  source: nothing in the depth/normal snapshot path, viewport, camera identity under
+  interpolation, projection convention, uniform staging or reversed-Z differs per vendor. Three
+  changes stand: the velocity term is ceilinged by a frame-time-aware cap
+  (`kVelocityFusionFrameTime`), the **default Motion Response is 2** (the field-validated
+  range; the history is reprojected, so camera motion alone never needed a full reset), and the
+  noise **LUT is gone** - the Hilbert index is computed in-shader, because a game-thread texture
+  upload at init on a host that does not enable Dawn's implicit device synchronization is the one
+  path in the chain that genuinely can differ per driver, and a LUT reading as zero produces
+  exactly "directional, hard-edged AO that changes every frame". A driver-level cause cannot be
+  excluded; it also cannot be proven from here. **Debug views 5-8 (Geo Normal, Normal Agreement,
+  Raw AO, Depth MIP 3)** and the `adapter:` log line exist to localise it from an affected
+  machine; `docs/vbao.md` "AMD report: status" is the protocol and the record.
 - **`mods/realtime_sun_shadows/`** — "Realtime Sun Shadows": real-geometry sun/moon cascaded
   shadow maps (game draw-list replay into up to 3 nested light-space depth passes, plus an
   optional Link-only cascade) with PCF, receiver-plane + slope bias, sin-scaled normal-offset

@@ -117,8 +117,6 @@ bool g_sceneLayoutValid = false;
 WGPURenderPipeline g_compositeDebugPipeline = nullptr;
 WGPUBindGroupLayout g_compositeLayout = nullptr;
 WGPUBindGroupLayout g_compositeDebugLayout = nullptr;
-WGPUTexture g_hilbertLut = nullptr;
-WGPUTextureView g_hilbertLutView = nullptr;
 
 // AO chain targets, recreated when the render size (or halfRes) changes. Old sets are retired
 // for a few frames instead of released immediately: payloads embedding their views may still
@@ -550,53 +548,6 @@ bool build_composite_pipeline(const gfx_compat::ScenePassLayout& sceneLayout, bo
     return outLayout != nullptr;
 }
 
-// Hilbert curve index LUT for the R2 noise sequence, generated once at init.
-uint16_t hilbert_index(uint16_t x, uint16_t y) {
-    uint16_t index = 0;
-    for (uint16_t level = 32; level > 0; level /= 2) {
-        const uint16_t regionX = (x & level) > 0 ? 1 : 0;
-        const uint16_t regionY = (y & level) > 0 ? 1 : 0;
-        index += level * level * ((3 * regionX) ^ regionY);
-        if (regionY == 0) {
-            if (regionX == 1) {
-                x = 63 - x;
-                y = 63 - y;
-            }
-            std::swap(x, y);
-        }
-    }
-    return index;
-}
-
-bool build_hilbert_lut() {
-    WGPUTextureDescriptor texDesc = WGPU_TEXTURE_DESCRIPTOR_INIT;
-    texDesc.label = {"Enhanced AO hilbert LUT", WGPU_STRLEN};
-    texDesc.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
-    texDesc.size = {64, 64, 1};
-    texDesc.format = WGPUTextureFormat_R16Uint;
-    g_hilbertLut = wgpuDeviceCreateTexture(g_deviceInfo.device, &texDesc);
-    if (g_hilbertLut == nullptr) {
-        return false;
-    }
-    g_hilbertLutView = wgpuTextureCreateView(g_hilbertLut, nullptr);
-    if (g_hilbertLutView == nullptr) {
-        return false;
-    }
-
-    uint16_t lut[64 * 64];
-    for (uint16_t y = 0; y < 64; ++y) {
-        for (uint16_t x = 0; x < 64; ++x) {
-            lut[y * 64 + x] = hilbert_index(x, y);
-        }
-    }
-    WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
-    dst.texture = g_hilbertLut;
-    WGPUTexelCopyBufferLayout layout{.offset = 0, .bytesPerRow = 64 * 2, .rowsPerImage = 64};
-    WGPUExtent3D extent{64, 64, 1};
-    wgpuQueueWriteTexture(g_deviceInfo.queue, &dst, lut, sizeof(lut), &layout, &extent);
-    return true;
-}
-
 void release_targets(AoTargets& targets) {
     const auto releaseView = [](WGPUTextureView& view) {
         if (view != nullptr) {
@@ -768,7 +719,7 @@ void on_compute(
                                         textureEntry(7, data.preprocessedDepthMips[4])});
     WGPUBindGroup vbaoGroup = makeBindGroup(
         g_vbaoLayout, {textureEntry(0, data.preprocessedDepthAll),
-                          textureEntry(1, g_hilbertLutView), textureEntry(2, data.aoNoisy),
+                          textureEntry(2, data.aoNoisy),
                           textureEntry(3, data.depthDifferences), uniformEntry(4),
                           textureEntry(5, data.sceneNormal)});
     // Denoise ping-pongs aoNoisy <-> aoFinal; the last-written buffer feeds temporal/composite
@@ -1106,7 +1057,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const int64_t temporalFrames = std::clamp<int64_t>(get_int_option(g_cvarTemporalFrames, 5), 2, 12);
     uniforms.temporal_alpha = 1.0f / static_cast<float>(temporalFrames);
     uniforms.temporal_clamp_k = percent(g_cvarTemporalClamp, 200, 100, 300);
-    uniforms.velocity_scale = percent(g_cvarMotionResponse, 10, 0, 100);
+    uniforms.velocity_scale = percent(g_cvarMotionResponse, 2, 0, 100);
     uniforms.velocity_cap = velocityCap;
     uniforms.content_thresh = percent(g_cvarContentThresh, 100, 25, 300);
     uniforms.disocc_tol = percent(g_cvarDisoccTol, 0, 0, 20);
@@ -1338,8 +1289,11 @@ ModResult build_controls_tab(
         100, 300, 10, "%");
     add_number(left, "Motion Response", g_cvarMotionResponse,
         "How much camera motion shortens the accumulation so AO tracks geometry instead of "
-        "dragging behind it. Higher snaps faster in motion but shimmers more.",
-        0, 100, 5, "%");
+        "dragging behind it. Higher snaps faster in motion but shimmers more. The history is "
+        "reprojected, so camera motion alone does not need this; 0-2 is the flicker-free range "
+        "reported in the field, and high values expose the raw single-frame estimate whenever "
+        "the camera moves.",
+        0, 100, 1, "%");
     add_number(left, "Content Response", g_cvarContentThresh,
         "Threshold for treating a history/current mismatch as real change (animated objects). "
         "Lower reacts faster to moving objects; higher accumulates more on noisy detail like "
@@ -1530,7 +1484,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"debugDepthRange", 3300, &g_cvarDebugDepthRange},
         {"temporalFrames", 8, &g_cvarTemporalFrames},
         {"temporalClamp", 200, &g_cvarTemporalClamp},
-        {"motionResponse", 10, &g_cvarMotionResponse},
+        {"motionResponse", 2, &g_cvarMotionResponse},
         {"contentThresh", 100, &g_cvarContentThresh},
         {"disoccTol", 0, &g_cvarDisoccTol},
         {"denoisePasses", 1, &g_cvarDenoisePasses},
@@ -1567,9 +1521,6 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     // attachment layout, which changes at runtime once this mod's own normal request takes effect,
     // so they are built on first draw and rebuilt whenever the layout key moves — see
     // ensure_composite_pipelines.
-    if (!build_hilbert_lut()) {
-        return mods::set_error(error, MOD_ERROR, "failed to create AO noise LUT");
-    }
 
     GfxComputeTypeDesc computeDesc = GFX_COMPUTE_TYPE_DESC_INIT;
     computeDesc.label = "Enhanced AO chain";
@@ -1651,14 +1602,6 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     // Also clears the cached scene-layout key, so a reload rebuilds against whatever shape the pass
     // has then rather than trusting a key from the previous run.
     release_composite_pipelines();
-    if (g_hilbertLutView != nullptr) {
-        wgpuTextureViewRelease(g_hilbertLutView);
-        g_hilbertLutView = nullptr;
-    }
-    if (g_hilbertLut != nullptr) {
-        wgpuTextureRelease(g_hilbertLut);
-        g_hilbertLut = nullptr;
-    }
     g_cvarEnabled = g_cvarQuality = g_cvarCustomSlices = g_cvarCustomSteps = 0;
     g_cvarRadius = g_cvarRadiusFar = g_cvarRadiusRampStart = g_cvarRadiusRampEnd = 0;
     g_cvarRadiusMax = g_cvarIntensity = g_cvarContrast = 0;
