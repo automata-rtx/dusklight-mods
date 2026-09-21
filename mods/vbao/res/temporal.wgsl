@@ -18,6 +18,21 @@
 //  - velocity + content response: screen-space motion and a direct |history - current| mismatch
 //    both shorten the accumulation so AO tracks geometry instead of dragging behind it.
 //
+// THE VELOCITY TERM IS CAPPED, AND THE CAP DEPENDS ON FRAME TIME (`velocity_cap`, host-set).
+// `motion_px * velocity_scale` is pixels of screen motion PER FRAME, so for one and the same camera
+// pan it is twice as large at 30 fps as at 60 fps and five times as large as at 144 fps. At the
+// default response (0.1 per pixel) any ordinary pan at 30-60 fps drove the blend weight to 1.0 -
+// that is, threw the whole history away every frame and displayed the raw single-frame estimate,
+// whose sampling pattern advances every frame. At 144 Hz the eye fuses that into a mild shimmer;
+// at 30-60 Hz it is plain flicker/boiling the moment the camera moves, and the lower the frame rate
+// the worse it looks. (Reported as AMD-specific: setting Motion Response to 0-1 made it go away,
+// which is exactly this term being switched off. Nothing in this chain is vendor-specific; frame
+// rate is the variable, and the port renders at 30 fps unless frame interpolation is on.)
+// The host therefore measures the frame interval and hands down a ceiling that only lets the term
+// reach a full reset when frames are short enough for per-frame noise to fuse (see
+// kVelocityFusionFrameTime in mod.cpp). The disocclusion and content rejects are NOT capped: those
+// are correctness terms, and a wrong-surface history must still be discarded outright.
+//
 // History format: rg32float = (accumulated AO, view depth / far plane).
 
 struct Uniforms {
@@ -54,7 +69,7 @@ struct Uniforms {
     radius_ramp_start: f32, // radius ramp band start, world units of view depth
     radius_ramp_end: f32,   // radius ramp band end, world units of view depth
     denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
-    _pad0: f32,
+    velocity_cap: f32,      // ceiling on the motion-response alpha (frame-time aware, host-set)
     _pad1: f32,
     _pad2: f32,
 }
@@ -230,8 +245,10 @@ fn temporal_accumulate(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     smoothstep(0.12 * uniforms.content_thresh, 0.35 * uniforms.content_thresh,
                         abs(hist.x - cur)),
                     covered);
+                // Velocity response, ceilinged by the frame-time-aware cap (see the header).
+                let velocity_alpha = min(motion_px * uniforms.velocity_scale, uniforms.velocity_cap);
                 let a = clamp(max(max(base_alpha, depth_reject),
-                                  max(motion_px * uniforms.velocity_scale, content_motion)),
+                                  max(velocity_alpha, content_motion)),
                     0.0, 1.0);
                 out_ao = mix(hist_used, cur, a);
             }

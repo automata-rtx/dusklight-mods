@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -188,6 +189,72 @@ constexpr uint32_t kNormalLatchGraceFrames = 8;
 uint32_t g_normalWaitFrames = 0;
 bool g_loggedChain = false;
 float g_loggedFarPlane = 1.0f;  // last far plane reported to the log (world-unit calibration)
+
+// Frame-time-aware ceiling on the temporal velocity response (see temporal.wgsl's header).
+//
+// The velocity term is `screen motion in pixels PER FRAME * motionResponse`, so the same camera pan
+// drives it twice as hard at 30 fps as at 60 and five times as hard as at 144. At the default
+// response it reached a full history reset (blend weight 1.0) on any ordinary pan below ~100 fps,
+// and a full reset shows the raw single-frame estimate whose sampling pattern advances every frame.
+// Whether that reads as flicker is a question of how long each frame is on screen: at 144 Hz the
+// eye fuses it, at 30-60 Hz it does not. So the ceiling is `kVelocityFusionFrameTime / frame time`:
+// a full reset stays available above 250 fps, 144 fps allows ~0.58, 60 fps ~0.24 (at least a
+// four-frame average during pans) and 30 fps ~0.12, where the term falls below the base blend
+// weight and is inert. It caps ONLY the velocity term; the disocclusion and content rejects keep
+// their full authority because they answer "is this history from the same surface", not "how
+// visible is per-frame noise". The port renders at 30 fps unless frame interpolation is on, which
+// is why this bit users whose setups happened to sit there and looked hardware-specific.
+constexpr float kVelocityFusionFrameTime = 0.004f; // seconds: 250 fps and above allow a full reset
+constexpr float kFrameDtMin = 0.001f;              // clamp for the raw interval (spikes, hitches)
+constexpr float kFrameDtMax = 0.100f;
+constexpr float kFrameDtResetGap = 0.5f;           // a pause/menu gap restarts the smoothing
+constexpr float kFrameDtLogInterval = 2.0f;        // seconds between log lines, at most
+bool g_frameTimeValid = false;                     // g_lastStageTime holds a usable previous sample
+bool g_frameTimeSeeded = false;                    // the EMA has seen a real interval since (re)start
+std::chrono::steady_clock::time_point g_lastStageTime{};
+std::chrono::steady_clock::time_point g_lastFrameTimeLog{};
+float g_smoothedFrameDt = 1.0f / 60.0f;            // EMA of the stage-hook interval (seconds)
+float g_loggedFrameDt = 0.0f;                      // last interval reported to the log
+
+// Game thread, once per rendered frame: advance the frame-interval estimate and return the velocity
+// ceiling for this frame. Measured on the stage hook itself (one call per rendered frame) rather
+// than from any game clock, so it stays service-only and follows whatever the port presents -
+// 30 fps with interpolation off, the capped/uncapped rate with it on.
+float update_velocity_cap() {
+    const auto now = std::chrono::steady_clock::now();
+    bool measured = false;
+    if (g_frameTimeValid) {
+        const float rawDt = std::chrono::duration<float>(now - g_lastStageTime).count();
+        if (rawDt > kFrameDtResetGap) {
+            g_frameTimeValid = false; // restart below rather than smear a pause into the average
+        } else {
+            const float dt = std::clamp(rawDt, kFrameDtMin, kFrameDtMax);
+            // The first real interval seeds the average outright so the estimate (and the log line
+            // below) does not spend its first seconds blending out of the 60 fps initial guess.
+            g_smoothedFrameDt = g_frameTimeSeeded ? g_smoothedFrameDt + (dt - g_smoothedFrameDt) * 0.1f : dt;
+            g_frameTimeSeeded = true;
+            measured = true;
+        }
+    }
+    // No interval yet (first frame, or after a gap): keep the previous estimate (initially 60 fps).
+    g_frameTimeValid = true;
+    g_lastStageTime = now;
+    const float cap = std::clamp(kVelocityFusionFrameTime / g_smoothedFrameDt, 0.0f, 1.0f);
+    // Calibration aid, once per material change (>25%) rather than per frame: lets a report of
+    // "flickers in motion" be read against the frame rate it happened at.
+    if (measured && std::fabs(g_smoothedFrameDt - g_loggedFrameDt) > g_loggedFrameDt * 0.25f &&
+        std::chrono::duration<float>(now - g_lastFrameTimeLog).count() > kFrameDtLogInterval)
+    {
+        g_loggedFrameDt = g_smoothedFrameDt;
+        g_lastFrameTimeLog = now;
+        char msg[128];
+        std::snprintf(msg, sizeof(msg),
+            "frame time %.1f ms (%.0f fps): motion response ceiling %.2f", g_smoothedFrameDt * 1000.0f,
+            1.0f / g_smoothedFrameDt, cap);
+        svc_log->info(mod_ctx, msg);
+    }
+    return cap;
+}
 std::atomic g_chainExecuted{false};
 
 // Mirror of the WGSL Uniforms struct (keep in sync with res/*.wgsl).
@@ -225,7 +292,7 @@ struct AoUniforms {
     float radius_ramp_start; // radius ramp band start, world units of view depth
     float radius_ramp_end;   // radius ramp band end, world units of view depth
     float denoise_strength;  // spatial denoise blend, 0 raw .. 1 fully blurred
-    float _pad0;
+    float velocity_cap;      // ceiling on the motion-response alpha (frame-time aware, host-set)
     float _pad1;
     float _pad2;
 };
@@ -837,6 +904,8 @@ void on_draw(
 // Game thread, after opaque scene draws and before translucent/fog overlay lists.
 void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) {
     tick_retired_targets();
+    // Sampled before the early-outs so the interval estimate follows every rendered frame.
+    const float velocityCap = update_velocity_cap();
     if (!get_bool_option(g_cvarEnabled, true)) {
         g_historyValid = false;
         g_prevCameraValid = false;
@@ -981,6 +1050,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.temporal_alpha = 1.0f / static_cast<float>(temporalFrames);
     uniforms.temporal_clamp_k = percent(g_cvarTemporalClamp, 200, 100, 300);
     uniforms.velocity_scale = percent(g_cvarMotionResponse, 10, 0, 100);
+    uniforms.velocity_cap = velocityCap;
     uniforms.content_thresh = percent(g_cvarContentThresh, 100, 25, 300);
     uniforms.disocc_tol = percent(g_cvarDisoccTol, 0, 0, 20);
     const bool distanceFade = get_bool_option(g_cvarDistanceFade, false);
@@ -1535,6 +1605,10 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_normalWaitFrames = 0;
     g_warnedNoInputs = false;
     g_loggedFarPlane = 1.0f;
+    g_frameTimeValid = false;
+    g_frameTimeSeeded = false;
+    g_smoothedFrameDt = 1.0f / 60.0f;
+    g_loggedFrameDt = 0.0f;
     return MOD_OK;
 }
 }

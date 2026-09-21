@@ -8,6 +8,13 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   framework). **Service-only**: it uses only mod-API services (gfx, camera, config, ui,
   resource, log) — it must NOT include game headers or call game code, which is what lets it
   survive game updates without a rebuild.
+  **"Flickers in motion on AMD" was frame rate, not hardware.** The temporal velocity response is
+  pixels of screen motion *per frame*, so at the port's default 30 fps (frame interpolation off) any
+  ordinary pan reset the whole history every frame and showed the raw per-frame estimate. Nothing in
+  the chain is vendor-specific (checked: depth snapshot format, camera/interpolation view identity,
+  uniform staging, shader math). The term is now ceilinged by a frame-time-aware cap
+  (`kVelocityFusionFrameTime`) and the mod logs its measured frame time; see `docs/vbao.md`
+  "Motion response and frame rate" before touching it again.
 - **`mods/realtime_sun_shadows/`** — "Realtime Sun Shadows": real-geometry sun/moon cascaded
   shadow maps (game draw-list replay into up to 3 nested light-space depth passes, plus an
   optional Link-only cascade) with PCF, receiver-plane + slope bias, sin-scaled normal-offset

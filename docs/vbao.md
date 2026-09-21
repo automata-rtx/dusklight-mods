@@ -123,6 +123,37 @@ back to full resolution rather than blurred up (restores the aurora fork's check
 - At full res every pixel is trivially "covered", so this reduces to the original per-pixel
   accumulation with no behavior change. GPU-validated in `scratchpad/halfres_taau_test.py`.
 
+### Motion response and frame rate
+
+The velocity term in `temporal.wgsl` is `screen motion in pixels per FRAME × motionResponse`, and
+that "per frame" is the trap: one and the same camera pan produces twice the pixels per frame at
+30 fps as at 60, and five times as many as at 144. At the default response (0.1 per pixel) a pan of
+10 px/frame — a leisurely turn at 30–60 fps — drove the blend weight to 1.0, i.e. threw the whole
+history away every frame and displayed the raw single-frame estimate, whose R2 sampling pattern
+advances every frame. At 144 Hz the eye fuses that into a mild shimmer; at 30–60 Hz it is plain
+boiling/flicker the moment the camera moves. **The port renders at 30 fps unless frame interpolation
+is switched on** (`game.enableFrameInterpolation`, default Off), so a user on the port's defaults
+sits at the worst end of that scale.
+
+This was reported as **AMD-specific flickering in motion**, fixed by setting Motion Response to 0–1
+— which is exactly this term being switched off. The investigation found nothing vendor-specific
+anywhere in the chain: the depth snapshot is `Depth32Float` blitted to `R32Float` on every backend,
+the camera the stage hook receives is the same object the port's frame interpolation rewrites
+(`dComIfGd_setView(&camera->view)`), the uniform ring is staged and copied per frame, and the
+shader math uses nothing with vendor-dependent precision. Frame rate is the variable that the report
+correlates with; it just happened to line up with hardware in the reports we had.
+
+The fix keeps the knob and its semantics but **ceilings the velocity term by
+`kVelocityFusionFrameTime / frame time`** (`update_velocity_cap()` in `mod.cpp`, 4 ms), measured on
+the stage hook itself so it stays service-only: a full reset stays available above 250 fps, 144 fps
+allows ~0.58, 60 fps ~0.24 (at least a four-frame average during pans) and 30 fps ~0.12, where the
+term drops below the base blend weight and is inert. High-frame-rate behaviour is essentially
+unchanged; low frame rates keep their history through pans, and the reprojection already
+compensates camera motion so that costs only a little softness. The disocclusion and content rejects
+are **not** capped — they decide whether the history is the same surface at all. The mod logs
+`frame time X ms (Y fps): motion response ceiling Z` whenever the smoothed interval moves by more
+than 25%, so a "flickers in motion" report can be read against the frame rate it happened at.
+
 ## Tunables (config vars; UI shows them in sections)
 
 Ints are fixed-point (usually /100) unless noted.
@@ -146,7 +177,7 @@ Ints are fixed-point (usually /100) unless noted.
 | `temporal` | on | temporal accumulation master |
 | `temporalFrames` | 5 | accumulation length → alpha = 1/frames |
 | `temporalClamp` | 200 | neighborhood clamp k ×0.01 |
-| `motionResponse` | 10 | accumulation shortening per pixel of motion ×0.01 |
+| `motionResponse` | 10 | accumulation shortening per pixel of screen motion **per frame** ×0.01. Capped by a frame-time-aware ceiling — see "Motion response and frame rate" below |
 | `contentThresh` | 100 | content-mismatch response threshold ×0.01 |
 | `disoccTol` | 0 | disocclusion depth tolerance, % of depth (0–20). 0 rejects most aggressively; a small fixed depth floor still admits history on matching surfaces, minimizing distant ghosting |
 | `denoisePasses` | 1 | spatial passes 0–3 (ping-pong parity is mirrored on the CPU side —

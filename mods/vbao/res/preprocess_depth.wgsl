@@ -47,7 +47,7 @@ struct Uniforms {
     radius_ramp_start: f32, // radius ramp band start, world units of view depth
     radius_ramp_end: f32,   // radius ramp band end, world units of view depth
     denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
-    _pad0: f32,
+    velocity_cap: f32,      // ceiling on the motion-response alpha (frame-time aware, host-set)
     _pad1: f32,
     _pad2: f32,
 }
