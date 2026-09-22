@@ -623,9 +623,11 @@ bool ensure_targets(uint32_t width, uint32_t height, uint32_t fullWidth, uint32_
                   width, height, g_targets.depthDifferences) &&
               createStorageTexture(
                   "Enhanced AO final", WGPUTextureFormat_R32Float, 1, width, height, g_targets.aoFinal) &&
-              createStorageTexture("Enhanced AO history 0", WGPUTextureFormat_RG32Float, 1,
+              // (ao, depth, octahedral normal .xy) - 8 bytes/pixel, same as the rg32float it
+              // replaced; the normal is the temporal pass's second surface-identity test.
+              createStorageTexture("Enhanced AO history 0", WGPUTextureFormat_RGBA16Float, 1,
                   fullWidth, fullHeight, g_targets.history[0]) &&
-              createStorageTexture("Enhanced AO history 1", WGPUTextureFormat_RG32Float, 1,
+              createStorageTexture("Enhanced AO history 1", WGPUTextureFormat_RGBA16Float, 1,
                   fullWidth, fullHeight, g_targets.history[1]);
     if (ok) {
         for (uint32_t mip = 0; mip < 5 && ok; ++mip) {
@@ -744,7 +746,8 @@ void on_compute(
         temporalGroup = makeBindGroup(g_temporalLayout,
             {textureEntry(0, denoisedView), textureEntry(1, data.historyIn),
                 textureEntry(2, data.preprocessedDepthMips[0]), textureEntry(3, data.depth),
-                textureEntry(4, data.historyOut), uniformEntry(5)});
+                textureEntry(4, data.historyOut), uniformEntry(5),
+                textureEntry(6, data.sceneNormal)});
     }
     if (preprocessGroup == nullptr || mip4Group == nullptr || vbaoGroup == nullptr || !denoiseOk ||
         (data.run_temporal != 0 && temporalGroup == nullptr))

@@ -93,7 +93,14 @@ See `docs/deferred_fog.md`.
    accumulation (`reproject = prev.proj_from_world × cur.world_from_view`), rejects history on
    depth disocclusion (expected-prev-depth vs stored depth), clamps history into the local
    mean ± k·σ neighborhood, and shortens accumulation on screen motion and content mismatch.
-   History = rg32float (ao, viewDepth/far) at full res, ping-ponged; invalidated on resize/toggle.
+   History = rgba16float (ao, viewDepth/far, octahedral view-space normal) at full res,
+   ping-ponged; invalidated on resize/toggle. **Two history candidates per pixel**: the
+   camera-reprojected one and the un-reprojected one at the pixel's own position, each scored on
+   depth *and* normal agreement with the current surface; the camera one is preferred and the static
+   one taken only when clearly the better surface match. That is the substitute for per-object
+   motion vectors: a screen-static character (Link under a following camera) takes the static
+   candidate on every curved part of his body, which is what stopped his AO smearing along the
+   world's motion.
    In **Half Res** this pass is also a **temporal upsampler** — see below.
 6. **`composite.wgsl`** — reads the AO source at its native resolution: full-res history 1:1 when
    temporal accumulation is on, else a depth-aware 4-tap bilinear upscale of the half-res estimate.
@@ -189,6 +196,18 @@ passed as "same surface" and neither the clamp nor the outlier test treats a sam
 as stale. The tolerance is now relative to the pixel's own depth (≥ 1.5%), which is the same
 lesson the radius ramp and distance fade learned earlier: nothing in this scene should be measured
 in far-plane fractions.
+
+**Third field result:** defaults look good everywhere except a very soft trail just behind Link.
+That one is structural: the reprojection is the camera's, and Link is nearly static on screen while
+the world moves, so the camera-reprojected history for a pixel on his body is a *neighbouring* part
+of his body, same depth and similar AO, and it smeared along the world's motion. Per-object motion
+vectors would fix it exactly, but the port's interpolation matrices live in the game
+(`dusk::interp`), not in aurora, and turning them into a per-pixel motion attachment is a renderer
+change (the shape of the normal attachment) plus game-side plumbing. Within the mod, the answer is
+the two-candidate history above: the history now stores the octahedral normal, the temporal pass
+reads the scene normal, and a static candidate wins wherever the normal or depth says the
+reprojected one is a different part of the surface. Cost is one extra history fetch and a normal
+load per pixel in the temporal pass; the history stays 8 bytes/pixel.
 
 **Could it simply be a driver issue?** Possibly, and it cannot be proven or excluded from source.
 The paths where a driver can differ are the resource upload above (removed), Dawn's inter-dispatch

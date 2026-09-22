@@ -35,7 +35,9 @@
 // kVelocityFusionFrameTime in mod.cpp). The disocclusion and content rejects are NOT capped: those
 // are correctness terms, and a wrong-surface history must still be discarded outright.
 //
-// History format: rg32float = (accumulated AO, view depth / far plane).
+// History format: rgba16float = (accumulated AO, view depth / far plane, octahedral view-space
+// normal .xy). The normal is what lets the pass tell two history candidates apart - see
+// "TWO HISTORY CANDIDATES" in temporal_accumulate.
 
 struct Uniforms {
     projection: mat4x4f,
@@ -84,11 +86,32 @@ struct Uniforms {
 // sparse. At full res depth_scale is 1: every pixel is "covered" and this reduces to the original
 // per-pixel accumulation.
 @group(0) @binding(0) var ao_current: texture_2d<f32>;        // denoised half-res AO (chain res)
-@group(0) @binding(1) var history_in: texture_2d<f32>;        // full-res (ao, depth) previous frame
+@group(0) @binding(1) var history_in: texture_2d<f32>;        // full-res (ao, depth, oct normal) previous frame
 @group(0) @binding(2) var preprocessed_depth: texture_2d<f32>; // half-res MIP0, for upscale weights
 @group(0) @binding(3) var raw_depth: texture_2d<f32>;         // full-res raw reversed-Z snapshot
-@group(0) @binding(4) var history_out: texture_storage_2d<rg32float, write>; // full-res
+@group(0) @binding(4) var history_out: texture_storage_2d<rgba16float, write>; // full-res
 @group(0) @binding(5) var<uniform> uniforms: Uniforms;
+// The scene's authored view-space normal snapshot (full res, xyz*0.5+0.5, alpha 1 where valid) -
+// the same texture vbao.wgsl shades with; here it is the second surface-identity test.
+@group(0) @binding(6) var scene_normal: texture_2d<f32>;
+
+// Octahedral normal encoding, so the history carries a unit normal in two f16 channels.
+fn oct_encode(n: vec3f) -> vec2f {
+    let l1 = abs(n.x) + abs(n.y) + abs(n.z);
+    var e = n.xy / max(l1, 1.0e-6);
+    if n.z < 0.0 {
+        e = (1.0 - abs(e.yx)) * select(vec2f(-1.0), vec2f(1.0), e >= vec2f(0.0));
+    }
+    return e;
+}
+
+fn oct_decode(e: vec2f) -> vec3f {
+    var n = vec3f(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+    let t = max(-n.z, 0.0);
+    n.x += select(t, -t, n.x >= 0.0);
+    n.y += select(t, -t, n.y >= 0.0);
+    return normalize(n);
+}
 
 fn full_size() -> vec2f {
     return uniforms.size * uniforms.depth_scale;
@@ -155,8 +178,8 @@ fn upscale_ao(uv: vec2f, reference_depth: f32) -> f32 {
     return sum / weight_sum;
 }
 
-// Manual bilinear history fetch at full res (rg32float is unfilterable without optional features).
-fn sample_history(uv: vec2f) -> vec2f {
+// Manual bilinear history fetch at full res (a plain textureLoad blend; no sampler needed).
+fn sample_history(uv: vec2f) -> vec4f {
     let fs = full_size();
     let coordinates = uv * fs - 0.5;
     let base = floor(coordinates);
@@ -164,10 +187,10 @@ fn sample_history(uv: vec2f) -> vec2f {
     let maxc = vec2<i32>(fs) - 1i;
     let p00 = clamp(vec2<i32>(base), vec2<i32>(0i), maxc);
     let p11 = clamp(vec2<i32>(base) + 1i, vec2<i32>(0i), maxc);
-    let v00 = textureLoad(history_in, vec2<i32>(p00.x, p00.y), 0i).rg;
-    let v10 = textureLoad(history_in, vec2<i32>(p11.x, p00.y), 0i).rg;
-    let v01 = textureLoad(history_in, vec2<i32>(p00.x, p11.y), 0i).rg;
-    let v11 = textureLoad(history_in, vec2<i32>(p11.x, p11.y), 0i).rg;
+    let v00 = textureLoad(history_in, vec2<i32>(p00.x, p00.y), 0i);
+    let v10 = textureLoad(history_in, vec2<i32>(p11.x, p00.y), 0i);
+    let v01 = textureLoad(history_in, vec2<i32>(p00.x, p11.y), 0i);
+    let v11 = textureLoad(history_in, vec2<i32>(p11.x, p11.y), 0i);
     return mix(mix(v00, v10, fraction.x), mix(v01, v11, fraction.x), fraction.y);
 }
 
@@ -183,11 +206,15 @@ fn temporal_accumulate(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let rd = textureLoad(raw_depth, clamp(p, vec2<i32>(0i), vec2<i32>(fs) - 1i), 0i).r;
     if rd <= 0.0 {
-        textureStore(history_out, p, vec4f(1.0, 1.0, 0.0, 0.0)); // sky: no occlusion, far depth
+        textureStore(history_out, p, vec4f(1.0, 1.0, 0.0, 0.0)); // sky: no occlusion, far depth, no normal
         return;
     }
     let view_pos = reconstruct_view_space_position(rd, uv);
     let depth_norm = clamp(max(-view_pos.z, 0.0) * uniforms.inv_far, 0.0, 1.0);
+    let scene_n_raw = textureLoad(scene_normal, clamp(p, vec2<i32>(0i), vec2<i32>(fs) - 1i), 0i);
+    let has_n = scene_n_raw.w >= 0.5;
+    let n_cur = select(vec3f(0.0, 0.0, 1.0), normalize(scene_n_raw.xyz * 2.0 - 1.0), has_n);
+    let n_oct = select(vec2f(0.0), oct_encode(n_cur), has_n);
 
     let taau = uniforms.depth_scale.x >= 1.5;
     let hc = select(p, p / vec2<i32>(2i), taau); // half-res texel this pixel maps to
@@ -226,25 +253,55 @@ fn temporal_accumulate(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let prev_uv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
             if prev_uv.x >= 0.0 && prev_uv.y >= 0.0 && prev_uv.x <= 1.0 && prev_uv.y <= 1.0 {
                 let motion_px = length((prev_uv - uv) * fs);
-                let hist = sample_history(prev_uv);
 
-                // Depth disocclusion: clip w is the current point's view depth in the PREVIOUS
-                // frame, in the same normalization the history stored its own depth.
+                // Surface-identity mismatch of a history sample, in units of tolerance (1 = at
+                // tolerance, 3 = full reject): the depth term, relative to the point's depth
+                // (>= 1.5%), and the normal term, (1 - cos) over 0.15 (~30 degrees = 1).
                 //
-                // The tolerance is RELATIVE to the point's depth (>= 1.5% of it). It used to have
-                // a floor of 0.002 of the far plane, and TP's far plane is per-stage and huge: on
-                // a 200000-unit stage that floor was 400 world units, larger than Link, so ground
-                // he had just vacated matched his body's stored depth and kept his AO - a
-                // full-body trail behind him that no other guard could remove (the depth WAS
-                // "close enough", so the clamp and the outlier test never saw a disocclusion).
-                // Relative tolerance follows the scene: 15 units at 1000, 150 at 10000, which
-                // still admits the same surface at grazing angles (reprojection error is
-                // sub-pixel) while separating a character from the ground behind it.
-                let expected_prev_d = clamp(clip_prev.w * uniforms.inv_far, 0.0, 1.0);
+                // The depth tolerance is RELATIVE to depth on purpose. It used to have a floor of
+                // 0.002 of the far plane, and TP's far plane is per-stage and huge: on a
+                // 200000-unit stage that floor was 400 world units, larger than Link, so ground he
+                // had just vacated matched his body's stored depth and kept his AO as a full-body
+                // trail. Relative tolerance follows the scene: 15 units at 1000, 150 at 10000,
+                // which still admits the same surface at grazing angles while separating a
+                // character from the ground behind it.
                 let rel_tol = max(uniforms.disocc_tol, 0.015);
-                let depth_tol = max(expected_prev_d * rel_tol, 1.0e-6);
-                let depth_reject =
-                    smoothstep(depth_tol, depth_tol * 3.0, abs(expected_prev_d - hist.y));
+
+                // TWO HISTORY CANDIDATES. There are no per-object motion vectors: the reprojection
+                // is the CAMERA's, so for anything that moves in the world it is wrong. The case
+                // that matters is Link: the camera follows him, so he is nearly static on screen
+                // while the world moves, and the camera-reprojected history for a pixel on his
+                // body is a NEIGHBOURING part of his body (the world's motion away). Same depth,
+                // similar AO, so nothing rejected it, and his AO smeared along the world's motion
+                // as a soft trail. Candidate B is the history at this pixel's OWN screen position
+                // (no reprojection), which is exactly right for a screen-static object. Each
+                // candidate is scored on how well it is the same surface as the current pixel
+                // (depth AND normal - depth alone cannot tell two parts of a body apart, the
+                // normal can), the camera candidate stays preferred, and B is taken only when it
+                // is clearly the better match. Static world geometry under camera motion scores
+                // A near zero and keeps it; on Link's curved parts B wins and the smear stops;
+                // on his flattest regions the two tie, A stays, and a smear of near-identical AO
+                // values is invisible. Where neither candidate is the same surface, the chosen
+                // one's mismatch drives the disocclusion reject as before.
+                // Depth of the current point in the previous view (clip w), in the history's
+                // normalization; candidate B is compared against the current depth, since a
+                // screen-static object barely changes depth between frames.
+                let expected_prev_d = clamp(clip_prev.w * uniforms.inv_far, 0.0, 1.0);
+                let hist_a = sample_history(prev_uv);
+                let mis_a = abs(expected_prev_d - hist_a.y) / max(expected_prev_d * rel_tol, 1.0e-6);
+                let nrm_a = select(0.0, (1.0 - dot(n_cur, oct_decode(hist_a.zw))) / 0.15, has_n);
+                var hist = hist_a;
+                var mismatch = max(mis_a, nrm_a);
+                if motion_px > 0.5 {
+                    let hist_b = sample_history(uv); // exact texel: uv is this pixel's centre
+                    let mis_b = abs(depth_norm - hist_b.y) / max(depth_norm * rel_tol, 1.0e-6);
+                    let nrm_b = select(0.0, (1.0 - dot(n_cur, oct_decode(hist_b.zw))) / 0.15, has_n);
+                    if (mis_b + nrm_b) + 0.5 < (mis_a + nrm_a) {
+                        hist = hist_b;
+                        mismatch = max(mis_b, nrm_b);
+                    }
+                }
+                let depth_reject = smoothstep(1.0, 3.0, mismatch);
 
                 // Covered pixels accumulate the fresh sample (clamp + content-reject guard against
                 // ghosting); uncovered pixels keep history unless camera motion / disocclusion
@@ -282,5 +339,5 @@ fn temporal_accumulate(@builtin(global_invocation_id) global_id: vec3<u32>) {
             }
         }
     }
-    textureStore(history_out, p, vec4f(clamp(out_ao, 0.0, 1.0), depth_norm, 0.0, 0.0));
+    textureStore(history_out, p, vec4f(clamp(out_ao, 0.0, 1.0), depth_norm, n_oct.x, n_oct.y));
 }

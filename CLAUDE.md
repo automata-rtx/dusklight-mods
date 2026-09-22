@@ -30,7 +30,13 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   clamp - not by bringing the velocity reset back. The full-body trail behind Link that remained was
   the disocclusion tolerance floor being `0.002` of the **far plane** (hundreds of world units on
   TP's stages, more than Link's separation from the ground behind him); it is relative to the
-  pixel's own depth now. Nothing in this scene is measured in far-plane fractions any more.
+  pixel's own depth now. Nothing in this scene is measured in far-plane fractions any more. The
+  last soft trail on Link is the camera-only reprojection fetching a *neighbouring* part of his
+  body (he is screen-static under the following camera); without per-object motion vectors - the
+  port's interpolation matrices live in the game, and a motion attachment would be an aurora
+  change - the temporal pass now keeps **two history candidates** (reprojected, and static at the
+  pixel's own position), scored on depth AND the normal the history now stores (`rgba16float`),
+  reprojected preferred, static taken only when clearly the better surface.
   **Debug views 5-8 (Geo Normal, Normal Agreement,
   Raw AO, Depth MIP 3)** and the `adapter:` log line exist to localise it from an affected
   machine; `docs/vbao.md` "AMD report: status" is the protocol and the record.
