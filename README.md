@@ -1,50 +1,30 @@
 # Dusklight Graphics Mods
 
 Graphics mods for [Dusklight](https://github.com/TwilitRealm/dusklight) (the Twilight Princess
-PC/mobile port), built on the official [Dusklight mod template](https://github.com/TwilitRealm/mod-template):
+PC/mobile port), built on the official [Dusklight mod template](https://github.com/TwilitRealm/mod-template).
+
+Three mods are released and maintained for users:
 
 | Mod | Package | What it does |
 |---|---|---|
-| VBAO | `vbao.dusk` | Visibility-bitmask ambient occlusion with temporal accumulation, edge-aware denoise, and a large tuning surface. Reads the game's authored surface normals from the graphics service |
-| Deferred Fog | `deferred_fog.dusk` | Re-applies the game's fog after screen-space effects, so AO darkens the world *under* the fog instead of darkening the fog itself. Install alongside VBAO |
-| SMAA | `smaa.dusk` | Subpixel morphological antialiasing (SMAA 1x). Luma edges unioned with geometric edges from the authored normals + depth |
-| Realtime Sun Shadows | `realtime_sun_shadows.dusk` | Real-geometry sun/moon cascaded shadow maps with PCF, slope-scaled bias, contact (screen-space) shadows, and indoor auto-disable |
-| SSILVB | `ssilvb.dusk` | Screen-space indirect lighting with visibility bitmask (Therrien et al. 2023): one-bounce colored light gathered through the same 32-sector bitmask VBAO uses; with the bounce disabled it acts as a standalone directional AO. Not currently built — awaiting the normal-service port |
-| Effect Remover | `effect_remover.dusk` | Cuts down TP's built-in fake-shading so it doesn't fight new realtime effects. Three independently-toggleable removers: **Projected Shadow Removal** (the "moya" fake ground shade — swaying canopy dapple vs. rolling cloud shadows are per-mode toggles), **Terrain Shadow Removal** (the animated shadow overlay baked into terrain materials, per material code), and **Unbaked Vertex Lighting** (fades the lighting painted into vertex colors, 0 = flat, 100 = vanilla). Experimental |
+| **VBAO** | `vbao.dusk` | Visibility-bitmask ambient occlusion — a 32-sector visibility bitmask per hemisphere slice (Therrien et al. 2022), so separated occluders, gaps and thin geometry such as grass are handled correctly where a horizon tracker over-darkens. Temporal accumulation with camera reprojection, a two-candidate history that keeps characters clean without per-object motion vectors, an edge-aware denoiser, depth-aware compositing, and a large tuning surface. Reads the game's own authored surface normals from the graphics service. **Service-only**: no game code, so it survives game updates without a rebuild |
+| **Deferred Fog** | `deferred_fog.dusk` | Suppresses the game's per-draw fog during the opaque world and re-applies it, bit-exact, as one fullscreen pass right before the translucent lists — so AO darkens the world *under* the fog instead of darkening the fog itself. **Install alongside VBAO.** Game-linked (hooks game functions), so it is coupled to the pinned game build |
+| **SMAA** | `smaa.dusk` | Subpixel morphological antialiasing (SMAA 1x). Luma edges are unioned with geometric edges from the authored normals and depth, which catches silhouettes and creases where luma contrast is weak; the blend-weight pass uses CMAA2-style compute compaction. Composites before bloom and translucency so the game's own post effects operate on antialiased geometry. **Service-only** |
 
-VBAO, SMAA and SSILVB are **service-only** (mod-API services only, no game code, so they survive
-game updates without a rebuild). Deferred Fog, Realtime Sun Shadows and Effect Remover are
-**game-linked** (they hook game functions, so they are coupled to the pinned game build).
-
-Surface normals come from the graphics service itself, so no mod provides them for another and the
-normal consumers install standalone. **Install Deferred Fog alongside VBAO**: without it the AO
-multiplies over already-fogged pixels and distant shading reads as grime on the haze. Running SSILVB
-and VBAO together double-darkens unless you disable one mod's AO term (SSILVB has an "Apply AO"
-toggle for exactly this).
+**Install Deferred Fog alongside VBAO**: without it the AO multiplies over already-fogged pixels and
+distant shading reads as grime on the haze. Surface normals come from the graphics service itself,
+so nothing extra has to be installed for them.
 
 Each `.dusk` is a **single cross-platform bundle** (Windows x64/arm64, macOS arm64/x64,
 Linux x64/arm64, Android arm64) produced by CI.
 
-> **Three mods are built right now: VBAO, SMAA and Deferred Fog.** The platform moved to **upstream
-> Dusklight 2.0**, which supplies surface normals through GfxService 1.3's resolve pair
-> (`GfxResolveDesc::normal` → `GfxResolvedTargets::normal`, resolved alongside depth); these three are
-> ported to it. A test drop is exactly these rather than a mix of mods at different stages. The rest
-> are still in the tree and come back a mod at a time — Celestial Orbit and Effect Remover need their
-> hook symbols re-verified against the new game build, and SSILVB and Realtime Sun Shadows need the
-> same normal-API port. See the note in `CMakeLists.txt`. Graphics Hub is retired — its Depth to
-> Normal half is obsolete now the service provides normals directly, and its Deferred Fog half is the
-> standalone mod above.
->
-> Deferred Fog is **ported but not yet re-verified in-game** on this platform; it is game-linked, so
-> that is a real distinction. See `docs/deferred_fog.md` STATUS.
-
 ## Installing
 
-1. Install the matching game build: **upstream Dusklight** at the commit pinned as
-   `DUSKLIGHT_VERSION` in `CMakeLists.txt` (currently the **`v2.0.0`** release tag, which is
-   GameService 2.0). Our
-   fork is retired — these are built against stock upstream now. See the matched-pair note below.
-2. Download the latest `mods-combined` artifact from this repo's Actions page.
+1. Install the matching game build: **upstream Dusklight** at the tag pinned as `DUSKLIGHT_VERSION`
+   in `CMakeLists.txt` (currently the **`v2.0.0`** release, which is GameService 2.0). See the
+   matched-pair note below.
+2. Download the latest `mods-combined` artifact from this repo's Actions page, or the `.dusk` files
+   from a release.
 3. Copy the `.dusk` files into the game's mods folder:
    - Windows: `%APPDATA%\TwilitRealm\Dusklight\mods`
    - Linux: `~/.local/share/TwilitRealm/Dusklight/mods`
@@ -67,6 +47,17 @@ fails to load, or loads and does nothing, that pin and your game build have dive
 After replacing a `.dusk` with a newer build, the in-game **Reload** button picks it up without
 restarting.
 
+### VBAO 1.1.0 notes
+
+The temporal accumulation was reworked after field reports of flicker in motion. The history now
+keeps two candidates per pixel (camera-reprojected, and static at the pixel's own position) scored
+on depth and the stored normal, which keeps Link free of trails without per-object motion vectors;
+the disocclusion test is relative to depth rather than the far plane; the content reject is a
+σ-normalised outlier test; and the motion response fades with view distance (**Motion Response
+Range**), so characters stay full and responsive while distant, broad AO keeps its accumulation.
+The defaults are the field-validated ones. Debug views 5–8 (Geo Normal, Normal Agreement, Raw AO,
+Depth MIP 3) exist for reporting a problem: `docs/vbao.md` has the protocol.
+
 ## Building
 
 This repo is the official [Dusklight mod template](https://github.com/TwilitRealm/mod-template),
@@ -85,7 +76,10 @@ cmake --build build     # -> build/mods/*.dusk
 (newlines collapse in mod descriptions, the list view shows two lines, and an option named
 `enabled` silently kills the mod).
 
-Three checkers guard things a build cannot catch, all skipping cleanly when the game tree is absent:
+CI does not validate shaders — it only packages the `.wgsl` files — so validate a shader change
+locally before pushing; `tools/wgsl_check.cpp` compiles every shader through Dawn's null backend and
+needs no GPU (the recipe is in `CLAUDE.md`). Three checkers guard things a build cannot catch, all
+skipping cleanly when the game tree is absent:
 
 ```sh
 python3 tools/check_reserved_config_names.py   # a config var the host reserves (silent load failure)
@@ -96,9 +90,7 @@ python3 tools/check_source_citations.py        # `file.cpp:LINE` citations still
 That's it, on any platform — including Windows (plain MSVC). **No local overrides are needed.**
 `DUSKLIGHT_REPOSITORY` is upstream `TwilitRealm/dusklight`, and the SDK downloads its per-arch link
 stubs from upstream's own **version-independent** `sdk` release, so there is no stub URL to keep in
-sync with the pin. (The fork-era `DUSKLIGHT_SDK_STUB_URL` and `DUSKLIGHT_AURORA_VERSION` knobs are
-gone; if a future base is ever a fork again, remember a fork release's stubs *are* per-build and the
-URL has to move with `DUSKLIGHT_VERSION`.)
+sync with the pin.
 
 CI (`.github/workflows/build.yml`) is the template's build + combine pipeline: it builds every mod on
 all seven platforms and merges each into one cross-platform `.dusk` via `tools/merge_mod.py`
@@ -107,14 +99,26 @@ all seven platforms and merges each into one cross-platform `.dusk` via `tools/m
 ## Docs
 
 - `CLAUDE.md` — repo overview, build model, hard constraints, and the platform/ABI pin (read first)
-- `docs/self_editing_guide.md` — **how to change defaults / hardcode options and build without AI**
-- `docs/fake_shading_systems.md` — TP's fake-shading systems (moya, terrain overlay, vertex
-  lighting), their in-code names, and which Effect Remover feature handles each
-- `docs/vbao.md` — AO algorithm, every tunable, defaults rationale
-- `docs/realtime_sun_shadows.md` — shadow architecture, known issues and their fixes, tuning
-- `docs/deferred_fog.md` — deferred fog design, mixed-config handling, caveats (now the Deferred
-  Fog mod)
-- `docs/depth_to_normal_plan.md`, `docs/depth_to_normal_consumers.md` — the normal-reconstruction
-  *(historical — the graphics service now provides normals directly; see `docs/authored_normals.md`)*
+- `docs/vbao.md` — AO algorithm, every tunable, defaults rationale, the temporal accumulation
+  design and its field history
+- `docs/deferred_fog.md` — deferred fog design, mixed-config handling, status and caveats
+- `docs/smaa.md` — the SMAA implementation
+- `docs/editing-options.md` and `docs/self_editing_guide.md` — how to change defaults or hardcode
+  options and build without AI
+- `docs/authored_normals.md` — how the authored normals reach the mods, and what was learned
 - `docs/mod-api-notes.md` — mod-API pitfalls learned the hard way
 - Upstream mod API reference: <https://github.com/TwilitRealm/dusklight/blob/main/docs/modding.md>
+
+## Unreleased mods in the tree
+
+Three more mods live in `mods/` but are **not built or released**; they are on the back burner
+until they are ported to this platform and re-verified in-game (see the note in `CMakeLists.txt`):
+
+- **Realtime Sun Shadows** — real-geometry sun/moon cascaded shadow maps (game-linked).
+- **SSILVB** — screen-space indirect lighting with the same visibility bitmask VBAO uses.
+- **Effect Remover** — cuts down the game's built-in fake shading (haze, terrain shadow overlay,
+  baked vertex lighting) so it does not fight realtime effects (game-linked, experimental).
+- **Celestial Orbit** — raises the sun/moon travel path for more expressive shadows (game-linked).
+
+Their docs (`docs/realtime_sun_shadows.md`, `docs/ssilvb_plan.md`, `docs/fake_shading_systems.md`,
+`docs/celestial_orbit.md`) are kept current for when they return.

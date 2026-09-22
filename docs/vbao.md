@@ -81,8 +81,9 @@ See `docs/deferred_fog.md`.
    separate 4-tap geometric plane from depth for sample rejection, then walk `slice_count`
    hemisphere slices × `steps_per_side` marching steps, carving a 32-bit sector bitmask
    per slice (Therrien et al. 2022 visibility bitmask). Occlusion = carved fraction weighted
-   by a cosine lobe. Sampling noise: Hilbert LUT + R2 sequence, advanced per frame when
-   temporal accumulation is on (so successive frames measure different directions).
+   by a cosine lobe. Sampling noise: an order-6 Hilbert index computed in-shader + R2 sequence,
+   advanced per frame when temporal accumulation is on (so successive frames measure different
+   directions). There is no noise LUT and no init-time upload.
    Thickness handling: front/back horizons with a log-scaled thickness and depth-difference
    fade (`t_eff = t_base * clamp(1 - |dz|/depth_range)`) — this is what keeps grass/foliage
    from over-darkening.
@@ -105,7 +106,9 @@ See `docs/deferred_fog.md`.
 6. **`composite.wgsl`** — reads the AO source at its native resolution: full-res history 1:1 when
    temporal accumulation is on, else a depth-aware 4-tap bilinear upscale of the half-res estimate.
    Then black point, contrast power, optional distance fade, multiply over scene color. Debug
-   views 1–4 (AO / normals / depth / staircase detector).
+   views 1–8 (AO / normals / depth / staircase detector / geometric normal / normal agreement /
+   raw AO / depth MIP 3 — the last four are described under "Temporal accumulation: history and
+   diagnostics").
 
 The occlusion estimate runs at snapshot resolution, or half of it with **Half Res** on; the
 temporal history and composite are always full render resolution.
@@ -130,21 +133,21 @@ back to full resolution rather than blurred up (restores the aurora fork's check
 - At full res every pixel is trivially "covered", so this reduces to the original per-pixel
   accumulation with no behavior change. GPU-validated in `scratchpad/halfres_taau_test.py`.
 
-### AMD report: status (OPEN)
+### Temporal accumulation: history and diagnostics
 
-**Symptom, from the user's reports:** flickering AO, overwhelmingly on AMD GPUs, with two NVIDIA
-reports as well (not established to be the same manifestation). **It is the temporal path**:
-disabling Temporal Accumulation removes the flicker; Motion Response 0–1 with accumulation on
-almost entirely removes it. AO that looks wrong — improper angles, shading on open surfaces, hard
-edges although the normal buffer reads smooth — is most likely motion-only, which is consistent with
-the mechanism: whenever the velocity term drives the blend weight to 1 the frame displays the
-**raw single-frame estimate**, whose slice directions and step offsets advance every frame. Frame
-interpolation is **on by default in the shipped build** (the pinned *source* default is Off; the
-build is what matters).
+**Status: resolved in 1.1.0, confirmed in the field at each step.** This section is the record of
+the 1.0.x report and of what each change was for, so the design above is not mistaken for a set of
+arbitrary knobs.
 
-**A first pass misdiagnosed this as "users at 30 fps".** That was wrong. What that pass established
-is the list of things that are **not** the cause — each read in the pinned upstream source, so they
-need not be re-derived:
+**The report.** Flickering AO in motion, overwhelmingly on AMD GPUs, with two NVIDIA reports as
+well. It was the temporal path: disabling Temporal Accumulation removed the flicker, and Motion
+Response 0–1 with accumulation on almost entirely removed it. The wrong-looking AO in motion
+(improper angles, hard edges, with a smooth normal buffer) was the **raw single-frame estimate**
+being displayed whenever the velocity term drove the blend weight to 1, its slice directions
+advancing every frame. Frame interpolation is on by default in the shipped build, so frame rate was
+not the variable; a first pass that said so was wrong and is withdrawn.
+
+**What was ruled out**, each read in the pinned upstream source, so it need not be re-derived:
 
 | Ruled out | Evidence |
 |---|---|
@@ -159,74 +162,51 @@ need not be re-derived:
 | Vendor-dependent shader semantics | shifts are masked, every `textureLoad` clamps, no `var<workgroup>` race in the MIP prefilter (Bevy's, re-checked), no wave ops, NaN guards negated (`!(len > eps)`) |
 | Upstream aurora after the pin | four commits, none touching rendering |
 
-**What changed in 1.0.2 in response (three things, all in the temporal/noise path):**
+**What shipped, in order, and what each fixed:**
 
-1. **The velocity term is ceilinged by frame time** (`kVelocityFusionFrameTime`, next section) so a
-   full reset is only reachable when frames are short enough for per-frame noise to fuse.
-2. **Default Motion Response 10 → 2.** The history is reprojected, so camera motion alone never
-   needed a full reset; ghosting of *moving objects* is the clamp's and the content reject's job.
-   0–1 is the field-validated flicker-free range; 2 keeps a little responsiveness (a 10 px/frame
-   pan shortens the accumulation to ~5 frames instead of discarding it).
-3. **The noise LUT is gone.** `vbao.wgsl` now computes the order-6 Hilbert index per pixel
-   (`hilbert_index`, six integer iterations) instead of reading a 64×64 `R16Uint` texture the host
-   uploaded with `wgpuQueueWriteTexture` at init. That upload ran on the game thread while the
-   render worker was submitting, on a host that does **not** enable Dawn's
-   `implicit_device_synchronization` toggle, which makes it the one path in this chain that can
-   genuinely behave differently per driver. A LUT that reads as zero gives every pixel the *same*
-   slice directions — a strongly directional, hard-edged estimate that changes direction every
-   frame, invisible while the accumulator averages the 64-frame R2 cycle and glaring the moment the
-   velocity term discards the history. That is a precise match for the report; it is not proven,
-   and the change is correct either way (the procedural index is verified to be the same
-   permutation the LUT held).
+1. **Frame-time cap on the velocity term** (`kVelocityFusionFrameTime`, next section): a full
+   history reset is only reachable when frames are short enough for per-frame noise to fuse.
+2. **In-shader Hilbert noise.** `vbao.wgsl` computes the order-6 Hilbert index per pixel instead of
+   reading a 64×64 `R16Uint` texture the host uploaded with `wgpuQueueWriteTexture` at init. That
+   upload ran on the game thread while the render worker submitted, on a host that does **not**
+   enable Dawn's `implicit_device_synchronization` toggle — the one path in the chain that could
+   genuinely differ per driver, and a LUT reading as zero gives every pixel the same slice
+   directions: directional, hard-edged AO that changes every frame. Not proven to be the cause, and
+   correct either way (the procedural index is verified to be the permutation the LUT held).
+3. **Low Motion Response** removed the flicker in the field, and traded it for ghosting: moving
+   occluders left trails (Link's contact AO staying on ground he had left — the receiver reprojects
+   correctly, its stored AO is simply stale, and the depth test cannot see that). The content
+   reject had been an absolute `|history − current|` test against the noisy single-frame sample,
+   firing on noise and missing trails; it became a **σ-normalised outlier test against the 3×3
+   mean** (discard from ~1σ to 2.5σ), and the clamp tightens to 0.6k under screen motion.
+4. Environment ghosting gone; a **full-body trail behind Link** remained regardless of settings.
+   The disocclusion tolerance floor was `0.002` of the **far plane** — on TP's per-stage far planes
+   hundreds of world units, more than a character's separation from the ground behind him, so the
+   trail passed as "same surface". The tolerance is now **relative to the pixel's own depth**
+   (≥ 1.5%). Nothing in this scene is measured in far-plane fractions any more.
+5. A very soft trail just behind Link remained: structural, because the reprojection is the camera's
+   and Link is nearly static on screen while the world moves, so the camera-reprojected history for
+   a pixel on his body is a *neighbouring* part of his body. Per-object motion vectors would fix it
+   exactly, but the port's interpolation matrices live in the game (`dusk::interp`), not in aurora,
+   and a per-pixel motion attachment is a renderer change plus game-side plumbing. Within the mod:
+   the **two-candidate history** (the history stores the octahedral normal, the temporal pass reads
+   the scene normal, and the un-reprojected candidate wins wherever depth or normal says the
+   reprojected one is a different part of the surface). Cost: one extra history fetch and a normal
+   load per pixel; the history stays 8 bytes/pixel. Confirmed "phenomenal for Link".
+6. Link's AO then read less full; Motion Response 100% fixed that and made distant, broad AO sparse
+   in motion. Both are one fact at two distances: the raw estimate is dense close to the camera
+   (constant pixel radius, fine world sampling) and sparse far away. The velocity response now
+   **fades with view depth** (`motionRange`), and the default response is 100%. That is 1.1.0.
 
-**1.0.2 field result:** the flicker is gone on the affected machine. It traded for a meaningful
-increase in ghosting, as expected once the velocity term stopped resetting history in motion: the
-trail is Link's contact AO staying on the ground he just left (the receiver reprojects correctly,
-its stored AO is simply stale, and the depth test cannot see that). The content reject was an
-absolute `|history − current|` test against the noisy single-frame sample, so it fired on noise and
-missed trails; it is now a σ-normalised outlier test against the 3×3 mean (discard from ~1σ to
-2.5σ), and the clamp tightens to 0.6k under screen motion. In-distribution history keeps
-accumulating, so the noise averaging that removed the flicker is preserved.
+**Could the original report have been a driver issue?** Possibly; it cannot be proven or excluded
+from source. The paths where a driver can differ are the noise upload (removed), Dawn's
+inter-dispatch barriers for storage textures (Dawn-managed, heavily exercised), and frame pacing
+(AMD's Vulkan driver exposes no Mailbox present mode), which feeds the per-frame velocity term and
+is what the cap addresses.
 
-**Second field result:** environment ghosting is gone in motion, panning and traversal; what
-remained was a full-body trail behind Link. That is a disocclusion the depth test could not see:
-its tolerance floor was `0.002` of the far plane, which on TP's per-stage far planes is hundreds of
-world units, more than a character's depth separation from the ground behind him, so the trail
-passed as "same surface" and neither the clamp nor the outlier test treats a same-surface history
-as stale. The tolerance is now relative to the pixel's own depth (≥ 1.5%), which is the same
-lesson the radius ramp and distance fade learned earlier: nothing in this scene should be measured
-in far-plane fractions.
-
-**Third field result:** defaults look good everywhere except a very soft trail just behind Link.
-That one is structural: the reprojection is the camera's, and Link is nearly static on screen while
-the world moves, so the camera-reprojected history for a pixel on his body is a *neighbouring* part
-of his body, same depth and similar AO, and it smeared along the world's motion. Per-object motion
-vectors would fix it exactly, but the port's interpolation matrices live in the game
-(`dusk::interp`), not in aurora, and turning them into a per-pixel motion attachment is a renderer
-change (the shape of the normal attachment) plus game-side plumbing. Within the mod, the answer is
-the two-candidate history above: the history now stores the octahedral normal, the temporal pass
-reads the scene normal, and a static candidate wins wherever the normal or depth says the
-reprojected one is a different part of the surface. Cost is one extra history fetch and a normal
-load per pixel in the temporal pass; the history stays 8 bytes/pixel.
-
-**Fourth field result (→ 1.1.0):** the two-candidate history is "phenomenal for Link" and he no
-longer ghosts. His AO read less full, which a Motion Response of 100% fixed — and that in turn made
-distant, broad AO sparse and noisy in motion. Both are the same fact seen from two distances: the
-raw single-frame estimate is dense close to the camera (constant pixel radius, fine world sampling)
-and sparse far away, so shortening the accumulation is free on a character and ruinous on a
-landmark. The velocity response now **fades with view depth** (`motionRange`, world units: full up
-to it, gone at twice it), and the default response is the validated 100%.
-
-**Could it simply be a driver issue?** Possibly, and it cannot be proven or excluded from source.
-The paths where a driver can differ are the resource upload above (removed), Dawn's inter-dispatch
-barriers for storage textures (Dawn-managed, heavily exercised), and frame pacing (AMD's Vulkan
-driver exposes no Mailbox present mode, so frame times differ), which feeds the per-frame velocity
-term and is what the cap and the new default address.
-
-**If 1.0.2 does not clear it on an affected machine,** the next step is measurement, which is what
-debug views 5–8 exist for. View 7 (Raw AO) at rest is the first one to look at: uniform directional
-streaking there means the noise, tiles mean the prefilter, and a clean view 7 with flicker in view 1
-means the temporal pass itself.
+**If a temporal report comes in again,** measure before theorising. View 7 (Raw AO) at rest is the
+first thing to look at: uniform directional streaking there means the noise, tiles mean the
+prefilter, and a clean view 7 with flicker in view 1 means the temporal pass itself.
 
 | View | Shows | If it is broken on the affected machine |
 |---|---|---|
@@ -238,24 +218,23 @@ means the temporal pass itself.
 **Protocol for the reporter:** same spot, standing still, screenshots of views 1, 2, 5, 6, 7 and 8,
 plus the mod's log lines `adapter: …` (GPU and backend) and `frame time …`. A green view 6 with a
 clean view 5 and a broken view 7 points into `vbao.wgsl`'s march; anything else points upstream of
-it. Do not propose a fourth mechanism without those.
-
-The frame-time cap on the velocity term below stays in as a bounded improvement; it is not the fix.
+it. Do not propose a mechanism without those.
 
 ### Motion response and frame rate
 
 The velocity term in `temporal.wgsl` is `screen motion in pixels per FRAME × motionResponse`, so
 one and the same camera pan produces twice the pixels per frame at 30 fps as at 60, and five times
-as many as at 144. At the default response (0.1 per pixel) a pan of 10 px/frame drove the blend
-weight to 1.0, i.e. threw the whole history away every frame and displayed the raw single-frame
-estimate, whose R2 sampling pattern advances every frame. At 144 Hz the eye fuses that into a mild
-shimmer; at 30–60 Hz it is plain boiling. The term is now **ceilinged by
+as many as at 144. At the 1.0.x default (0.1 per pixel, uncapped) a pan of 10 px/frame drove the
+blend weight to 1.0, i.e. threw the whole history away every frame and displayed the raw
+single-frame estimate, whose R2 sampling pattern advances every frame. At 144 Hz the eye fuses that
+into a mild shimmer; at 30–60 Hz it is plain boiling. The term is now **ceilinged by
 `kVelocityFusionFrameTime / frame time`** (`update_velocity_cap()` in `mod.cpp`, 4 ms), measured on
 the stage hook itself so it stays service-only: a full reset stays available above 250 fps, 144 fps
 allows ~0.58, 60 fps ~0.24 and 30 fps ~0.12, where the term drops below the base blend weight and
 is inert. The disocclusion and content rejects are **not** capped. The mod logs
 `frame time X ms (Y fps): motion response ceiling Z` whenever the smoothed interval moves by more
-than 25%.
+than 25%. The response itself (default 100%) also fades with view depth — full up to `motionRange`,
+gone at twice it — see the tunables.
 
 ## Tunables (config vars; UI shows them in sections)
 
@@ -278,7 +257,7 @@ Ints are fixed-point (usually /100) unless noted.
 | `thickDist` | 60 | distance thickness: radius-proportional thickness floor, ‰ of the view radius. The log-scaled base thickness becomes a vanishing fraction of the (depth-proportional) radius with distance and starves mid/far occlusion; this restores it. 0 = old behavior |
 | `depthBias` | 4 | self-occlusion bias, ‰ toward camera |
 | `temporal` | on | temporal accumulation master |
-| `temporalFrames` | 5 | accumulation length → alpha = 1/frames |
+| `temporalFrames` | 8 | accumulation length → alpha = 1/frames |
 | `temporalClamp` | 200 | neighborhood clamp k ×0.01 (mean ± kσ over 3×3); tightened to 0.6k at ≥ 16 px/frame of screen motion |
 | `motionResponse` | 100 | accumulation shortening per pixel of screen motion **per frame** ×0.01, applied within `motionRange` and faded out beyond it, and capped by a frame-time-aware ceiling — see "Motion response and frame rate" below. Field-validated at 100 for full, responsive AO on characters once the range fade protected distant AO |
 | `motionRange` | 5000 | world units of view depth up to which `motionResponse` applies in full; fades to nothing at 2×. Near geometry is sampled densely (clean single frames), distant AO sparsely (needs the accumulation); 0 = no fade |
@@ -290,7 +269,7 @@ Ints are fixed-point (usually /100) unless noted.
 | `halfRes` | off | compute occlusion at half resolution. With temporal accumulation on, a jittered temporal upsampler reconstructs full-res detail (near-full-res look at ¼ the occlusion cost); with it off, a depth-aware bilinear upscale (softer) |
 | `distanceFade` | off | fade AO out toward the far plane |
 | `fadeStart` / `fadeEnd` | 15000 / 40000 | fade band, world units of view depth (converted from far-plane % for the same reason as the radius ramp band) |
-| `debugMode` | 0 | 0 off, 1 AO, 2 normals, 3 depth, 4 staircase, 5 geometric normal, 6 normal agreement, 7 raw AO, 8 depth MIP 3 (see "AMD report: status") |
+| `debugMode` | 0 | 0 off, 1 AO, 2 normals, 3 depth, 4 staircase, 5 geometric normal, 6 normal agreement, 7 raw AO, 8 depth MIP 3 (see "Temporal accumulation: history and diagnostics") |
 | `debugDepthRange` | 3300 | depth debug view gradient scale in world units (visualization only) |
 
 Debug views draw at `FRAME_BEFORE_HUD` (the normal composite stays at `SCENE_AFTER_OPAQUE`)

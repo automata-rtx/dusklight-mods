@@ -27,9 +27,9 @@
 // that is, threw the whole history away every frame and displayed the raw single-frame estimate,
 // whose sampling pattern advances every frame. At 144 Hz the eye fuses that into a mild shimmer;
 // at 30-60 Hz it is plain flicker/boiling the moment the camera moves, and the lower the frame rate
-// the worse it looks. (In the AMD report, Motion Response 0-1 reduced the in-motion flicker, which
-// is this term being switched off - but that report's AO is also wrong at REST, which no temporal
-// term can explain; the root cause is open, see docs/vbao.md "AMD report: status".)
+// the worse it looks. (That was the 1.0.x "flickers in motion" report; the record is in
+// docs/vbao.md "Temporal accumulation: history and diagnostics".) The response also fades with view
+// depth - full up to velocity_range, gone at twice it - see the velocity_alpha block below.
 // The host therefore measures the frame interval and hands down a ceiling that only lets the term
 // reach a full reset when frames are short enough for per-frame noise to fuse (see
 // kVelocityFusionFrameTime in mod.cpp). The disocclusion and content rejects are NOT capped: those

@@ -8,42 +8,36 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   framework). **Service-only**: it uses only mod-API services (gfx, camera, config, ui,
   resource, log) — it must NOT include game headers or call game code, which is what lets it
   survive game updates without a rebuild.
-  **OPEN BUG: temporal flicker, overwhelmingly on AMD GPUs (two NVIDIA reports too).** The user's
-  own reading, which the evidence supports: it is the TEMPORAL path. Disabling Temporal Accumulation
-  removes the flicker; Motion Response 0-1 with accumulation on almost entirely removes it; the
-  wrong-looking AO (improper angles, hard edges) is probably motion-only, i.e. it is the raw
-  single-frame estimate being displayed whenever the velocity term drives the blend weight to 1.
-  A first pass misread it as "30 fps, frame interpolation off"; **that was wrong** (interpolation
-  is on by default in the shipped build). What is established, all read in the pinned upstream
-  source: nothing in the depth/normal snapshot path, viewport, camera identity under
-  interpolation, projection convention, uniform staging or reversed-Z differs per vendor. Three
-  changes stand: the velocity term is ceilinged by a frame-time-aware cap
-  (`kVelocityFusionFrameTime`), the **default Motion Response is 2** (the field-validated
-  range; the history is reprojected, so camera motion alone never needed a full reset), and the
-  noise **LUT is gone** - the Hilbert index is computed in-shader, because a game-thread texture
-  upload at init on a host that does not enable Dawn's implicit device synchronization is the one
-  path in the chain that genuinely can differ per driver, and a LUT reading as zero produces
-  exactly "directional, hard-edged AO that changes every frame". A driver-level cause cannot be
-  excluded; it also cannot be proven from here. **1.0.2 result: the flicker is gone in the field**;
-  it traded for ghosting (moving-occluder trails, e.g. Link's contact shadow on ground he left),
-  answered by a σ-normalised history outlier test against the local mean plus a motion-tightened
-  clamp - not by bringing the velocity reset back. The full-body trail behind Link that remained was
-  the disocclusion tolerance floor being `0.002` of the **far plane** (hundreds of world units on
-  TP's stages, more than Link's separation from the ground behind him); it is relative to the
-  pixel's own depth now. Nothing in this scene is measured in far-plane fractions any more. The
-  last soft trail on Link is the camera-only reprojection fetching a *neighbouring* part of his
-  body (he is screen-static under the following camera); without per-object motion vectors - the
-  port's interpolation matrices live in the game, and a motion attachment would be an aurora
-  change - the temporal pass now keeps **two history candidates** (reprojected, and static at the
-  pixel's own position), scored on depth AND the normal the history now stores (`rgba16float`),
-  reprojected preferred, static taken only when clearly the better surface. Confirmed
-  "phenomenal for Link". The velocity response then went to the validated **100% within
-  `motionRange` (5000 world units), fading to nothing at 2×**: the raw estimate is dense near the
-  camera and sparse at distance, so a short accumulation is free on a character and ruinous on a
-  far landmark. That is **1.1.0**.
-  **Debug views 5-8 (Geo Normal, Normal Agreement,
-  Raw AO, Depth MIP 3)** and the `adapter:` log line exist to localise it from an affected
-  machine; `docs/vbao.md` "AMD report: status" is the protocol and the record.
+  **Temporal accumulation (1.1.0) — the design, and the field history behind it.** The history
+  is camera-reprojected and stored as `rgba16float` (AO, view depth / far, octahedral view-space
+  normal). Per pixel the pass keeps **two history candidates** — the camera-reprojected one and the
+  un-reprojected one at the pixel's own position — each scored on surface identity (depth mismatch
+  relative to the pixel's own depth, plus normal mismatch); the reprojected one is preferred and
+  the static one taken only when clearly the better surface. That is the substitute for per-object
+  motion vectors, which the mod cannot have (the port's interpolation matrices live in the game,
+  and a motion attachment would be an aurora change): a screen-static character under the
+  following camera takes the static candidate on every curved part of his body. The chosen
+  candidate is then guarded by a disocclusion reject on its mismatch (≥ 1.5% of the pixel's own
+  depth — **never a far-plane fraction**: the old `0.002`-of-far-plane floor was hundreds of world
+  units and let Link trail), a neighbourhood clamp (mean ± kσ, tightened under screen motion) and a
+  **σ-normalised outlier test** against the 3×3 mean (not an absolute difference against the noisy
+  single-frame sample). The velocity response is **100% within `motionRange` (5000 world units),
+  fading to nothing at 2×**, and ceilinged by a frame-time-aware cap (`kVelocityFusionFrameTime`):
+  the raw estimate is dense near the camera and sparse at distance, so a short accumulation is free
+  on a character and ruinous on a far landmark. Sampling noise is an in-shader order-6 Hilbert
+  index + R2 — no LUT, no init-time upload.
+  **How it got here** — the 1.0.x "flickers in motion, mostly on AMD" report: the velocity term
+  reset the whole history on ordinary pans and displayed the raw estimate (the cap and a low
+  response fixed it); that traded for moving-occluder trails (the outlier test); a full-body trail
+  on Link (the far-plane tolerance floor); a soft trail on Link (the two candidates); thin AO on
+  Link versus sparse distant AO (the depth-faded response). Each step was confirmed in the field.
+  Nothing in the depth/normal snapshot path, viewport, camera identity under interpolation,
+  projection convention or uniform staging differs per vendor (all read in the pinned upstream
+  source); the one path that genuinely could — the init-time noise-LUT upload on a host without
+  Dawn's implicit device synchronization — is gone. The full record, the ruled-out table and the
+  diagnostic protocol (debug views 5–8: Geo Normal, Normal Agreement, Raw AO, Depth MIP 3, plus the
+  `adapter:` and `frame time` log lines) are in `docs/vbao.md` "Temporal accumulation: history and
+  diagnostics".
 - **`mods/realtime_sun_shadows/`** — "Realtime Sun Shadows": real-geometry sun/moon cascaded
   shadow maps (game draw-list replay into up to 3 nested light-space depth passes, plus an
   optional Link-only cascade) with PCF, receiver-plane + slope bias, sin-scaled normal-offset

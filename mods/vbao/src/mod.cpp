@@ -6,9 +6,12 @@
 //    classic horizon tracker: separated occluders, gaps and thin geometry (grass) are handled
 //    correctly instead of overdarkening behind the nearest occluder;
 //  - TEMPORAL ACCUMULATION: the sampling noise advances every frame and a reprojected history
-//    buffer averages the estimates into a clean, stable result (neighborhood clamp + depth
-//    disocclusion rejection + velocity/content response control ghosting). With accumulation
-//    disabled the spatial denoiser alone remains as the single-frame fallback;
+//    buffer averages the estimates into a clean, stable result. Two history candidates per pixel
+//    (camera-reprojected, and static at the pixel's own position) scored on depth AND the normal
+//    the history stores stand in for per-object motion vectors; a depth-relative disocclusion
+//    reject, a neighbourhood clamp, a sigma-normalised outlier test and a depth-faded,
+//    frame-time-capped velocity response control ghosting. With accumulation disabled the
+//    spatial denoiser alone remains as the single-frame fallback;
 //  - a depth-aware composite upscale (no AO bleed across silhouettes at half resolution);
 //  - thickness and contrast controls, and a depth-proportional sampling radius;
 //  - AUTHORED NORMALS: the shading normal is the game's own view-space vertex normal, resolved
@@ -136,7 +139,8 @@ struct AoTargets {
     WGPUTextureView depthDifferencesView = nullptr;
     WGPUTexture aoFinal = nullptr;
     WGPUTextureView aoFinalView = nullptr;
-    // Temporal accumulation ping-pong: rg32float (accumulated AO, normalized view depth).
+    // Temporal accumulation ping-pong: rgba16float (accumulated AO, normalized view depth,
+    // octahedral view-space normal).
     WGPUTexture history[2] = {};
     WGPUTextureView historyViews[2] = {};
 };
@@ -203,10 +207,9 @@ float g_loggedFarPlane = 1.0f;  // last far plane reported to the log (world-uni
 // their full authority because they answer "is this history from the same surface", not "how
 // visible is per-frame noise".
 //
-// SCOPE: this bounds how much a full history reset can show; it is NOT the diagnosis of the
-// "broken AO on AMD" report, which is wrong at rest as well (AO at improper angles on surfaces that
-// should be open, with hard edges) and so cannot be a temporal effect. That cause is OPEN - see
-// docs/vbao.md "AMD report: status" and the debug views 5-8 that exist to localise it.
+// This was the first of the 1.1.0 temporal changes; the response itself also fades with view depth
+// (motionRange). The whole sequence and the field results are in docs/vbao.md "Temporal
+// accumulation: history and diagnostics".
 constexpr float kVelocityFusionFrameTime = 0.004f; // seconds: 250 fps and above allow a full reset
 constexpr float kFrameDtMin = 0.001f;              // clamp for the raw interval (spikes, hitches)
 constexpr float kFrameDtMax = 0.100f;
