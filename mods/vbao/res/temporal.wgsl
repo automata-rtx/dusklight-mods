@@ -74,7 +74,7 @@ struct Uniforms {
     radius_ramp_end: f32,   // radius ramp band end, world units of view depth
     denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
     velocity_cap: f32,      // ceiling on the motion-response alpha (frame-time aware, host-set)
-    _pad1: f32,
+    velocity_range: f32,    // motion response fades out from this view depth to 2x it (world units; 0 = never)
     _pad2: f32,
 }
 
@@ -330,8 +330,18 @@ fn temporal_accumulate(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     smoothstep(1.0 * uniforms.content_thresh, 2.5 * uniforms.content_thresh,
                         hist_dev),
                     covered);
-                // Velocity response, ceilinged by the frame-time-aware cap (see the header).
-                let velocity_alpha = min(motion_px * uniforms.velocity_scale, uniforms.velocity_cap);
+                // Velocity response, ceilinged by the frame-time-aware cap (see the header) and
+                // faded out with VIEW DEPTH: full up to velocity_range world units, gone at twice
+                // it. The raw single-frame estimate is dense and clean close to the camera and
+                // sparse at distance (constant pixel radius, growing world radius), so a short
+                // accumulation is free on a character and ruinous on a far landmark - which is
+                // exactly what the field showed at a high response: Link full, distant AO sparse.
+                let view_depth = max(-view_pos.z, 0.0);
+                let range_w = select(1.0,
+                    1.0 - smoothstep(uniforms.velocity_range, uniforms.velocity_range * 2.0, view_depth),
+                    uniforms.velocity_range > 0.0);
+                let velocity_alpha =
+                    min(motion_px * uniforms.velocity_scale * range_w, uniforms.velocity_cap);
                 let a = clamp(max(max(base_alpha, depth_reject),
                                   max(velocity_alpha, content_motion)),
                     0.0, 1.0);

@@ -36,7 +36,11 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   port's interpolation matrices live in the game, and a motion attachment would be an aurora
   change - the temporal pass now keeps **two history candidates** (reprojected, and static at the
   pixel's own position), scored on depth AND the normal the history now stores (`rgba16float`),
-  reprojected preferred, static taken only when clearly the better surface.
+  reprojected preferred, static taken only when clearly the better surface. Confirmed
+  "phenomenal for Link". The velocity response then went to the validated **100% within
+  `motionRange` (5000 world units), fading to nothing at 2×**: the raw estimate is dense near the
+  camera and sparse at distance, so a short accumulation is free on a character and ruinous on a
+  far landmark. That is **1.1.0**.
   **Debug views 5-8 (Geo Normal, Normal Agreement,
   Raw AO, Depth MIP 3)** and the `adapter:` log line exist to localise it from an affected
   machine; `docs/vbao.md` "AMD report: status" is the protocol and the record.

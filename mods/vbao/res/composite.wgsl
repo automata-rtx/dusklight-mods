@@ -64,7 +64,7 @@ struct Uniforms {
     radius_ramp_end: f32,   // radius ramp band end, world units of view depth
     denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
     velocity_cap: f32,      // ceiling on the motion-response alpha (frame-time aware, host-set)
-    _pad1: f32,
+    velocity_range: f32,    // motion response fades out from this view depth to 2x it (world units; 0 = never)
     _pad2: f32,
 }
 

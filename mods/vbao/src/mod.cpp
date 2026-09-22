@@ -77,6 +77,7 @@ ConfigVarHandle g_cvarTemporal = 0;
 ConfigVarHandle g_cvarTemporalFrames = 0;
 ConfigVarHandle g_cvarTemporalClamp = 0;
 ConfigVarHandle g_cvarMotionResponse = 0;
+ConfigVarHandle g_cvarMotionRange = 0;
 ConfigVarHandle g_cvarContentThresh = 0;
 ConfigVarHandle g_cvarDisoccTol = 0;
 ConfigVarHandle g_cvarDenoisePasses = 0;
@@ -348,7 +349,7 @@ struct AoUniforms {
     float radius_ramp_end;   // radius ramp band end, world units of view depth
     float denoise_strength;  // spatial denoise blend, 0 raw .. 1 fully blurred
     float velocity_cap;      // ceiling on the motion-response alpha (frame-time aware, host-set)
-    float _pad1;
+    float velocity_range;    // motion response fades out from this view depth to 2x it (world units; 0 = never)
     float _pad2;
 };
 static_assert(sizeof(AoUniforms) % 16 == 0);
@@ -1060,7 +1061,14 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const int64_t temporalFrames = std::clamp<int64_t>(get_int_option(g_cvarTemporalFrames, 5), 2, 12);
     uniforms.temporal_alpha = 1.0f / static_cast<float>(temporalFrames);
     uniforms.temporal_clamp_k = percent(g_cvarTemporalClamp, 200, 100, 300);
-    uniforms.velocity_scale = percent(g_cvarMotionResponse, 2, 0, 100);
+    uniforms.velocity_scale = percent(g_cvarMotionResponse, 100, 0, 100);
+    // World units of view depth: the motion response is full up to this depth and gone at twice
+    // it. The raw single-frame estimate is dense and clean close to the camera (constant pixel
+    // radius = fine world sampling) and sparse at distance (the same pixel radius spans a huge
+    // world radius), so shortening the accumulation costs nothing on a character and everything
+    // on a far landmark. 0 disables the fade.
+    uniforms.velocity_range = static_cast<float>(
+        std::clamp<int64_t>(get_int_option(g_cvarMotionRange, 5000), 0, 200000));
     uniforms.velocity_cap = velocityCap;
     uniforms.content_thresh = percent(g_cvarContentThresh, 100, 25, 300);
     uniforms.disocc_tol = percent(g_cvarDisoccTol, 0, 0, 20);
@@ -1292,12 +1300,18 @@ ModResult build_controls_tab(
         "responsive (less ghosting, more shimmer); higher accumulates more (cleaner, can ghost).",
         100, 300, 10, "%");
     add_number(left, "Motion Response", g_cvarMotionResponse,
-        "How much camera motion shortens the accumulation so AO tracks geometry instead of "
-        "dragging behind it. Higher snaps faster in motion but shimmers more. The history is "
-        "reprojected, so camera motion alone does not need this; 0-2 is the flicker-free range "
-        "reported in the field, and high values expose the raw single-frame estimate whenever "
-        "the camera moves.",
-        0, 100, 1, "%");
+        "How much screen motion shortens the accumulation so AO tracks geometry instead of "
+        "dragging behind it. Applies within Motion Response Range and fades out beyond it, and "
+        "is ceilinged by frame time so a full reset is only reachable at very high frame rates. "
+        "Higher keeps characters' AO full and responsive in motion; lower accumulates more.",
+        0, 100, 5, "%");
+    add_number(left, "Motion Response Range", g_cvarMotionRange,
+        "View distance in world units up to which Motion Response applies in full; it fades to "
+        "nothing at twice this distance. Close geometry is sampled densely and its single-frame "
+        "estimate is clean, so a short accumulation costs nothing there; distant, broad AO is "
+        "sampled sparsely and needs the accumulation to stay solid in motion. 0 applies Motion "
+        "Response at every distance.",
+        0, 200000, 500, nullptr);
     add_number(left, "Content Response", g_cvarContentThresh,
         "Threshold for treating history as stale, measured in sigmas of the current local AO "
         "distribution (100% = discard from about 1 to 2.5 sigma). This is what removes trails "
@@ -1489,7 +1503,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"debugDepthRange", 3300, &g_cvarDebugDepthRange},
         {"temporalFrames", 8, &g_cvarTemporalFrames},
         {"temporalClamp", 200, &g_cvarTemporalClamp},
-        {"motionResponse", 2, &g_cvarMotionResponse},
+        {"motionResponse", 100, &g_cvarMotionResponse},
+        {"motionRange", 5000, &g_cvarMotionRange},
         {"contentThresh", 100, &g_cvarContentThresh},
         {"disoccTol", 0, &g_cvarDisoccTol},
         {"denoisePasses", 1, &g_cvarDenoisePasses},
@@ -1613,6 +1628,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarBlackPoint = g_cvarThickness = g_cvarThickFade = g_cvarThickDist = g_cvarDepthBias = 0;
     g_cvarDebugDepthRange = 0;
     g_cvarTemporal = g_cvarTemporalFrames = g_cvarTemporalClamp = g_cvarMotionResponse = 0;
+    g_cvarMotionRange = 0;
     g_cvarContentThresh = g_cvarDisoccTol = g_cvarDenoisePasses = g_cvarDenoiseStrength = 0;
     g_cvarDistanceFade = g_cvarFadeStart = g_cvarFadeEnd = 0;
     g_cvarHalfRes = g_cvarDebugView = 0;
