@@ -1302,10 +1302,10 @@ ModResult build_controls_tab(
         "reacts faster to moving objects; higher accumulates more on noisy detail like grass.",
         25, 300, 25, "%");
     add_number(left, "Disocclusion Tolerance", g_cvarDisoccTol,
-        "Depth mismatch (as % of depth) before reprojected history is treated as a different "
-        "surface and discarded. Lower rejects more aggressively at silhouettes; higher keeps "
-        "more history. 0 rejects the most (a small fixed depth floor still admits history on "
-        "matching surfaces), which minimizes distant ghosting.",
+        "Depth mismatch (as % of the pixel's own depth) before reprojected history is treated as "
+        "a different surface and discarded. Lower rejects more aggressively at silhouettes; "
+        "higher keeps more history. Values below 1.5% act as 1.5%, which separates a character "
+        "from the ground behind it at any distance.",
         0, 20, 1, "%");
 
     svc_ui->pane_add_section(mod_ctx, left, "Filtering");

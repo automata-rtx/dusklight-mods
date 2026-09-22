@@ -230,10 +230,21 @@ fn temporal_accumulate(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
                 // Depth disocclusion: clip w is the current point's view depth in the PREVIOUS
                 // frame, in the same normalization the history stored its own depth.
+                //
+                // The tolerance is RELATIVE to the point's depth (>= 1.5% of it). It used to have
+                // a floor of 0.002 of the far plane, and TP's far plane is per-stage and huge: on
+                // a 200000-unit stage that floor was 400 world units, larger than Link, so ground
+                // he had just vacated matched his body's stored depth and kept his AO - a
+                // full-body trail behind him that no other guard could remove (the depth WAS
+                // "close enough", so the clamp and the outlier test never saw a disocclusion).
+                // Relative tolerance follows the scene: 15 units at 1000, 150 at 10000, which
+                // still admits the same surface at grazing angles (reprojection error is
+                // sub-pixel) while separating a character from the ground behind it.
                 let expected_prev_d = clamp(clip_prev.w * uniforms.inv_far, 0.0, 1.0);
-                let depth_tol = max(expected_prev_d * uniforms.disocc_tol, 0.002);
+                let rel_tol = max(uniforms.disocc_tol, 0.015);
+                let depth_tol = max(expected_prev_d * rel_tol, 1.0e-6);
                 let depth_reject =
-                    smoothstep(depth_tol, depth_tol * 4.0, abs(expected_prev_d - hist.y));
+                    smoothstep(depth_tol, depth_tol * 3.0, abs(expected_prev_d - hist.y));
 
                 // Covered pixels accumulate the fresh sample (clamp + content-reject guard against
                 // ghosting); uncovered pixels keep history unless camera motion / disocclusion

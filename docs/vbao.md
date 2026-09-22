@@ -181,6 +181,15 @@ missed trails; it is now a σ-normalised outlier test against the 3×3 mean (dis
 2.5σ), and the clamp tightens to 0.6k under screen motion. In-distribution history keeps
 accumulating, so the noise averaging that removed the flicker is preserved.
 
+**Second field result:** environment ghosting is gone in motion, panning and traversal; what
+remained was a full-body trail behind Link. That is a disocclusion the depth test could not see:
+its tolerance floor was `0.002` of the far plane, which on TP's per-stage far planes is hundreds of
+world units, more than a character's depth separation from the ground behind him, so the trail
+passed as "same surface" and neither the clamp nor the outlier test treats a same-surface history
+as stale. The tolerance is now relative to the pixel's own depth (≥ 1.5%), which is the same
+lesson the radius ramp and distance fade learned earlier: nothing in this scene should be measured
+in far-plane fractions.
+
 **Could it simply be a driver issue?** Possibly, and it cannot be proven or excluded from source.
 The paths where a driver can differ are the resource upload above (removed), Dawn's inter-dispatch
 barriers for storage textures (Dawn-managed, heavily exercised), and frame pacing (AMD's Vulkan
@@ -246,7 +255,7 @@ Ints are fixed-point (usually /100) unless noted.
 | `temporalClamp` | 200 | neighborhood clamp k ×0.01 (mean ± kσ over 3×3); tightened to 0.6k at ≥ 16 px/frame of screen motion |
 | `motionResponse` | 2 | accumulation shortening per pixel of screen motion **per frame** ×0.01 (was 10; 0–2 is the field-validated flicker-free range). Capped by a frame-time-aware ceiling — see "Motion response and frame rate" below |
 | `contentThresh` | 100 | history outlier threshold ×0.01, in **sigmas of the 3×3 local AO distribution** (100 = discard from ~1σ to 2.5σ from the local mean). Was an absolute `|history − current|` test against the noisy single-frame sample, which fired on noise and missed trails; the σ-normalised test against the mean is what removes moving-occluder ghosting now that the velocity term no longer resets history |
-| `disoccTol` | 0 | disocclusion depth tolerance, % of depth (0–20). 0 rejects most aggressively; a small fixed depth floor still admits history on matching surfaces, minimizing distant ghosting |
+| `disoccTol` | 0 | disocclusion depth tolerance, % of the pixel's own depth (0–20; below 1.5 acts as 1.5). The old floor was `0.002` of the **far plane**, i.e. 400 world units on a 200000-unit stage, larger than Link, so ground he had just vacated kept his AO as a full-body trail |
 | `denoisePasses` | 1 | spatial passes 0–3 (ping-pong parity is mirrored on the CPU side —
   see mod-api-notes) |
 | `denoiseStrength` | 60 | per-pass blur blend, % (0 raw, 100 full blur). Lowered from full so the sharper temporal result keeps its detail |

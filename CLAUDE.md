@@ -27,7 +27,11 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   excluded; it also cannot be proven from here. **1.0.2 result: the flicker is gone in the field**;
   it traded for ghosting (moving-occluder trails, e.g. Link's contact shadow on ground he left),
   answered by a σ-normalised history outlier test against the local mean plus a motion-tightened
-  clamp - not by bringing the velocity reset back. **Debug views 5-8 (Geo Normal, Normal Agreement,
+  clamp - not by bringing the velocity reset back. The full-body trail behind Link that remained was
+  the disocclusion tolerance floor being `0.002` of the **far plane** (hundreds of world units on
+  TP's stages, more than Link's separation from the ground behind him); it is relative to the
+  pixel's own depth now. Nothing in this scene is measured in far-plane fractions any more.
+  **Debug views 5-8 (Geo Normal, Normal Agreement,
   Raw AO, Depth MIP 3)** and the `adapter:` log line exist to localise it from an affected
   machine; `docs/vbao.md` "AMD report: status" is the protocol and the record.
 - **`mods/realtime_sun_shadows/`** — "Realtime Sun Shadows": real-geometry sun/moon cascaded
