@@ -31,6 +31,7 @@
 
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
 #include "JSystem/J3DGraphBase/J3DShape.h"
+#include "d/actor/d_a_player.h"
 #include "d/actor/d_flower.h"
 #include "d/actor/d_grass.h"
 #include "d/d_bg_parts.h"
@@ -99,6 +100,7 @@ ConfigVarHandle g_cvarFogEnabled = 0;    // DEFAULT below in init()
 ConfigVarHandle g_cvarFogMixed = 0;      // DEFAULT below in init()
 ConfigVarHandle g_cvarFogDebug = 0;      // DEFAULT below in init()
 ConfigVarHandle g_cvarFogSkipUnfogged = 0;  // DEFAULT below in init()
+ConfigVarHandle g_cvarFogDeferInSenses = 0;  // DEFAULT below in init()
 
 UiWindowHandle g_controlsWindow = 0;
 GfxDrawTypeHandle g_drawType = 0;
@@ -346,6 +348,52 @@ bool effect_enabled() {
     return get_bool_option(g_cvarFogEnabled, true) && g_shapeHookOk;
 }
 
+// WOLF SENSES: THE FRAME IS LEFT ENTIRELY TO THE GAME'S OWN FOG.
+//
+// The reported bug: with Wolf Senses active, some camera directions lose the close-range fog and
+// show far more of the world than the sense view is meant to. Senses is where a fullscreen fog pass
+// is at its most exposed. While the wolf's senses are up, every environment fog setter replaces the
+// palette fog with BLACK over a tiny range: fog_col is zeroed and dKy_WolfPowerup_FogNearFar picks a
+// start/end like 750..1750 (d_kankyo.cpp:413, applied at :2459 for the global fog, :2922 for BG
+// tevstrs, :3097 for actors), where ordinary fog runs over tens of thousands of units. Past ~1750
+// the whole scene is meant to be black.
+//
+// The quad computes ONE fog term per pixel from the ONE depth the depth buffer holds, whereas
+// forward fog fogs every fragment at its own depth. The two agree only where the surface that owns
+// the pixel's depth is also the one its colour comes from. Where they differ — a see-through
+// surface that writes depth in front of distant geometry, or geometry that writes no depth over the
+// sky (depth 0, which the quad skips) — the colour behind is fogged at the wrong depth or not at
+// all. Ordinary fog only reaches full strength far away, so there the error is usually small. Under
+// senses fog it is the difference between pure black and full visibility, which is exactly "revealing far more of the scene", and
+// it is camera-direction dependent because it depends on which of those surfaces are in view. WHICH
+// geometry does it in the reported views is NOT established — the stage archives are not in the
+// source tree — and it does not need to be, because:
+//
+// BLACK FOG HAS NOTHING TO DEFER. Forward fog toward F = 0 is mix(x, 0, f) = (1 - f) * x, a pure
+// attenuation, and a multiplicative composite m (AO, shadows) applied on top gives
+// m * (1 - f) * x = (1 - f) * (m * x) — the deferred result, EXACTLY. The whole point of this mod
+// is that AO multiplies over already-fogged colour; with black fog that is already correct. So in
+// senses deferring buys nothing and can only lose exactness, and the right answer is to open no
+// suppression scope at all: no fog is suppressed, no quad is pushed, no replay runs, and the frame
+// is the game's own, bit for bit. (An ADDITIVE composite — indirect light — would differ, since it
+// adds light on top of the black instead of under it. No mod in the build adds light.)
+//
+// The predicate is the game's own: daPy_py_c::checkNowWolfPowerUp() is exactly what every one of
+// those fog setters tests, so the scope closes on the same frame the fog turns black and reopens
+// on the same frame it turns back. The player check covers frames with no player actor, where
+// checkNowWolfEyeUp would dereference null.
+//
+// fogDeferInSenses turns the exemption off. It is a DIAGNOSTIC, default off: it brings the bug back
+// so the per-pixel mechanism can be measured (Fog Factor view in the failing direction — a region
+// that is dark in the fog-factor view but bright in the scene is a depth mismatch, not a config
+// one). The same mismatch exists under ordinary fog at a far smaller scale, which is the only reason
+// to go looking for it.
+bool wolf_senses_active() {
+    return dComIfGp_getLinkPlayer() != nullptr && daPy_py_c::checkNowWolfPowerUp();
+}
+
+bool g_sensesExempt = false;
+bool g_wasSensesExempt = false;
 
 // The frame's world viewport width in the game's logical (640-wide) space, sampled once per frame
 // while the world viewport is still current. Only the width is needed: aurora's centre term is
@@ -1179,8 +1227,23 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
     g_selfDrawnIndexValid = false;
     g_selfDrawnIndex = 0;
     g_scopeActive = effect_enabled();
+    // Before anything is suppressed: in senses, no scope opens at all. See wolf_senses_active().
+    g_sensesExempt = g_scopeActive && wolf_senses_active() &&
+                     !get_bool_option(g_cvarFogDeferInSenses, false);
+    if (g_sensesExempt) {
+        g_scopeActive = false;
+        std::snprintf(g_statusText, sizeof(g_statusText),
+            "Wolf Senses: fog left to the game (black fog has nothing to defer)");
+    }
+    if (g_sensesExempt != g_wasSensesExempt) {
+        svc_log->info(mod_ctx, g_sensesExempt
+                                   ? "deferred fog: Wolf Senses active; the game's own fog is used"
+                                   : "deferred fog: Wolf Senses over; deferring again");
+        g_wasSensesExempt = g_sensesExempt;
+    }
     if (!g_scopeActive) {
         g_suppressAllowed = false;
+        g_lastFrameDeferred = false;
     }
 }
 
@@ -1397,6 +1460,20 @@ ModResult build_controls_tab(
     control.config_var = g_cvarFogSkipUnfogged;
     add_control(left, control);
 
+    control = UI_CONTROL_DESC_INIT;
+    control.kind = UI_CONTROL_TOGGLE;
+    control.label = "Defer Fog During Wolf Senses (diagnostic)";
+    control.help_rml =
+        "Off by default, and should stay off for play. While Wolf Link's senses are active the game "
+        "switches its fog to a short black fog, and black fog gains nothing from being deferred - "
+        "so the mod normally steps aside and lets the game draw it. Turning this on makes the mod "
+        "defer it anyway, which brings back the known senses bug (some camera directions show far "
+        "more of the world than the senses view allows). It exists only so that bug can be "
+        "examined with the Debug View.";
+    control.binding = UI_BINDING_CONFIG_VAR;
+    control.config_var = g_cvarFogDeferInSenses;
+    add_control(left, control);
+
     static const char* kDebugOptions[] = {"Off", "Fog Factor", "Config IDs"};
     control = UI_CONTROL_DESC_INIT;
     control.kind = UI_CONTROL_SELECT;
@@ -1605,6 +1682,15 @@ ModResult init(ModError* error) {
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogSkipUnfogged) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
+    // DEFAULT OFF. A diagnostic that re-enables deferral during Wolf Senses, i.e. brings the senses
+    // bug back on purpose — see wolf_senses_active().
+    cvarDesc = CONFIG_VAR_DESC_INIT;
+    cvarDesc.name = "fogDeferInSenses";
+    cvarDesc.type = CONFIG_VAR_BOOL;
+    cvarDesc.default_bool = false;
+    if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogDeferInSenses) != MOD_OK) {
+        return mods::set_error(error, MOD_ERROR, "failed to register fog option");
+    }
     // DEFAULT: fog debug view off (0).
     cvarDesc = CONFIG_VAR_DESC_INIT;
     cvarDesc.name = "fogDebug";
@@ -1707,7 +1793,8 @@ void shutdown() {
     svc_resource->free(mod_ctx, &g_shaderSource);
     release_fog_pipelines();
     g_cvarFogEnabled = g_cvarFogMixed = g_cvarFogDebug = g_cvarFogLog = 0;
-    g_cvarFogSkipUnfogged = 0;
+    g_cvarFogSkipUnfogged = g_cvarFogDeferInSenses = 0;
+    g_sensesExempt = g_wasSensesExempt = false;
     g_lastFogLogSig[0] = '\0';
     g_controlsWindow = 0;
     g_drawType = g_sceneBeginHook = g_sceneAfterOpaqueHook = g_frameBeforeHudHook = 0;

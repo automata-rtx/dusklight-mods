@@ -199,6 +199,13 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   next to the camera. Widest-`endZ` now resolves only the barrier dome.
   Mixed-scene mode defaults to **Exact**: most outdoor scenes mix configs, and Vanilla hands those
   back to forward fog, i.e. AO on top of the fog again in exactly the scenes the mod exists for.
+  **Wolf Senses opens no scope at all (1.0.2, not yet confirmed in-game).** Senses swaps every fog
+  for black over ~750..1750 (`dKy_WolfPowerup_FogNearFar`). Black fog commutes with multiplicative
+  composites (`m·(1−f)·x`), so there is nothing to defer. The quad's one-depth-per-pixel error,
+  usually small under ordinary fog, becomes black-versus-visible under senses fog. That was the
+  "senses reveal far more of the scene in some directions" report. Which geometry caused it was
+  never established; the exemption is exact either way. `fogDeferInSenses` (default off) brings
+  the bug back so it can be measured with the Fog Factor view.
   Diagnostic: `fogLogConfigs` dumps the frame's captured fog-config table; the Status line reports
   how many shared-DL materials carried live fog. **Game-linked** + webgpu.
   Docs: `docs/deferred_fog.md`.

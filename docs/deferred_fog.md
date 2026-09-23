@@ -29,8 +29,8 @@ again.
 
 **Shipped but NOT separately confirmed in-game** — do not describe these as verified: fog range
 adjustment, the `dBgp_c` map-unit path, the exact-literal Ganon-barrier signature, Exact-as-default,
-the quad-anchor readout, and the fog-off / additive counters. They are verified against the *game
-source*, which is a different claim.
+the quad-anchor readout, the fog-off / additive counters, and the Wolf Senses exemption (1.0.2, see
+"Wolf Senses"). They are verified against the *game source*, which is a different claim.
 
 **ONE OPEN QUESTION — PARKED BY THE USER, UNRESOLVED, AFTER THREE FAILED FIXES.** Distant
 landmarks — the user reports Death Mountain specifically, and the Ganon barrier — read **brighter
@@ -131,6 +131,58 @@ second row is the one that has already been walked to its end.
 **Fog Factor** view discriminates the two directly: unfogged geometry is a *silhouette* difference
 (the landmark shows its own texture through the haze); an over-unity blend is a *fog-coloured*
 difference (the landmark shows **more haze than the haze**).
+
+## Wolf Senses — the mod steps aside (1.0.2, NOT yet confirmed in-game)
+
+**The report** (from a player, relayed by the user): with Wolf Senses active, in some camera
+directions the close-range fog disappears and the view shows far more of the world than the senses
+view normally allows.
+
+**What senses does to the fog.** While `daPy_py_c::checkNowWolfPowerUp()` is true, every
+environment fog setter swaps the palette fog for a **black, very short** fog: `fog_col` is zeroed
+and `dKy_WolfPowerup_FogNearFar` (`d_kankyo.cpp:413`) sets start/end from a per-stage table —
+750..1750 outdoors (pattern 1), 1000..1800 indoors (pattern 5). It does this for the global fog
+(`:2459`), for BG tevstrs (`:2922`) and for actor tevstrs (`:3097`), so every material the dKy
+stamps gets it. Ordinary fog runs over tens of thousands of units; senses fog reaches full black
+about 1750 units out.
+
+**Why that exposes the deferred pass.** The quad derives one fog term per pixel from the one depth
+the depth buffer holds. Forward fog fogs each fragment at its own depth. The two agree only where
+the surface that owns the pixel's depth is also the surface its colour comes from. Two cases break
+that: a see-through surface that writes depth in front of distant geometry (what is behind is
+fogged at the near surface's depth, i.e. hardly at all), and geometry that writes no depth over
+the sky (depth 0, which the quad skips as sky). Ordinary fog only reaches full strength far away,
+so there either error is usually small. Under senses fog the same error is the difference between pure black and full visibility, which
+is exactly the report, and it depends on camera direction because it depends on which such
+surfaces are in view. **Which geometry does it in the reported views is NOT established.** The
+stage archives are not in the source tree, so no material's blend or Z mode is readable, and
+nobody has looked at it in-game with the Debug View. Do not treat this as the confirmed mechanism.
+
+**Why the fix does not need to know.** Black fog has nothing to defer. Forward fog toward
+`F = 0` is `mix(x, 0, f) = (1 − f)·x`, a pure attenuation. A multiplicative composite `m` (AO,
+shadows) applied afterwards gives `m·(1 − f)·x = (1 − f)·(m·x)`, which is the deferred result
+exactly. So in senses the mod opens **no suppression scope at all**: nothing is suppressed, no
+quad is pushed, no replay runs, and the frame is the game's own. The fix is exact whatever the
+mechanism turns out to be. The Status line reads
+`Wolf Senses: fog left to the game (black fog has nothing to defer)`, and the transitions are
+logged. The predicate is the game's own `checkNowWolfPowerUp()`, so the scope closes on the frame
+the fog turns black and reopens on the frame it turns back. It is guarded by
+`dComIfGp_getLinkPlayer() != nullptr`, because `checkNowWolfEyeUp` dereferences the player
+unconditionally.
+
+**What it gives up:** nothing for AO or shadows, per the algebra above. An *additive* composite
+(indirect light, e.g. SSILVB's bounce) would now add light on top of the black fog instead of
+under it. No mod in the current build adds light.
+
+**Measuring the mechanism, if anyone wants to.** `fogDeferInSenses` (Controls window, default
+off) brings the old behaviour back. Stand in a failing direction with it on and switch the Debug
+View to **Fog Factor**. If the revealed region is *dark* in the fog-factor view while the scene
+behind it is far away, the quad is reading a depth nearer than the colour it fogs. That is a
+depth-owner mismatch, and it is worth knowing because the same mismatch exists at a smaller scale
+under ordinary fog. If the fog-factor view is *white* there but the scene still shows through, the
+quad's output is being overwritten after it lands, which is a different problem (read the anchor
+on the Status line first). Either reading is per-pixel evidence. That is the kind of evidence the
+Death Mountain question above has so far lacked, and it was never gathered there.
 
 ## The exported service is for ORDERING, not data
 
@@ -525,8 +577,10 @@ special-fog materials), and the two modes handle that differently (`mixedMode`):
   - MSAA silhouettes may resolve to an invalid ID on 1-px fringes → reference config.
 - **Vanilla**: the original behavior — only draws matching the frame's reference config
   are suppressed; any deviant reverts the scene to forward fog from the next frame until
-  it is uniform again. Twilight black fog (type 7 → linear black), wolf-senses white fog
-  (type 6), and room transitions all take the vanilla path in this mode.
+  it is uniform again. Twilight black fog (type 7 → linear black), the white fog `mType = 6`
+  forces on `MA09`, and room transitions all take the vanilla path in this mode. (This line used
+  to call type 6 "wolf-senses white fog". Wolf Senses fog is black and linear — see "Wolf Senses"
+  — and it never reaches this path, because no scope opens while senses are up.)
 
 A scene that uses a special configuration *uniformly* (all draws agree) is deferred
 normally in both modes — all five GX fog curves (LIN/EXP/EXP2/REVEXP/REVEXP2) are
@@ -564,6 +618,7 @@ fog itself at range (unnatural darkening on distant fog-washed terrain). Tools:
 | `fogDebug` | 0 | 1 = deferred fog factor as grayscale, 2 = config IDs (exact mode, mixed frames) |
 | `fogSkipUnfogged` | off | mark pixels the game drew with fog switched off so the quad leaves them alone (see "Geometry the game draws with no fog at all"); forces the ID replay, and needs `fogMixedMode` = Exact to do anything |
 | `fogLogConfigs` | off | dump the frame's captured fog-config table to the log whenever it changes |
+| `fogDeferInSenses` | off | **diagnostic**: keep deferring while Wolf Senses are active, which brings the senses bug back so it can be measured (see "Wolf Senses") |
 
 These are the names `register_var` is actually called with; an earlier revision of this table
 listed `effectEnabled` / `mixedMode` / `debugView`, which the mod has never registered.
