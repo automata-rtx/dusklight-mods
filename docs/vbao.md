@@ -144,10 +144,23 @@ i.e. their authored normals point straight up, while Geo Normal (view 5) showed 
 camera as they geometrically do. Normal Agreement (view 6) was red and white on the fence and the
 trunk and green on the ground and Link — and the red/white regions were the broken AO.
 
-**Cause:** the authored normal does not always describe the surface. Two game-side reasons, neither
-fixable from a service-only mod: props and foliage whose normals were authored for flat lighting,
-and J3D shapes that load their normal matrix by index from an array `J3DModel::viewCalc` fills at
-the simulation tick (`J3DShapeMtx::loadMtxIndx_PNGP`), not for the presented view. A hemisphere
+**Cause: NOT established.** The reports that still show this come from old AMD drivers (an RDNA2
+laptop on a November 2024 driver, an RDNA1 5600 XT on maintenance-only drivers). Two game-side
+candidates exist — props and foliage whose normals were authored for flat lighting, and J3D shapes
+that load their normal matrix by index from an array `J3DModel::viewCalc` fills at the simulation
+tick (`J3DShapeMtx::loadMtxIndx_PNGP`) — but **both are CPU-side data and would reproduce on every
+GPU.** If an NVIDIA machine shows correct (camera-facing, blue) fence posts in view 2 at the same
+spot, the normal buffer's *contents* differ per driver, and the cause is in the renderer path those
+drivers run: aurora's generated shader transforms the normal as
+`vec4f(nrm, 0.0) * ubuf.nrm_mtx[in_pnmtxidx]`, a dynamically indexed `mat3x4` array in a uniform
+buffer placed after the larger `postex_mtx` array, and writes it to a second `RGB10A2Unorm` colour
+target. A driver that fetched the wrong array element would produce exactly what view 2 shows — a
+coherent normal in the wrong frame, varying with the angle between that frame and the view — while
+positions stay correct. That would be an aurora/Dawn/driver report, not a mod bug. What decides
+it: view 2 from an NVIDIA machine at the same spot, and the affected user's `adapter:` log line
+plus the same view with the other backend (D3D12 ↔ Vulkan) and, if possible, a current driver.
+Either way, the runtime check below catches it, because it tests the normal the mod actually
+receives. A hemisphere
 centred 40–90° off the real surface carves sectors out of the very plane the samples lie in —
 AO on open geometry, varying with the angle between the wrong normal and the view.
 
