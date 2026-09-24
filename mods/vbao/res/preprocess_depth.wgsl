@@ -40,7 +40,7 @@ struct Uniforms {
     fade_end: f32,       // distance fade end, world units of view depth
     debug_view: u32,
     frame_index: u32,
-    flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
+    flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade, bit 3 = normal repair (experimental)
     thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
     inv_debug_depth: f32,   // debug depth view gradient scale (1 / world units)
     radius_far: f32,        // far effect radius (fraction of view depth); 0 disables the ramp

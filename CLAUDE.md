@@ -26,15 +26,18 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   the raw estimate is dense near the camera and sparse at distance, so a short accumulation is free
   on a character and ruinous on a far landmark. Sampling noise is an in-shader order-6 Hilbert
   index + R2 — no LUT, no init-time upload.
-  **Authored normals are not trusted blindly (1.1.1).** Where the authored normal disagrees with
+  **Normal Repair (1.1.1) is EXPERIMENTAL and OFF by default — the user's explicit decision: do
+  not interfere with game-authored normals where it can be avoided. Do not turn it on by default.**
+  When enabled (`normalRepairExperimental`, flags bit 3), where the authored normal disagrees with
   the depth-derived face normal by more than ~37° (`dot < 0.8`, red/white in debug view 6) both
   the occlusion pass and the temporal pass blend it to the geometric normal, fully at `dot ≤ 0.6`.
   Field screenshots showed fence posts whose authored normals point straight up, and AO on the
   trunk/fence exactly where view 6 was red. **The cause is not established**: the reports come from
-  old AMD drivers (RDNA2 Nov-2024, RDNA1 maintenance); the game-side candidates (flat-lighting
+  AMD cards (RDNA2 laptop, RDNA1 5600 XT); updating the RDNA2 laptop to the latest driver did NOT
+  fix it (D3D12; Vulkan and NVIDIA at the same spot still untested). The game-side candidates (flat-lighting
   normals, sim-tick normal matrices) would reproduce on every GPU, so if NVIDIA shows correct
   normals at the same spot it is a driver-dependent renderer path (aurora's dynamically indexed
-  `nrm_mtx` uniform array is the prime suspect) — see `docs/vbao.md`. The runtime check works
+  `nrm_mtx` uniform array is the prime suspect) — see `docs/vbao.md`. The opt-in check works
   whichever it is. Smooth
   shading on low-poly curvature stays under the threshold, so it keeps its benefit.
   **How it got here** — the 1.0.x "flickers in motion, mostly on AMD" report: the velocity term

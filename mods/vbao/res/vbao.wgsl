@@ -43,7 +43,7 @@ struct Uniforms {
     fade_end: f32,       // distance fade end, world units of view depth
     debug_view: u32,
     frame_index: u32,
-    flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
+    flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade, bit 3 = normal repair (experimental)
     thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
     inv_debug_depth: f32,   // debug depth view gradient scale (1 / world units)
     radius_far: f32,        // far effect radius (fraction of view depth); 0 disables the ramp
@@ -331,7 +331,8 @@ fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // and the full account of the three separate places it had to be deleted from is in
     // docs/authored_normals.md 2a.
     //
-    // UNTRUSTED AUTHORED NORMALS. The authored normal is only as good as the game made it, and on
+    // NORMAL REPAIR (EXPERIMENTAL, flags bit 3, OFF by default - the authored normal is used
+    // unmodified unless the user opts in). The authored normal is only as good as the game made it, and on
     // some geometry it does not describe the surface at all: prop and foliage normals authored for
     // flat lighting (a vertical fence post whose normals point straight up), and J3D shapes whose
     // normal matrix comes from an array filled at the simulation tick rather than for the
@@ -343,7 +344,8 @@ fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // full; below it the normal blends to the geometric one and is fully geometric under 0.6
     // (~53 degrees) or when it points into the surface. The geometric normal is a flat facet, but
     // it is the plane the samples actually lie in, so it carves nothing on open geometry.
-    let normal_trust = smoothstep(0.6, 0.8, dot(pixel_normal, geo_n));
+    let normal_trust = select(1.0, smoothstep(0.6, 0.8, dot(pixel_normal, geo_n)),
+        (uniforms.flags & 8u) != 0u);
     let normal = normalize(mix(geo_n, pixel_normal, normal_trust));
 
     // Depth-proportional radius: constant screen-space search radius. Base thickness grows

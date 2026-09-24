@@ -66,7 +66,7 @@ struct Uniforms {
     fade_end: f32,       // distance fade end, world units of view depth
     debug_view: u32,
     frame_index: u32,
-    flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
+    flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade, bit 3 = normal repair (experimental)
     thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
     inv_debug_depth: f32,   // debug depth view gradient scale (1 / world units)
     radius_far: f32,        // far effect radius (fraction of view depth); 0 disables the ramp
@@ -240,12 +240,16 @@ fn temporal_accumulate(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let scene_n_raw = textureLoad(scene_normal, clamp(p, vec2<i32>(0i), vec2<i32>(fs) - 1i), 0i);
     let has_n = scene_n_raw.w >= 0.5;
     let n_auth = select(vec3f(0.0, 0.0, 1.0), normalize(scene_n_raw.xyz * 2.0 - 1.0), has_n);
-    // Same trust rule as vbao.wgsl: an authored normal that contradicts the depth geometry (debug
+    // Same trust rule as vbao.wgsl, and like it only with Normal Repair (experimental, flags bit 3)
+    // on; off, the authored normal is used unmodified. An authored normal that contradicts the depth geometry (debug
     // view 6 red/white) is replaced by the geometric one, so history identity is judged on the
     // surface that is really there. An unstable wrong normal would otherwise reject history from
     // frame to frame and read as flicker.
-    let geo_n = full_res_geometric_normal(p, view_pos, n_auth);
-    let n_cur = normalize(mix(geo_n, n_auth, smoothstep(0.6, 0.8, dot(n_auth, geo_n))));
+    var n_cur = n_auth;
+    if (uniforms.flags & 8u) != 0u {
+        let geo_n = full_res_geometric_normal(p, view_pos, n_auth);
+        n_cur = normalize(mix(geo_n, n_auth, smoothstep(0.6, 0.8, dot(n_auth, geo_n))));
+    }
     let n_oct = select(vec2f(0.0), oct_encode(n_cur), has_n);
 
     let taau = uniforms.depth_scale.x >= 1.5;

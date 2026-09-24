@@ -86,6 +86,7 @@ ConfigVarHandle g_cvarDisoccTol = 0;
 ConfigVarHandle g_cvarDenoisePasses = 0;
 ConfigVarHandle g_cvarDenoiseStrength = 0;
 ConfigVarHandle g_cvarDistanceFade = 0;
+ConfigVarHandle g_cvarNormalRepair = 0;
 ConfigVarHandle g_cvarFadeStart = 0;
 ConfigVarHandle g_cvarFadeEnd = 0;
 ConfigVarHandle g_cvarHalfRes = 0;
@@ -344,7 +345,7 @@ struct AoUniforms {
     float fade_end;
     uint32_t debug_view;
     uint32_t frame_index;
-    uint32_t flags; // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
+    uint32_t flags; // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade, bit 3 = normal repair (experimental)
     float thick_dist_scale;  // extra occluder thickness, fraction of the view-space radius
     float inv_debug_depth;   // debug depth view gradient scale (1 / world units)
     float radius_far;        // far effect radius (fraction of view depth); 0 disables the ramp
@@ -1076,6 +1077,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.content_thresh = percent(g_cvarContentThresh, 100, 25, 300);
     uniforms.disocc_tol = percent(g_cvarDisoccTol, 0, 0, 20);
     const bool distanceFade = get_bool_option(g_cvarDistanceFade, false);
+    // Experimental, default off: replace authored normals that contradict the depth geometry.
+    const bool normalRepair = get_bool_option(g_cvarNormalRepair, false);
     uniforms.fade_start = static_cast<float>(
         std::clamp<int64_t>(get_int_option(g_cvarFadeStart, 15000), 0, 200000));
     uniforms.fade_end = static_cast<float>(
@@ -1099,7 +1102,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     // denoiser alone then sees a stable pattern, matching the single-frame fallback).
     uniforms.frame_index = temporal ? g_frameIndex : 0u;
     uniforms.flags =
-        (temporal ? 1u : 0u) | (g_historyValid ? 2u : 0u) | (distanceFade ? 4u : 0u);
+        (temporal ? 1u : 0u) | (g_historyValid ? 2u : 0u) | (distanceFade ? 4u : 0u) |
+        (normalRepair ? 8u : 0u);
 
     GfxRange uniformRange{0, 0};
     if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &uniformRange) != MOD_OK) {
@@ -1345,6 +1349,14 @@ ModResult build_controls_tab(
         "frames, so the result stays close to full-res; with it off, a depth-aware bilinear upscale "
         "is used instead (silhouettes stay crisp, but softer).");
 
+    svc_ui->pane_add_section(mod_ctx, left, "Experimental");
+    add_toggle(left, "Normal Repair (Experimental)", g_cvarNormalRepair,
+        "EXPERIMENTAL, off by default. Where the game's surface normal disagrees with the shape "
+        "of the geometry by more than about 37 degrees (red or white in the Normal Agreement "
+        "debug view), the AO uses the geometry's own face normal instead. Intended for machines "
+        "that show stray AO on open surfaces (a tree trunk, a fence) that changes with viewing "
+        "angle and flickers in motion. Off, the game's normals are used exactly as authored.");
+
     svc_ui->pane_add_section(mod_ctx, left, "Distance Fade");
     add_toggle(left, "Distance Fade", g_cvarDistanceFade,
         "Fades the AO out with distance so far terrain (already washed toward fog) is not "
@@ -1370,8 +1382,8 @@ ModResult build_controls_tab(
         "Agreement: how well the scene normal agrees with that face normal - green good, yellow "
         "the tilt smoothed low-poly curvature is expected to have, red poor, WHITE pointing away "
         "from the surface (a wrong-space or wrong-frame normal), blue no scene normal. Flat ground "
-        "should read green; red and white regions have the scene normal replaced by the face normal "
-        "for the AO.<br/>Raw AO: the single-frame estimate before denoise and accumulation, "
+        "should read green; with Normal Repair (Experimental) on, red and white regions use the "
+        "face normal for the AO.<br/>Raw AO: the single-frame estimate before denoise and accumulation, "
         "unshaped.<br/>Depth MIP 3: the coarse prefiltered depth the march samples at distance."
         "<br/>Debug views draw over the finished frame (after fog and bloom), so other effects "
         "never obscure them. When reporting broken AO, screenshots of AO, Normals, Geo Normal, "
@@ -1476,6 +1488,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         {"effectEnabled", true, &g_cvarEnabled},
         {"temporal", true, &g_cvarTemporal},
         {"distanceFade", false, &g_cvarDistanceFade},
+        {"normalRepairExperimental", false, &g_cvarNormalRepair},
         {"halfRes", true, &g_cvarHalfRes},
     };
     for (const auto& opt : boolOptions) {
@@ -1635,6 +1648,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_cvarMotionRange = 0;
     g_cvarContentThresh = g_cvarDisoccTol = g_cvarDenoisePasses = g_cvarDenoiseStrength = 0;
     g_cvarDistanceFade = g_cvarFadeStart = g_cvarFadeEnd = 0;
+    g_cvarNormalRepair = 0;
     g_cvarHalfRes = g_cvarDebugView = 0;
     g_computeType = g_drawType = 0;
     g_afterOpaqueHook = g_afterHudHook = 0;
