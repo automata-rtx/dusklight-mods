@@ -165,7 +165,7 @@ coherent normal in the wrong frame, varying with the angle between that frame an
 positions stay correct. That would be an aurora/Dawn/driver report, not a mod bug. What decides
 it: view 2 from an NVIDIA machine at the same spot, and the affected user's `adapter:` log line
 plus the same view with the other backend (D3D12 ↔ Vulkan) and, if possible, a current driver.
-Either way, the runtime check below catches it, because it tests the normal the mod actually
+Either way, the opt-in Normal Repair check below catches it when enabled, because it tests the normal the mod actually
 receives. A hemisphere
 centred 40–90° off the real surface carves sectors out of the very plane the samples lie in —
 AO on open geometry, varying with the angle between the wrong normal and the view.
