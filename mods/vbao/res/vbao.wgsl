@@ -330,7 +330,21 @@ fn vbao(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // widest. The threshold was the wrong thing to argue about - the test itself was. It is gone,
     // and the full account of the three separate places it had to be deleted from is in
     // docs/authored_normals.md 2a.
-    let normal = pixel_normal;
+    //
+    // UNTRUSTED AUTHORED NORMALS. The authored normal is only as good as the game made it, and on
+    // some geometry it does not describe the surface at all: prop and foliage normals authored for
+    // flat lighting (a vertical fence post whose normals point straight up), and J3D shapes whose
+    // normal matrix comes from an array filled at the simulation tick rather than for the
+    // presented view. Debug view 6 (Normal Agreement) shows exactly these as red and white, and
+    // they are exactly where AO appeared on open surfaces, varied with viewing angle and flickered
+    // in motion: a hemisphere centred 40-90 degrees off the real surface carves sectors out of the
+    // plane the samples lie in. Smooth shading on low-poly curvature disagrees with the facet by at
+    // most ~35 degrees (cos >= 0.8, yellow in view 6), so above 0.8 the authored normal is kept in
+    // full; below it the normal blends to the geometric one and is fully geometric under 0.6
+    // (~53 degrees) or when it points into the surface. The geometric normal is a flat facet, but
+    // it is the plane the samples actually lie in, so it carves nothing on open geometry.
+    let normal_trust = smoothstep(0.6, 0.8, dot(pixel_normal, geo_n));
+    let normal = normalize(mix(geo_n, pixel_normal, normal_trust));
 
     // Depth-proportional radius: constant screen-space search radius. Base thickness grows
     // logarithmically with the view-space radius (keeps close-up foliage from overdarkening),

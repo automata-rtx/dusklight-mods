@@ -55,7 +55,9 @@ on depth and the stored normal, which keeps Link free of trails without per-obje
 the disocclusion test is relative to depth rather than the far plane; the content reject is a
 σ-normalised outlier test; and the motion response fades with view distance (**Motion Response
 Range**), so characters stay full and responsive while distant, broad AO keeps its accumulation.
-The defaults are the field-validated ones. Debug views 5–8 (Geo Normal, Normal Agreement, Raw AO,
+The defaults are the field-validated ones. 1.1.1 stops trusting the game's surface normal where it
+contradicts the geometry (some props carry normals authored for flat lighting), which removed AO
+that appeared on open surfaces at certain angles. Debug views 5–8 (Geo Normal, Normal Agreement, Raw AO,
 Depth MIP 3) exist for reporting a problem: `docs/vbao.md` has the protocol.
 
 ## Building

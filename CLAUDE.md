@@ -26,6 +26,13 @@ Graphics mods for Dusklight (the Twilight Princess PC/mobile port), built on its
   the raw estimate is dense near the camera and sparse at distance, so a short accumulation is free
   on a character and ruinous on a far landmark. Sampling noise is an in-shader order-6 Hilbert
   index + R2 — no LUT, no init-time upload.
+  **Authored normals are not trusted blindly (1.1.1).** Where the authored normal disagrees with
+  the depth-derived face normal by more than ~37° (`dot < 0.8`, red/white in debug view 6) both
+  the occlusion pass and the temporal pass blend it to the geometric normal, fully at `dot ≤ 0.6`.
+  Field screenshots showed fence posts whose authored normals point straight up, and AO on the
+  trunk/fence exactly where view 6 was red — props authored for flat lighting, and J3D shapes whose
+  indexed normal matrix is filled at the sim tick rather than for the presented view. Smooth
+  shading on low-poly curvature stays under the threshold, so it keeps its benefit.
   **How it got here** — the 1.0.x "flickers in motion, mostly on AMD" report: the velocity term
   reset the whole history on ordinary pans and displayed the raw estimate (the cap and a low
   response fixed it); that traded for moving-occluder trails (the outlier test); a full-body trail

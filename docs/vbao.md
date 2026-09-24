@@ -78,7 +78,9 @@ See `docs/deferred_fog.md`.
    downsample) so distant AO samples read small MIPs instead of thrashing bandwidth.
 3. **`vbao.wgsl`** — the occlusion estimator. Per pixel: unproject the view position, read the
    scene normal from the service snapshot (skipping to full visibility where it has none), derive a
-   separate 4-tap geometric plane from depth for sample rejection, then walk `slice_count`
+   separate 4-tap geometric plane from depth for sample rejection, **replace the authored normal
+   by that geometric one where the two disagree by more than ~37° (see "Untrusted authored
+   normals")**, then walk `slice_count`
    hemisphere slices × `steps_per_side` marching steps, carving a 32-bit sector bitmask
    per slice (Therrien et al. 2022 visibility bitmask). Occlusion = carved fraction weighted
    by a cosine lobe. Sampling noise: an order-6 Hilbert index computed in-shader + R2 sequence,
@@ -132,6 +134,32 @@ back to full resolution rather than blurred up (restores the aurora fork's check
   resolution (`ensure_targets`).
 - At full res every pixel is trivially "covered", so this reduces to the original per-pixel
   accumulation with no behavior change. GPU-validated in `scratchpad/halfres_taau_test.py`.
+
+### Untrusted authored normals (1.1.1)
+
+**Symptom:** after 1.1.0 a small number of users still saw AO on open surfaces — a tree trunk, a
+fence — that changed with viewing angle and flickered in motion. Raising the black point hid it.
+Their debug views located it exactly: in Normals (view 2) the vertical fence posts were **green**,
+i.e. their authored normals point straight up, while Geo Normal (view 5) showed them facing the
+camera as they geometrically do. Normal Agreement (view 6) was red and white on the fence and the
+trunk and green on the ground and Link — and the red/white regions were the broken AO.
+
+**Cause:** the authored normal does not always describe the surface. Two game-side reasons, neither
+fixable from a service-only mod: props and foliage whose normals were authored for flat lighting,
+and J3D shapes that load their normal matrix by index from an array `J3DModel::viewCalc` fills at
+the simulation tick (`J3DShapeMtx::loadMtxIndx_PNGP`), not for the presented view. A hemisphere
+centred 40–90° off the real surface carves sectors out of the very plane the samples lie in —
+AO on open geometry, varying with the angle between the wrong normal and the view.
+
+**Fix:** `vbao.wgsl` compares the authored normal with the geometric one it already builds for
+sample rejection. At `dot ≥ 0.8` (≤ ~37°, which covers smooth shading on any low-poly curvature — a
+hexagonal trunk deviates at most 30°) the authored normal is kept in full; below that it blends to
+the geometric normal, fully geometric at `dot ≤ 0.6` or when it points into the surface. The
+temporal pass applies the same rule (with a full-res geometric normal from the raw depth) before
+using the normal for history identity, so a wrong, unstable normal no longer rejects history from
+frame to frame. The geometric normal is a flat facet, but it is the plane the samples lie in, so it
+carves nothing on open geometry. View 6 still shows the *raw* agreement, so it keeps working as the
+diagnostic for this.
 
 ### Temporal accumulation: history and diagnostics
 

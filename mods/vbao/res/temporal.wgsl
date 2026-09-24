@@ -95,6 +95,32 @@ struct Uniforms {
 // the same texture vbao.wgsl shades with; here it is the second surface-identity test.
 @group(0) @binding(6) var scene_normal: texture_2d<f32>;
 
+// Geometric (face) normal of the full-res depth surface at pixel p, view space: 4 taps at +/-1,
+// side-selected on the smaller depth step, flipped to face the camera - the same construction as
+// vbao.wgsl's geometric_normal_view. Sky taps and degenerate cross products fall back.
+fn full_res_view_pos(q: vec2<i32>, fs: vec2f) -> vec3f {
+    let c = clamp(q, vec2<i32>(0i), vec2<i32>(fs) - 1i);
+    let d = textureLoad(raw_depth, c, 0i).r;
+    return reconstruct_view_space_position(d, (vec2f(c) + 0.5) / fs);
+}
+
+fn full_res_geometric_normal(p: vec2<i32>, centre: vec3f, fallback: vec3f) -> vec3f {
+    let fs = full_size();
+    let r = full_res_view_pos(p + vec2<i32>(1i, 0i), fs);
+    let l = full_res_view_pos(p - vec2<i32>(1i, 0i), fs);
+    let d = full_res_view_pos(p + vec2<i32>(0i, 1i), fs);
+    let u = full_res_view_pos(p - vec2<i32>(0i, 1i), fs);
+    let ddx = select(centre - l, r - centre, abs(r.z - centre.z) < abs(l.z - centre.z));
+    let ddy = select(centre - u, d - centre, abs(d.z - centre.z) < abs(u.z - centre.z));
+    let g = cross(ddy, ddx);
+    let len = length(g);
+    if !(len > 1.0e-12) {
+        return fallback;
+    }
+    let gn = g / len;
+    return select(gn, -gn, dot(gn, centre) > 0.0);
+}
+
 // Octahedral normal encoding, so the history carries a unit normal in two f16 channels.
 fn oct_encode(n: vec3f) -> vec2f {
     let l1 = abs(n.x) + abs(n.y) + abs(n.z);
@@ -213,7 +239,13 @@ fn temporal_accumulate(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let depth_norm = clamp(max(-view_pos.z, 0.0) * uniforms.inv_far, 0.0, 1.0);
     let scene_n_raw = textureLoad(scene_normal, clamp(p, vec2<i32>(0i), vec2<i32>(fs) - 1i), 0i);
     let has_n = scene_n_raw.w >= 0.5;
-    let n_cur = select(vec3f(0.0, 0.0, 1.0), normalize(scene_n_raw.xyz * 2.0 - 1.0), has_n);
+    let n_auth = select(vec3f(0.0, 0.0, 1.0), normalize(scene_n_raw.xyz * 2.0 - 1.0), has_n);
+    // Same trust rule as vbao.wgsl: an authored normal that contradicts the depth geometry (debug
+    // view 6 red/white) is replaced by the geometric one, so history identity is judged on the
+    // surface that is really there. An unstable wrong normal would otherwise reject history from
+    // frame to frame and read as flicker.
+    let geo_n = full_res_geometric_normal(p, view_pos, n_auth);
+    let n_cur = normalize(mix(geo_n, n_auth, smoothstep(0.6, 0.8, dot(n_auth, geo_n))));
     let n_oct = select(vec2f(0.0), oct_encode(n_cur), has_n);
 
     let taau = uniforms.depth_scale.x >= 1.5;
