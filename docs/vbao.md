@@ -358,3 +358,14 @@ default once the jittered temporal upsampler made it look close to full resoluti
 
 VBAO was ported from the maintainer's earlier implementation in the retired `dusklight-ao` and
 `aurora-ao` forks onto upstream's `ao_mod` demo framework.
+
+The code is this project's own. The store description in `mod.json` credits iMMERSE's MXAO ReShade
+filter as an inspiration; that is the **only** place MXAO is mentioned, by design. Do not reference
+MXAO in code, comments or other docs: an unqualified mention invites mistaken claims that its code
+was copied, which it was not.
+
+### Experiments not merged
+
+Branch `claude/vbao-amd-flickering-xbualq` contains a "1.1.1 Normal Repair" experiment (distrusting
+authored normals that contradict the depth-derived geometry). It was a failed experiment and is
+intentionally not merged; do not merge it.

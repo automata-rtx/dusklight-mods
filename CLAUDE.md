@@ -38,6 +38,14 @@ and `docs/authored_normals.md` (the normal buffer), `docs/japanese-naming.md` (g
   shipping a guess. A debug view must read the same resource, under the same conditions, as the
   effect it diagnoses.
 
+## Decisions already made
+
+- **MXAO**: VBAO's `mod.json` description ("Inspired by iMMerse's MXAO Reshade filter") is the sole
+  permitted mention of MXAO. Never reference it in code, comments or docs; the code is our own and
+  a stray mention invites false plagiarism claims.
+- **VBAO 1.1.1 "Normal Repair"** (branch `claude/vbao-amd-flickering-xbualq`) was a failed
+  experiment and is intentionally unmerged. Do not merge or revive it.
+
 ## Deferred Fog's open issue: read before touching it
 
 Distant landmarks (Death Mountain, the Ganon barrier) look brighter with the mod **off**. Three fixes
