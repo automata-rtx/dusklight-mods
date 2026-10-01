@@ -4,14 +4,16 @@
 #include <cstdint>
 #include <cstring>
 
-// The (a, b, c) fog coefficients exactly as aurora's per-draw fog state ends up holding
-// them. The game encodes fog into BP registers (J3DGDSetFog in J3DGD.cpp; the aurora
-// GXSetFog shim is equivalent): A and C stored as floats truncated to sign|exp|11-bit
-// mantissa, B as a 24-bit mantissa plus 5-bit shift. Aurora's command processor
-// (command_processor.cpp, regs 0xEE-0xF1) decodes them back. Mirroring the full round trip,
-// quantization included, makes the deferred fog pass bit-identical to forward fog.
+// The (a, b, c) fog coefficients as aurora's fog state ends up holding them after a
+// J3DGDSetFog / GXSetFog / GFSetFog call. The game encodes fog into BP registers 0xEE-0xF1
+// (J3DGDSetFog; aurora's GXSetFog encodes perspective fog the same way): A and C as floats
+// truncated to sign, exponent and 11 mantissa bits, B as a 24-bit mantissa plus a 5-bit shift.
+// Aurora decodes them in lib/gx/regs.cpp (decode_fog_a, bp_fog0..bp_fog3). This mirrors the
+// encode/decode round trip, quantization included, so the coefficients match the ones forward fog
+// used. Perspective fog only: orthographic types (0x08) encode A differently and are not handled.
 namespace dusk_fog {
 
+// Keeps sign, exponent and the top 11 mantissa bits, as the BP fog registers store them.
 inline float truncate_fog_float(float value) {
     uint32_t bits;
     std::memcpy(&bits, &value, sizeof(bits));

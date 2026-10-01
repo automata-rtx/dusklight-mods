@@ -8,7 +8,7 @@ darken the surfaces *under* the fog instead of darkening the fog itself.
 | Mod id | `dev.automata.deferred_fog` (`mods/deferred_fog/`) |
 | Version | see `mods/deferred_fog/mod.json` (1.0.2 at the time of writing) |
 | Kind | **Game-linked**: includes game headers, calls game functions, and hooks ten game functions. It must be built against the game build it runs on |
-| Status | Released and in use on Dusklight `v2.0.0`. One open issue: [some distant landmarks are brighter with the mod off](#known-issue-distant-landmarks-brighter-with-the-mod-off) |
+| Status | Released and in use on Dusklight `v2.0.0`. One open issue: [some distant landmarks are brighter with the mod off](#distant-landmarks-brighter-with-the-mod-off) |
 
 **Why it exists.** The game fogs every draw as it renders it. A mod that composites after the
 opaque world (VBAO at `SCENE_AFTER_OPAQUE`) therefore multiplies over pixels that are already
@@ -275,7 +275,9 @@ What one fullscreen pass over the finished opaque image cannot reproduce exactly
 - Before proposing a fix for a visual difference, get per-pixel evidence (the debug views), not
   only the Status counters. See the next section for why.
 
-## Known issue: distant landmarks brighter with the mod off
+## Known issues
+
+### Distant landmarks brighter with the mod off
 
 **Report.** Distant landmarks, Death Mountain in particular and the Ganon barrier, look brighter
 with Deferred Fog off than on, with no other mods enabled: *"chunks of the far off Death Mountain
@@ -330,7 +332,7 @@ the mark never fired.
 | additive > 0, no-Z = additive | over-unity blend, none of it owns depth | cannot be fixed with one pass |
 | everything 0 | neither known mechanism | start from the debug views; also consider the depth-ownership limitation |
 
-## Code issues
+### Code issues
 
 Found in the documentation audit; none is known to cause a visible problem.
 
@@ -343,6 +345,12 @@ Found in the documentation audit; none is known to cause a visible problem.
   (a build warning).
 - `deferring` in the exported service means "armed at `SCENE_AFTER_OPAQUE`"; a later depth-resolve
   failure still reports true.
+- The warning logged when the `GFSetFog` hook fails says grass *and flowers* lose deferral; only
+  grass uses `GFSetFog`.
+- Any other mod that replays the game's draw lists while the scope is open (Realtime Sun Shadows
+  does, from `SCENE_AFTER_TERRAIN`; it is unreleased) would have those draws captured and their fog
+  suppressed, and a J3D draw from another mod's `SCENE_AFTER_OPAQUE` hook registered after this one
+  would trigger the translucent anchor early.
 
 ## History
 

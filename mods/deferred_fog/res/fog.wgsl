@@ -1,45 +1,42 @@
-// Deferred Fog - fullscreen re-application of the game's fog after other mods' screen-space
-// effects (AO, shadows) have composited.
+// Deferred Fog: fullscreen re-application of the game's fog after other mods' screen-space
+// composites (AO, shadows).
 //
-// This reproduces aurora's fog EXACTLY: aurora's generated fragment shaders compute
-//     fogF = clamp(a / (b - (1.0 - in.pos.z)) - c, 0.0, 1.0)     (reversed-Z)
-// followed by one of five curves, then mix(pixel, fogColor, fogZ). The only per-fragment
-// input is the raw depth value - exactly what the scene depth snapshot holds - so applying
-// the same math per pixel over the opaque scene yields the same result forward fog would
-// have produced. The (a, b, c) coefficients arrive pre-computed from mod.cpp, which mirrors
-// the exact J3DGDSetFog BP encode -> aurora command-processor decode round trip (including
-// the 11-bit mantissa truncation), so even the quantization matches the vanilla path.
+// Follows aurora's generated fog code. With reversed-Z (1 = near):
+//     fogF = clamp(a / (b - (1.0 - z)) * range_mul - c, 0.0, 1.0)
+// then one of five curves, then mix(pixel, fogColor, fogZ). The only per-fragment input is depth,
+// which the scene depth snapshot holds, so each pixel gets the fog of the surface that owns its
+// depth. The (a, b, c) coefficients come from mod.cpp through the same BP-register quantization
+// the game's fog goes through (src/fog_math.h). Differences from aurora: range_mul is computed per
+// pixel from the full-target uv, where aurora bakes a per-column LUT over the render viewport (the
+// two agree when the world viewport spans the target), and orthographic fog is treated as
+// perspective.
 //
-// Blending: (srcAlpha, oneMinusSrcAlpha) on color with fogZ in alpha reproduces aurora's
-// mix(); the target's alpha channel is left untouched (Zero/One), matching forward fog
-// which never wrote alpha.
+// Blending: (SrcAlpha, OneMinusSrcAlpha) on colour with fogZ in alpha reproduces aurora's mix();
+// alpha is left untouched (Zero, One), as forward fog leaves it.
 //
-// Sky pixels (raw depth 0) are skipped: the sky draws before the world lists, outside the
-// suppression scope, and keeps its own forward fog.
+// Sky pixels (raw depth 0) are skipped: the sky draws before the suppression scope opens and keeps
+// its own forward fog.
 
-// GX fog range adjustment ("XFog"), reproduced from aurora's build_fog_range_lut. Fog is driven by
-// Z, the distance along the view axis, but a pixel at the screen edge is genuinely further from the
-// eye than a centre pixel of the same Z; the hardware corrects for that with a per-column
-// multiplier on the fog term, applied BEFORE the start-Z bias c is subtracted. TP enables it
-// globally (envcolor_init, d_kankyo.cpp:1257) and re-arms it after every fog set, so it is part
-// of what vanilla renders. Aurora bakes one multiplier per target column into a storage buffer;
-// this evaluates the identical function per pixel instead, which needs no storage binding.
+// GX fog range adjustment ("XFog"; see FogRangeAdj in mod.cpp): a per-column multiplier on the fog
+// term, applied before the start-Z bias c is subtracted, because a pixel near the screen edge is
+// further from the eye than a centre pixel with the same Z.
 struct FogRange {
-    center: f32,    // fog-range centre column in NDC x (2 * center / viewport_width - 1)
+    center: f32,    // centre column in NDC x (2 * center / viewport_width - 1)
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
-    k: array<vec4f, 3>,  // the 10 range constants, pair-swapped and scaled by 1/64 as aurora does
+    k: array<vec4f, 3>,  // the 10 range constants, pair-swapped and scaled by 1/64 as aurora does;
+                         // entries 10 and 11 repeat entry 9
 }
 
 struct FogUniforms {
-    color: vec4f,   // fog color (rgb; a unused)
+    color: vec4f,   // fog colour (rgb; a unused)
     a: f32,         // decoded fog coefficients, see above
     b: f32,
     c: f32,
     fog_type: u32,  // low 3 bits of GXFogType: 2 LIN, 4 EXP, 5 EXP2, 6 REVEXP, 7 REVEXP2.
-                    // Bit 4 (0x10) additionally means "apply the range adjustment" — GXFogType's
-                    // own bit 3 means orthographic, so the flag sits above the masked type.
+                    // 0x10 = apply range adjustment (GXFogType's own 0x08, orthographic, is
+                    // masked off).
     debug_mode: u32, // 1 = output the fog factor as grayscale (unblended pipeline)
     _pad0: f32,
     _pad1: f32,
@@ -47,12 +44,11 @@ struct FogUniforms {
     range: FogRange,
 }
 
-// Mixed-configuration mode (fs_mixed): a per-pixel config-ID buffer, produced by replaying the
-// opaque draw lists with each shape's output forced to a flat index color, selects which of up
-// to 8 captured fog configurations applies to each pixel. IDs are encoded sparsely as
-// (index + 1) * 24 in the red channel, so configs 0..7 occupy 24..192 and colors written by
-// geometry outside the ID override decode as invalid and take mixed.fallback_index. Slot 8
-// (red 216) is reserved as the "no deferred fog" sentinel — see config_index_at.
+// Mixed-configuration mode (fs_mixed): a per-pixel config-ID buffer, made by replaying the opaque
+// lists with each draw forced to a flat colour, selects one of up to 8 captured configs. The ID is
+// (index + 1) * 24 in red, so configs 0..7 use 24..192; anything else decodes as unstamped and
+// takes mixed.fallback_index. Red 216 (index 8, decoded as slot 9) is the "no fog" sentinel; see
+// config_index_at.
 struct MixedFogEntry {
     color: vec4f,
     a: f32,
@@ -65,7 +61,7 @@ struct MixedFogUniforms {
     configs: array<MixedFogEntry, 8>,
     count: u32,
     debug_mode: u32, // 1 = combined fog factor, 2 = config-ID visualization
-    fallback_index: u32, // config for pixels the ID replay could not cover (see config_index_at)
+    fallback_index: u32, // config for pixels the ID replay could not stamp (see config_index_at)
     _pad1: f32,
     range: FogRange, // shared by every config; each config opts in via its fog_type bit 0x10
 }
@@ -96,10 +92,9 @@ fn scene_depth_at(uv: vec2f) -> f32 {
     return textureLoad(scene_depth, texel, 0i).r;
 }
 
-// The per-column range-adjust multiplier, matching aurora's build_fog_range_lut exactly: the table
-// is indexed from the centre outwards (entry 9 at the centre column, entry 0 at |offset| >= 1) with
-// linear interpolation between neighbours, and the multiplier is the ratio between the eye distance
-// and the axial distance for a column that far off centre.
+// The range-adjust multiplier, the same function aurora's build_fog_range_lut bakes per column:
+// the table runs from entry 9 at the centre column to entry 0 at |offset| >= 1, linearly
+// interpolated, and the result is the ratio of eye distance to axial distance at that offset.
 fn fog_range_factor(range: FogRange, ndc_x: f32) -> f32 {
     let offset = ndc_x - range.center;
     let index = clamp(9.0 - abs(offset) * 9.0, 0.0, 9.0);
@@ -112,10 +107,9 @@ fn fog_range_factor(range: FogRange, ndc_x: f32) -> f32 {
     return sqrt(offset * offset + k * k) / k;
 }
 
-// Aurora's fog term, verbatim: (1.0 - depth) is the GC screen-z convention (0 = near). range_mul is
-// the range-adjust multiplier (1.0 when the config has it off); aurora applies it to the a/(b - z)
-// term before subtracting c, and where it lands matters — c is a large constant for narrow
-// far-starting bands, so folding it in afterwards would scale the bias too.
+// Aurora's fog term and curves. (1.0 - depth) converts reversed-Z to GX screen z (0 = near).
+// range_mul (1.0 when the config has range adjustment off) scales the a / (b - z) term before c is
+// subtracted, as aurora does; c is large for far-starting bands, so the order matters.
 fn fog_z_for(a: f32, b: f32, c: f32, fog_type: u32, depth: f32, range_mul: f32) -> f32 {
     var fog_f = clamp((a / (b - (1.0 - depth))) * range_mul - c, 0.0, 1.0);
     var fog_z: f32;
@@ -163,23 +157,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     return vec4f(uniforms.color.rgb, fog_z);
 }
 
-// Returns the fog-config index for a pixel from the ID buffer, or NO_FOG_INDEX.
+// Returns this pixel's config index from the ID buffer, or NO_FOG_INDEX.
 //
-// The replay's flat-ID override outputs (id, 0, 0): the index in red, green and blue forced to
-// zero. Geometry that bypassed the override - self-drawing packets (field/tall grass, flowers,
-// waterfalls) and any direct GX drawers - rasterizes real LIT colors instead, which vary with
-// the time of day and almost always carry non-zero green/blue. Requiring green and blue to be
-// ~0 rejects all of that, so those pixels take mixed.fallback_index, which the mod records from
-// the grass/flower packets' OWN fog setter — the config they actually drew with — instead of a
-// per-pixel config that would flicker with the lighting. (Before the green/blue guard, a blade's
-// shaded red channel could land in another config's decode window and flicker between configs as
-// the lighting changed. Pure-red bypassed geometry could still alias, but none occurs in practice.)
+// The replay's flat-ID override writes (id, 0, 0). Geometry it cannot reach (the self-drawing
+// packets: grass, flowers, dMdl_c models, 3D lines, and any other direct GX drawing) rasterizes lit
+// colours, which almost always have non-zero green or blue. Rejecting those sends such pixels to
+// mixed.fallback_index (the config the grass and flower packets drew with) instead of whichever
+// config their red channel happens to decode to, which would flicker with the lighting. Pure-red
+// unstamped geometry could still alias.
 //
-// The Ganon barrier dome is NOT in that category: it writes no colour at all in the replay, so its
-// pixels carry the config of the castle and hills behind it.
-// Slot 9 (red byte 216) is the "this pixel had no fog in vanilla" sentinel — see kNoFogSlot in
-// mod.cpp. It is checked BEFORE the `slot <= count` guard, which would otherwise reject it, and it
-// can never collide with a real config: those occupy slots 1..8, red 24..192.
+// The Ganon barrier writes no colour in the replay, so its pixels carry the config behind it.
+// Slot 9 (red 216, kNoFogSlot in mod.cpp) is the "no fog in vanilla" sentinel. It is checked before
+// the `slot <= count` test, which would reject it, and cannot collide with a real config (slots
+// 1..8, red 24..192).
 const NO_FOG_INDEX: u32 = 0xFFFFFFFFu;
 
 fn config_index_at(uv: vec2f) -> u32 {
@@ -211,16 +201,16 @@ fn fs_mixed(in: VertexOutput) -> @location(0) vec4f {
     }
 
     let index = config_index_at(in.uv);
-    // Checked before the config-ID visualization below: otherwise the sentinel renders as
-    // (9 + 1) / count, clips to white, and reads as "the highest config".
+    // Checked before the config-ID visualization below, where NO_FOG_INDEX would clip to white and
+    // read as the highest config.
     if index == NO_FOG_INDEX {
         if mixed.debug_mode != 0u {
-            return vec4f(1.0, 0.0, 0.0, 1.0);  // red = this pixel is left unfogged
+            return vec4f(1.0, 0.0, 0.0, 1.0);  // red in either debug view = left unfogged
         }
         return vec4f(0.0);
     }
     if mixed.debug_mode == 2u {
-        // Config-ID visualization: distinct gray band per config.
+        // Config-ID visualization: one gray level per config.
         let value = (f32(index) + 1.0) / max(f32(mixed.count), 1.0);
         return vec4f(value, value, value, 1.0);
     }

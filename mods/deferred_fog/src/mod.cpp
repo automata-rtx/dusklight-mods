@@ -1,27 +1,21 @@
-// Deferred Fog — moves the game's fog to AFTER the opaque scene, so screen-space effects darken
-// the world UNDER the fog instead of darkening the fog itself.
+// Deferred Fog: moves the game's fog out of the opaque draws and into one fullscreen pass after
+// them, so screen-space effects composited at SCENE_AFTER_OPAQUE (AO, shadows) darken the surface
+// under the fog instead of the fog itself.
 //
-// The game applies fog per draw, inside the opaque lists. Anything a mod composites afterwards
-// (ambient occlusion, GI, shadows) therefore multiplies over pixels that are ALREADY fogged, and
-// distant geometry gets its AO applied to the fog colour — the effect reads as grime on the haze
-// rather than shading on the world. This mod suppresses the per-draw fog during the opaque world
-// lists and re-applies it as a single fullscreen pass after every mod's SCENE_AFTER_OPAQUE
-// composite, using aurora's own fog math bit-exactly (see src/fog_math.h), so the result is the
-// game's fog over an already-shaded world.
+// Per frame, on the game thread unless noted:
+//   SCENE_BEGIN         open the suppression scope (not while disabled or during Wolf Senses).
+//   inside the scope    hooks on GXSetFog/GFSetFog, J3DShape::drawFast and dBgp_c's shared
+//                       display lists record each draw's fog config and switch its fog off.
+//   SCENE_AFTER_OPAQUE  close the scope and arm the quad. In Exact mode, when the frame used
+//                       several configs (or Skip Unfogged has geometry to mark), replay the opaque
+//                       lists into a per-pixel config-ID buffer.
+//   quad anchor         push the quad at the first J3DShape::drawFast after that stage, else before
+//                       the game's bloom, else at FRAME_BEFORE_HUD (see QuadAnchor).
+//   render worker       on_draw records the quad; res/fog.wgsl applies aurora's fog math, with the
+//                       coefficients from src/fog_math.h.
 //
-// It was previously a sub-feature of the combined "Graphics Hub" mod. Graphics Hub is retired: its
-// other half (Depth to Normal) reconstructed a surface normal from depth and published it as a mod
-// service, which GfxService 1.3's resolve pair supersedes entirely — the game now hands mods
-// the artist's authored normal directly, so there is nothing left for a provider mod to do. What
-// remains is this, which is a genuine game-behaviour change and can only live in a game-linked mod.
-//
-// No mod imports this one. Ordering is guaranteed by STAGE SEPARATION, not by load order: a
-// composite at SCENE_AFTER_OPAQUE is already ahead of a fog quad pushed at FRAME_BEFORE_HUD, and
-// anything that must land ON TOP of the fog draws at FRAME_AFTER_HUD (which is what VBAO's debug
-// views do). The exported service is still here so a consumer can read whether this frame actually
-// deferred; see include/deferred_fog_service.h.
-//
-// Game-linked (hooks game fog functions) + webgpu.
+// Other mods need no import to composite under the fog: their SCENE_AFTER_OPAQUE hooks always run
+// before the quad. Game-linked (hooks game functions) and webgpu. Design: docs/deferred_fog.md.
 
 #include "global.h"
 
@@ -79,19 +73,20 @@ IMPORT_SERVICE(LogService, svc_log);
 
 namespace {
 
-// Hook targets (each emits a modmeta hook record the host resolves at load).
+// Hook targets (each emits a modmeta hook record the host resolves by symbol at load). Only
+// GXSetFog is required (init fails without it); without drawFast the mod stays inert; the others
+// log a warning and degrade.
 DEFINE_HOOK(GXSetFog, SetFog);
 DEFINE_HOOK(GFSetFog, SetGfFog);
 DEFINE_HOOK(&J3DShape::drawFast, ShapeDrawFast);
-// The shared-display-list draw path, which bypasses drawFast entirely — see
-// on_material_shared_dl_post. drawSimple brackets the window; one loadSharedDL hook per material
-// class the loader can produce.
+// dBgp_c's shared-display-list path, which bypasses drawFast (see on_material_shared_dl_post).
+// drawSimple brackets it; there is one loadSharedDL hook per material class.
 DEFINE_HOOK(&dBgp_c::modelMaterial_c::drawSimple, BgpDrawSimple);
-// The self-drawing opaque packets — see g_selfDrawnIndex.
+// The self-drawing grass and flower packets (see g_selfDrawnIndex).
 DEFINE_HOOK(&dGrass_packet_c::draw, GrassPacketDraw);
 DEFINE_HOOK(&dFlower_packet_c::draw, FlowerPacketDraw);
 DEFINE_HOOK(&J3DMaterial::loadSharedDL, MaterialSharedDL);
-// Last chance to get the fog quad in before the game's own post-processing — see g_quadAnchor.
+// Fallback quad anchor before the game's bloom (see QuadAnchor).
 DEFINE_HOOK(&mDoGph_gInf_c::bloom_c::draw, BloomDraw);
 DEFINE_HOOK(&J3DPatchedMaterial::loadSharedDL, PatchedMaterialSharedDL);
 DEFINE_HOOK(&J3DLockedMaterial::loadSharedDL, LockedMaterialSharedDL);
@@ -118,52 +113,29 @@ WGPUBindGroupLayout g_fogDebugLayout = nullptr;
 WGPUBindGroupLayout g_mixedLayout = nullptr;
 WGPUBindGroupLayout g_mixedDebugLayout = nullptr;
 
-// THE SCENE PASS CHANGES SHAPE MID-SESSION, SO THESE FOUR PIPELINES CANNOT BE BUILT AT INIT.
-//
-// The renderer adds the authored-normal attachment on demand: the first resolve_pass anywhere that
-// asks for normals enables it from the NEXT frame on. A pipeline that described a one-attachment
-// pass is rejected from that point, and WebGPU's rejection is silent - the fog quad simply stops
-// drawing, which looks exactly like the mod being off.
-//
-// THIS MOD IS THE ONE MOST EXPOSED TO IT, because the request need not be its own. Deferred Fog
-// never asks for normals; VBAO and SMAA do, and the docs tell the user to install Deferred Fog
-// ALONGSIDE VBAO. So the pass gains its second attachment a frame or two into the session, driven
-// by a different mod entirely, and fog built at init would die with no log line and no way to
-// connect the symptom to the cause. Rebuilding on the layout key removes the coupling: whatever
-// shape the pass is, the pipeline recorded into it was built for that shape.
+// The four fog pipelines are built lazily from the live GfxDrawContext::layout and rebuilt whenever
+// layout.key changes. The scene pass gains the authored-normal attachment at runtime, from the
+// frame after any mod first asks for normals (VBAO and SMAA do; this mod does not), and WebGPU
+// rejects a pipeline built for the old shape with no visible error: the fog quad just stops
+// drawing.
 uint64_t g_sceneLayoutKey = 0;
 bool g_sceneLayoutValid = false;
 bool ensure_fog_pipelines(const GfxDrawContext& ctx);
 void release_fog_pipelines();
 
-// GX FOG RANGE ADJUSTMENT — the game's own name for it is XFog.
+// GX fog range adjustment, which the game calls XFog (GxXFog_set, mXFogTbl). Fog is driven by Z,
+// the distance along the view axis, but a pixel near the left or right edge is further from the eye
+// than a centre pixel with the same Z. GXSetFogRangeAdj corrects for that with a per-column
+// multiplier on the fog term, built from a 10-entry table and a centre column and applied before
+// the start-Z bias c is subtracted.
 //
-// GX fog is computed from the fragment's Z, but Z is the distance along the view AXIS, not to the
-// eye: a pixel at the left or right edge of the screen is genuinely further away than a pixel of
-// the same Z at the centre. The hardware corrects for that with a per-column multiplier applied to
-// the fog term BEFORE the start-Z bias is subtracted, driven by a 10-entry table plus a centre
-// column (GXSetFogRangeAdj).
-//
-// TP has it ON EVERYWHERE. envcolor_init turns it on at environment init and nothing ever clears it
-// (d_kankyo.cpp:1257-1260: mFogAdjEnable = true, mFogAdjTableType = 0, mFogAdjCenter = 0x140), and
-// every path that sets fog re-arms it: the three direct setters (dKy_GxFog_set,
-// dKy_GxFog_tevstr_set, dKy_GfFog_tevstr_set) each call GxXFog_set() immediately afterwards
-// (:9416/:9438/:9460), and every BG material's J3DFog block is stamped with the same globals
-// (:4481-4484) so J3DFog::load() re-issues it per material. "XFog" is the authored abbreviation —
-// x for the screen x axis the table is indexed by.
-//
-// Aurora implements it: build_fog_range_lut bakes one multiplier per target column and the
-// generated fragment shader applies `fogBase *= lut[u32(in.pos.x)]` right before `- c`
-// (command_processor.cpp:201-220, shader.cpp:1550-1553). So it is part of what vanilla renders,
-// and a deferred pass that omits it flattens a horizontal gradient the game has. The error is
-// (lut - 1) * (c + fogF): ~3% of the fog term at the screen edges, which is a fraction of a
-// percentage point for near fog but reaches double digits for the narrow, far-STARTING bands that
-// distant haze uses (c = startZ/(endZ - startZ) is large there) — i.e. exactly the wide vistas
-// where the difference was noticed. The mod reproduces the multiplier analytically in fog.wgsl
-// rather than baking a LUT; see fog_range_factor there.
-//
-// (docs/deferred_fog.md used to state that aurora ignores range adjustment and that the mod
-// therefore correctly ignored it too. That was false on this pin and is why nobody looked.)
+// TP enables it in envcolor_init and never turns it off. The three direct fog setters
+// (dKy_GxFog_set, dKy_GxFog_tevstr_set, dKy_GfFog_tevstr_set) call GxXFog_set() right after setting
+// fog, and setLightTevColorType_MAJI_sub stamps the same globals into each material fog block it
+// processes. Aurora implements it (build_fog_range_lut), so leaving it out would change the fog
+// term by (lut - 1) * (fogF + c): about 3% at the screen edges with TP's default table, which is
+// most visible in far-starting bands where c = startZ / (endZ - startZ) is large. fog.wgsl
+// evaluates the multiplier per pixel (fog_range_factor).
 struct FogRangeAdj {
     bool enable = false;
     uint16_t center = 0x140;
@@ -181,45 +153,27 @@ struct FogConfig {
     FogRangeAdj adj;
 };
 
+// True from SCENE_BEGIN to SCENE_AFTER_OPAQUE while fog is being captured and suppressed.
 bool g_scopeActive = false;
+// Set at SCENE_AFTER_OPAQUE; the first anchor that sees it pushes the quad and clears it.
 bool g_quadArmed = false;
 
-// WHERE IN THE FRAME THE FOG QUAD ACTUALLY LANDED. This is a diagnostic because the anchor is not
-// a fixed point in the frame, and the difference between the anchors is large.
+// Where this frame's fog quad was pushed, shown on the Status line. The quad belongs right after
+// the SCENE_AFTER_OPAQUE stage and before the translucent lists. There is no stage hook there, so
+// the mod pushes it from the first J3DShape::drawFast after the stage, which is the first
+// translucent J3D draw. (dComIfGd_drawXluListBG is DUSK_NOINLINE on this pin, so hooking it
+// directly may now be possible; that is untested.)
 //
-// The quad wants to go in immediately after every mod's SCENE_AFTER_OPAQUE composite and before the
-// translucent lists — the game runs the stage hook at m_Do_graphic.cpp:2404, one line before
-// dComIfGd_drawXluListBG. There is no stage hook there and the list entry points are all inline, so
-// the mod anchors on the first J3DShape::drawFast AFTER the stage closes, which is the first
-// translucent J3D packet. When a frame HAS one, that is exactly the right place.
-//
-// When a frame has none, the quad used to fall all the way through to FRAME_BEFORE_HUD, which the
-// game runs at :2795. IT IS NOT ESTABLISHED THAT SUCH A FRAME OCCURS — and the in-game evidence is
-// against it: the user reports the open field view DOES contain translucent geometry, so the
-// translucent anchor should be firing there and this fallback is probably dead code. The Status
-// line's anchor readout is how to check rather than assume. Keep the fallback anyway; it costs
-// nothing when it does not fire, and where it DOES fire the alternative is much worse. :2795 is
-// AFTER every particle pass and, the one that matters, BLOOM (:2663). Fog applied after bloom is
-// fog the bloom never saw, so the bright distant things vanilla blooms hard — Death Mountain, the
-// Ganon barrier — come out dimmer and sharper, which is the reported symptom. A pre-hook on the
-// bloom draw is therefore a much closer fallback than the end of the frame.
-//
-// Bloom is the load-bearing one because it is ON by default and ungated by the mod: bloomMode
-// defaults to BloomMode::Dusk (dusk/settings.cpp:68), and bloom_c::draw2 runs whenever the area's
-// own bloom is enabled. The other two full-screen passes in that window are NOT: drawDepth2
-// (:2492) is depth of field, gated on auto-focus, and motionBlure (:2483) — despite the name — is
-// not motion blur at all but a blend of the PREVIOUS frame's captured framebuffer over this one,
-// gated on g_env_light.is_blure, which ordinary play leaves off. Do not cite either as something
-// the fog normally lands after.
+// A frame with no translucent J3D draw falls back to a pre-hook on mDoGph_gInf_c::bloom_c::draw,
+// and failing that to FRAME_BEFORE_HUD, which runs after bloom (on by default: game.bloomMode
+// defaults to BloomMode::Dusk). Fog applied after bloom is fog the bloom never saw, so brightly
+// bloomed distant subjects come out dimmer. Both fallbacks also fog the translucent geometry drawn
+// before them.
 enum class QuadAnchor : uint8_t { None, Translucent, BeforeBloom, FrameEnd };
 QuadAnchor g_quadAnchor = QuadAnchor::None;
 
-// THE ONE THE STATUS LINE REPORTS, and it is the PREVIOUS frame's. The status string is built in
-// on_scene_after_opaque, and every anchor writes g_quadAnchor after that — the translucent anchor
-// during the translucent lists, the bloom pre-hook later still, FRAME_BEFORE_HUD last. Reading
-// g_quadAnchor there always found the value on_scene_begin had just cleared, so the line read
-// "not pushed" in every frame however well the quad was landing. One frame of lag is nothing in a
-// static view; reporting the wrong thing entirely is not.
+// The anchor the Status line reports. The line is built in on_scene_after_opaque, before this
+// frame's anchor fires, so it shows the previous frame's.
 QuadAnchor g_lastQuadAnchor = QuadAnchor::None;
 
 const char* quad_anchor_name() {
@@ -230,12 +184,17 @@ const char* quad_anchor_name() {
     default: return "not pushed";
     }
 }
-// Published through the service: did this frame actually defer, or did it fall back to the game's
-// own forward fog? Written on the game thread once per frame, read by consumers on the same thread.
+// Published through the service (deferred_fog_service.h): whether this frame's quad was armed.
+// Written once per frame at SCENE_AFTER_OPAQUE; game thread only.
 bool g_lastFrameDeferred = false;
+// Vanilla mode: whether this frame may suppress configs that match the reference. It is the
+// previous frame's verdict (no deviant configs), because a frame's configs are known only after
+// its opaque lists have drawn. In the first frame of a mixed scene the matching draws are still
+// deferred, and the deviant draws get both their forward fog and the quad.
 bool g_suppressAllowed = false;
 bool g_shapeHookOk = false;
 bool g_warnedPushFailure = false;
+// The frame's first captured config. The single-config quad uses it.
 FogConfig g_reference;
 uint32_t g_suppressedCount = 0;
 uint32_t g_deviantCount = 0;
@@ -246,32 +205,33 @@ char g_statusText[224] = "Waiting for first fogged frame";
 
 constexpr uint32_t kMaxFogConfigs = 8;
 
-// The config-ID buffer's "this pixel had no fog in vanilla — leave it alone" mark. stamp_replay_id
-// writes (index + 1) * 24 into the red channel, so real configs 0..7 occupy 24..192 and slot 8
-// takes 216, which can never collide. 216 round-trips exactly through the 8-bit channel
-// (216/255 = 0.847058..., round(0.847058... * 255) = 216): the ID pass is single-sample, the shader
-// reads it with textureLoad (no filtering), and aurora forces a non-sRGB surface format
-// (best_surface_format -> to_linear), which the offscreen target inherits — so nothing can move the
-// byte. The decode in fog.wgsl already resolves 216 to slot 9 exactly; only the `slot <= count`
-// guard rejects it today.
+// Config-ID index for "vanilla drew this pixel with no fog; leave it alone". stamp_replay_id writes
+// (index + 1) * 24 into the red channel, so real configs 0..7 use 24..192 and this index writes
+// 216, which fog.wgsl decodes as slot 9 and tests before its config-range check. The byte survives
+// exactly: the offscreen ID target is single-sample, takes aurora's linear (non-sRGB) surface
+// format, and the shader reads it with textureLoad.
 constexpr uint32_t kNoFogSlot = 8;
 static_assert(kNoFogSlot >= kMaxFogConfigs, "the sentinel must not collide with a real config");
 static_assert((kNoFogSlot + 1) * 24 <= 255, "the sentinel must fit in the red channel");
+// Exact mode: the distinct configs captured this frame, indexed as in the config-ID buffer.
 FogConfig g_frameConfigs[kMaxFogConfigs];
 uint32_t g_frameConfigCount = 0;
+// True while replay_config_ids re-draws the opaque lists.
 bool g_fogReplayActive = false;
+// This frame's resolved config-ID buffer. Borrowed from the gfx service; valid this frame only.
 WGPUTextureView g_configIdView = nullptr;
 bool g_wasMixed = false;
 bool g_warnedReplayFailure = false;
 
-// Bit set in the shader-side fog_type field when the range-adjust multiplier applies to that
-// config. GXFogType's own bit 3 (0x08) means ORTHOGRAPHIC, and the shader masks the type to three
-// bits, so this uses the next free bit up rather than colliding with a real GX meaning.
+// Set in the shader-side fog_type when range adjustment applies to that config. GXFogType's own
+// 0x08 bit means orthographic and the shader masks the type to three bits, so this uses 0x10.
 constexpr uint32_t kFogTypeRangeAdjBit = 0x10u;
 
-// Mirror of the WGSL FogRange struct. One per frame, shared by every config: the game drives the
-// table, the centre and the enable from the same g_env_light globals, so the configs in a frame
-// cannot disagree about them (only about whether they are enabled at all, which rides in fog_type).
+// The uniform structs below mirror res/fog.wgsl byte for byte; keep the static_asserts true.
+//
+// FogRange: one per frame, shared by every config. The game stamps the table and centre from the
+// same g_env_light globals, so normally only the enable differs between configs (it rides in
+// fog_type); the mixed pass uses the first enabled config's table.
 struct FogRangeUniform {
     float center;   // fog-range centre column, in NDC x
     float _pad0;
@@ -281,7 +241,7 @@ struct FogRangeUniform {
 };
 static_assert(sizeof(FogRangeUniform) == 64);
 
-// Mirror of the WGSL FogUniforms struct (keep in sync with res/fog.wgsl).
+// FogUniforms: the single-config pass (fs_main).
 struct FogUniforms {
     float color[4];
     float a;
@@ -298,6 +258,7 @@ static_assert(sizeof(FogUniforms) % 16 == 0);
 static_assert(sizeof(FogUniforms) == 112);
 static_assert(offsetof(FogUniforms, range) == 48);
 
+// MixedFogEntry / MixedFogUniforms: the per-pixel-config pass (fs_mixed).
 struct MixedFogEntry {
     float color[4];
     float a;
@@ -318,6 +279,8 @@ static_assert(sizeof(MixedFogUniforms) % 16 == 0);
 static_assert(sizeof(MixedFogUniforms) == 336);
 static_assert(offsetof(MixedFogUniforms, range) == 272);
 
+// Inline payload handed to on_draw on the render worker. configIds is null for the single-config
+// pass. The views are borrowed for this frame only.
 struct DrawPayload {
     WGPUTextureView sceneDepth;
     WGPUTextureView configIds;
@@ -348,46 +311,15 @@ bool effect_enabled() {
     return get_bool_option(g_cvarFogEnabled, true) && g_shapeHookOk;
 }
 
-// WOLF SENSES: THE FRAME IS LEFT ENTIRELY TO THE GAME'S OWN FOG.
-//
-// The reported bug: with Wolf Senses active, some camera directions lose the close-range fog and
-// show far more of the world than the sense view is meant to. Senses is where a fullscreen fog pass
-// is at its most exposed. While the wolf's senses are up, every environment fog setter replaces the
-// palette fog with BLACK over a tiny range: fog_col is zeroed and dKy_WolfPowerup_FogNearFar picks a
-// start/end like 750..1750 (d_kankyo.cpp:413, applied at :2459 for the global fog, :2922 for BG
-// tevstrs, :3097 for actors), where ordinary fog runs over tens of thousands of units. Past ~1750
-// the whole scene is meant to be black.
-//
-// The quad computes ONE fog term per pixel from the ONE depth the depth buffer holds, whereas
-// forward fog fogs every fragment at its own depth. The two agree only where the surface that owns
-// the pixel's depth is also the one its colour comes from. Where they differ — a see-through
-// surface that writes depth in front of distant geometry, or geometry that writes no depth over the
-// sky (depth 0, which the quad skips) — the colour behind is fogged at the wrong depth or not at
-// all. Ordinary fog only reaches full strength far away, so there the error is usually small. Under
-// senses fog it is the difference between pure black and full visibility, which is exactly "revealing far more of the scene", and
-// it is camera-direction dependent because it depends on which of those surfaces are in view. WHICH
-// geometry does it in the reported views is NOT established — the stage archives are not in the
-// source tree — and it does not need to be, because:
-//
-// BLACK FOG HAS NOTHING TO DEFER. Forward fog toward F = 0 is mix(x, 0, f) = (1 - f) * x, a pure
-// attenuation, and a multiplicative composite m (AO, shadows) applied on top gives
-// m * (1 - f) * x = (1 - f) * (m * x) — the deferred result, EXACTLY. The whole point of this mod
-// is that AO multiplies over already-fogged colour; with black fog that is already correct. So in
-// senses deferring buys nothing and can only lose exactness, and the right answer is to open no
-// suppression scope at all: no fog is suppressed, no quad is pushed, no replay runs, and the frame
-// is the game's own, bit for bit. (An ADDITIVE composite — indirect light — would differ, since it
-// adds light on top of the black instead of under it. No mod in the build adds light.)
-//
-// The predicate is the game's own: daPy_py_c::checkNowWolfPowerUp() is exactly what every one of
-// those fog setters tests, so the scope closes on the same frame the fog turns black and reopens
-// on the same frame it turns back. The player check covers frames with no player actor, where
-// checkNowWolfEyeUp would dereference null.
-//
-// fogDeferInSenses turns the exemption off. It is a DIAGNOSTIC, default off: it brings the bug back
-// so the per-pixel mechanism can be measured (Fog Factor view in the failing direction — a region
-// that is dark in the fog-factor view but bright in the scene is a depth mismatch, not a config
-// one). The same mismatch exists under ordinary fog at a far smaller scale, which is the only reason
-// to go looking for it.
+// Wolf Senses: while the senses are up, the environment fog setters replace the palette fog with
+// black fog over a short range (dKy_WolfPowerup_FogNearFar; 750..1750 outdoors and 1000..1800
+// indoors by default, other stages differ). Black fog commutes with multiplicative composites,
+// m * (1 - f) * x == (1 - f) * (m * x), so deferring it gains nothing, while the quad's single
+// depth per pixel can only lose exactness (it visibly revealed far more of the scene in some camera
+// directions). So no scope opens while checkNowWolfPowerUp() is true, the same test those setters
+// use. An additive composite (indirect light) would differ; none is currently built.
+// fogDeferInSenses disables this exemption for diagnosis. The player check is needed because
+// checkNowWolfEyeUp dereferences the player actor.
 bool wolf_senses_active() {
     return dComIfGp_getLinkPlayer() != nullptr && daPy_py_c::checkNowWolfPowerUp();
 }
@@ -395,16 +327,15 @@ bool wolf_senses_active() {
 bool g_sensesExempt = false;
 bool g_wasSensesExempt = false;
 
-// The frame's world viewport width in the game's logical (640-wide) space, sampled once per frame
-// while the world viewport is still current. Only the width is needed: aurora's centre term is
+// The world viewport width in the game's logical coordinates, sampled at SCENE_AFTER_OPAQUE while
+// the world viewport is still current. Aurora's range centre is
 // ((center - vp.left) / vp.width) * 2 - 1 + (renderVp.left / renderVp.width) * 2, and the render
-// viewport is just the logical one uniformly scaled (gx.cpp map_logical_viewport), so the two
-// vp.left terms cancel exactly and leave 2 * center / vp.width - 1.
+// viewport is the logical one scaled along x (map_logical_viewport), so the left terms cancel and
+// only the width is needed: 2 * center / vp.width - 1.
 float g_frameViewportWidth = 640.0f;
 
-// Per-material range adjustment: dKy stamps every BG material's J3DFog block with the environment
-// globals (d_kankyo.cpp:4481-4484) and J3DFog::load() re-issues GXSetFogRangeAdj from it
-// (J3DMatBlock.h:1526), so the material's own block is authoritative for the shapes it draws.
+// Range adjustment for a material's own fog: J3DFog::load() issues J3DGDSetFogRangeAdj from the
+// same block as the fog, so the block is authoritative for the shapes the material draws.
 void capture_adj_from_material(const J3DFog& fog, FogConfig& out) {
     out.adj.enable = fog.mAdjEnable != 0;
     out.adj.center = fog.mCenter;
@@ -413,10 +344,8 @@ void capture_adj_from_material(const J3DFog& fog, FogConfig& out) {
     }
 }
 
-// Direct-setter range adjustment: dKy_GxFog_set, dKy_GxFog_tevstr_set and dKy_GfFog_tevstr_set each
-// call GxXFog_set() immediately after their GXSetFog/GFSetFog, and that re-issues
-// GXSetFogRangeAdj straight from these globals — so for a config captured at the setter, the live
-// environment state IS the range adjustment that will be in force for it.
+// Range adjustment for a config captured at GXSetFog/GFSetFog: the direct setters call GxXFog_set()
+// right afterwards, which issues GXSetFogRangeAdj from these globals.
 void capture_adj_from_env(FogConfig& out) {
     out.adj.enable = g_env_light.mFogAdjEnable != 0;
     out.adj.center = g_env_light.mFogAdjCenter;
@@ -425,10 +354,9 @@ void capture_adj_from_env(FogConfig& out) {
     }
 }
 
-// Reproduces aurora's build_fog_range_lut (command_processor.cpp:201-220) as shader uniforms: the
-// same constants, in the same pair-swapped order, at the same 1/64 scale, with the centre column
-// mapped to NDC. fog.wgsl then evaluates sqrt(offset^2 + k^2) / k per pixel instead of reading a
-// baked per-column table, which is the same function of the same inputs.
+// Packs the range constants as aurora's build_fog_range_lut prepares them (pair-swapped, scaled by
+// 1/64) plus the centre column in NDC. fog.wgsl evaluates the LUT's formula per pixel instead of
+// reading a baked per-column table.
 FogRangeUniform build_fog_range(const FogRangeAdj& adj) {
     FogRangeUniform out{};
     out.center =
@@ -442,11 +370,11 @@ FogRangeUniform build_fog_range(const FogRangeAdj& adj) {
     return out;
 }
 
+// Whether two configs render the same fog, within small tolerances so near-identical configs share
+// one table slot.
 bool config_matches(const FogConfig& reference, const FogConfig& candidate) {
-    // Two draws that agree on colour and range but disagree on range adjustment do NOT render the
-    // same, so they are distinct configs. In practice every config in a frame carries the same
-    // globals and this never splits the table; it matters only for a material whose fog block dKy
-    // never touched, which keeps whatever the .bmd authored.
+    // Range adjustment is part of the config. Normally every config carries the same globals; a
+    // material whose fog block the game never re-stamps keeps the values authored in its model.
     if (reference.adj.enable != candidate.adj.enable) {
         return false;
     }
@@ -476,57 +404,27 @@ bool config_matches(const FogConfig& reference, const FogConfig& candidate) {
            std::fabs(candidate.farZ - reference.farZ) <= reference.farZ * 0.01f + 1.0f;
 }
 
-// The Hyrule Castle "Ganon barrier" (game actor d_a_obj_ganonwall2) is a translucent dome, but it
-// draws in the OPAQUE BG list (its Draw() calls dComIfGd_setListBG()), so it lands inside the
-// suppression scope. Every frame that actor rewrites its material fog to pure BLACK with a huge
-// range (startZ 1000, endZ 250000) so the dome fades to black at distance. If we defer that config,
-// two things break: the config-ID replay rasterizes the (really translucent) dome SOLID and stamps
-// its black fog onto the castle and trees INSIDE it (they turn dark), and the barrier's own
-// fog-then-blend compositing is lost. So we recognise this one distinctive signature and leave the
-// barrier entirely on its vanilla forward fog: its shapes are never suppressed and never registered
-// as a frame config. The frame then stays uniform (the field fog), the geometry inside the barrier
-// keeps the correct field fog, and the dome keeps its own black forward fog. (Residual: the
-// fullscreen quad still adds the field fog over the dome pixels — minor, and far better than the
-// black-stamped geometry it replaces. A perfect result is impossible here: a single fullscreen fog
-// pass cannot reproduce per-fragment fog through a translucent surface.)
+// The Hyrule Castle barrier dome (actors d_a_obj_ganonwall and d_a_obj_ganonwall2) is translucent,
+// but its materials draw inside the suppression scope (seen in-game: stamping its config in the
+// replay darkened the castle behind it). Each Draw() rewrites their fog to black over 1000..250000.
+// Deferring that config fails twice: the replay stamps the dome as a solid surface, so its black
+// fog lands on the castle and trees behind it, and the dome loses its own fog-before-blend. So the
+// barrier keeps its forward fog: its draws are neither suppressed nor registered, and in the replay
+// it writes no colour, so its pixels take the config of whatever is behind. (The quad still adds
+// that fog over the dome; one fullscreen pass cannot fog through a translucent surface.)
 //
-// The Ganon barrier dome writes these three literals every frame, in both barrier actors:
-// d_a_obj_ganonwall2.cpp:112-116 and d_a_obj_ganonwall.cpp:131-135 set colour 0,0,0 with
-// mStartZ = 1000.0f and mEndZ = 250000.0f. Matching the exact triple is free and is the only
-// safe test.
-//
-// THIS USED TO BE `black && endZ > 100000`, WHICH MATCHED A WHOLE MATERIAL CLASS. `mType = 7` is
-// the GAME'S OWN black-fog sentinel, not a barrier marker: dKy_bg_MAxx_proc stamps it on the
-// terrain water family MA03/MA17/MA19 (d_kankyo.cpp:11390) and on MA20 (:11588), and
-// setLightTevColorType_MAJI_sub reads it and forces the fog COLOUR to pure black (:4466-4470)
-// while the start/end Z stay the room palette's. So in any room whose palette fog_end_z exceeds
-// 100000, every water surface and every MA20 material looked like the barrier: the mod left them
-// on vanilla forward fog AND painted the quad over them, i.e. double fog. Palette fog is
-// interpolated by float_kankyo_color_ratio_set and cannot land on both literals, so the exact test
-// cannot collide with it.
+// Match the exact literal triple the actors write. A looser test (black && endZ > 100000) also
+// caught the game's own mType 7 materials (water MA03/MA17/MA19, and MA20), which
+// setLightTevColorType_MAJI_sub turns black while keeping the room palette's range, and fogged
+// them twice.
 bool is_barrier_fog(const FogConfig& c) {
     return c.color.r == 0 && c.color.g == 0 && c.color.b == 0 && c.startZ == 1000.0f &&
         c.endZ == 250000.0f;
 }
 
-// (A "widest fog" helper used to live here, ranking the frame's configs by reach so uncovered
-// pixels and the barrier dome could be given "the distant fog". It is gone. There is no distant
-// fog to find: every config in a frame carries the same near/far from the one live view
-// (d_kankyo.cpp:4461-4463 for BG materials, :9394/:9429/:9451 for the direct setters), the world
-// lists draw under one perspective projection (m_Do_graphic.cpp:2338), and what TP widens for
-// distant scenery is the CPU clipper (d_a_bg.cpp:298, d_bg_parts.cpp:681), which never touches
-// fog. Both of its callers now have exact answers instead of a ranking: uncovered pixels take
-// g_selfDrawnIndex, and the barrier dome takes the config of whatever is behind it.)
-
-// The fallback here MUST be the value fogMixedMode is registered with (1 = Exact). The two
-// disagreed once already, which meant a failed config read silently ran the mode the UI was not
-// showing; keep them in step.
-// DEFAULT OFF, deliberately. Vanilla applies literally zero fog to a material whose fog block has
-// mType 0, so the quad must apply zero fog there — that part is not a judgement call. What IS a
-// judgement call is whether that geometry exists in the view being complained about, and what it
-// costs: switching this on forces the config-ID replay (a whole extra opaque geometry pass) in
-// frames that were uniform before. The Status line's "fog-off" counter answers both questions
-// BEFORE anything changes, which is the step the two previous attempts at this bug skipped.
+// fogSkipUnfogged, read once per frame in on_scene_begin. Off by default because it forces the
+// config-ID replay (an extra pass over the opaque geometry) in frames that would otherwise be
+// uniform; the Status line's fog-off counts show whether it can have any effect in a view.
 bool g_skipUnfogged = false;
 
 bool read_skip_unfogged() {
@@ -537,15 +435,19 @@ bool skip_unfogged_geometry() {
     return g_skipUnfogged;
 }
 
+// The fallback must equal fogMixedMode's registered default (1 = Exact); otherwise a failed config
+// read silently runs a mode the UI is not showing.
 bool exact_mode() {
     return get_int_option(g_cvarFogMixed, 1) == 1;
 }
 
-// ONE gate, two call sites — the frame that builds the ID buffer and the frame that uses it. They
-// were separate booleans and this file already records one drift of exactly that shape, so they are
-// factored here and must stay factored.
+// The one test for "this frame uses the config-ID buffer", shared by on_scene_after_opaque (which
+// builds the buffer) and push_fog_quad (which reads it). Keep it in one function so the two cannot
+// drift apart.
 bool needs_id_buffer();
 
+// Returns the config's slot in this frame's table, adding it if new. When the table is full, an
+// unmatched config is merged into slot 0.
 uint32_t register_frame_config(const FogConfig& config) {
     for (uint32_t i = 0; i < g_frameConfigCount; ++i) {
         if (config_matches(g_frameConfigs[i], config)) {
@@ -560,6 +462,7 @@ uint32_t register_frame_config(const FogConfig& config) {
     return 0;
 }
 
+// Like register_frame_config but never adds; an unknown config maps to slot 0.
 uint32_t lookup_frame_config(const FogConfig& config) {
     for (uint32_t i = 0; i < g_frameConfigCount; ++i) {
         if (config_matches(g_frameConfigs[i], config)) {
@@ -569,6 +472,9 @@ uint32_t lookup_frame_config(const FogConfig& config) {
     return 0;
 }
 
+// Records a captured config and returns whether to suppress its forward fog. Exact mode registers
+// it in the frame table and always suppresses ("deviant" there just means "not slot 0"). Vanilla
+// mode suppresses only configs matching the reference, and only if g_suppressAllowed.
 bool vote_config(const FogConfig& config) {
     if (!g_reference.valid) {
         g_reference = config;
@@ -604,44 +510,16 @@ bool vote_config(const FogConfig& config) {
 
 void push_fog_quad();
 
-// A NOTE ON WHY THERE IS NO "BLENDED DRAWS KEEP VANILLA FOG" RULE HERE ANY MORE.
-//
-// GX fog runs per fragment BEFORE the blend, so for a see-through surface vanilla computes
-// blend(mix(src, fogCol, f), dst) while a fullscreen pass can only compute
-// mix(blend(src, dst), fogCol, f). That reasoning is correct, and TP really does draw see-through
-// surfaces inside the opaque lists (water: dKy_bg_MAxx_proc's mType 6/7 sentinels; the Ganon
-// barrier: d_a_obj_ganonwall2). A rule that detected blended materials and left them all on
-// vanilla forward fog was tried and MEASURED WORSE in-game than not having it, and it changed
-// nothing about the Death Mountain / barrier brightness difference it was meant to explain. The
-// reason it backfires: the deferred quad still fogs those pixels (they are in the depth buffer
-// like anything else), so a blended surface that keeps its forward fog is simply fogged TWICE.
-// Fixing it properly needs a per-pixel "no deferred fog" mark, not a suppression exemption. THAT
-// MARK NOW EXISTS — see kNoFogSlot and skip_unfogged_geometry() — but it is keyed on mType == 0,
-// not on blending. Extending it to over-unity blends is possible in principle and is gated on the
-// g_overUnityCount / g_noDepthOverUnityCount measurements: if every such material has depth-write
-// off, marking its pixels would blank the fog on the terrain behind it and the answer is "cannot
-// be done", not "not done yet". Do not reintroduce the suppression exemption on its own.
-// Only the barrier keeps an exemption, because its own fog is pure black over a huge range and
-// stamping it into the config table is worse still.
-
-// THE THREE STATES A MATERIAL'S FOG CAN BE IN, kept apart on purpose.
-//
-// `Off` is NOT the same as `NoBlock`, even though both mean "we have no config to register". A
-// material with a fog block whose mType is 0 is an ARTIST-FACING PER-MATERIAL OPT-OUT that the game
-// honours: J3DFog::load() issues J3DGDSetFog(GXFogType(mType), ...) unconditionally
-// (J3DMatBlock.h:1525), so mType 0 programs a real GX_FOG_NONE, and setLightTevColorType_MAJI_sub
-// refuses to overwrite such a block — `if (fog_info->mType != 0)` guards its whole fog section
-// (d_kankyo.cpp:4429-4487). Vanilla therefore applies LITERALLY ZERO FOG to that geometry, however
-// far away it is. It is also invisible to this mod's GXSetFog/GFSetFog hooks, because J3DGDSetFog
-// writes raw BP commands into the FIFO (J3DGD.cpp:581-585) rather than calling GX.
-//
-// `NoBlock` means the material inherits whatever the last GXSetFog left, which the GXSetFog hook
-// has already dealt with. In RETAIL TP this case does not arise: J3DMaterial::createPEBlock only
-// picks the fog-less Opa/TexEdge/Xlu blocks when its flags argument is 0 (J3DMaterial.cpp:68-83),
-// and every retail model load masks to 0x10000000 (d_resorce.cpp:228/:378/:412/:437,
-// d_file_select.cpp:5948, d_menu_collect.cpp:2805), so every world material is a J3DPEBlockFull.
-// The distinction is kept anyway: if that ever changes, a mark keyed on `Off` stops firing rather
-// than firing on geometry that does have fog.
+// A material's fog as the deferred pass sees it:
+//   Live     its J3DFog block programs real fog; capture and suppress it.
+//   Off      its block has mType 0. J3DFog::load() then programs GX_FOG_NONE, and
+//            setLightTevColorType_MAJI_sub leaves such blocks alone, so vanilla draws this geometry
+//            with no fog at any distance. J3DGDSetFog writes raw BP commands, so the GXSetFog hook
+//            never sees it.
+//   NoBlock  no fog block; the draw inherits the last GXSetFog, which that hook already handled.
+//            Retail TP should not produce this (the game's model loaders request J3DPEBlockFull,
+//            PE flag 0x10000000). It is kept apart from Off so the fog-off mark never fires on
+//            geometry that does have fog.
 enum class MaterialFog : uint8_t { NoBlock, Off, Live };
 
 MaterialFog material_fog_state(J3DMaterial* material, FogConfig& out) {
@@ -663,26 +541,14 @@ MaterialFog material_fog_state(J3DMaterial* material, FogConfig& out) {
     return MaterialFog::Live;
 }
 
-// WHY A BLEND WITH dst == ONE IS THE ONE THAT MATTERS, AND "IS IT BLENDED" IS NOT.
-//
-// Aurora fogs the fragment SOURCE, inside the fragment shader, before the hardware blend:
-// shader.cpp:1543 emits `prev = mix(prev.rgb, fog.color.rgb, fogZ)` into the fragment function,
-// while the GX blend equation is a WebGPU pipeline blend state applied afterwards (gx.cpp:332-338).
-// For layers drawn with GX factors (s_i, d_i) over an accumulator, the two orders differ by
-//
-//     divergence = f * F * (K - 1),   K = SUM_i ( s_i * PRODUCT_{j>i} d_j )
-//
-// with F the fog colour and f the fog factor. For an ordinary alpha blend (s = a, d = 1 - a) over
-// an opaque base K = a + (1 - a) = 1 and the deferred result is BIT-EXACT — which is why the
-// blanket "blended draws keep vanilla fog" experiment measured worse: it exempted a pile of draws
-// that were already exact, and got them fogged twice for the trouble.
-//
-// K != 1 only when the destination factor is not (1 - src): an ADDITIVE blend (dst == GX_BL_ONE)
-// gives K = 1 + a, and GX_BM_SUBTRACT maps to ReverseSubtract One/One (gx.cpp:129-136). And this is
-// the part that matters at Death Mountain range: mix(scene, F, f) is bounded by max(scene, F) and
-// converges to exactly F as f -> 1, so the quad clamps every distant pixel to precisely the haze
-// colour, while vanilla converges to K * F and can be a MULTIPLE of it. That is what "chunks of the
-// far off geometry overpower the fog" looks like in arithmetic.
+// Whether the material's blend makes forward and deferred fog differ (counted for the Status line).
+// Aurora fogs each fragment's source colour in the shader, before the pipeline blend; the quad fogs
+// the blended result. With one fog factor f and colour F for the pixel, layers drawn with GX
+// factors (s_i, d_i) differ by f * F * (K - 1), where K = sum_i(s_i * prod_{j>i} d_j). An alpha
+// blend over an opaque base gives K = 1, no difference; additive blends (dst factor ONE) and
+// GX_BM_SUBTRACT (ReverseSubtract One/One in aurora) do not. This is also why blended draws must
+// not simply be exempted from suppression: the quad still fogs their pixels, so they get fogged
+// twice. See docs/deferred_fog.md "Known issues".
 bool material_over_unity_blend(J3DMaterial* material) {
     J3DPEBlock* peBlock = material != nullptr ? material->getPEBlock() : nullptr;
     const J3DBlend* blend = peBlock != nullptr ? peBlock->getBlend() : nullptr;
@@ -696,13 +562,11 @@ bool material_over_unity_blend(J3DMaterial* material) {
     return mode == GX_BM_BLEND && blend->getDstFactor() == GX_BL_ONE;
 }
 
-// THE OTHER RESTRICTION ON MARKING A PIXEL. stamp_replay_id forces
-// GXSetAlphaCompare(GX_ALWAYS, ...) and binds no texture, so an alpha-TESTED material stamps its
-// whole quad in the replay rather than its cutout shape. That is invisible today because every
-// stamped ID resolves to the same room fog, but a mark that DIFFERS would punch a rectangular hole
-// in the fog around every such surface. So only mark materials whose alpha test passes everything
-// anyway. calcAlphaCmpID packs (comp0 << 5) + (op << 3) + comp1 (J3DMatBlock.h:1531) and GX_ALWAYS
-// is 7, so the default 0x00E7 is "always AND always".
+// The fog-off mark may only go on materials whose alpha test passes everything. stamp_replay_id
+// forces GX_ALWAYS and binds no texture, so an alpha-tested material stamps its whole primitive
+// rather than its cutout, and a mark that differs from its surroundings would punch a hole in the
+// fog. calcAlphaCmpID packs (comp0 << 5) + (op << 3) + comp1 and GX_ALWAYS is 7, so the default
+// 0x00E7 is "always AND always".
 bool material_alpha_test_trivial(J3DMaterial* material) {
     J3DPEBlock* peBlock = material != nullptr ? material->getPEBlock() : nullptr;
     const J3DAlphaComp* comp = peBlock != nullptr ? peBlock->getAlphaComp() : nullptr;
@@ -713,30 +577,24 @@ bool material_alpha_test_trivial(J3DMaterial* material) {
     return ((comp->mID >> 5) & 7) == kAlways && (comp->mID & 7) == kAlways;
 }
 
-// THE SAFETY INVARIANT FOR ANY PER-PIXEL FOG MARK: the quad's fog factor comes from the depth
-// buffer, so only the draw that OWNS the depth at a pixel may decide that pixel's fog. A fog-off
-// overlay that does not write depth sits over geometry whose depth is what the quad reads; marking
-// it would blank the fog on everything behind it.
+// The quad takes its fog factor from the depth buffer, so only a draw that owns the depth at a
+// pixel may decide that pixel's fog. Marking a fog-off overlay that does not write depth would
+// remove the fog from whatever is behind it.
 bool material_owns_depth(J3DMaterial* material) {
     J3DPEBlock* peBlock = material != nullptr ? material->getPEBlock() : nullptr;
     const J3DZMode* zMode = peBlock != nullptr ? peBlock->getZMode() : nullptr;
     return zMode != nullptr && zMode->getCompareEnable() != 0 && zMode->getUpdateEnable() != 0;
 }
 
-// Per-frame measurements. These exist because this bug has already absorbed two fixes built on a
-// plausible mechanism with no per-view measurement behind it. Read them in the view that looks
-// wrong before changing anything.
-uint32_t g_fogOffCount = 0;            // materials in scope that vanilla draws with NO fog
-uint32_t g_fogOffNoDepth = 0;          // ... of those, how many do not own their depth
-uint32_t g_fogOffAlphaTested = 0;      // ... and how many own depth but are alpha-TESTED
-uint32_t g_overUnityCount = 0;         // materials whose blend makes K != 1 (additive / subtract)
-uint32_t g_noDepthOverUnityCount = 0;  // ... of those, how many do not own their depth
+// Per-frame Status line counters (docs/deferred_fog.md "Status line"). They count draws in the
+// scope (each drawFast or shared-DL load), not distinct materials.
+uint32_t g_fogOffCount = 0;            // draws vanilla renders with no fog (MaterialFog::Off)
+uint32_t g_fogOffNoDepth = 0;          // ... of those, draws that do not own their depth
+uint32_t g_fogOffAlphaTested = 0;      // ... draws that own depth but are alpha-tested
+uint32_t g_overUnityCount = 0;         // draws whose blend gives K != 1 (additive / subtract)
+uint32_t g_noDepthOverUnityCount = 0;  // ... of those, draws that do not own their depth
 
-// A fog-off material is MARKABLE only if it survives both restrictions, so
-// markable = g_fogOffCount - g_fogOffNoDepth - g_fogOffAlphaTested. Reporting the two rejection
-// reasons separately is the difference between "the fix did not fire" and "the fix cannot fire for
-// this geometry, and here is which restriction blocked it" — the second is actionable, the first
-// costs a round trip.
+// Fog-off draws that pass both marking restrictions (own their depth, trivial alpha test).
 uint32_t fog_off_markable() {
     return g_fogOffCount - g_fogOffNoDepth - g_fogOffAlphaTested;
 }
@@ -748,7 +606,8 @@ bool needs_id_buffer() {
     return g_frameConfigCount > 1 || (g_skipUnfogged && g_fogOffCount > 0);
 }
 
-// Replay mode: force everything this draw emits to a flat config-ID colour, and no fog.
+// Replay mode: force everything this draw emits to a flat config-ID colour (index + 1) * 24 in red,
+// with no fog, no blending and no alpha test.
 void stamp_replay_id(uint32_t index) {
     const auto idByte = static_cast<u8>((index + 1) * 24);
     GXSetColorUpdate(GX_TRUE);
@@ -764,14 +623,15 @@ void stamp_replay_id(uint32_t index) {
     GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, GXColor{0, 0, 0, 0});
 }
 
+// Replay mode, one material draw: stamp its config ID, the no-fog sentinel, or (for the barrier)
+// nothing.
 void replay_stamp_material(J3DMaterial* material) {
     FogConfig config;
     const MaterialFog state = material_fog_state(material, config);
     if (state == MaterialFog::Live && is_barrier_fog(config)) {
-        // Write no colour, so the config of whatever is behind this surface survives in the ID
-        // buffer — that is the config the deferred quad should use for these pixels. stamp_replay_id
-        // turns colour writes back on for the next ordinary draw, and replay_config_ids restores
-        // them at the end of the pass. Tested BEFORE the fog-off mark below, never replaced by it.
+        // Write no colour, so the config of whatever is behind the dome survives in the ID buffer.
+        // stamp_replay_id turns colour writes back on for the next draw, and replay_config_ids
+        // restores them at the end of the pass. This test must stay ahead of the fog-off mark.
         GXSetColorUpdate(GX_FALSE);
         return;
     }
@@ -784,8 +644,8 @@ void replay_stamp_material(J3DMaterial* material) {
     stamp_replay_id(state == MaterialFog::Live ? lookup_frame_config(config) : 0u);
 }
 
-// Capture mode: register the material's own fog and suppress it if we are deferring it. Returns
-// whether the material carried live fog at all (for the shared-DL diagnostic).
+// Capture mode: update the Status counters, register the material's own fog and suppress it if it
+// is being deferred. Returns whether the material carried live fog (for the shared-DL counter).
 bool suppress_material_fog(J3DMaterial* material) {
     FogConfig config;
     const MaterialFog state = material_fog_state(material, config);
@@ -815,6 +675,10 @@ bool suppress_material_fog(J3DMaterial* material) {
     return true;
 }
 
+// Pre-hook on J3DShape::drawFast. The material's display list (fog included) has already been sent
+// when it runs, so a GXSetFog here overrides the material's fog. Three roles: stamp the config ID
+// during the replay; push the armed quad at the first draw after SCENE_AFTER_OPAQUE; and inside the
+// scope, capture and suppress the material's fog.
 HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     if (g_fogReplayActive) {
         const J3DShape* shape = mods::arg<const J3DShape*>(args, 0);
@@ -835,56 +699,30 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
-// THE SHARED-DISPLAY-LIST PATH DOES NOT GO THROUGH J3DShape::drawFast.
+// dBgp_c map units (the shared, instanced pieces a stage is assembled from) bypass
+// J3DShape::drawFast: dBgp_c::modelMaterial_c::drawSimple calls loadSharedDL() and then
+// J3DShapeDraw::draw() directly. Their packet sets the room fog with dKy_GxFog_tevstr_set (caught
+// by the GXSetFog hook) before its material loop, but each material's display list then re-issues
+// J3DGDSetFog from the material's own fog block. Without these hooks that geometry would keep its
+// forward fog under the quad (double fog) and would never be stamped in the replay.
 //
-// dBgp_c ("bg parts" — the shared, instanced MAP UNITS a stage is assembled from, which in the
-// field is a good deal of the middle and far distance, though HOW MUCH is not established from
-// source — the Status line's shared-DL counter is the measurement) draws its geometry itself:
-// dBgp_c::modelMaterial_c::drawSimple (d_bg_parts.cpp:20) calls mpMaterial->loadSharedDL() and then
-// walks the shape's matrix groups calling J3DShapeDraw::draw() directly — never
-// J3DShape::drawFast. d_model.cpp, d_particle.cpp and the chain actors use the same shape. The
-// packet-level fog those paths set through dKy_GxFog_tevstr_set IS caught (that is a real GXSetFog
-// call), but the material display list replayed by loadSharedDL re-issues J3DGDSetFog from the
-// material's OWN fog block afterwards, and nothing we hooked runs in between. Two consequences,
-// both worst exactly where the fog term is largest:
-//
-//   * that geometry kept its forward fog AND got the deferred quad on top — double fog;
-//   * in exact mode the replay never stamped it, so it rasterized real lit colours, decoded as
-//     "uncovered", and fell through to the fallback config instead of its own.
-//
-// Post-hooking loadSharedDL lands exactly between the display list and the shapes. All three
-// overrides are hooked because the material class a model loads with (plain / patched / locked) is
-// a J3DMaterialFactory decision we do not control; an override that fails to resolve is warned
-// about rather than being fatal, and only costs the coverage it would have added.
-//
-// IT IS SCOPED TO dBgp_c, and that is not caution — it is required. Every OTHER loadSharedDL caller
-// (d_model.cpp:22, d_particle.cpp:593, the fchain/wchain/hookshot chain shapes) calls
-// dKy_GxFog_tevstr_set IMMEDIATELY AFTER loading the display list, so the material's own fog is
-// overwritten before a single triangle rasterizes and never renders at all. Registering it would
-// put a config in the frame table that vanilla never draws with — enough to make a uniform scene
-// read as "mixed", which in Vanilla mode reverts the whole scene to forward fog. dBgp_c is the one
-// caller that sets its fog BEFORE the material loop (d_bg_parts.cpp:157), so there, and only there,
-// the display list has the last word.
+// The post-hook on loadSharedDL lands between the display list and the shapes. All three material
+// classes' overrides are hooked, since which class a model gets is J3DMaterialFactory's choice.
+// Important: the hook must stay bracketed to drawSimple. Every other loadSharedDL caller (dMdl_c,
+// dPa_modelEcallBack::model_c, the chain and hookshot shapes) sets its fog after the display list,
+// so the material's own fog never renders there, and registering it would add a config vanilla
+// never draws with (enough to make a uniform scene "mixed").
 bool g_inBgpMaterial = false;
 uint32_t g_sharedDlFogCount = 0;
 
-// THE UNCOVERED-PIXEL FALLBACK: the config the SELF-DRAWING opaque packets used this frame.
-//
-// Field/tall grass (dGrass_packet_c) and flowers (dFlower_packet_c) do not draw through J3D at all.
-// They call the room's fog setter, replay their own static material display lists, and then emit
-// raw GX batches — so the replay's per-draw flat-ID override cannot reach them: the material list
-// re-programs TEV after anything we could set, and the geometry is not a J3DShape. They therefore
-// rasterize REAL LIT COLOURS into the ID buffer, the shader's green/blue guard correctly rejects
-// those, and every grass and flower pixel lands on the fallback. That makes the fallback's value
-// the fog those two packets get, which is worth measuring rather than assuming.
-//
-// So bracket their draws and record the config index their own fog setter resolved to. It is the
-// room's environment fog — the same one the terrain under them uses. If the hooks do not resolve,
-// the value stays 0, the frame's reference config, which is that same room fog in an ordinary
-// frame; the degradation is invisible.
-//
-// (This also catches MSAA silhouette fringes and any other stray unstamped pixel. Giving those the
-// room fog is right for the same reason.)
+// Fallback for pixels the replay could not stamp: the config the grass (dGrass_packet_c) and flower
+// (dFlower_packet_c) packets used this frame. Those packets call their material display list, then
+// their fog setter (grass: dKy_GfFog_tevstr_set, flowers: dKy_GxFog_tevstr_set), then emit raw GX
+// batches, so the flat-ID override never reaches them; they rasterize lit colours, which fog.wgsl
+// rejects as unstamped. Their pre/post hooks bracket the draw and on_set_fog_pre records the slot
+// their setter resolved to. Other self-drawing packets (dMdl_c models, 3D lines) land on the same
+// fallback. If the hooks fail it stays slot 0, normally the same room fog. (Picking the config with
+// the widest endZ instead would give grass the weakest fog in the frame.)
 bool g_inSelfDrawnPacket = false;
 bool g_selfDrawnIndexValid = false;
 uint32_t g_selfDrawnIndex = 0;
@@ -924,6 +762,8 @@ void on_material_shared_dl_post(ModContext*, void* args, void*, void*) {
     }
 }
 
+// Pre-hook on GXSetFog and GFSetFog: turns fog off during the replay, and inside the scope captures
+// the config and suppresses it.
 HookAction on_set_fog_pre(ModContext*, void* args, void*, void*) {
     if (g_fogReplayActive) {
         mods::arg_ref<GXFogType>(args, 0) = GX_FOG_NONE;
@@ -948,10 +788,8 @@ HookAction on_set_fog_pre(ModContext*, void* args, void*, void*) {
         return HOOK_CONTINUE;  // leave the Ganon barrier on its own forward fog (see is_barrier_fog)
     }
     const bool suppress = vote_config(config);
-    // Grass and flowers set their fog from inside their own packet draw, and this is the only place
-    // we ever see it. Remember the config it resolved to — those packets' pixels all land on the
-    // uncovered-pixel fallback. First one in the frame wins; per-room palette differences within the
-    // config-match tolerance collapse to the same index anyway.
+    // Inside a grass or flower packet: remember the slot this config resolved to, as the fallback
+    // for unstamped pixels (see g_selfDrawnIndex). The first one in the frame wins.
     if (g_inSelfDrawnPacket && !g_selfDrawnIndexValid) {
         g_selfDrawnIndex = lookup_frame_config(config);
         g_selfDrawnIndexValid = true;
@@ -962,10 +800,12 @@ HookAction on_set_fog_pre(ModContext*, void* args, void*, void*) {
     return HOOK_CONTINUE;
 }
 
+// Render worker: records the fullscreen fog triangle into the scene pass. Uses only the payload,
+// the draw context and wgpu calls.
 void on_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
-    // ensure_fog_pipelines() has to run before anything reads g_fogPipeline & co: they do not exist
-    // until the first draw, and they are rebuilt whenever the scene pass changes shape.
+    // The pipelines do not exist until the first draw and are rebuilt when the pass changes shape,
+    // so this must run before anything reads g_fogPipeline and the others.
     if (payloadSize != sizeof(DrawPayload) || ctx == nullptr || !ensure_fog_pipelines(*ctx)) {
         return;
     }
@@ -1010,6 +850,9 @@ void on_draw(
     wgpuBindGroupRelease(bindGroup);
 }
 
+// Game thread, at the quad anchor: snapshots the scene depth and pushes the fog draw. Uses fs_mixed
+// with the config-ID buffer when needs_id_buffer() and the replay succeeded, otherwise fs_main with
+// the reference config.
 void push_fog_quad() {
     GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
     resolveDesc.color = false;
@@ -1050,17 +893,16 @@ void push_fog_quad() {
         }
         uniforms.count = g_frameConfigCount;
         uniforms.debug_mode = debugMode;
-        // One range block for the whole frame: every config's table and centre come from the same
-        // environment globals, so the first enabled one speaks for all of them. Configs with the
-        // adjustment off simply don't set kFogTypeRangeAdjBit and ignore it.
+        // One range block for the whole frame, from the first config that has it enabled (see
+        // FogRangeUniform). Configs with it off do not set kFogTypeRangeAdjBit.
         for (uint32_t i = 0; i < g_frameConfigCount; ++i) {
             if (g_frameConfigs[i].adj.enable) {
                 uniforms.range = build_fog_range(g_frameConfigs[i].adj);
                 break;
             }
         }
-        // Pixels the config-ID replay could not stamp fall back to this config — in practice grass
-        // and flowers, which cannot be stamped at all. See g_selfDrawnIndex.
+        // Unstamped pixels (grass, flowers and other self-drawing packets) take this config; see
+        // g_selfDrawnIndex.
         uniforms.fallback_index = g_selfDrawnIndexValid ? g_selfDrawnIndex : 0;
         GfxRange uniformRange{0, 0};
         if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &uniformRange) !=
@@ -1098,6 +940,8 @@ void push_fog_quad() {
     svc_gfx->push_draw(mod_ctx, g_drawType, &payload, sizeof(payload));
 }
 
+// The lists the replay re-draws: the opaque lists of the scope, without the Pri0_B particle passes
+// and dComIfGd_drawShadow, which the game draws between them.
 void draw_opaque_scene_lists() {
     dComIfGd_drawOpaListBG();
     dComIfGd_drawOpaListDarkBG();
@@ -1113,6 +957,9 @@ bool draw_lists_ready() {
            dComIfGd_getListPacket() != nullptr;
 }
 
+// Exact mode: re-draws the opaque lists into an offscreen pass with every draw forced to its flat
+// config-ID colour (the drawFast and shared-DL hooks do the stamping while g_fogReplayActive), then
+// resolves the colour as this frame's ID buffer. Restores the viewport, scissor and J3D state.
 bool replay_config_ids(uint32_t width, uint32_t height) {
     f32 savedViewport[6];
     GXGetViewportv(savedViewport);
@@ -1164,8 +1011,8 @@ bool replay_config_ids(uint32_t width, uint32_t height) {
     return true;
 }
 
-// Diagnostic: dump the frame's captured fog-config table on change, so the exact configs at a
-// spot (uniform vs multiple, their ranges/colors) can be read off in-game. Off by default.
+// Diagnostic (fogLogConfigs, off by default): logs the frame's captured fog-config table whenever
+// it changes.
 ConfigVarHandle g_cvarFogLog = 0;
 char g_lastFogLogSig[128] = "";
 
@@ -1208,6 +1055,8 @@ void log_fog_configs() {
     }
 }
 
+// SCENE_BEGIN (after the sky lists): resets per-frame state and opens the suppression scope unless
+// the mod is disabled, the drawFast hook failed, or Wolf Senses is active.
 void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
     g_reference = FogConfig{};
     g_firstDeviant = FogConfig{};
@@ -1227,7 +1076,7 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
     g_selfDrawnIndexValid = false;
     g_selfDrawnIndex = 0;
     g_scopeActive = effect_enabled();
-    // Before anything is suppressed: in senses, no scope opens at all. See wolf_senses_active().
+    // During Wolf Senses no scope opens at all; see wolf_senses_active().
     g_sensesExempt = g_scopeActive && wolf_senses_active() &&
                      !get_bool_option(g_cvarFogDeferInSenses, false);
     if (g_sensesExempt) {
@@ -1247,14 +1096,16 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
     }
 }
 
+// SCENE_AFTER_OPAQUE: closes the scope, arms the quad, runs the config-ID replay when this frame
+// needs it, decides g_suppressAllowed for the next frame, logs mode transitions and builds the
+// Status line.
 void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
     if (!g_scopeActive) {
         return;
     }
     g_scopeActive = false;
-    // Sample the world viewport while it is still current — by FRAME_BEFORE_HUD, where the vanilla
-    // path pushes the quad, the game has moved on to its 2D viewport. Width only; see
-    // g_frameViewportWidth.
+    // Sample the world viewport while it is still current; by the time a fallback anchor fires the
+    // game has moved on to other viewports. See g_frameViewportWidth.
     f32 viewport[6];
     GXGetViewportv(viewport);
     if (viewport[2] > 1.0f) {
@@ -1351,8 +1202,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
     log_fog_configs();
 }
 
-// Fires at m_Do_graphic.cpp:2632, before the game's bloom reads the framebuffer. Only does anything
-// when the frame had no translucent J3D packet to anchor on; see g_quadAnchor.
+// Pre-hook on mDoGph_gInf_c::bloom_c::draw, before the game's bloom reads the frame. Pushes the
+// quad only if no translucent draw has done so this frame; see QuadAnchor.
 HookAction on_bloom_draw_pre(ModContext*, void*, void*, void*) {
     if (g_quadArmed) {
         g_quadArmed = false;
@@ -1362,6 +1213,7 @@ HookAction on_bloom_draw_pre(ModContext*, void*, void*, void*) {
     return HOOK_CONTINUE;
 }
 
+// Last-resort anchor, after bloom; see QuadAnchor.
 void on_frame_before_hud(ModContext*, const GfxStageContext*, void*) {
     if (!g_quadArmed) {
         return;
@@ -1429,8 +1281,8 @@ ModResult build_controls_tab(
         "AO-under-fog benefit in most outdoor scenes, which mix configs.<br/>"
         "<b>Exact (replay)</b> (default): always defer, replaying the opaque geometry into a "
         "per-pixel config-ID buffer so each pixel gets the fog its own draw used. Costs one extra "
-        "opaque geometry pass on mixed frames. Pixels the replay cannot label - grass and flowers, "
-        "which draw their own geometry - take the fog those packets themselves set.";
+        "opaque geometry pass on mixed frames. Pixels the replay cannot label, such as grass and "
+        "flowers (which draw their own geometry), take the fog the grass and flower packets set.";
     control.binding = UI_BINDING_CONFIG_VAR;
     control.config_var = g_cvarFogMixed;
     control.options = kMixedOptions;
@@ -1440,9 +1292,8 @@ ModResult build_controls_tab(
     control = UI_CONTROL_DESC_INIT;
     control.kind = UI_CONTROL_TOGGLE;
     control.label = "Skip Unfogged Geometry (experimental)";
-    // The help text used to promise this fixed distant landmarks. It was built for exactly that
-    // and tested in-game on Death Mountain, where it changed nothing - so saying so would send
-    // every user who has that symptom to the wrong switch. See docs/deferred_fog.md STATUS.
+    // The help text says plainly that this did not fix the distant-landmark case it was written
+    // for, so players with that symptom are not sent to it (docs/deferred_fog.md, Known issues).
     control.help_rml =
         "Some surfaces are drawn by the game with fog switched off entirely, so they stay at full "
         "brightness however far away they are. The deferred pass has no way to know that on its "
@@ -1522,7 +1373,8 @@ void on_open_controls(ModContext*, void*) {
     }
 }
 
-// Adds this sub-feature's section to the shared mods panel.
+// The mod's section in the shared mods panel: Enabled, Status, and a button for the full controls
+// window.
 void build_section(UiElementHandle panel) {
     svc_ui->pane_add_section(mod_ctx, panel, "Deferred Fog");
     add_enabled_toggle(panel);
@@ -1535,6 +1387,8 @@ void build_section(UiElementHandle panel) {
     add_control(panel, control);
 }
 
+// Builds one fullscreen fog pipeline for `entryPoint`. blend = true mixes the fog colour in by
+// fogZ; blend = false is the debug variant, which writes the shader output directly.
 bool build_fog_pipeline(const gfx_compat::ScenePassLayout& sceneLayout, bool blend,
     const char* entryPoint, WGPURenderPipeline& outPipeline, WGPUBindGroupLayout& outLayout) {
     WGPUShaderSourceWGSL wgsl = WGPU_SHADER_SOURCE_WGSL_INIT;
@@ -1555,12 +1409,9 @@ bool build_fog_pipeline(const gfx_compat::ScenePassLayout& sceneLayout, bool ble
             .srcFactor = WGPUBlendFactor_Zero,
             .dstFactor = WGPUBlendFactor_One},
     };
-    // `sceneLayout` is the pass the host is about to record this draw into, read from the live
-    // GfxDrawContext by the caller - never rebuilt from GfxDeviceInfo, which is a copy of the
-    // renderer's logic that goes silently wrong the moment the pass gains an attachment. Any
-    // attachment the mod does not own comes back write-masked off, so the fog leaves the game's
-    // authored normals untouched. That is correct in itself: fog changes what a surface looks
-    // like, not which way it faces.
+    // `sceneLayout` is the pass this draw is recorded into, taken from the live GfxDrawContext by
+    // ensure_fog_pipelines (never derived from GfxDeviceInfo). Attachments the mod does not own,
+    // such as the normal buffer, come back write-masked off, so the fog leaves normals untouched.
     gfx_compat::ScenePassLayout layout = sceneLayout;
     if (blend) {
         layout.color_targets[0].blend = &blendState;
@@ -1617,10 +1468,9 @@ void release_fog_pipelines() {
     g_sceneLayoutKey = 0;
 }
 
-/// Builds all four pipelines against the pass this draw is being recorded into, and rebuilds them
-/// if that pass has changed shape since. Called from the draw callback on the render worker, where
-/// the layout is a fact rather than a prediction. Either all four exist for the current key or none
-/// do, so the caller only has to check the one it wants.
+/// Builds all four pipelines for the pass this draw is recorded into, rebuilding them when its
+/// layout key changes. Runs on the render worker from on_draw. Either all four exist for the
+/// current key or none do, so the caller only has to check the one it wants.
 bool ensure_fog_pipelines(const GfxDrawContext& ctx) {
     const uint64_t key = gfx_compat::scene_pass_layout_key(ctx);
     if (g_sceneLayoutValid && g_sceneLayoutKey == key && g_fogPipeline != nullptr &&
@@ -1661,11 +1511,9 @@ ModResult init(ModError* error) {
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogEnabled) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
-    // DEFAULT: mixed-scene mode = Exact replay (1). 0 = Vanilla revert. Exact keeps deferring in a
-    // multi-config scene and reconstructs each pixel's own config from a replayed ID buffer, so the
-    // AO-under-fog benefit survives scenes that mix configs — which is most outdoor scenes. Vanilla
-    // gives those scenes back to the game's forward fog instead, exact but with AO on top of the
-    // fog again. Keep exact_mode()'s fallback in step with this value.
+    // DEFAULT: mixed-scene mode = Exact replay (1); 0 = Vanilla revert. Exact keeps deferring in
+    // scenes that mix configs, which most outdoor scenes do. Keep exact_mode()'s fallback equal to
+    // this value.
     cvarDesc = CONFIG_VAR_DESC_INIT;
     cvarDesc.name = "fogMixedMode";
     cvarDesc.type = CONFIG_VAR_INT;
@@ -1673,8 +1521,7 @@ ModResult init(ModError* error) {
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogMixed) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
-    // DEFAULT OFF. See g_skipUnfogged — this forces the config-ID replay in frames that were
-    // uniform before, so it is opt-in until the Status line's fog-off counter says it applies.
+    // DEFAULT: off (it can force the config-ID replay; see g_skipUnfogged).
     cvarDesc = CONFIG_VAR_DESC_INIT;
     cvarDesc.name = "fogSkipUnfogged";
     cvarDesc.type = CONFIG_VAR_BOOL;
@@ -1682,8 +1529,7 @@ ModResult init(ModError* error) {
     if (svc_config->register_var(mod_ctx, &cvarDesc, &g_cvarFogSkipUnfogged) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to register fog option");
     }
-    // DEFAULT OFF. A diagnostic that re-enables deferral during Wolf Senses, i.e. brings the senses
-    // bug back on purpose — see wolf_senses_active().
+    // DEFAULT: off. Diagnostic that disables the Wolf Senses exemption; see wolf_senses_active().
     cvarDesc = CONFIG_VAR_DESC_INIT;
     cvarDesc.name = "fogDeferInSenses";
     cvarDesc.type = CONFIG_VAR_BOOL;
@@ -1711,9 +1557,8 @@ ModResult init(ModError* error) {
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "failed to query device info");
     }
-    // The four pipelines are NOT built here. They describe the scene pass, and the scene pass gains
-    // its normal attachment partway through a session - see g_sceneLayoutKey. ensure_pipelines()
-    // builds them on the first draw and rebuilds them whenever the pass changes shape.
+    // The pipelines are not built here: ensure_fog_pipelines() builds them on the first draw and
+    // rebuilds them when the scene pass changes shape (see g_sceneLayoutKey).
 
     GfxDrawTypeDesc drawDesc = GFX_DRAW_TYPE_DESC_INIT;
     drawDesc.label = "deferred fog";
@@ -1763,8 +1608,8 @@ ModResult init(ModError* error) {
             MOD_OK) &
         (mods::hook_add_post<LockedMaterialSharedDL>(svc_hook, on_material_shared_dl_post) ==
             MOD_OK);
-    // Bracket the self-drawing opaque packets so the uncovered-pixel fallback is measured rather
-    // than assumed (see g_selfDrawnIndex). Failure degrades to the reference config, so it warns.
+    // Bracket the grass and flower packets for the unstamped-pixel fallback (see g_selfDrawnIndex).
+    // Without them the fallback is the reference config, so failure only warns.
     const bool selfDrawnOk =
         (mods::hook_add_pre<GrassPacketDraw>(svc_hook, on_self_drawn_packet_pre) == MOD_OK) &
         (mods::hook_add_post<GrassPacketDraw>(svc_hook, on_self_drawn_packet_post) == MOD_OK) &
@@ -1827,10 +1672,8 @@ ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
 
 }  // namespace
 
-// Exported so a consumer can read whether this frame's fog was actually deferred (a mod can then
-// tell the user whether its composite is landing under the fog). Importing it also happens to force
-// load order, which is the only ordering lever the mod API has - but no mod in this repo needs
-// that: see the note at the top of this file. See include/deferred_fog_service.h.
+// The exported service: whether this frame's fog is being deferred. See
+// include/deferred_fog_service.h.
 namespace {
 ModResult service_get_state(ModContext*, DeferredFogState* outState) {
     if (outState == nullptr || outState->struct_size < sizeof(DeferredFogState)) {

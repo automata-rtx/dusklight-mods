@@ -311,7 +311,7 @@ did not appear.
 Open problems worth knowing about before you start:
 
 - **Deferred Fog: distant landmarks (Death Mountain, the Ganon barrier) are brighter with the mod
-  off.** Three fixes have failed. `docs/deferred_fog.md` "Known issue" has the evidence so far and
+  off.** Three fixes have failed. `docs/deferred_fog.md` "Known issues" has the evidence so far and
   what to measure next.
 - **SMAA** handles orthogonal edge patterns only: edges at or near 45° get little or no smoothing,
   and diagonal search and corner rounding are not implemented.

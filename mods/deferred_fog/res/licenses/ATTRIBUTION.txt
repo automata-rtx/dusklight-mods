@@ -11,14 +11,14 @@ https://github.com/encounter/aurora  -  Copyright (c) 2022 Luke Street, MIT.
 Aurora is the renderer Dusklight draws through, and it is vendored in the game
 tree, not here.
 
-src/fog_math.h reimplements aurora's fog pipeline in C++: the GX fog coefficient
-setup, the quantization the hardware applies when those coefficients pass
-through the BP registers, and the per-column fog range adjustment. This is a
-behavioural reimplementation written from reading the code and the hardware
-documentation - the point of the mod is that fog re-applied later in the frame
-is bit-identical to fog applied during it, which is only possible by matching
-aurora's arithmetic exactly. No aurora source is copied or distributed here.
-Aurora's MIT license is at the URL above.
+The mod reimplements aurora's fog pipeline: src/fog_math.h reproduces the GX
+fog coefficient setup and the quantization those coefficients go through in the
+BP registers, and res/fog.wgsl reproduces aurora's per-pixel fog curves and the
+per-column fog range adjustment. This is a behavioural reimplementation written
+from reading the code and the hardware documentation - the point of the mod is
+that fog re-applied later in the frame matches fog applied during it, which is
+only possible by matching aurora's arithmetic. No aurora source is copied or
+distributed here. Aurora's MIT license is at the URL above.
 
 Nintendo / the GameCube GX pipeline
 -----------------------------------

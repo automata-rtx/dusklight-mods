@@ -46,7 +46,7 @@ Status-line counters alone.** Twice a per-frame counter correctly showed that a 
 *present* in the view without showing it was what the view *looks like*. The next step needs
 per-pixel evidence (the Fog Factor and Config IDs debug views) plus the `markable / no-Z / alpha`
 breakdown that was never captured. The evidence, the failed fixes and the decision table are in
-`docs/deferred_fog.md` "Known issue".
+`docs/deferred_fog.md` "Known issues".
 
 ## Hard constraints
 
