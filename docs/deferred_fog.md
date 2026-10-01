@@ -27,10 +27,14 @@
 success"), and specifically the grass/flower uncovered-pixel fix — grass darkens with distance
 again.
 
+**Confirmed in-game by the user on upstream 2.0:** the Wolf Senses exemption (1.0.2, see
+"Wolf Senses") works as intended. While senses are up the mod leaves the fog to the game, and the
+"senses reveal far more of the scene" report is gone.
+
 **Shipped but NOT separately confirmed in-game** — do not describe these as verified: fog range
 adjustment, the `dBgp_c` map-unit path, the exact-literal Ganon-barrier signature, Exact-as-default,
-the quad-anchor readout, the fog-off / additive counters, and the Wolf Senses exemption (1.0.2, see
-"Wolf Senses"). They are verified against the *game source*, which is a different claim.
+the quad-anchor readout, and the fog-off / additive counters. They are verified against the *game
+source*, which is a different claim.
 
 **ONE OPEN QUESTION — PARKED BY THE USER, UNRESOLVED, AFTER THREE FAILED FIXES.** Distant
 landmarks — the user reports Death Mountain specifically, and the Ganon barrier — read **brighter
@@ -132,7 +136,7 @@ second row is the one that has already been walked to its end.
 (the landmark shows its own texture through the haze); an over-unity blend is a *fog-coloured*
 difference (the landmark shows **more haze than the haze**).
 
-## Wolf Senses — the mod steps aside (1.0.2, NOT yet confirmed in-game)
+## Wolf Senses — the mod steps aside (1.0.2, confirmed in-game)
 
 **The report** (from a player, relayed by the user): with Wolf Senses active, in some camera
 directions the close-range fog disappears and the view shows far more of the world than the senses
