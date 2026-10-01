@@ -239,7 +239,7 @@ the citation so it can be re-checked cheaply rather than believed.
 
 Effect Remover's Terrain Shadow Removal (`er_tsr`) post-hooks `dKy_bg_MAxx_proc` and
 overwrites TEV KColor register 1's red channel. Our documentation described the value
-the game puts there as "**env fog density**" (`docs/fake_shading_systems.md` §2, and
+the game puts there as "**env fog density**" (`docs/unreleased/fake_shading_systems.md` §2, and
 the `er_tsr` bullet in `CLAUDE.md`).
 
 The game says otherwise, three independent ways:
@@ -290,7 +290,7 @@ not change what 255 does. So `er_tsr` pinning 255 is **corroborated by the engin
 usage** — a materially stronger position than the "known-effective, not known-faithful"
 this document used to record.
 
-**Corrected: two documentation sentences** (`docs/fake_shading_systems.md` §2 and the
+**Corrected: two documentation sentences** (`docs/unreleased/fake_shading_systems.md` §2 and the
 `er_tsr` bullet in `CLAUDE.md`). **No mod code changed.** `er_tsr` behaves exactly as
 it did; whether it *should* is a question for the audit, not a doc edit. Documented is
 not done.
@@ -517,7 +517,7 @@ or **still open**, so nothing here reads as coverage it does not have.
   `sun_pos` (`d_kankyo.cpp:8574`), and the shadow mod's own derivation mirrors
   `setSunpos()`. Since Celestial Orbit landed, they agree *by construction*: that mod
   rewrites `sun_pos`/`moon_pos` and publishes the same orbit as a service, which the
-  shadow mod imports — see `docs/celestial_orbit.md`.
+  shadow mod imports — see `docs/unreleased/celestial_orbit.md`.
 
 **Still open.**
 
@@ -554,13 +554,13 @@ after a configure, or point `DUSKLIGHT_DIR` at a checkout.
 
 ## See also
 
-- `docs/fake_shading_systems.md` — the three fake-shading systems Effect Remover targets,
+- `docs/unreleased/fake_shading_systems.md` — the three fake-shading systems Effect Remover targets,
   plus (§4) four more the same game function sets up that we do not
-- `docs/celestial_orbit.md` — the sun/moon vocabulary in §3, in use
+- `docs/unreleased/celestial_orbit.md` — the sun/moon vocabulary in §3, in use
 - **Historical only, in the older fork branches:** `dusklight-ao/docs/japanese-naming.md` and
   `aurora-ao/docs/japanese-naming.md`. Neither repo is the platform any more. The aurora
   one describes reading a baked TEV meaning out of a generated shader — still the right
   method for the one thing §4.1 leaves unread, but aurora is now vendored inside the
   fetched game tree at `dusklight/extern/aurora`, so go there rather than to the fork.
-- `docs/deferred_fog.md`, `docs/realtime_sun_shadows.md` — the two mods most exposed
+- `docs/deferred_fog.md`, `docs/unreleased/realtime_sun_shadows.md` — the two mods most exposed
   to this vocabulary

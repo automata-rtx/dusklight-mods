@@ -1,5 +1,8 @@
 # Realtime Sun Shadows
 
+> **Unreleased mod, potentially outdated.** This mod is not built or released, and this document was not re-audited
+> against the current code or the `v2.0.0` pin. See `docs/unreleased/README.md` before relying on it.
+
 Mod id `dev.automata.realtime_sun_shadows`. Game-linked: includes game headers, hooks game
 functions, and (on Windows) links the platform release's `windows-amd64.lib` import library.
 

@@ -991,7 +991,7 @@ So the idea is sound, not hand-waving. It is still the wrong thing to build.
    main scene's geometry walk and vertex streaming, added to the **game thread**.
 2. **It runs straight into the per-frame streaming budget**, the one whose overflow is an
    unconditional `abort()` (`ByteBuffer::resize`) — the v1.6.0 instant-crash-to-desktop. See
-   `realtime_sun_shadows.md`. The renderer-side buffer streams *zero* extra vertices: it writes one
+   `docs/unreleased/realtime_sun_shadows.md`. The renderer-side buffer streams *zero* extra vertices: it writes one
    more 4-byte value per fragment already being rasterized.
 3. **Alpha-tested cutouts.** Forcing the colour path is safe; the alpha path is not. Leaves, grass,
    chains and ladders need their texture alpha test intact, and TP materials vary in which stage and

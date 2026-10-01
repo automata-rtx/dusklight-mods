@@ -30,7 +30,7 @@
 // The framework WGSL in res/ derives from Bevy Engine's SSAO (MIT OR Apache-2.0) and Intel
 // XeGTAO (MIT); see res/licenses/ and the headers of each shader.
 //
-// Design + rationale: docs/ssilvb_plan.md (read §0 first).
+// Design + rationale: docs/unreleased/ssilvb_plan.md (read §0 first).
 
 #include "mods/service.hpp"
 #include "depth_to_normal_service.h"

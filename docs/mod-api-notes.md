@@ -48,7 +48,7 @@ Upstream reference: the fetched `dusklight/docs/modding.md` and `dusklight/sdk/i
   (`mat4_mul_col` in vbao), not game matrix code.
 - WebGPU clip conventions: `uv = (ndc.x*0.5+0.5, 0.5 - ndc.y*0.5)`. The single most
   expensive bug of the aurora era was a missed Y flip here (shadows sampled mirrored, which
-  a sun-direction negation silently "fixed" — see realtime_sun_shadows.md issue 2).
+  a sun-direction negation silently "fixed" — see docs/unreleased/realtime_sun_shadows.md issue 2).
 - `get_camera` returns `MOD_UNAVAILABLE` before the first real in-game frame — handle it by
   skipping the frame.
 

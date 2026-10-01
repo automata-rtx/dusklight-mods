@@ -1,5 +1,8 @@
 # SSILVB — Screen Space Indirect Lighting with Visibility Bitmask (implementation plan)
 
+> **Unreleased mod, potentially outdated.** This mod is not built or released, and this document was not re-audited
+> against the current code or the `v2.0.0` pin. See `docs/unreleased/README.md` before relying on it.
+
 New **service-only** mod `mods/ssilvb/` (id `dev.automata.ssilvb`, name "SSILVB"), implementing
 the paper of the same name — *Screen Space Indirect Lighting with Visibility Bitmask* (Therrien,
 Levesque, Gilet, The Visual Computer 2023 / arXiv 2301.11376) — on our stack. It is the natural
@@ -96,7 +99,7 @@ mods/ssilvb/
 Root `CMakeLists.txt` gets one `add_subdirectory(mods/ssilvb)`; CI needs **zero changes** (the
 combine loop iterates every `.dusk` the platform legs produce). Docs: this file + a `docs/ssilvb.md`
 tunables/architecture doc once it lands, plus one line each in `CLAUDE.md`/`README.md` and a
-check-mark in `depth_to_normal_consumers.md` (SSGI row becomes "shipped: ssilvb").
+check-mark in `docs/historical/depth_to_normal_consumers.md` (SSGI row becomes "shipped: ssilvb").
 
 ## 3. Light input — what stands in for the paper's HDR direct-light buffer
 

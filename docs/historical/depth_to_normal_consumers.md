@@ -68,7 +68,7 @@ The natural evolution of the existing AO: instead of just "how occluded is this 
 single bounce of light (SSGI) or directional occlusion (SSDO) from neighbors, weighted by their
 normals and depths. Adds colored bounce light and directional contact shading. Shares the AO's
 sampling machinery; the normal is what makes it *directional* rather than uniform darkening.
-This is now being built as the SSILVB mod (`docs/ssilvb_plan.md`), which is also the first
+This is now being built as the SSILVB mod (`docs/unreleased/ssilvb_plan.md`), which is also the first
 **hard** (non-optional) consumer of the service — it needs the normal at every marched sample.
 
 ### Rim light / fresnel / wetness

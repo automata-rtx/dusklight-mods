@@ -3301,7 +3301,7 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     //
     // Moya suppression belongs to Effect Remover's Haze Removal, which owns it per mode and
     // deliberately spares modes > 11. Do not re-add a hook here: it would silently override
-    // those per-mode toggles. See docs/fake_shading_systems.md §1.
+    // those per-mode toggles. See docs/unreleased/fake_shading_systems.md §1.
     if (mods::hook_add_pre<GameShadowImageDraw>(svc_hook, on_game_shadow_pre) !=
             MOD_OK ||
         mods::hook_add_pre<GameShadowDraw>(svc_hook, on_game_shadow_pre) != MOD_OK)

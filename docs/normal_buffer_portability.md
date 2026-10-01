@@ -296,4 +296,4 @@ general and the reason to keep the delta small enough to throw away.
    buffers, so check them if a new base ever *shrinks* those. The current pin uses upstream's sizes
    (Vertex 5 MB / Index 2 MB / Storage 8 MB); the enlarged 16 / 4 / 16 buffers the fork once
    carried are gone and are not needed, because upstream raised both the vertex and index buffers
-   itself. See `docs/realtime_sun_shadows.md` for the dates.
+   itself. See `docs/unreleased/realtime_sun_shadows.md` for the dates.

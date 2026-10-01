@@ -1,5 +1,8 @@
 # Celestial Orbit — raising the sun/moon travel path
 
+> **Unreleased mod, potentially outdated.** This mod is not built or released, and this document was not re-audited
+> against the current code or the `v2.0.0` pin. See `docs/unreleased/README.md` before relying on it.
+
 Twilight Princess never lifts the sun above **59 degrees**. That ceiling is the single
 biggest limit on what realtime sun shadows can express: the light is slanted even at high
 noon, so shadows stay long and raked all day and the sun never reads as "overhead". This

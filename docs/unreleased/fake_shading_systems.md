@@ -1,5 +1,8 @@
 # Twilight Princess's fake-shading systems (what Effect Remover disables)
 
+> **Unreleased mod, potentially outdated.** This mod is not built or released, and this document was not re-audited
+> against the current code or the `v2.0.0` pin. See `docs/unreleased/README.md` before relying on it.
+
 TP has almost no realtime lighting: the world looks "lit" because the shading is **faked** and
 baked in several different ways. Our realtime mods (Realtime Sun Shadows, SSILVB) add real shading
 *on top* of that fake shading, so the fakes have to be turned down or they fight the new look

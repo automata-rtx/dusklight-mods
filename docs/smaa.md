@@ -179,6 +179,6 @@ and was not used.
 First working version, CI-green on all seven platforms (host code compiles + packages). CI does **not**
 validate WGSL or the visual result — shaders are validated by the game at pipeline-creation time, so
 shader compilation and visual correctness (especially the coverage sign/magnitude) are confirmed
-in-game. Iterate via screenshots + taste feedback per the working model in `docs/ssilvb_plan.md` §0.
+in-game. Iterate via screenshots + taste feedback per the working model in `docs/unreleased/ssilvb_plan.md` §0.
 Next candidates once the orthogonal base is confirmed: diagonal search, corner rounding, and (if
 wanted) staging debug views to `FRAME_BEFORE_HUD`.

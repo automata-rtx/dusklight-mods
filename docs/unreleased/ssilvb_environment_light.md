@@ -1,7 +1,10 @@
 # SSILVB — Environment Light (the probe)
 
+> **Unreleased mod, potentially outdated.** This mod is not built or released, and this document was not re-audited
+> against the current code or the `v2.0.0` pin. See `docs/unreleased/README.md` before relying on it.
+
 Added in SSILVB 0.10.0. This documents the environment-probe ambient only; the bounce itself is
-covered by `docs/ssilvb_plan.md`.
+covered by `docs/unreleased/ssilvb_plan.md`.
 
 ## What problem it solves
 

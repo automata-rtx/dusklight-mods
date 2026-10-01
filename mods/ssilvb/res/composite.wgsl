@@ -12,7 +12,7 @@
 // which this game never materializes (forward TEV renderer, no G-buffer). chroma_lift blends the
 // proxy between the raw snapshot color (near-exact under vanilla TP's flat ambient lighting,
 // where scene color ~= albedo x constant) and full chroma normalization (robust when our shadow
-// and AO mods darken the snapshot for lighting reasons). See docs/ssilvb_plan.md 5.1.
+// and AO mods darken the snapshot for lighting reasons). See docs/unreleased/ssilvb_plan.md 5.1.
 //
 // The GI source is read at its native resolution: full-res history 1:1 when temporal
 // accumulation is on, else a depth-aware 4-tap upscale of the (half-res) chain output - both
