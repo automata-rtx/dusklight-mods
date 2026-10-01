@@ -1,22 +1,27 @@
-// SMAA — pass 2: blending-weight calculation (compute, CMAA2-style compacted).
+// SMAA pass 2: blend-weight calculation (compute, 16x16 workgroups, compacted).
 //
-// For every edge pixel, reconstruct the aliased silhouette as a straight line over the run of
-// collinear edge pixels and compute how much of the pixel the line cuts away — the blend weight.
-// This is the expensive pass (per-edge-pixel searches), so it uses the CMAA2 optimization
-// (Intel, 2018): within each 16x16 workgroup, edge pixels are compacted into contiguous threads
-// via a groupshared list, so the sparse, thin edges run in fully-occupied warps instead of being
-// scattered one-per-warp. Non-edge pixels return immediately after the compaction scan.
+// For each edge pixel: find the run of collinear edge pixels through it, model the aliased
+// silhouette as a straight line over that run, and turn the line's offset at this pixel's centre
+// into a blend weight.
 //
-// This first version handles ORTHOGONAL patterns (horizontal / vertical edges and the shallow
-// stairs they form). Diagonal-specific search and corner rounding are deferred; the neighborhood
-// pass still smooths diagonals via the orthogonal weights, just less precisely at ~45 degrees.
+// This is the expensive pass, so it compacts its work as Intel's CMAA2 (2018) describes: each
+// workgroup appends its edge pixels to a groupshared list, then the first `count` threads take one
+// entry each, so sparse edges run in fully occupied warps. Pixels without an edge are never
+// processed; pass 1 already zeroed their weights.
 //
-// Weight packing (matches neighborhood_blend.wgsl):
-//   BlendTex.r = this pixel pulls from the pixel ABOVE  (its own top edge)
-//   BlendTex.g = the pixel above pulls from this pixel   (its own top edge, other side)
-//   BlendTex.b = this pixel pulls from the pixel to the LEFT (its own left edge)
-//   BlendTex.a = the pixel to the left pulls from this pixel (its own left edge, other side)
+// Orthogonal patterns only: there is no diagonal search or corner rounding, so edges at or near
+// 45 degrees get little or no blending. The search is linear and the coverage analytic, so there
+// are no SearchTex/AreaTex lookup textures. The run-end test also differs from reference SMAA; see
+// end_sign_h.
+//
+// BlendTex packing (read by neighborhood_blend.wgsl):
+//   .r = this pixel pulls from the pixel above        (this pixel's top edge)
+//   .g = the pixel above pulls from this pixel        (same edge, other side)
+//   .b = this pixel pulls from the pixel to the left  (this pixel's left edge)
+//   .a = the pixel to the left pulls from this pixel  (same edge, other side)
+// Each value is at most 0.5 * blend_strength, so at most 0.75 at the 150% maximum.
 
+// Mirrors SmaaUniforms in src/mod.cpp (and the copies in the other two shaders).
 struct Uniforms {
     screen_size: vec2f,
     inv_screen_size: vec2f,
@@ -48,8 +53,9 @@ fn load_edges(p: vec2i, dims: vec2u) -> vec2f {
     return textureLoad(edges_tex, c, 0i).xy;
 }
 
-// Walk from p along `step` while the edge channel selected by `chan` (0 = left/vertical run,
-// 1 = top/horizontal run) keeps continuing. Returns the number of continuation pixels (capped).
+// Walk from p in direction `dstep` while the edge channel `chan` continues (0 = left edges, a
+// vertical run; 1 = top edges, a horizontal run). Returns how many pixels past p the run extends,
+// capped at max_steps. Coordinates clamp at the screen border.
 fn search_run(p: vec2i, dstep: vec2i, chan: i32, dims: vec2u, max_steps: i32) -> i32 {
     var d = 0;
     for (var i = 1; i <= max_steps; i = i + 1) {
@@ -63,8 +69,10 @@ fn search_run(p: vec2i, dstep: vec2i, chan: i32, dims: vec2u, max_steps: i32) ->
     return d;
 }
 
-// Sign of the silhouette turn at a horizontal run's end: +1 if the edge continues one row up just
-// past the end, -1 if one row down, 0 if it simply stops.
+// Which way a horizontal run steps at one end. At the first pixel past the run's end, look at the
+// same top-edge channel one row up and one row down: +1 if the edge continues one row up (toward
+// the pixel above), -1 if one row down, 0 if neither (the up test wins if both fire). Reference
+// SMAA classifies the end from the crossing, perpendicular edges instead; this is a simplification.
 fn end_sign_h(p: vec2i, dir: i32, d: i32, dims: vec2u) -> f32 {
     let beyond = p + vec2i(dir * (d + 1), 0i);
     if (load_edges(beyond + vec2i(0i, -1i), dims).y > 0.5) { return 1.0; }
@@ -72,8 +80,9 @@ fn end_sign_h(p: vec2i, dir: i32, d: i32, dims: vec2u) -> f32 {
     return 0.0;
 }
 
-// Sign of the silhouette turn at a vertical run's end: +1 if it continues one column left just past
-// the end (bulging toward the left pixel), -1 if one column right, 0 if it stops.
+// The same for a vertical run, using the left-edge channel one column left and right of the first
+// pixel past the end: +1 if it continues one column left (toward the pixel to the left), -1 if one
+// column right, 0 if neither.
 fn end_sign_v(p: vec2i, dir: i32, d: i32, dims: vec2u) -> f32 {
     let beyond = p + vec2i(0i, dir * (d + 1));
     if (load_edges(beyond + vec2i(-1i, 0i), dims).x > 0.5) { return 1.0; }
@@ -93,11 +102,13 @@ fn compute_weights(pos: vec2i, dims: vec2u) -> vec4f {
         let signL = end_sign_h(pos, -1i, dL, dims);
         let signR = end_sign_h(pos, 1i, dR, dims);
         let run_len = f32(dL + dR + 1);
+        // This pixel centre's position along the run, 0 at the left end and 1 at the right end.
         let t = (f32(dL) + 0.5) / run_len;
-        // Reconstructed line height at this pixel's centre, signed (+ = toward the pixel above).
+        // The line runs from +-0.5 px at each end that steps (0 where the run just stops); h is its
+        // offset from the edge at this pixel's centre (+ = into the pixel above).
         let h = mix(0.5 * signL, 0.5 * signR, t);
-        weights.r = max(-h, 0.0); // line dips into this pixel -> pull from above
-        weights.g = max(h, 0.0);  // line bulges up -> the above pixel pulls from this one
+        weights.r = max(-h, 0.0); // line lies inside this pixel -> pull from above
+        weights.g = max(h, 0.0);  // line lies inside the pixel above -> it pulls from this one
     }
 
     // Vertical edge on the left boundary -> blend horizontally.
@@ -108,11 +119,12 @@ fn compute_weights(pos: vec2i, dims: vec2u) -> vec4f {
         let signD = end_sign_v(pos, 1i, dD, dims);
         let run_len = f32(dU + dD + 1);
         let t = (f32(dU) + 0.5) / run_len;
-        let h = mix(0.5 * signU, 0.5 * signD, t); // + = toward the pixel to the left
+        let h = mix(0.5 * signU, 0.5 * signD, t); // + = into the pixel to the left
         weights.b = max(-h, 0.0); // pull from the left
         weights.a = max(h, 0.0);  // the left pixel pulls from this one
     }
 
+    // |h| <= 0.5, so each weight is at most 0.5 * blend_strength.
     return weights * uniforms.blend_strength;
 }
 
@@ -140,7 +152,8 @@ fn blend_weights(
     }
     workgroupBarrier();
 
-    // Only the first `count` threads do the expensive work, now packed into contiguous lanes.
+    // The first `count` threads each take one listed edge pixel, so the expensive work runs in
+    // contiguous lanes; the rest exit.
     let count = atomicLoad(&worker_count);
     if (lidx >= count) {
         return;

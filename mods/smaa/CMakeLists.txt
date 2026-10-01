@@ -1,9 +1,9 @@
-# SMAA — subpixel morphological antialiasing (SMAA 1x). Service-only (gfx/config/ui/resource/log),
-# no game headers or hooks. The mod SDK is configured once by the top-level CMakeLists.
+# SMAA: subpixel morphological antialiasing (SMAA 1x). Service-only (gfx/config/ui/resource/log):
+# no game headers, no hooks. The mod SDK is configured once by the top-level CMakeLists.
 #
-# Its geometric edge detector reads the game's authored surface normals straight from GfxService
-# (GfxResolveDesc::normal -> GfxResolvedTargets::normal, via common/gfx_normal_compat.h), so it
-# depends on no other mod.
+# The geometric edge detector reads the game's authored normals straight from GfxService
+# (GfxResolveDesc::normal -> GfxResolvedTargets::normal, through common/gfx_normal_compat.h), so the
+# mod depends on no other mod. common/ also provides gfx_scene_pass.h.
 add_mod(smaa
     FEATURES webgpu
     SOURCES  src/mod.cpp

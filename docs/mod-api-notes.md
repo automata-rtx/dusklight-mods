@@ -1,206 +1,181 @@
-# Mod API notes — pitfalls learned while building these mods
+# Mod API notes: pitfalls, crashes, debugging
 
-Upstream reference: the fetched `dusklight/docs/modding.md` and `dusklight/sdk/include/mods/`
-(fetched by `cmake/FetchDusklight.cmake`; also on GitHub at
-`TwilitRealm/dusklight/blob/main/docs/modding.md`). These notes are the deltas that actually bit us.
+The upstream reference is `dusklight/docs/modding.md` and the headers in
+`dusklight/sdk/include/mods/`, both in the tree that the first CMake configure fetches (pinned, so
+they match the game build; the GitHub `main` branch may be newer). These notes are the parts that
+actually caused problems here. `CONTRIBUTING.md` has the short version.
 
 ## Uniform buffers
 
-- Every uniform struct exists twice: a C mirror in `src/mod.cpp` and a WGSL struct in each
-  shader that binds it. They must match byte-for-byte, and the total size must be a
-  multiple of 16 (`static_assert(sizeof(X) % 16 == 0)` guards this — a 340-byte struct
-  once failed exactly there; pad with `float _padN`).
-- Avoid `vec3f` in uniform structs (16-byte alignment surprises); pack scalars instead
-  (e.g. `light_dir_world[3]` + a pad float).
-- All shaders of one mod share one Uniforms struct definition per shader file — when adding
-  a field, update EVERY `res/*.wgsl` that declares the struct, not just the one using it.
+- Every uniform struct exists twice: a C++ mirror in `src/mod.cpp` and a WGSL struct in each shader
+  that binds it. They must match byte for byte, and the size must be a multiple of 16.
+  `static_assert`s on size and offsets guard this; pad with `float _padN` fields.
+- Avoid `vec3f` in uniform structs (16-byte alignment); pack scalars instead.
+- When a mod's shaders share one uniform struct (VBAO's five, SMAA's three), every shader file
+  declares it. Adding a field means updating **every** `.wgsl` that declares the struct, not just
+  the one that reads the field.
 
 ## Threading
 
-- Stage callbacks (`register_stage_hook`) run on the **game thread** during frame recording.
-  This is where you read game state, camera service, config vars, and push work.
-- Draw/compute callbacks (`push_draw`, `register_compute_type`) run on the **render worker**
-  with the live encoder. Only use the payload (≤128 bytes) and `wgpu*` calls there. Any
-  decision that needs game state must be baked into the payload on the game thread.
-- Mirror GPU-side choices on the CPU: e.g. the denoiser ping-pongs textures, so the
-  composite's input (`passes % 2 ? A : B`) is computed identically in mod.cpp and must stay
-  in sync with the compute chain.
+- **Stage hooks** (`register_stage_hook`) run on the **game thread** during frame recording. Read
+  game state, the camera and config here, and push work.
+- **Draw and compute callbacks** (`register_draw_type`, `register_compute_type`) run later on the
+  **render worker** with a live encoder. Use only the payload (128 bytes at most) and `wgpu*` calls.
+  Anything that depends on game state has to be decided on the game thread and put in the payload.
+  The render worker cannot use the log service, so failures there are silent unless the game
+  thread can observe them.
+- Mirror GPU-side choices on the CPU exactly. VBAO's denoiser ping-pongs two textures, so which one
+  the composite reads (`passes % 2`) is computed in `mod.cpp` and must match the compute chain.
 
-## Gfx service
+## Graphics service
 
-- `resolve_pass` gives single-sample color + R32Float depth snapshots, frame-pooled: views
-  are valid this frame only — re-resolve every frame, never cache.
-- `create_pass(w, h)` opens an offscreen pass that subsequent GX draws render into (that's
-  how the shadow map re-renders the world); `resolve_pass` then yields its depth.
-- Check `get_device_info` for `uses_reversed_z` and formats rather than assuming — but note
-  the whole codebase currently assumes reversed-Z (1 = near, sky raw depth = 0).
-- **Stage order vs the game's post-processing**: the game draws bloom *mid-scene*, between
-  `GFX_STAGE_SCENE_AFTER_OPAQUE` and `GFX_STAGE_FRAME_BEFORE_HUD` (see `m_Do_graphic.cpp`).
-  A screen-space effect that should sit under bloom (AO, shadows) must push its composite at
-  `SCENE_AFTER_OPAQUE`; a draw pushed at `FRAME_BEFORE_HUD` lands on top of bloom (and DOF,
-  motion blur, and all translucency). `push_draw` encodes at the push point in the command
-  stream, so the stage you push from is the layer you get.
+- **`resolve_pass`** returns single-sample snapshots of the current scene pass: colour, depth
+  (`R32Float`, reversed-Z) and, if requested via `GfxResolveDesc::normal`, the authored normal
+  (`RGB10A2Unorm`, view space). Each call ends the current render pass, copies what was asked for
+  at that moment, and continues in a new pass. The views are frame-pooled and valid for this frame
+  only: resolve again every frame, never cache them.
+- **The normal latches.** The first resolve that asks for the normal enables the attachment from the
+  next frame and returns null this frame. Go through `common/gfx_normal_compat.h`.
+- **`push_compute`** also splits the scene pass; compute work is recorded between the two halves.
+- **`create_pass(w, h)`** opens an offscreen pass that subsequent GX draws render into (Deferred
+  Fog's config-ID replay uses it); `resolve_pass` then closes it and returns its targets.
+- **Scene-pass pipelines** must take their layout from `GfxDrawContext::layout` and be rebuilt when
+  `layout.key` changes. See `CONTRIBUTING.md` "Rules that have bitten before".
+- Everything here assumes reversed-Z (1 = near, sky = 0). `GfxDeviceInfo::uses_reversed_z` reports
+  it.
+- **Stage order versus the game's post effects.** The game draws translucency, particles, depth of
+  field and bloom between `GFX_STAGE_SCENE_AFTER_OPAQUE` and `GFX_STAGE_FRAME_BEFORE_HUD` (see
+  `m_Do_graphic.cpp`). An effect that should sit under those (AO, AA) composites at
+  `SCENE_AFTER_OPAQUE`; a draw pushed at `FRAME_BEFORE_HUD` lands on top of all of them. `push_draw`
+  encodes at the point you push it, so the stage you push from is the layer you get.
+- Pipelines with automatic layout (`layout` left unset, bind-group layout taken from the pipeline)
+  drop bindings their entry point never uses. A bind group that supplies such a binding then fails
+  to create.
 
 ## Camera service
 
-- Matrices are column-major float[16], matrix × column-vector convention — the TRANSPOSE of
-  the game's row-major `Mtx`. CPU-side multiplies must use the column-major helper
-  (`mat4_mul_col` in vbao), not game matrix code.
-- WebGPU clip conventions: `uv = (ndc.x*0.5+0.5, 0.5 - ndc.y*0.5)`. The single most
-  expensive bug of the aurora era was a missed Y flip here (shadows sampled mirrored, which
-  a sun-direction negation silently "fixed" — see docs/unreleased/realtime_sun_shadows.md issue 2).
-- `get_camera` returns `MOD_UNAVAILABLE` before the first real in-game frame — handle it by
-  skipping the frame.
+- Matrices are column-major `float[16]` for column vectors: the transpose of the game's row-major
+  `Mtx`. CPU-side multiplies must use a column-major helper (`mat4_mul_col` in VBAO), not the game's
+  matrix code.
+- WebGPU clip to UV: `uv = (ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5)`. A missed Y flip here once
+  produced mirrored shadow sampling that a sign change elsewhere hid for a long time.
+- `get_camera` returns `MOD_UNAVAILABLE` before the first in-game frame; skip the frame.
 
-## Hooks
+## Hooks (game-linked mods)
 
-- Typed hooks (`hook_add_pre<&Class::method>`) resolve through the linked symbol — they work
-  without the symbol manifest. By-NAME hooks (`NamedHook`, `resolve`) need the game's symbol
-  manifest, which is embedded inside `dusklight.exe` on the `platform-v2-test` base (upstream
-  #2216; earlier bases shipped it as a standalone `dusklight.symdb` next to the exe). Prefer
-  typed hooks.
-- On Windows/MSVC, only functions and `DUSK_GAME_DATA`-annotated data are reachable through
-  the import library; un-annotated data references fail at link time.
+- `DEFINE_HOOK(&Class::method, Alias)` declares a target from a member-function pointer: the
+  compiler checks the signature, and the loader resolves the symbol by name when the mod loads.
+  Attach callbacks with `mods::hook::add_pre<Alias>(fn)` / `add_post` from `<mods/svc/hook.hpp>`.
+  Deferred Fog still uses the older `mods::hook_add_pre<Alias>(svc_hook, fn)` from the deprecated
+  `<mods/hook.hpp>`, which builds with a deprecation warning.
+- `DEFINE_HOOK_SYMBOL("name", signature, Alias)` hooks by symbol name instead, and needs the game's
+  symbol manifest; without one the hook service returns `MOD_UNSUPPORTED`. Prefer `DEFINE_HOOK`.
+- On Windows only functions and `DUSK_GAME_DATA`-annotated data are reachable through the import
+  library; an un-annotated data reference fails at link time.
 
-## Config/UI
+## Config and UI
 
-- **NEVER name a config var `enabled` — the host reserves it for EVERY mod.** The loader gives
-  each discovered mod a bool at `mod.<escaped id>.enabled` for the mod manager's own on/off
-  checkbox (`mod_enabled_cvar_name`, `loader.cpp`), created at discovery, *before* any mod
-  initializes. `register_var` formats a mod's own var into the same namespace as
-  `mod.<escaped id>.<name>`, so `"enabled"` produces the identical key, `GetConfigVar` finds the
-  manager's var, and registration returns **`MOD_CONFLICT`**. If that is the mod's first
-  registration — the natural place to put an on/off toggle — the mod fails init and never loads.
+- **Never name a config var `enabled`.** The loader gives every mod a bool at
+  `mod.<escaped id>.enabled` for the mod manager's own on/off checkbox, created before any mod
+  initializes. `register_var` puts a mod's own vars in the same namespace, so `"enabled"` collides
+  and registration returns `MOD_CONFLICT`. If that is the mod's first registration, the mod fails
+  to initialize and never loads. Nothing at build time catches it, and the log line names the
+  mod's own option, so it reads like a mod bug. (Celestial Orbit shipped that way and never loaded.)
+  Prefix the name (`orbitEnabled`); the UI label can still say "Enabled".
 
-  It is silent in every way that matters: the tree builds, the mod packages, the manifest is
-  correct, and the only symptom is a runtime line naming *whatever the mod called its own option*,
-  which reads like a mod bug rather than a name collision. Celestial Orbit shipped that way and
-  simply never loaded; its own `set_error` string (`"failed to register enabled option"`) and its
-  own generic `MOD_ERROR` code masked the host's `MOD_CONFLICT` completely. Prefix the name instead
-  (`orbitEnabled`); the UI label can still read "Enabled".
+  The two toggles are different anyway: the manager's checkbox unloads the mod, while a mod's own
+  toggle keeps it loaded (and any service it exports available) and just stops it acting.
 
-  Note the two toggles are not the same question anyway. The manager's checkbox *unloads* the mod;
-  a mod's own toggle keeps it loaded, keeps any service it exports resolvable, and only stops it
-  acting — which is what Celestial Orbit needs, since Realtime Sun Shadows imports its service and
-  must still be told "vanilla orbit" rather than have the import vanish.
-
-  `python3 tools/check_reserved_config_names.py` scans every mod for this. It re-derives the
-  reserved list from the fetched game tree rather than trusting a constant, so a host that reserves
-  a *second* name is reported instead of silently missed; it skips cleanly with no tree. Run it
-  after adding a config var.
-- `UI_BINDING_CONFIG_VAR` requires matching types: TOGGLE=bool, NUMBER/SELECT=int. Floats
-  aren't bindable — register ints and scale (×0.01 convention throughout these mods).
-- Values from config.json apply at `register_var` without firing change callbacks — read
-  the value after registration for the starting state.
-- **A mod's own error string can hide the host's reason.** `mods::set_error(error, MOD_ERROR, …)`
-  replaces the service's `ModResult` with a generic `MOD_ERROR` (1), and `fail_mod` prints *that*
-  code next to *your* message. When a service call fails unexpectedly, read the host's
-  implementation for its real return values — or log the actual `ModResult` — before theorising.
+  `python3 tools/check_reserved_config_names.py` scans for this, deriving the reserved list from
+  the fetched game tree, but it only recognises names written as `cvarDesc.name = "..."` or
+  `register_bool_option("...")`. Names in VBAO's and SMAA's option tables are not checked.
+- `UI_BINDING_CONFIG_VAR` needs matching types: TOGGLE = bool, NUMBER and SELECT = int. Floats are
+  not bindable, so fractional options are stored as ints and scaled on read (×0.01 for most, ×0.001
+  for some VBAO options, plain world units for distances).
+- Values from `config.json` are applied at `register_var` without firing change callbacks. Read the
+  value after registering it for the starting state.
+- **A mod's own error string can hide the host's reason.** `mods::set_error(error, MOD_ERROR, ...)`
+  replaces the service's result with a generic `MOD_ERROR`, and the loader prints *that* code next
+  to *your* message. When a service call fails unexpectedly, log the actual `ModResult` or read the
+  host's implementation before theorising.
 
 ## Build system
 
-- The SDK (in the fetched `dusklight/sdk`) provides `add_mod()`, game headers
-  (`dusklight_game_headers` INTERFACE target), and Dawn headers via a prebuilt package. The tree is
-  fetched by `cmake/FetchDusklight.cmake` (pinned by `DUSKLIGHT_VERSION`) — nothing from the game
+- The SDK in the fetched `dusklight/sdk` provides `add_mod()`, game headers for `FEATURES game`
+  mods, and WebGPU headers via a prebuilt Dawn package for `FEATURES webgpu`. Nothing from the game
   compiles in this repo.
-- On **Windows/macOS/Android**, a mod using `FEATURES game|webgpu` (all of ours) links against a
-  per-arch stub the SDK **auto-downloads** (import library on Windows, `bundle_loader`/`.so` stub on
-  macOS/Android) — no manual `DUSK_GAME_EXE` needed (set it to override the download). The URL comes
-  from `DUSKLIGHT_SDK_STUB_URL`, which we **do not set**: upstream's default is a single
-  version-independent `sdk` release (`dusklight/cmake/ModSDK.cmake:5`). Only a fork base would need
-  it overridden, because a fork's stubs are per-release. **Linux needs nothing** — game symbols
-  resolve at load (`-Wl,--allow-shlib-undefined`).
-- Windows builds with plain MSVC (`cl`); no clang-cl override. The base game's `modmeta` parser
-  tolerates linker padding, so `DEFINE_HOOK` records register under `cl`.
-- `.dusk` = zip of {`lib/<platform>/mod.{dll,so}`, mod.json, res/}. CI builds one per platform and
-  `tools/merge_mod.py` merges them into a single cross-platform bundle (the `mods-combined`
-  artifact); the loader also picks up a `mods/` dir next to the app for dev builds.
+- On Windows, macOS and Android a mod with `FEATURES game` or `webgpu` links against a per-arch stub
+  of the game executable, which the SDK downloads automatically (`DUSKLIGHT_SDK_STUB_URL`, default
+  in `dusklight/cmake/ModSDK.cmake`; set `DUSK_GAME_EXE` to use a real game binary instead). Linux
+  needs no stub: game symbols resolve at load (`-Wl,--allow-shlib-undefined`).
+- Windows builds use plain MSVC (`cl`). Build `RelWithDebInfo`: a `Release` link strips the hook
+  records the loader scans for.
+- A `.dusk` is a zip of `lib/<platform>/mod.{so,dll}`, `mod.json` and `res/`. CI builds one per
+  platform and `tools/merge_mod.py` merges them into one cross-platform bundle.
 
-## Validation workflow
+## Validation
 
-- CI (the template's build + combine) compiles every mod on all seven platforms; the Linux legs are
-  a fast full type-check of mod.cpp against the game headers. Shaders are validated by the game at
-  pipeline-creation time — there is no separate offline WGSL validator (it was dropped in the move to
-  the pure template; `git log` for `tools/wgsl_validate.cpp` if you want to reinstate it).
+- CI compiles every mod on all seven platforms. The Linux jobs are a quick full type-check of
+  `mod.cpp` against the game headers.
+- CI does **not** validate WGSL. `tools/wgsl_check.cpp` does, offline and without a GPU; see
+  `CONTRIBUTING.md` "Check your change" for the build command. Run it after every shader edit.
 
-## Symbolizing a game crash (do this FIRST, not after guessing)
+## Symbolizing a game crash
 
-A Dusklight crash dump gives module-relative RVAs and no symbols. **Resolve them properly — do not
-try to infer the faulting code from the mod's source.** The platform release ships the PDB, so the
-exact function, source file and line are always available:
+A Dusklight crash dump gives module-relative addresses and no symbols. Resolve them; do not try to
+infer the faulting code from the mod's source. The upstream Windows build ships its PDB:
 
-```sh
-# 1. The Windows build for the pinned platform, from the release that matches DUSKLIGHT_VERSION.
-#    (The URL below is the RETIRED fork's and is kept only to show the shape; the platform is now
-#    upstream TwilitRealm/dusklight, so take the win32-msvc-x86_64 archive from its release.)
-curl -sSL -o dusk.zip \
-  "https://github.com/automata-rtx/dusklight-ao/releases/download/platform-normals-test/dusklight-UNKNOWN-VERSION-win32-msvc-x86_64.zip"
-unzip -q dusk.zip -d dusk
+1. From the upstream release (or CI run) that matches `DUSKLIGHT_VERSION`, get the Windows artifact
+   (`dusklight-<version>-win32-msvc-<arch>`). It contains the `.exe` and `debug.7z`.
+2. Extract `dusklight.pdb` from `debug.7z` (`7z x`, or `py7zr` in Python), next to the `.exe`.
+3. The image base is `0x140000000`, so the address is base + RVA:
 
-# 2. debug.7z inside it holds dusklight.pdb (~246 MB). No 7z binary here; py7zr works.
-pip install py7zr
-python3 -c "import py7zr; py7zr.SevenZipFile('dusk/debug.7z').extract(path='dusk', targets=['dusklight.pdb'])"
+   ```sh
+   llvm-symbolizer --obj=dusklight.exe --functions=linkage --demangle --inlines 0x1403c2828
+   ```
 
-# 3. llvm-symbolizer needs the PDB beside the exe. Image base is 0x140000000, so VMA = base + rva.
-llvm-symbolizer --obj=dusk/dusklight.exe --functions=linkage --demangle --inlines 0x1403c2828
-```
-
-`--inlines` is the important flag: the outermost entry names the real function, the inner ones the
-inlined accessor chain that actually faulted. That is how the boot-scene crash was pinned to
+`--inlines` matters: the outermost entry is the real function and the inner ones are the inlined
+accessor chain that actually faulted. That is how one start-up crash was pinned to
 `dKy_Indoor_check -> dStage_stagInfo_GetSTType -> BE<u32>::swap` in one step, after two rounds of
 wrong guesses from reading mod source.
 
-Notes:
+- Symbolize every frame, not just the crash address. The game-side frames name the stage dispatch
+  (`dusk::mods::gfx_run_stage`) and the game loop, which tells you which of your callbacks was
+  running.
+- The `.exe` is stripped, so the PDB is required.
+- Mod-side frames need the matching `mod.dll` from the CI per-platform artifact.
+- A fault address under about `0x100` is a null dereference at that struct offset; match it to the
+  field offset in the header to identify the object.
 
-- Symbolize **every** frame, not just the crash PC. The game-side frames name the stage dispatch
-  (`dusk::mods::gfx_run_stage`) and the game loop, which tells you which callback of yours was
-  running and when.
-- The `.exe` itself is stripped (`objdump -t` shows no symbols) — the PDB is mandatory.
-- Mod-side frames need the matching `mod.dll`, which lives in the CI per-platform artifact. Fetching
-  that needs the artifact host, which the agent proxy may block; the game-side frames are usually
-  enough to identify the call.
-- **A fault address under ~0x100 is a null dereference at that struct offset** — match it against
-  the field offset in the header (`0xc` -> `field_0x0c`) to confirm the object involved.
+### Game state that does not exist yet on the boot screens
 
-### Game state that does not exist on the boot/logo scene
+Stage hooks also fire on 2D screens, from the very first frame. Several game accessors are
+unguarded there, and the game never notices because nothing of its own asks that early:
 
-Stage callbacks fire on 2D screens too, on the very first frame the window appears. Several game
-accessors are unguarded there, and the game itself never notices because nothing of its own asks
-that early:
+- `dKy_Indoor_check()` → `dStage_stagInfo_GetSTType(getStagInfo())` dereferences the stage info
+  without a null check, and `dComIfGp_getStage()->getStagInfo()` is null until a stage loads.
+- `dKy_getEnvlight()` returns null there.
 
-- `dKy_Indoor_check()` -> `dStage_stagInfo_GetSTType(getStagInfo())` dereferences the stage info
-  with no null check. `dComIfGp_getStage()->getStagInfo()` is **null until a stage loads**.
-- `dKy_getEnvlight()` returns null there (it is null-checked by callers in our mods — keep it that way).
+`draw_lists_ready()` (in Deferred Fog) is not a general "a scene exists" test: the draw lists are
+populated on the logo screen while the stage info is still null. Check each piece of game state for
+availability on its own.
 
-`draw_lists_ready()` is **not** a general "a scene exists" test: the draw lists are already populated
-on the logo scene while the stage info is still null. Guard each piece of game state on its own
-availability, not on a proxy for it.
+## Debugging lessons
 
-## Debugging methodology (learned the expensive way)
+These are from investigations that cost days; `docs/authored_normals.md` §8 has the full case
+studies.
 
-These cost multiple days across the authored-normals work. Full case studies in
-`docs/authored_normals.md` §8.
-
-- **A debug view is only trustworthy if it samples the same resource the effect does, under the
-  same gate.** Three separate views in this repo showed one thing while the effect consumed another,
-  each sending an investigation the wrong way for rounds. If a view forces a resource on that the
-  effect would not have bound, it is lying.
-- **A view that shows a *combined* result cannot diagnose which input failed.** Build the view that
-  separates the terms *before* theorising. The shadow mod's "Shadow Terms" (view 15) exists because
-  rounds were spent guessing between two opposite bugs that look identical in "Shadow Factor".
-- **Never ship a fix built on an unverified premise.** If the premise is checkable in the source or
-  a binary, check it first — `grep -rn "config.msaa" src/` disproved an entire theory in one
-  command, but only after a fix had already been written and shipped for it.
-- **Symbolize crashes; do not infer them.** See the runbook above. Two wrong fixes preceded the one
-  `llvm-symbolizer --inlines` call that gave the exact answer.
-- **Read the user's observation literally.** "The affected area changes with camera position and
-  aim" instantly discriminated between two theories — it was already in hand when the wrong fix was
-  written.
-- **A host-side "do I need to bind X" gate that duplicates a shader-side "do I use X" condition will
-  drift, and the failure is silent** when the shader has a fallback. Mirror them explicitly and say
-  so at both ends. Prefer having the host set a "this is bound" uniform that the shader trusts, as
-  the shadow mod's `map_enabled` / `link_enabled` / `contact_enabled` flags do — those never drifted
-  precisely because there is one source of truth.
-- **CI is ~5 minutes for all seven platforms.** Shipping a build that adds a diagnostic is cheap;
-  a round trip through the user's testing is not. Prefer the view that answers the question over
-  another guess.
+- **A debug view is only trustworthy if it samples the same resource the effect does, under the same
+  conditions.** Three views in this repo showed one thing while the effect used another, and each
+  sent an investigation the wrong way.
+- **A view that shows a combined result cannot tell you which input failed.** Build the view that
+  separates the terms before theorising.
+- **Check a fix's premise before shipping it.** If it can be checked in the source or a binary, check
+  it: one `grep` disproved a whole theory, but only after a fix for it had shipped.
+- **Read the tester's observation literally.** "The affected area changes with camera position and
+  aim" separated two theories at once; it was available before the wrong fix was written.
+- **A host-side "do I need to bind X" test that duplicates a shader-side "do I use X" test will
+  drift silently** when the shader has a fallback. Prefer one source of truth: the host sets a
+  "this is bound" uniform flag that the shader trusts.
+- **CI takes a few minutes for all seven platforms**, while a round trip through in-game testing
+  takes much longer. When unsure, ship the build that adds the diagnostic, not another guess.

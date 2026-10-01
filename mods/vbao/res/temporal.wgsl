@@ -1,71 +1,53 @@
-// VBAO (Visibility Bitmask Ambient Occlusion) - temporal accumulation pass.
+// VBAO temporal accumulation (compute, full render resolution).
 //
-// Reprojects the previous frame's accumulated AO into the current frame using the camera motion
-// (reproject = prev proj_from_world * cur world_from_view) and blends it with the current
-// denoised estimate. Because the occlusion pass advances its sampling noise every frame, each
-// frame is a DIFFERENT noisy estimate, and the accumulation averages them into a clean, stable
-// result (the accumulation is the primary noise reducer; the spatial denoiser softens what a
-// single frame shows and is the standalone fallback when accumulation is off).
+// Blends this frame's denoised AO estimate into a camera-reprojected history
+// (reproject = previous proj_from_world * current world_from_view). The occlusion pass changes its
+// sampling noise every frame, so this averaging is the main noise reducer; with accumulation off
+// the spatial denoiser is the only filter.
 //
-// Ghosting control, in order of authority:
-//  - depth disocclusion rejection: the current point's EXPECTED depth in the previous view
-//    (clip w) is compared against the depth the history stored at the reprojected texel; a large
-//    mismatch means the reprojection crossed a silhouette, so the history belongs to a different
-//    surface and is discarded. Comparing the expected previous depth (not the current depth)
-//    keeps ordinary camera translation from tripping it.
-//  - neighborhood clamp: history is clamped into the current local AO distribution
-//    (mean +- k*sigma over 3x3, k tightened under screen motion), so stale values snap to the
-//    present instead of ghosting.
-//  - velocity + content response: screen-space motion (capped, see below) and a sigma-normalised
-//    outlier test of the history against the local mean both shorten the accumulation so AO
-//    tracks geometry instead of dragging behind it.
+// History: rgba16float = (accumulated AO, view depth / far plane, octahedral view-space normal .xy).
 //
-// THE VELOCITY TERM IS CAPPED, AND THE CAP DEPENDS ON FRAME TIME (`velocity_cap`, host-set).
-// `motion_px * velocity_scale` is pixels of screen motion PER FRAME, so for one and the same camera
-// pan it is twice as large at 30 fps as at 60 fps and five times as large as at 144 fps. At the
-// default response (0.1 per pixel) any ordinary pan at 30-60 fps drove the blend weight to 1.0 -
-// that is, threw the whole history away every frame and displayed the raw single-frame estimate,
-// whose sampling pattern advances every frame. At 144 Hz the eye fuses that into a mild shimmer;
-// at 30-60 Hz it is plain flicker/boiling the moment the camera moves, and the lower the frame rate
-// the worse it looks. (That was the 1.0.x "flickers in motion" report; the record is in
-// docs/vbao.md "Temporal accumulation: history and diagnostics".) The response also fades with view
-// depth - full up to velocity_range, gone at twice it - see the velocity_alpha block below.
-// The host therefore measures the frame interval and hands down a ceiling that only lets the term
-// reach a full reset when frames are short enough for per-frame noise to fuse (see
-// kVelocityFusionFrameTime in mod.cpp). The disocclusion and content rejects are NOT capped: those
-// are correctness terms, and a wrong-surface history must still be discarded outright.
+// Per pixel:
+//  - Two history candidates, camera-reprojected and un-reprojected, each scored on depth and normal
+//    agreement with the current surface (a stand-in for per-object motion vectors, which a
+//    service-only mod cannot have). The chosen candidate's mismatch drives a disocclusion reject.
+//  - Covered pixels clamp history to the 3x3 mean +- k * sigma (k tightened under screen motion).
+//  - Blend weight = max(1 / Temporal Frames, disocclusion reject, velocity term, outlier term).
+//    The velocity term (screen motion in px/frame * velocity_scale) fades out with view depth
+//    (velocity_range) and is capped by velocity_cap, which the host derives from frame time
+//    (kVelocityFusionFrameTime in mod.cpp). The disocclusion and outlier terms are not capped:
+//    they detect history that is wrong, not merely old.
 //
-// History format: rgba16float = (accumulated AO, view depth / far plane, octahedral view-space
-// normal .xy). The normal is what lets the pass tell two history candidates apart - see
-// "TWO HISTORY CANDIDATES" in temporal_accumulate.
+// Design and field history: docs/vbao.md "Temporal accumulation".
 
+// Mirrors AoUniforms in src/mod.cpp and the copies in the other shaders, byte for byte.
 struct Uniforms {
-    projection: mat4x4f,
-    inverse_projection: mat4x4f,
-    reproject: mat4x4f,
-    size: vec2f,        // AO chain size in pixels (may be half the render size)
+    projection: mat4x4f,          // proj_from_view
+    inverse_projection: mat4x4f,  // view_from_proj
+    reproject: mat4x4f,           // current view -> previous frame's clip space
+    size: vec2f,        // AO chain size in pixels (half the render size in Half Res)
     inv_size: vec2f,
-    depth_scale: vec2f, // input depth snapshot pixels per chain pixel (1 or 2)
-    effect_radius: f32, // fraction of view depth
-    intensity: f32,
+    depth_scale: vec2f, // render (snapshot) pixels per chain pixel: 1 or 2
+    effect_radius: f32, // near radius, fraction of view depth
+    intensity: f32,     // composite strength, 1 = 100%
     slice_count: f32,
     steps_per_side: f32,
-    thickness: f32,
-    contrast: f32,
-    temporal_alpha: f32,
-    temporal_clamp_k: f32,
-    inv_far: f32,
+    thickness: f32,     // base occluder thickness multiplier
+    contrast: f32,      // exponent applied to visibility in the composite
+    temporal_alpha: f32,   // base history blend weight, 1 / Temporal Frames
+    temporal_clamp_k: f32, // history clamp half-width, in sigmas of the 3x3 neighbourhood
+    inv_far: f32,          // 1 / far plane; normalises the depth stored in the history
     radius_max: f32,     // screen-space radius cap, fraction of viewport height
-    depth_bias: f32,     // self-occlusion bias, fraction toward the camera
+    depth_bias: f32,     // self-occlusion bias: view position scaled by (1 - depth_bias)
     thick_fade: f32,     // occluder-thickness fade range, multiple of the view radius
-    velocity_scale: f32, // accumulation shortening per pixel of screen motion
-    content_thresh: f32, // content-mismatch response threshold scale (1 = default)
-    disocc_tol: f32,     // disocclusion depth tolerance, fraction of depth
+    velocity_scale: f32, // velocity blend weight per pixel/frame of screen motion
+    content_thresh: f32, // outlier-test threshold scale (1 = 1..2.5 sigma)
+    disocc_tol: f32,     // disocclusion depth tolerance, fraction of depth (shader floor 0.015)
     black_point: f32,    // occlusion floor removed in the composite
     fade_start: f32,     // distance fade start, world units of view depth
     fade_end: f32,       // distance fade end, world units of view depth
     debug_view: u32,
-    frame_index: u32,
+    frame_index: u32,    // advances per frame while accumulating, else 0
     flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
     thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
     inv_debug_depth: f32,   // debug depth view gradient scale (1 / world units)
@@ -73,25 +55,23 @@ struct Uniforms {
     radius_ramp_start: f32, // radius ramp band start, world units of view depth
     radius_ramp_end: f32,   // radius ramp band end, world units of view depth
     denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
-    velocity_cap: f32,      // ceiling on the motion-response alpha (frame-time aware, host-set)
-    velocity_range: f32,    // motion response fades out from this view depth to 2x it (world units; 0 = never)
+    velocity_cap: f32,      // ceiling on the velocity blend weight (frame-time aware, host-set)
+    velocity_range: f32,    // velocity term fades over [this, 2x] view depth, world units; 0 = off
     _pad2: f32,
 }
 
-// The AO chain runs at `size` (chain res, half the render size in Half Res). History, output and
-// the raw depth snapshot are at the FULL render size (`size * depth_scale`). In half-res + temporal
-// mode this pass is a temporal UPSAMPLER: each frame's jittered half-res estimate covers a
-// different full-res pixel, and history reconstructs the full resolution over ~4 frames. Uncovered
-// pixels (and fresh disocclusions) fall back to the depth-aware bilinear upscale so nothing is
-// sparse. At full res depth_scale is 1: every pixel is "covered" and this reduces to the original
-// per-pixel accumulation.
+// The AO chain runs at `size` (half the render size in Half Res). History, output and the raw
+// depth snapshot are at the full render size (`size * depth_scale`). In Half Res this pass is a
+// temporal upsampler: each frame's jittered half-res estimate covers one pixel of every 2x2 block,
+// and the history reconstructs full resolution over ~4 frames. Pixels without valid history fall
+// back to the depth-aware bilinear upscale. At full res every pixel is covered every frame.
 @group(0) @binding(0) var ao_current: texture_2d<f32>;        // denoised half-res AO (chain res)
 @group(0) @binding(1) var history_in: texture_2d<f32>;        // full-res (ao, depth, oct normal) previous frame
 @group(0) @binding(2) var preprocessed_depth: texture_2d<f32>; // half-res MIP0, for upscale weights
 @group(0) @binding(3) var raw_depth: texture_2d<f32>;         // full-res raw reversed-Z snapshot
 @group(0) @binding(4) var history_out: texture_storage_2d<rgba16float, write>; // full-res
 @group(0) @binding(5) var<uniform> uniforms: Uniforms;
-// The scene's authored view-space normal snapshot (full res, xyz*0.5+0.5, alpha 1 where valid) -
+// The scene's authored view-space normal snapshot (full res, xyz*0.5+0.5, alpha 1 where valid),
 // the same texture vbao.wgsl shades with; here it is the second surface-identity test.
 @group(0) @binding(6) var scene_normal: texture_2d<f32>;
 
@@ -219,9 +199,9 @@ fn temporal_accumulate(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let taau = uniforms.depth_scale.x >= 1.5;
     let hc = select(p, p / vec2<i32>(2i), taau); // half-res texel this pixel maps to
     let jit = taau_jitter();
-    // "Covered" = this pixel has a genuine fresh half-res sample this frame (always, at full res;
-    // the jittered pixel, in half-res upsampling). Uncovered pixels carry history forward and only
-    // fall back to the spatial upscale when there is no valid history to keep.
+    // "Covered" = this pixel has a fresh sample this frame (every pixel at full res; the jittered
+    // pixel of each 2x2 block in Half Res). Uncovered pixels carry history forward and move toward
+    // the spatial upscale only under disocclusion or screen motion, or when there is no history.
     let covered = !taau || ((p.x & 1i) == jit.x && (p.y & 1i) == jit.y);
     var cur: f32;
     if covered {
@@ -230,9 +210,9 @@ fn temporal_accumulate(@builtin(global_invocation_id) global_id: vec3<u32>) {
         cur = upscale_ao(uv, rd);
     }
 
-    // Local statistics from the half-res AO neighborhood size the clamp band (applied only to
-    // covered pixels, where `cur` is a real sample; clamping an uncovered pixel against the coarse
-    // half-res distribution would erase the very detail the upsampler is reconstructing).
+    // 3x3 statistics of the chain-resolution AO, for the clamp and the outlier test. Both apply
+    // only to covered pixels: clamping an uncovered pixel to the coarse half-res distribution
+    // would erase the detail the upsampler is reconstructing.
     var msum = 0.0;
     var m2 = 0.0;
     for (var dy = -1; dy <= 1; dy += 1) {
@@ -256,36 +236,29 @@ fn temporal_accumulate(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
                 // Surface-identity mismatch of a history sample, in units of tolerance (1 = at
                 // tolerance, 3 = full reject): the depth term, relative to the point's depth
-                // (>= 1.5%), and the normal term, (1 - cos) over 0.15 (~30 degrees = 1).
+                // (at least 1.5%), and the normal term, (1 - cos) / 0.15 (about 32 degrees = 1).
                 //
-                // The depth tolerance is RELATIVE to depth on purpose. It used to have a floor of
-                // 0.002 of the far plane, and TP's far plane is per-stage and huge: on a
-                // 200000-unit stage that floor was 400 world units, larger than Link, so ground he
-                // had just vacated matched his body's stored depth and kept his AO as a full-body
-                // trail. Relative tolerance follows the scene: 15 units at 1000, 150 at 10000,
-                // which still admits the same surface at grazing angles while separating a
-                // character from the ground behind it.
+                // Important: keep the depth tolerance relative to depth, never a fraction of the
+                // far plane. The far plane is per-stage and huge, so a far-plane floor is hundreds
+                // of world units, wider than a character, and lets the character's AO trail over
+                // the ground behind it. 1.5% is 15 units at 1000 and 150 at 10000.
                 let rel_tol = max(uniforms.disocc_tol, 0.015);
 
-                // TWO HISTORY CANDIDATES. There are no per-object motion vectors: the reprojection
-                // is the CAMERA's, so for anything that moves in the world it is wrong. The case
-                // that matters is Link: the camera follows him, so he is nearly static on screen
-                // while the world moves, and the camera-reprojected history for a pixel on his
-                // body is a NEIGHBOURING part of his body (the world's motion away). Same depth,
-                // similar AO, so nothing rejected it, and his AO smeared along the world's motion
-                // as a soft trail. Candidate B is the history at this pixel's OWN screen position
-                // (no reprojection), which is exactly right for a screen-static object. Each
-                // candidate is scored on how well it is the same surface as the current pixel
-                // (depth AND normal - depth alone cannot tell two parts of a body apart, the
-                // normal can), the camera candidate stays preferred, and B is taken only when it
-                // is clearly the better match. Static world geometry under camera motion scores
-                // A near zero and keeps it; on Link's curved parts B wins and the smear stops;
-                // on his flattest regions the two tie, A stays, and a smear of near-identical AO
-                // values is invisible. Where neither candidate is the same surface, the chosen
-                // one's mismatch drives the disocclusion reject as before.
-                // Depth of the current point in the previous view (clip w), in the history's
-                // normalization; candidate B is compared against the current depth, since a
-                // screen-static object barely changes depth between frames.
+                // Two history candidates. The reprojection only follows the camera, so it is wrong
+                // for anything that moves in the world. The case that matters is a character the
+                // camera follows: nearly static on screen, so the camera-reprojected history for a
+                // pixel on his body is a neighbouring part of the same body, with the same depth,
+                // and his AO smears along the world's motion. Candidate A is the camera-reprojected
+                // history; candidate B is the history at this pixel's own screen position, which
+                // is right for a screen-static object. Both are scored on depth and normal (the
+                // normal tells two parts of one body apart where depth cannot). A is preferred; B
+                // is taken only when its summed score is lower by more than 0.5 and the camera
+                // moved this pixel by more than half a pixel. The chosen candidate's mismatch
+                // drives the disocclusion reject.
+                //
+                // A is compared at the current point's depth in the previous view (clip w), in the
+                // history's normalisation; B against the current depth, since a screen-static
+                // object barely changes depth between frames.
                 let expected_prev_d = clamp(clip_prev.w * uniforms.inv_far, 0.0, 1.0);
                 let hist_a = sample_history(prev_uv);
                 let mis_a = abs(expected_prev_d - hist_a.y) / max(expected_prev_d * rel_tol, 1.0e-6);
@@ -303,22 +276,19 @@ fn temporal_accumulate(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 }
                 let depth_reject = smoothstep(1.0, 3.0, mismatch);
 
-                // Covered pixels accumulate the fresh sample (clamp + content-reject guard against
-                // ghosting); uncovered pixels keep history unless camera motion / disocclusion
-                // forces them toward the spatial fill.
+                // Covered pixels accumulate the fresh sample; uncovered pixels keep history unless
+                // disocclusion or screen motion pushes them toward the spatial fill.
                 //
-                // GHOSTING, with the velocity term no longer resetting history in motion, comes
-                // from occluders that moved in the WORLD: Link's contact shadow stays on the ground
-                // he just left, because that ground reprojects correctly and its stored AO is
-                // simply stale. The depth test cannot see it (same surface). Two guards handle it:
-                //  - the clamp bounds the stale value to the current local distribution, and it
-                //    tightens under screen motion (k * 0.6 at >= 16 px/frame), where stale
-                //    occluders are likeliest;
-                //  - the content reject is an OUTLIER test in sigma units against the 3x3 MEAN,
-                //    not an absolute difference against the noisy single-frame sample: a trail sits
-                //    several sigma from the unoccluded ground around it and is discarded within a
-                //    frame or two, while in-distribution history (|dev| < 1 sigma) keeps
-                //    accumulating, which is what keeps the noise averaging that removed the flicker.
+                // The remaining ghosting source is an occluder that moved in the world, such as a
+                // character's contact shadow left on the ground he walked off: that ground
+                // reprojects correctly, so the depth test cannot see that its AO is stale. Two
+                // guards handle it, for covered pixels:
+                //  - the clamp bounds history to the current 3x3 distribution, tightened to
+                //    k * 0.6 at 16 px/frame of motion or more;
+                //  - the outlier test measures history against the 3x3 mean in sigma units, not
+                //    against the noisy single-frame sample: a trail sits several sigma away and is
+                //    dropped within a frame or two, while history within ~1 sigma keeps
+                //    accumulating.
                 let motion_tighten = mix(1.0, 0.6, clamp(motion_px / 16.0, 0.0, 1.0));
                 let k_eff = uniforms.temporal_clamp_k * motion_tighten;
                 let hist_used = select(hist.x,
@@ -330,12 +300,11 @@ fn temporal_accumulate(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     smoothstep(1.0 * uniforms.content_thresh, 2.5 * uniforms.content_thresh,
                         hist_dev),
                     covered);
-                // Velocity response, ceilinged by the frame-time-aware cap (see the header) and
-                // faded out with VIEW DEPTH: full up to velocity_range world units, gone at twice
-                // it. The raw single-frame estimate is dense and clean close to the camera and
-                // sparse at distance (constant pixel radius, growing world radius), so a short
-                // accumulation is free on a character and ruinous on a far landmark - which is
-                // exactly what the field showed at a high response: Link full, distant AO sparse.
+                // Velocity term, capped by the frame-time-aware velocity_cap (see the header) and
+                // faded out with view depth: full up to velocity_range world units, gone at twice
+                // that. The single-frame estimate is clean close to the camera and sparse far away,
+                // so a short accumulation costs nothing on a nearby character and visibly thins
+                // distant AO.
                 let view_depth = max(-view_pos.z, 0.0);
                 let range_w = select(1.0,
                     1.0 - smoothstep(uniforms.velocity_range, uniforms.velocity_range * 2.0, view_depth),

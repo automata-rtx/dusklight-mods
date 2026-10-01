@@ -1,300 +1,360 @@
-# VBAO — Visibility Bitmask Ambient Occlusion
+# VBAO: Visibility Bitmask Ambient Occlusion
 
-Mod id `dev.automata.vbao` (directory `mods/vbao/`). Service-only (no game code): stages + snapshots from the
-gfx service, matrices from the camera service.
+Screen-space ambient occlusion using a per-slice 32-sector visibility bitmask (Therrien, Levesque
+and Gilet, 2023, arXiv:2301.11376), with temporal accumulation, an edge-aware denoiser and a
+depth-aware composite.
 
-**Normals come from the gfx service** (GfxService 1.3), resolved alongside depth —
-`GfxResolveDesc::normal` → `GfxResolvedTargets::normal`, reached through
-`common/gfx_normal_compat.h`. (Until the move to upstream Dusklight this was a separate
-`get_scene_normals` call on our own fork; upstream implements the same feature through the resolve
-instead, and there is no such call in the upstream vtable.) The game's
-renderer writes the artist-authored vertex normal into a second colour attachment on the scene pass,
-and the HOST snapshots it once per frame — immediately after the opaque lists, before any
-`SCENE_AFTER_OPAQUE` hook — then hands the same texture to every mod that asks. VBAO just asks.
+| | |
+| :-- | :-- |
+| Mod id | `dev.automata.vbao` (`mods/vbao/`) |
+| Version | see `mods/vbao/mod.json` (1.1.0 at the time of writing) |
+| Kind | Service-only: graphics, camera, config, UI, resource and log services. No game headers, no hooks, no dependency on other mods |
+| Runs at | `GFX_STAGE_SCENE_AFTER_OPAQUE` (debug views at `GFX_STAGE_FRAME_AFTER_HUD`) |
+| Needs | The game's authored normals from the graphics service: a D3D12, Vulkan or Metal device |
 
-That means **no dependency on any other mod**: VBAO imports only the stock services (gfx, camera,
-config, ui, resource, log). It also means **no reconstructed *shading* normal** — no fallback path
-to maintain, and none of the faceting a depth-gradient normal has by construction.
+A bitmask records *which* parts of each hemisphere slice are occluded rather than tracking a single
+horizon angle. Gaps between separate occluders, and thin geometry such as grass, therefore do not
+over-darken the way they do with horizon-based AO.
 
-> **`geometric_normal_view()` in `vbao.wgsl` is still a depth-derived normal, and it stays.** It is
-> not leftover reconstruction. It is the plane used to reject occlusion samples that lie *below* the
-> surface, which is a property of the geometry rather than of the artist's smoothed vertex normal —
-> and it is now permanently load-bearing, because the shading normal is always the authored one.
-> Deleting it does not simplify the port; passing it a zero vector switches AO off entirely. See
-> `docs/authored_normals.md` §8.11 and §8.11a. The snapshot is
-full render resolution and already in view space, so half-res AO samples it at each chain pixel's
-jittered full-res position and temporal accumulation integrates full-res normal detail even in
-half-res mode, at no change to the AO sampling cost.
+"Enhanced AO" is the mod's former name. It still appears in pipeline, texture and log labels, so
+search for both when reading logs or GPU captures.
 
-Two consequences worth knowing:
+## Files
 
-- **Pixels with no authored normal take full visibility.** Alpha 0 means there is no usable normal
-  here, so there is no hemisphere to build and VBAO leaves the pixel alone. The *attachment's*
-  coverage is exactly the depth buffer's — a draw writes a normal iff it writes depth — but **alpha
-  1 is not implied by depth coverage**: a draw whose NRM vertex attribute is simply absent writes
-  depth and stores alpha 0, as does a vertex normal that interpolation cancelled to zero. So this is
-  not only sky and billboards. Those pixels also have their denoiser edge weights zeroed, which
-  keeps their full-visibility value from bleeding into neighbours as a bright rim — sky never needed
-  that because sky is depth-discontinuous and the depth gate already rejected it, but an alpha-0
-  *surface* is depth-continuous with everything around it. Debug view 2 doubles as the coverage
-  map: it paints those pixels black.
-- **Two things make it permanently unavailable, and the first is a SETTING.**
-  - **MSAA.** The renderer will not create the normal buffer unless antialiasing is off
-    (`msaaSamples == 1`); with MSAA on it does not even record the request. So a perfectly capable
-    GPU gets no normals, and VBAO disables itself. The log line **names MSAA** in that case — it
-    re-queries `GfxDeviceInfo::sample_count` at the moment it warns, rather than trusting the value
-    cached at init, because the user can change MSAA mid-session. Telling them their GPU is at fault
-    when the fix is one setting would be the worst kind of wrong diagnostic.
-  - **The compatibility renderers.** On D3D11 and OpenGL ES the attachment cannot exist at all
-    (no WebGPU core features). VBAO disables itself with a one-time log line saying so; it needs a
-    D3D12 / Vulkan / Metal device.
+| File | Contents |
+| :-- | :-- |
+| `src/mod.cpp` | Option tables and UI, the per-frame stage hook (`on_scene_after_opaque`), compute callback (`on_compute`), draw callback (`on_draw`), texture management (`ensure_targets`), lazily built composite pipelines (`ensure_composite_pipelines`), the frame-time cap (`update_velocity_cap`) |
+| `res/preprocess_depth.wgsl` | Depth MIP chain |
+| `res/vbao.wgsl` | The occlusion estimator |
+| `res/denoise.wgsl` | Edge-aware spatial filter |
+| `res/temporal.wgsl` | Temporal accumulation and half-res upsampling |
+| `res/composite.wgsl` | Final shaping and composite, and all debug views |
+| `res/licenses/` | Bevy (MIT/Apache-2.0) and XeGTAO (MIT) notices for the adapted MIP chain and denoiser |
 
-The stored direction carries the sign the game gave it and is **never** flipped toward the camera —
-see `docs/authored_normals.md` §2a for the three separate places that guard had to be deleted from.
+The framework (MIP depth chain, compute scheduling, denoiser) comes from upstream Dusklight's
+`ao_mod` demo, which itself adapts Bevy and XeGTAO. The bitmask estimator, temporal accumulation,
+half-res upsampling and the composite controls are this mod's own.
 
-**Install Deferred Fog alongside it.** VBAO composites at `SCENE_AFTER_OPAQUE`, which is *inside*
-the fogged frame: without Deferred Fog the game has already applied fog per draw, so the AO
-multiplies over fogged pixels and distant occlusion reads as grime on the haze rather than depth in
-the world. Deferred Fog moves the fog after the composite and the AO lands under it.
+## Requirements and interactions
 
-**There is no dependency between the two mods, in either direction.** VBAO composites at
-`SCENE_AFTER_OPAQUE` and the fog quad draws at `FRAME_BEFORE_HUD`, so the ordering that matters is
-guaranteed by stage separation alone. VBAO's debug views draw at `FRAME_AFTER_HUD` — the last stage
-in the frame — so they land on top of the fog without needing the two mods to agree on anything.
-See `docs/deferred_fog.md`.
+**Normals.** VBAO reads the game's authored vertex normal, which the renderer writes into a second
+colour attachment of the scene pass. It asks for it through `resolve_pass` (via
+`common/gfx_normal_compat.h`). Without it VBAO does nothing and logs one warning:
 
-## Pipeline (per frame, at `GFX_STAGE_SCENE_AFTER_OPAQUE`)
+- **Start-up.** The first request turns the normal attachment on for the *next* frame and returns
+  nothing for this one. VBAO waits `kNormalLatchGraceFrames` (8) frames before treating missing
+  normals as permanent, so a normal start-up is silent.
+- **Compatibility renderers** (D3D11, OpenGL ES) cannot carry the attachment. VBAO needs D3D12,
+  Vulkan or Metal.
+- **MSAA.** The renderer only creates the attachment without MSAA. The current game build
+  (Dusklight `v2.0.0`) never enables MSAA, so this cannot happen today; the warning that names MSAA
+  is kept for builds that do.
 
-1. One `resolve_pass` snapshots **both** depth (R32Float, reversed-Z, single-sample) and the
-   scene normal (RGB10A2Unorm, view space). Colour is **not** resolved — the composite blends over
-   the live target. Without either input VBAO disables itself for the frame.
+The normal is in view space and keeps the sign the game gave it; it is never flipped toward the
+camera. Pixels with no authored normal (alpha 0: sky, billboards, draws without a normal attribute)
+get full visibility, and their denoiser edge weights are zeroed so that value does not bleed into
+neighbours as a bright rim. Debug view 2 shows them black.
 
-   **The normal snapshot latches on.** The first resolve that asks for it enables the attachment
-   for the *next* frame and returns null for this one, so an early null means "not yet", not
-   "never". VBAO counts consecutive null frames (`kNormalLatchGraceFrames`) and only reports the
-   device as unable once the count is past the handful the latch can plausibly take — otherwise the
-   "compatibility renderer" warning would fire on every cold start.
-2. **`preprocess_depth.wgsl`** — builds a 5-level MIP depth chain (XeGTAO-style weighted
-   downsample) so distant AO samples read small MIPs instead of thrashing bandwidth.
-3. **`vbao.wgsl`** — the occlusion estimator. Per pixel: unproject the view position, read the
-   scene normal from the service snapshot (skipping to full visibility where it has none), derive a
-   separate 4-tap geometric plane from depth for sample rejection, then walk `slice_count`
-   hemisphere slices × `steps_per_side` marching steps, carving a 32-bit sector bitmask
-   per slice (Therrien et al. 2022 visibility bitmask). Occlusion = carved fraction weighted
-   by a cosine lobe. Sampling noise: an order-6 Hilbert index computed in-shader + R2 sequence,
-   advanced per frame when temporal accumulation is on (so successive frames measure different
-   directions). There is no noise LUT and no init-time upload.
-   Thickness handling: front/back horizons with a log-scaled thickness and depth-difference
-   fade (`t_eff = t_base * clamp(1 - |dz|/depth_range)`) — this is what keeps grass/foliage
-   from over-darkening.
-4. **`denoise.wgsl`** — edge-aware 3×3 spatial filter, ping-ponged 0–3 times. With temporal
-   ON it softens the residual per-frame noise; with temporal OFF it is the whole denoiser
-   (single-frame fallback).
-5. **`temporal.wgsl`** (compute) — runs at **full render resolution**. Reprojects last frame's
-   accumulation (`reproject = prev.proj_from_world × cur.world_from_view`), rejects history on
-   depth disocclusion (expected-prev-depth vs stored depth), clamps history into the local
-   mean ± k·σ neighborhood, and shortens accumulation on screen motion and content mismatch.
-   History = rgba16float (ao, viewDepth/far, octahedral view-space normal) at full res,
-   ping-ponged; invalidated on resize/toggle. **Two history candidates per pixel**: the
-   camera-reprojected one and the un-reprojected one at the pixel's own position, each scored on
-   depth *and* normal agreement with the current surface; the camera one is preferred and the static
-   one taken only when clearly the better surface match. That is the substitute for per-object
-   motion vectors: a screen-static character (Link under a following camera) takes the static
-   candidate on every curved part of his body, which is what stopped his AO smearing along the
-   world's motion.
-   In **Half Res** this pass is also a **temporal upsampler** — see below.
-6. **`composite.wgsl`** — reads the AO source at its native resolution: full-res history 1:1 when
-   temporal accumulation is on, else a depth-aware 4-tap bilinear upscale of the half-res estimate.
-   Then black point, contrast power, optional distance fade, multiply over scene color. Debug
-   views 1–8 (AO / normals / depth / staircase detector / geometric normal / normal agreement /
-   raw AO / depth MIP 3 — the last four are described under "Temporal accumulation: history and
-   diagnostics").
+**Deferred Fog.** Without Deferred Fog, the game has already fogged each surface when VBAO
+composites, so AO darkens the fog itself and distant occlusion reads as grime on the haze. With it,
+the fog is re-applied after VBAO and the AO sits under the fog. The two mods do not know about each
+other; the ordering comes from the stages (Deferred Fog draws its fog after `SCENE_AFTER_OPAQUE`).
 
-The occlusion estimate runs at snapshot resolution, or half of it with **Half Res** on; the
-temporal history and composite are always full render resolution.
+**SMAA** also runs at `SCENE_AFTER_OPAQUE`. Their relative order follows mod load order and is not
+fixed; either order looks fine.
 
-### Half-res temporal upsampling
+## How it works
 
-With **Half Res** and **Temporal Accumulation** both on, the half-res estimate is reconstructed
-back to full resolution rather than blurred up (restores the aurora fork's checkerboard quality):
+### Per frame
 
-- The half-res sampling grid is **jittered** through the 4 sub-positions of each 2×2 full-res block
-  (4-phase, keyed off `frame_index`), in `preprocess_depth.wgsl` (`load_input_depth`) and
-  `vbao.wgsl` (`chain_uv`). Each frame therefore estimates a different quarter of the full-res
-  pixels. The jitter is derived shader-side (no uniform-layout change) and is a no-op at full res
-  or with temporal off.
-- `temporal.wgsl` runs at full res: a full-res pixel **covered** by this frame's jitter takes the
-  fresh half-res sample and accumulates it (clamp + content-reject guard ghosting); an **uncovered**
-  pixel carries history forward, falling back to the depth-aware bilinear upscale only when it has
-  no valid history (fresh disocclusion) or camera motion/disocclusion forces it. Full coverage
-  refreshes every ~4 frames. Full-res depth comes from the raw snapshot (the temporal pass reuses
-  the same depth texture the prefilter consumes); the history textures are sized to the full render
-  resolution (`ensure_targets`).
-- At full res every pixel is trivially "covered", so this reduces to the original per-pixel
-  accumulation with no behavior change. GPU-validated in `scratchpad/halfres_taau_test.py`.
+On the game thread, in `on_scene_after_opaque`:
 
-### Temporal accumulation: history and diagnostics
+1. Return early if disabled (and invalidate the temporal history).
+2. Read the camera, and `resolve_pass` for depth (`R32Float`, reversed-Z) and the normal
+   (`RGB10A2Unorm`, view space, `n*0.5+0.5`, alpha = valid). Colour is not resolved: the composite
+   multiplies over the live target. If either input is missing, skip the frame.
+3. `ensure_targets` (re)creates the textures when the chain size changes. The chain is the render
+   size, or half of it with **Half Resolution** on.
+4. Fill one uniform block (`AoUniforms`, 336 bytes, shared by every pass) and `push_uniform`.
+5. `push_compute` for the compute chain, then `push_draw` for the composite. With a debug view
+   selected, the draw is pushed from the `FRAME_AFTER_HUD` hook instead.
+6. Flip the temporal history and remember this frame's camera for next frame's reprojection.
 
-**Status: resolved in 1.1.0, confirmed in the field at each step.** This section is the record of
-the 1.0.x report and of what each change was for, so the design above is not mistaken for a set of
-arbitrary knobs.
+On the render worker, `on_compute` records the compute passes and `on_draw` the composite.
 
-**The report.** Flickering AO in motion, overwhelmingly on AMD GPUs, with two NVIDIA reports as
-well. It was the temporal path: disabling Temporal Accumulation removed the flicker, and Motion
-Response 0–1 with accumulation on almost entirely removed it. The wrong-looking AO in motion
-(improper angles, hard edges, with a smooth normal buffer) was the **raw single-frame estimate**
-being displayed whenever the velocity term drove the blend weight to 1, its slice directions
-advancing every frame. Frame interpolation is on by default in the shipped build, so frame rate was
-not the variable; a first pass that said so was wrong and is withdrawn.
+### Passes
 
-**What was ruled out**, each read in the pinned upstream source, so it need not be re-derived:
+All compute shaders use 8×8 workgroups and share one compute pass.
 
-| Ruled out | Evidence |
-|---|---|
-| Depth snapshot format / precision | `Depth32Float` (compile-time in aurora) blitted to `R32Float` by a fullscreen pass on every backend (`tex_copy_conv.cpp` `snapshot_depth`) |
-| Normal attachment path | `RGB10A2Unorm`, written `unit_nrm*0.5+0.5` with alpha 1/0, **no blend state** on that target, write mask tied to depth writes, copied 1:1 at the pass break (`gx.cpp:332`, `shader.cpp:1648`, `encoding.cpp:317`) |
-| Buffer size mismatch | frame, depth and normal buffers all created at the same `(width, height)` in `resize_swapchain_internal`; snapshots copied at the pass's colour-attachment size |
-| Viewport inset | the scene viewport is forced to `(0,0,FB_WIDTH,FB_HEIGHT)` (`m_Do_graphic.cpp:2252`) and both user policies map it to the full target (`map_logical_viewport`) |
-| Camera identity under interpolation | the stage hook receives `&camera_p->view`, the same object `camera_apply_presentation()` rewrites through `dComIfGd_getView()` (`view_setup` → `dComIfGd_setView(view)`) |
-| Projection convention | camera service `e=-p22, f=-p23` matches aurora's `proj.m2 *= -1` reversed-Z conversion; reversed-Z is `constexpr` |
-| Uniform staging | mapped staging buffers copied per frame (`FrameSlotCount = 2`), aurora already clamps `minUniformBufferOffsetAlignment` for AMD (`f88a7e7`) |
-| Pipeline cache | keys are Dawn's, which hash the WGSL source |
-| Vendor-dependent shader semantics | shifts are masked, every `textureLoad` clamps, no `var<workgroup>` race in the MIP prefilter (Bevy's, re-checked), no wave ops, NaN guards negated (`!(len > eps)`) |
-| Upstream aurora after the pin | four commits, none touching rendering |
+| # | Pass | Shader / entry | Resolution | Reads | Writes |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| 1 | Depth prefilter | `preprocess_depth.wgsl` / `preprocess_depth` | chain | scene depth | depth MIPs 0–3 |
+| 2 | Last MIP | `preprocess_depth.wgsl` / `downsample_mip4` | chain | MIP 3 | MIP 4 |
+| 3 | Occlusion | `vbao.wgsl` / `vbao` | chain | depth MIPs, scene normal | `aoNoisy`, packed edge weights |
+| 4 | Spatial denoise, 0–3 times | `denoise.wgsl` / `spatial_denoise` | chain | AO, edge weights | AO (ping-pong `aoNoisy` ↔ `aoFinal`) |
+| 5 | Temporal (if on) | `temporal.wgsl` / `temporal_accumulate` | **full** | denoised AO, previous history, MIP 0, scene depth, scene normal | new history |
+| 6 | Composite (draw) | `composite.wgsl` / `vs_main`, `fs_main` | full | AO source, depths, normal | scene colour, multiply blend |
 
-**What shipped, in order, and what each fixed:**
+| Texture | Format | Size |
+| :-- | :-- | :-- |
+| Preprocessed depth | `R32Float`, 5 MIP levels | chain |
+| `aoNoisy`, `aoFinal` | `R32Float` | chain |
+| Edge weights | `R32Uint` (packed) | chain |
+| History ×2 | `RGBA16Float`: AO, view depth ÷ far, octahedral view-space normal | full render size |
 
-1. **Frame-time cap on the velocity term** (`kVelocityFusionFrameTime`, next section): a full
-   history reset is only reachable when frames are short enough for per-frame noise to fuse.
-2. **In-shader Hilbert noise.** `vbao.wgsl` computes the order-6 Hilbert index per pixel instead of
-   reading a 64×64 `R16Uint` texture the host uploaded with `wgpuQueueWriteTexture` at init. That
-   upload ran on the game thread while the render worker submitted, on a host that does **not**
-   enable Dawn's `implicit_device_synchronization` toggle — the one path in the chain that could
-   genuinely differ per driver, and a LUT reading as zero gives every pixel the same slice
-   directions: directional, hard-edged AO that changes every frame. Not proven to be the cause, and
-   correct either way (the procedural index is verified to be the permutation the LUT held).
-3. **Low Motion Response** removed the flicker in the field, and traded it for ghosting: moving
-   occluders left trails (Link's contact AO staying on ground he had left — the receiver reprojects
-   correctly, its stored AO is simply stale, and the depth test cannot see that). The content
-   reject had been an absolute `|history − current|` test against the noisy single-frame sample,
-   firing on noise and missing trails; it became a **σ-normalised outlier test against the 3×3
-   mean** (discard from ~1σ to 2.5σ), and the clamp tightens to 0.6k under screen motion.
-4. Environment ghosting gone; a **full-body trail behind Link** remained regardless of settings.
-   The disocclusion tolerance floor was `0.002` of the **far plane** — on TP's per-stage far planes
-   hundreds of world units, more than a character's separation from the ground behind him, so the
-   trail passed as "same surface". The tolerance is now **relative to the pixel's own depth**
-   (≥ 1.5%). Nothing in this scene is measured in far-plane fractions any more.
-5. A very soft trail just behind Link remained: structural, because the reprojection is the camera's
-   and Link is nearly static on screen while the world moves, so the camera-reprojected history for
-   a pixel on his body is a *neighbouring* part of his body. Per-object motion vectors would fix it
-   exactly, but the port's interpolation matrices live in the game (`dusk::interp`), not in aurora,
-   and a per-pixel motion attachment is a renderer change plus game-side plumbing. Within the mod:
-   the **two-candidate history** (the history stores the octahedral normal, the temporal pass reads
-   the scene normal, and the un-reprojected candidate wins wherever depth or normal says the
-   reprojected one is a different part of the surface). Cost: one extra history fetch and a normal
-   load per pixel; the history stays 8 bytes/pixel. Confirmed "phenomenal for Link".
-6. Link's AO then read less full; Motion Response 100% fixed that and made distant, broad AO sparse
-   in motion. Both are one fact at two distances: the raw estimate is dense close to the camera
-   (constant pixel radius, fine world sampling) and sparse far away. The velocity response now
-   **fades with view depth** (`motionRange`), and the default response is 100%. That is 1.1.0.
+**Depth prefilter.** A 5-level MIP chain (XeGTAO-style weighted downsample), so distant samples read
+small MIPs instead of thrashing bandwidth. In half-res mode, MIP 0 is a jittered point sample of the
+full-res depth (see [Half-res upsampling](#half-res-upsampling)).
 
-**Could the original report have been a driver issue?** Possibly; it cannot be proven or excluded
-from source. The paths where a driver can differ are the noise upload (removed), Dawn's
-inter-dispatch barriers for storage textures (Dawn-managed, heavily exercised), and frame pacing
-(AMD's Vulkan driver exposes no Mailbox present mode), which feeds the per-frame velocity term and
-is what the cap addresses.
+**Occlusion.** Per pixel: reconstruct the view position, read the authored normal (or return full
+visibility where there is none), then walk `slice_count` hemisphere slices × `steps_per_side`
+steps, carving a 32-bit sector bitmask per slice. Occlusion is the carved fraction weighted by a
+cosine lobe.
 
-**If a temporal report comes in again,** measure before theorising. View 7 (Raw AO) at rest is the
-first thing to look at: uniform directional streaking there means the noise, tiles mean the
-prefilter, and a clean view 7 with flicker in view 1 means the temporal pass itself.
+- *Sampling noise*: an order-6 Hilbert index computed in the shader plus an R2 sequence, advanced
+  every frame when temporal accumulation is on, so successive frames sample different directions.
+- *Thickness*: front and back horizons with a log-scaled thickness plus a radius-proportional floor
+  (`thickDist`), faded by depth difference. This is what keeps grass and foliage from
+  over-darkening.
+- *Rejection plane*: `geometric_normal_view()` derives a face normal from depth. It is not a
+  fallback for the authored normal. It defines the plane below which samples are rejected, which is
+  a property of the actual geometry rather than of the smoothed vertex normal. It is load-bearing:
+  feeding it a zero vector switches AO off. See `docs/authored_normals.md` §8.11.
+- *Radius*: a fraction of view depth that ramps from `radius` to `radiusFar` across
+  [`radiusRampStart`, `radiusRampEnd`] world units, then is capped at `radiusMax` of the screen
+  height. At default settings the cap is reached from roughly 4,600 world units of view depth (at a
+  60° field of view), so beyond that **Max Screen Radius**, not Far Radius, sets the radius.
 
-| View | Shows | If it is broken on the affected machine |
-|---|---|---|
-| 5 Geo Normal | the face normal `vbao.wgsl` derives from depth for its rejection plane | the depth chain / position reconstruction is wrong |
-| 6 Normal Agreement | `dot(authored, geometric)` banded: green > 0.95, yellow 0.8–0.95 (normal on smoothed low-poly curvature), red < 0.8, **white = negative** (authored normal points away from the surface), blue = no authored normal, magenta = degenerate geometry | red/white on **flat ground** with a clean view 5 means the authored normal reaches the mod in the wrong space, sign or frame |
-| 7 Raw AO | the single-frame estimate before denoise/accumulation, unshaped | wrong here = the occlusion pass itself; fine here but wrong in view 1 = denoise or temporal |
-| 8 Depth MIP 3 | the coarse prefiltered level the march samples at distance | tiles/blocks = the prefilter chain |
+**Denoise.** An edge-aware 3×3 filter, ping-ponged 0–3 times, blended by `denoiseStrength`. With
+temporal on it softens the remaining per-frame noise; with temporal off it is the only denoiser.
 
-**Protocol for the reporter:** same spot, standing still, screenshots of views 1, 2, 5, 6, 7 and 8,
-plus the mod's log lines `adapter: …` (GPU and backend) and `frame time …`. A green view 6 with a
-clean view 5 and a broken view 7 points into `vbao.wgsl`'s march; anything else points upstream of
-it. Do not propose a mechanism without those.
+**Composite.** Reads the AO 1:1 when the source is full resolution (temporal on, or half-res off);
+otherwise it does a depth-aware 4-tap upscale of the half-res result. Then, in order: black point
+(remove a small uniform floor and rescale), contrast (power), optional distance fade (back to 1
+across [`fadeStart`, `fadeEnd`] world units of view depth), intensity (`mix(1, v, intensity)`),
+multiplied over the scene colour.
 
-### Motion response and frame rate
+The composite pipelines are built lazily on the render worker from the live
+`GfxDrawContext::layout` and rebuilt when `layout.key` changes (`ensure_composite_pipelines`).
+VBAO's own request for normals changes the scene pass shape a frame after start-up; see
+`CONTRIBUTING.md` "Rules that have bitten before".
 
-The velocity term in `temporal.wgsl` is `screen motion in pixels per FRAME × motionResponse`, so
-one and the same camera pan produces twice the pixels per frame at 30 fps as at 60, and five times
-as many as at 144. At the 1.0.x default (0.1 per pixel, uncapped) a pan of 10 px/frame drove the
-blend weight to 1.0, i.e. threw the whole history away every frame and displayed the raw
-single-frame estimate, whose R2 sampling pattern advances every frame. At 144 Hz the eye fuses that
-into a mild shimmer; at 30–60 Hz it is plain boiling. The term is now **ceilinged by
-`kVelocityFusionFrameTime / frame time`** (`update_velocity_cap()` in `mod.cpp`, 4 ms), measured on
-the stage hook itself so it stays service-only: a full reset stays available above 250 fps, 144 fps
-allows ~0.58, 60 fps ~0.24 and 30 fps ~0.12, where the term drops below the base blend weight and
-is inert. The disocclusion and content rejects are **not** capped. The mod logs
-`frame time X ms (Y fps): motion response ceiling Z` whenever the smoothed interval moves by more
-than 25%. The response itself (default 100%) also fades with view depth — full up to `motionRange`,
-gone at twice it — see the tunables.
+### Temporal accumulation
 
-## Tunables (config vars; UI shows them in sections)
+The history is reprojected with the camera: `reproject = previous proj_from_world × current
+world_from_view`. Per pixel:
 
-Ints are fixed-point (usually /100) unless noted.
+- **Two history candidates.** The camera-reprojected one, and the un-reprojected one at the pixel's
+  own position. Each is scored on surface identity: depth mismatch relative to the pixel's own
+  depth, plus normal mismatch against the stored octahedral normal. The reprojected one is
+  preferred; the static one is taken only when it is clearly the better match. This stands in for
+  per-object motion vectors, which a service-only mod cannot get: a character the camera follows
+  (Link) is nearly static on screen, so his pixels take the static candidate.
+- **Disocclusion reject.** A candidate whose depth differs by at least `disoccTol` of the pixel's
+  own depth (floor 1.5%) is discarded, fully at 3×.
+- **Neighbourhood clamp.** History is clamped to mean ± k·σ of the 3×3 neighbourhood
+  (`temporalClamp`), tightened to 0.6k at 16 px/frame or more of screen motion.
+- **Outlier test.** History far from the 3×3 mean, measured in σ (`contentThresh`), is discarded.
+  This is what removes trails behind moving occluders.
+- **Motion response.** Screen motion in pixels per frame × `motionResponse` shortens the
+  accumulation. It applies fully up to `motionRange` world units of view depth and fades out by
+  twice that, because the raw estimate is dense up close and sparse far away. It is also capped by
+  frame time (`update_velocity_cap`, `kVelocityFusionFrameTime` = 4 ms): a full history reset is
+  only allowed when frames are short enough for per-frame noise to fuse visually. The ceiling is
+  about 0.58 at 144 fps, 0.24 at 60 fps and 0.12 at 30 fps. The disocclusion and outlier rejects are
+  not capped.
 
-| Var | Default | Meaning |
-|---|---|---|
-| `effectEnabled` | on | master toggle |
-| `quality` | 2 (High) | 0 Low 3/2, 1 Med 5/2, 2 High 7/3, 3 Ultra 9/3, 4 Custom — slices/steps |
-| `customSlices` / `customSteps` | 7 / 3 | used when quality = Custom (1–16 / 1–8) |
-| `radius` | 200 | effect radius up close, % of view depth (depth-proportional world radius) |
-| `radiusFar` | 800 | effect radius at long view distance (same scale). The radius ramps from `radius` to this across the band below — tight contact detail near, broad landmark depth far. 0 disables (constant `radius`) |
-| `radiusRampStart` / `radiusRampEnd` | 0 / 10000 | radius ramp band, **world units** of view depth (same scale as the shadow mod's Coverage). Not far-plane fractions: the far plane is per-stage and far beyond the visible field, so fractions of it were scene-dependent and absurdly compressed (the useful range was 0–5%). The mod logs the stage's far plane on change for calibration |
-| `radiusMax` | 40 | screen-space radius cap, % of viewport height. The search radius is constant in screen space, so this only engages (bounding sampling cost) when `radius` is pushed very high; at normal values it has no visible effect |
-| `intensity` | 150 | final strength multiplier ×0.01 (up to 500) |
-| `contrast` | 150 | value power ×0.01 — deepens (>100) or lifts the falloff |
-| `blackPoint` | 3 | % occlusion floor removed then rescaled (cleans flat surfaces — VBAO leaves a faint floor on open surfaces that reads as whole-screen darkening; 3 clears it) |
-| `thickness` | 150 | occluder thickness ×0.01 (log-scaled internally) |
-| `thickFade` | 150 | thickness fade range, ×0.01 of view radius |
-| `thickDist` | 60 | distance thickness: radius-proportional thickness floor, ‰ of the view radius. The log-scaled base thickness becomes a vanishing fraction of the (depth-proportional) radius with distance and starves mid/far occlusion; this restores it. 0 = old behavior |
-| `depthBias` | 4 | self-occlusion bias, ‰ toward camera |
-| `temporal` | on | temporal accumulation master |
-| `temporalFrames` | 8 | accumulation length → alpha = 1/frames |
-| `temporalClamp` | 200 | neighborhood clamp k ×0.01 (mean ± kσ over 3×3); tightened to 0.6k at ≥ 16 px/frame of screen motion |
-| `motionResponse` | 100 | accumulation shortening per pixel of screen motion **per frame** ×0.01, applied within `motionRange` and faded out beyond it, and capped by a frame-time-aware ceiling — see "Motion response and frame rate" below. Field-validated at 100 for full, responsive AO on characters once the range fade protected distant AO |
-| `motionRange` | 5000 | world units of view depth up to which `motionResponse` applies in full; fades to nothing at 2×. Near geometry is sampled densely (clean single frames), distant AO sparsely (needs the accumulation); 0 = no fade |
-| `contentThresh` | 100 | history outlier threshold ×0.01, in **sigmas of the 3×3 local AO distribution** (100 = discard from ~1σ to 2.5σ from the local mean). Was an absolute `|history − current|` test against the noisy single-frame sample, which fired on noise and missed trails; the σ-normalised test against the mean is what removes moving-occluder ghosting now that the velocity term no longer resets history |
-| `disoccTol` | 0 | disocclusion depth tolerance, % of the pixel's own depth (0–20; below 1.5 acts as 1.5). The old floor was `0.002` of the **far plane**, i.e. 400 world units on a 200000-unit stage, larger than Link, so ground he had just vacated kept his AO as a full-body trail |
-| `denoisePasses` | 1 | spatial passes 0–3 (ping-pong parity is mirrored on the CPU side —
-  see mod-api-notes) |
-| `denoiseStrength` | 60 | per-pass blur blend, % (0 raw, 100 full blur). Lowered from full so the sharper temporal result keeps its detail |
-| `halfRes` | off | compute occlusion at half resolution. With temporal accumulation on, a jittered temporal upsampler reconstructs full-res detail (near-full-res look at ¼ the occlusion cost); with it off, a depth-aware bilinear upscale (softer) |
-| `distanceFade` | off | fade AO out toward the far plane |
-| `fadeStart` / `fadeEnd` | 15000 / 40000 | fade band, world units of view depth (converted from far-plane % for the same reason as the radius ramp band) |
-| `debugMode` | 0 | 0 off, 1 AO, 2 normals, 3 depth, 4 staircase, 5 geometric normal, 6 normal agreement, 7 raw AO, 8 depth MIP 3 (see "Temporal accumulation: history and diagnostics") |
-| `debugDepthRange` | 3300 | depth debug view gradient scale in world units (visualization only) |
+The history is invalidated when the textures are reallocated, when the effect or temporal
+accumulation is turned off, and when depth or normals are unavailable.
 
-Debug views draw at `FRAME_BEFORE_HUD` (the normal composite stays at `SCENE_AFTER_OPAQUE`)
-so deferred fog, translucency, and bloom never paint over them — judging AO strength through
-a fogged debug view reads as much weaker than the effect actually is.
+### Half-res upsampling
 
-## Defaults rationale + performance notes
+With **Half Resolution** and **Temporal Accumulation** both on (the defaults), the half-res
+estimate is reconstructed to full resolution instead of blurred up:
 
-Defaults were chosen to match the look the user approved on the aurora branch: High quality,
-intensity/contrast 150, thickness 150, 5-frame accumulation, 1 denoise pass; later in-game
-tuning moved radius to 200 near / 800 far (distance ramp) and denoise strength to 60%.
-Exposing everything costs nothing per frame — values upload in one uniform buffer that is
-written every frame regardless; only `quality`/`halfRes`/`denoisePasses` change the actual
-GPU work. Hardcoding would not measurably help: the shader reads the uniform once per pixel.
+- The half-res sample grid is jittered through the 4 positions of each 2×2 full-res block, keyed off
+  the frame index (`load_input_depth` in `preprocess_depth.wgsl`, `chain_uv` in `vbao.wgsl`). Each
+  frame estimates a different quarter of the full-res pixels.
+- The temporal pass runs at full resolution. A pixel covered by this frame's jitter takes the new
+  sample and accumulates; an uncovered pixel carries its history forward, falling back to a
+  depth-aware upscale only when it has no valid history. Full coverage refreshes every ~4 frames.
+- At full resolution every pixel is covered, so this reduces to plain per-pixel accumulation.
 
-Suggested experiments (from the porting session): Ultra quality; `denoisePasses 0` with
-temporal on (sharpest, tests accumulation quality); `blackPoint` 5–8 to clean broad floors;
-`distanceFade` on with 40/90 against TP's fog; `halfRes` with temporal on (the jittered upsampler
-reconstructs full-res detail, so it stays close to full-res at ~¼ the occlusion cost — a strong
-default candidate) or at high supersampling.
+## Options
 
-## History / provenance
+Defaults are registered in the `boolOptions[]` and `intOptions[]` tables in `mod_initialize`. Each
+value is read every frame (with a clamp and a scale) into the uniform block, so changes apply live.
+Only `quality`, the custom slice/step counts, `halfRes`, `denoisePasses`, `temporal` and
+`effectEnabled` change how much GPU work runs; the radius options affect bandwidth through MIP
+selection.
 
-Ported from our earlier pre-mod-API implementation in the `dusklight-ao` + `aurora-ao`
-forks onto Encounter's upstream `ao_mod` demo framework: the demo
-contributed the MIP depth chain, compute scheduling, and denoiser; ours contributed the
-bitmask estimator, temporal accumulation, depth-aware upscale, thickness/contrast/black
-point, and distance fade. Never reference MXAO in code or comments.
+| Config key | UI label | Default | Range | Meaning |
+| :-- | :-- | :-- | :-- | :-- |
+| **Effect** | | | | |
+| `effectEnabled` | Enabled | on | | Master switch. Off keeps the mod loaded and idle |
+| `intensity` | Intensity | 150 | 0–500 (%) | Final strength |
+| `contrast` | Contrast | 150 | 50–300 (%) | Power applied to visibility; >100 deepens the falloff |
+| `blackPoint` | Black Point | 1 | 0–30 (%) | Uniform occlusion floor removed before rescaling; cleans open flat surfaces |
+| **Occlusion** | | | | |
+| `quality` | Quality | 2 (High) | 0–4 | Slices × steps per side: Low 3×2, Medium 5×2, High 7×3, Ultra 9×3, Custom |
+| `customSlices` / `customSteps` | Custom Slices / Custom Steps | 7 / 3 | 1–16 / 1–8 | Used when Quality is Custom |
+| `radius` | Radius | 200 | 25–800 (‰ of view depth) | Effect radius up close: 200 = 0.2 × view depth |
+| `radiusFar` | Far Radius | 800 | 0–800 (‰) | Radius at long range; 0 disables the ramp |
+| `radiusRampStart` / `radiusRampEnd` | Far Radius Start / End | 0 / 10000 | world units | View-depth band over which the radius ramps from near to far |
+| `radiusMax` | Max Screen Radius | 40 | 10–100 (% of screen height) | Cap on the screen-space radius. Active at defaults beyond ~4,600 units, where it limits Far Radius |
+| `thickness` | Thickness | 150 | 25–400 (%) | Assumed occluder thickness (log-scaled) |
+| `thickFade` | Thickness Fade Range | 150 | 50–400 (%) | Depth range over which thickness fades, relative to the radius |
+| `thickDist` | Distance Thickness | 60 | 0–100 (‰ of radius) | Radius-proportional thickness floor; keeps mid and far occlusion from being starved. 0 disables |
+| `depthBias` | Depth Bias | 1 | 0–20 (‰) | Self-occlusion bias toward the camera |
+| **Temporal** | | | | |
+| `temporal` | Temporal Accumulation | on | | Master switch for accumulation |
+| `temporalFrames` | Temporal Frames | 8 | 2–12 | Accumulation length; blend weight = 1/frames |
+| `temporalClamp` | Temporal Clamp | 200 | 100–300 (%) | k in mean ± k·σ |
+| `motionResponse` | Motion Response | 100 | 0–100 (%) | Accumulation shortening per pixel/frame of motion |
+| `motionRange` | Motion Response Range | 5000 | world units | Full motion response up to this depth, none at 2×. 0 = no fade |
+| `contentThresh` | Content Response | 100 | 25–300 (%) | Outlier threshold in σ of the 3×3 neighbourhood (100 = reject from ~1σ to 2.5σ) |
+| `disoccTol` | Disocclusion Tolerance | 0 | 0–20 (% of own depth) | Below 1.5 acts as 1.5 |
+| **Filtering** | | | | |
+| `denoisePasses` | Denoise Passes | 1 | 0–3 | Spatial filter passes |
+| `denoiseStrength` | Denoise Strength | 60 | 0–100 (%) | Per-pass blend toward the filtered value |
+| `halfRes` | Half Resolution | on | | Estimate at half resolution; with temporal on, reconstructed to full res |
+| **Distance Fade** | | | | |
+| `distanceFade` | Distance Fade | off | | Fade AO out with distance |
+| `fadeStart` / `fadeEnd` | Fade Start / Fade End | 15000 / 40000 | world units | Fade band in view depth |
+| **Debug** | | | | |
+| `debugMode` | Debug View | 0 | 0–8 | See below |
+| `debugDepthRange` | Debug Depth Range | 3300 | world units | Gradient scale for the depth views |
+
+World-unit options are absolute distances. The camera's far plane is per stage and far beyond the
+visible field, so nothing here is a far-plane fraction; the mod logs the stage's far plane when it
+changes, for calibration.
+
+## Debug views
+
+Debug views are drawn at `FRAME_AFTER_HUD`, the last stage, so fog, translucency, bloom and the HUD
+cannot paint over them. They replace the whole frame, HUD included, and the normal AO composite is
+not drawn while one is selected.
+
+| # | View | Shows | If it looks wrong |
+| :-- | :-- | :-- | :-- |
+| 1 | AO | The final shaped term in grayscale | |
+| 2 | Normals | The authored normal snapshot as `n*0.5+0.5`; black where there is none | |
+| 3 | Depth | Prefiltered depth MIP 0, white = near | |
+| 4 | Staircase | Raw depth curvature ÷ gradient (R = x, G = y) | |
+| 5 | Geo Normal | The face normal derived from depth for the rejection plane; magenta = degenerate, black = sky | Depth chain or position reconstruction is wrong |
+| 6 | Normal Agreement | `dot(authored, geometric)`: green > 0.95, yellow 0.8–0.95 (smoothed low-poly curvature), red < 0.8, white < 0, blue = no authored normal, magenta = degenerate | Red or white on **flat ground** with a clean view 5: the normal reaches the mod in the wrong space, sign or frame |
+| 7 | Raw AO | `aoNoisy`, unshaped | Wrong here: the occlusion pass. Fine here, wrong in view 1: denoise or temporal |
+| 8 | Depth MIP 3 | The coarse level the march samples at distance | Tiles or blocks: the prefilter |
+
+View 7 is the single-frame estimate only with Denoise Passes at 0 or 1. With 2 or 3 passes the
+ping-pong overwrites `aoNoisy`, so view 7 shows a partially denoised image (see Known issues).
+
+**For a flicker or artefact report**, ask for screenshots of views 1, 2, 5, 6, 7 and 8 from the
+same spot while standing still, plus the `adapter:` and `frame time` log lines. Start with view 7 at
+rest: directional streaking means the noise, tiles mean the prefilter, and a clean view 7 with
+flicker in view 1 means the temporal pass.
+
+## Log lines
+
+| Line | Meaning |
+| :-- | :-- |
+| `vbao ready` | Initialised |
+| `adapter: ... backend ... vendorID ...` | GPU and backend, logged once |
+| `Enhanced AO chain executed OK` | The compute chain ran once |
+| `camera far plane: N world units` | The stage's far plane changed |
+| `frame time X ms (Y fps): motion response ceiling Z` | The frame-time cap moved by more than 25% |
+| a warning naming MSAA or the compatibility renderers | Normals or depth unavailable; VBAO is off. Logged once per session |
+
+## Known issues
+
+- **View 7 is not raw with 2–3 denoise passes** (above). The debug view should read a buffer the
+  denoiser never writes.
+- **Half-res history after a ±1 pixel resize.** `ensure_targets` keys on the chain size only, so in
+  half-res a render size change that leaves the chain size the same (an odd width becoming even,
+  for example) keeps full-res history textures of the old size. The composite's size test then
+  treats the history as half-res until the next chain resize.
+- **No history reset on a camera cut or failed camera read.** Only the per-pixel rejects catch a
+  cut. Likewise, if the compute callback skips the chain (a bind group failed to create), the game
+  thread has already marked the history valid and flipped it.
+- **The MSAA warning tells the player to turn antialiasing off in the video settings**, a setting
+  this game build does not have. Harmless today, since MSAA is never on.
+- **Thickness uses the uncapped radius.** When Max Screen Radius limits the search radius at long
+  range, the thickness and fade range still follow the full Far Radius. Possibly intended; untested.
+- **Read-site fallbacks differ from the registered defaults** for `halfRes`, `blackPoint`,
+  `depthBias` and `temporalFrames`. The fallback is only used if registration failed, so this is
+  cosmetic, but it makes the code misleading to read.
+- **Debug views 5 and 6 in half-res + temporal** reconstruct positions from the jittered MIP 0 at
+  unjittered coordinates, a sub-texel misregistration against what the occlusion pass uses.
+- **No per-object motion vectors.** Moving characters are handled by the two-candidate history, not
+  exactly. Real motion vectors would need a renderer change and game-side plumbing.
+
+## Changing things
+
+- **An option** lives in three places: its default in the option table, its read site in
+  `on_scene_after_opaque` (fallback, clamp, scale), and its UI control in `build_controls_tab`.
+  Keep the read-site clamp and the UI range in step. See `docs/editing-options.md`.
+- **A uniform field** means editing `AoUniforms` in `mod.cpp` and the `Uniforms` struct in **all
+  five** shaders, and keeping the size `static_assert` true.
+- **`ComputePayload` is exactly 128 bytes**, the payload limit, so adding a field to it needs
+  something else removed or packed. Resolutions are already packed as `width << 16 | height`.
+- **Compute bind-group layouts are automatic** (taken from each pipeline), so a binding that its
+  entry point does not use disappears from the layout and bind-group creation fails, skipping the
+  chain for that frame. `vbao.wgsl` deliberately has no binding 1 (a removed noise texture).
+- Validate shaders with `tools/wgsl_check` before pushing (see `CONTRIBUTING.md`).
+
+## History
+
+### Temporal accumulation in 1.1.0
+
+The 1.0.x builds had reports of AO flickering in motion, mostly on AMD GPUs and some on NVIDIA.
+Disabling temporal accumulation removed it. Each change below was confirmed in the field before the
+next:
+
+1. **Frame-time cap on the velocity term.** The velocity term reset the whole history on ordinary
+   pans and displayed the raw single-frame estimate, whose sampling pattern changes every frame. At
+   144 Hz that fuses into mild shimmer; at 30–60 Hz it boils. The cap allows a full reset only above
+   250 fps.
+2. **In-shader Hilbert noise** replaced a 64×64 noise texture uploaded at init. That upload ran on
+   the game thread while the render worker submitted, on a host without Dawn's implicit device
+   synchronization: the one path in the chain that could genuinely differ per driver. Not proven to
+   be the cause, but correct either way.
+3. **σ-normalised outlier test.** A low motion response removed the flicker but left trails behind
+   moving occluders. The old content reject compared history against the noisy single-frame sample
+   in absolute terms; comparing against the 3×3 mean in units of σ fixed the trails.
+4. **Disocclusion tolerance relative to the pixel's depth.** The old floor was 0.002 of the far
+   plane, hundreds of world units on TP's per-stage far planes, which let a full-body trail behind
+   Link pass as "same surface".
+5. **Two-candidate history.** A soft trail behind Link remained because camera reprojection maps a
+   pixel on a screen-static character to a neighbouring part of his body. The stored normal plus the
+   static candidate fixed it.
+6. **Depth-faded motion response, default 100%.** Full response made characters crisp but made
+   distant AO sparse in motion. Fading the response with view depth gives both.
+
+Ruled out along the way, by reading the pinned source (kept so it need not be re-derived):
+
+| Ruled out | Why |
+| :-- | :-- |
+| Depth snapshot precision | `Depth32Float` copied to `R32Float` on every backend |
+| Normal attachment path | `RGB10A2Unorm`, no blend state on that target, write mask tied to depth writes, copied 1:1 |
+| Buffer size mismatch | Colour, depth and normal buffers are all created at the same size |
+| Viewport inset | The scene viewport covers the full target |
+| Camera identity under frame interpolation | The stage hook receives the same view object the interpolation rewrites |
+| Projection convention | The camera service's reversed-Z terms match aurora's conversion |
+| Uniform staging | Per-frame staging buffers; aurora already handles AMD's uniform offset alignment |
+| Vendor-dependent shader behaviour | Masked shifts, clamped loads, no workgroup-memory race, no wave ops, NaN-safe guards |
+
+Whether the original report was partly a driver issue cannot be settled from source. The remaining
+per-driver variables are Dawn's barriers between storage-texture dispatches and frame pacing (AMD's
+Vulkan driver has no Mailbox present mode), and the latter is what the frame-time cap addresses.
+
+### Defaults
+
+The look was first tuned on the pre-mod-API forks: High quality, intensity and contrast 150,
+thickness 150. In-game tuning since then moved the radius to 200 near / 800 far, denoise strength
+to 60%, temporal frames to 8, black point to 1, depth bias to 1, and made Half Resolution the
+default once the jittered temporal upsampler made it look close to full resolution.
+
+### Origin
+
+VBAO was ported from the maintainer's earlier implementation in the retired `dusklight-ao` and
+`aurora-ao` forks onto upstream's `ao_mod` demo framework.

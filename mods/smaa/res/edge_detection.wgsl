@@ -1,27 +1,24 @@
-// SMAA — pass 1: edge detection (compute).
+// SMAA pass 1: edge detection (compute, 8x8 workgroups).
 //
-// Writes a two-channel edge mask (EdgesTex.r = edge on this pixel's LEFT boundary, .g = edge on
-// its TOP boundary) and, in the same pass, clears BlendTex to zero so the compacted blend-weight
-// pass (pass 2) can write only the sparse edge pixels and leave the rest at 0 (the folded-clear
-// trick from Marty's iMMERSE SMAA / CMAA2 — one pass instead of a separate clear).
+// Writes EdgesTex: .r = edge on this pixel's left boundary, .g = edge on its top boundary.
+// Also writes 0 to BlendTex at every pixel. Pass 2 writes only the edge pixels, so this stands in
+// for a separate clear pass.
 //
-// Two detectors are unioned:
-//   * Luma: the reference SMAA luma edge detector with local contrast adaptation (MIT SMAA,
-//     Jimenez et al.). Catches shading / texture / alpha-test edges.
-//   * Geometric: an angular difference of the game's authored view-space
-//     normal, plus a relative raw-depth discontinuity. Catches silhouettes AND creases (surfaces
-//     meeting at an angle with continuous depth) that luma misses on TP's flat-shaded art. Enabled
-//     only when the scene normals and a depth snapshot are both available (flags bit 0).
+// Two detectors, unioned:
+//   - Luma: the reference SMAA luma edge detector with local contrast adaptation, reimplemented
+//     from the MIT reference (iryoku/smaa). Catches shading, texture and alpha-test edges.
+//   - Geometric (flags bit 0; set only when the normal and depth snapshots both exist and the
+//     option is on): the angle between neighbouring authored normals, plus a relative raw-depth
+//     step. Catches silhouettes and creases (surfaces meeting at an angle with continuous depth)
+//     that luma misses on TP's flat-shaded art.
 //
-// Reversed-Z: sky raw depth is 0; near is 1. The scene normal texture holds the game's AUTHORED
-// view-space normal encoded xyz * 0.5 + 0.5, with alpha 1 where it is usable and 0 where it is not
-// (sky, billboards, draws with no normal attribute). Depth comes from its own snapshot: the old
-// old provider packed depth into this texture's alpha; the service uses that alpha for validity.
+// Inputs: depth is raw reversed-Z (1 = near, sky = 0). normal_tex holds the game's authored
+// view-space normal encoded xyz * 0.5 + 0.5; alpha is validity (1 = valid normal, 0 = none).
+// A dot product between two normals only needs them in the same space, so view space is fine.
 //
-// The angle test below is a dot product between two normals in the SAME space, which is invariant
-// under a shared rotation - so view-space normals need no conversion here, unlike a shading term.
-//
+// Provenance: res/licenses/ATTRIBUTION.txt.
 
+// Mirrors SmaaUniforms in src/mod.cpp (and the copies in the other two shaders).
 struct Uniforms {
     screen_size: vec2f,
     inv_screen_size: vec2f,
@@ -64,10 +61,10 @@ fn edge_detection(@builtin(global_invocation_id) gid: vec3u) {
     }
     let p = vec2i(gid.xy);
 
-    // Always clear this pixel's blend weights (pass 2 overwrites only the edge pixels).
+    // Clear this pixel's blend weights; pass 2 overwrites only the edge pixels.
     textureStore(blend_clear_out, p, vec4f(0.0));
 
-    // --- Luma edge detection (reference SMAA, with local contrast adaptation) ---
+    // --- Luma edges (reference SMAA) ---
     let L = load_luma(p, dims);
     let Lleft = load_luma(p + vec2i(-1i, 0i), dims);
     let Ltop = load_luma(p + vec2i(0i, -1i), dims);
@@ -75,9 +72,10 @@ fn edge_detection(@builtin(global_invocation_id) gid: vec3u) {
     var delta_lt = abs(L - vec2f(Lleft, Ltop));
     var luma_edges = step(vec2f(uniforms.threshold), delta_lt);
 
-    // Local contrast adaptation: suppress an edge when a much stronger neighbouring gradient runs
-    // parallel to it (kills doubled/edges inside high-contrast texture). Only meaningful when at
-    // least one edge fired; cheap enough to always run in a compute pass.
+    // Local contrast adaptation: drop an edge whose luma step is less than 1/local_contrast_factor
+    // of the largest step on this pixel's four boundaries and the boundaries one further left and
+    // up. Stops doubled edges inside high-contrast texture. Reference SMAA skips this when no edge
+    // fired; here it always runs.
     let Lright = load_luma(p + vec2i(1i, 0i), dims);
     let Lbottom = load_luma(p + vec2i(0i, 1i), dims);
     let delta_rb = abs(L - vec2f(Lright, Lbottom));
@@ -91,32 +89,31 @@ fn edge_detection(@builtin(global_invocation_id) gid: vec3u) {
 
     var edges = luma_edges;
 
-    // --- Geometric edge detection from the scene normals + depth ---
+    // --- Geometric edges (authored normals + depth) ---
     if ((uniforms.flags & 1u) != 0u) {
         let ndims = textureDimensions(normal_tex);
         let nc = textureLoad(normal_tex, clamp_coord(p, ndims), 0i);
         let nl = textureLoad(normal_tex, clamp_coord(p + vec2i(-1i, 0i), ndims), 0i);
         let nt = textureLoad(normal_tex, clamp_coord(p + vec2i(0i, -1i), ndims), 0i);
 
-        // Decode before comparing. The stored value is xyz * 0.5 + 0.5, so a dot product of the
-        // RAW texels is meaningless - every component is biased positive and even opposed normals
-        // would score as similar.
+        // Decode before comparing: the raw texels are biased positive (xyz * 0.5 + 0.5), so even
+        // opposed normals would score as similar.
         let dc_n = normalize(nc.xyz * 2.0 - 1.0);
         let dl_n = normalize(nl.xyz * 2.0 - 1.0);
         let dt_n = normalize(nt.xyz * 2.0 - 1.0);
 
-        // Angular difference: 0 = coplanar, grows with the crease/silhouette angle. Only meaningful
-        // where BOTH texels are valid: alpha 0 stores (0.5,0.5,0.5), which decodes to a zero vector
-        // and would normalize() to NaN, and NaN compares false so the edge would silently vanish.
-        // Gate explicitly instead, and let the DEPTH test carry those pixels - a sky or billboard
-        // boundary is a depth discontinuity, which is exactly what that test is for.
+        // Angular difference, 1 - cos(angle): 0 for parallel normals, growing with the angle. Only
+        // used where both texels are valid. A draw without normals stores (0.5, 0.5, 0.5), which
+        // decodes to a zero vector and normalizes to NaN, and a NaN comparison would silently drop
+        // the edge. Boundaries next to invalid pixels (e.g. sky) are left to the depth test.
         let valid_l = nc.w >= 0.5 && nl.w >= 0.5;
         let valid_t = nc.w >= 0.5 && nt.w >= 0.5;
         let normal_delta = vec2f(
             select(0.0, 1.0 - dot(dc_n, dl_n), valid_l),
             select(0.0, 1.0 - dot(dc_n, dt_n), valid_t));
 
-        // Relative raw-depth discontinuity (reversed-Z; robust across the depth range and to sky=0).
+        // Relative raw-depth step: |difference| / the larger raw depth (the nearer one, in
+        // reversed-Z). Sky next to sky gives 0; sky next to geometry gives 1.
         let ddims = textureDimensions(depth_tex);
         let dc = textureLoad(depth_tex, clamp_coord(p, ddims), 0i).r;
         let dl = textureLoad(depth_tex, clamp_coord(p + vec2i(-1i, 0i), ddims), 0i).r;

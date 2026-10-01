@@ -1,5 +1,16 @@
 # Authored normals (scene normal buffer) — consuming them, and how to A/B them
 
+> **Reading guide.** This is mostly a record of how the authored-normal work was done and what it
+> taught. For the current API and runtime behaviour, `docs/normal_buffer_portability.md` is shorter
+> and authoritative. Still current and relevant to the released mods here: §2a (never flip a normal
+> toward the camera), §5 (scene-pass layout), §7 (API surface), and §8.1–8.3, 8.5, 8.11 and 8.11a
+> (debugging lessons, and why VBAO's AO hemisphere comes from geometry). Historical: §1, §3, §4,
+> §4a, the commit table in §0, §8.4 and 8.6–8.10 and 8.12 (mostly Realtime Sun Shadows, which is
+> unreleased), and §9 (whether a mod could build the buffer itself; settled when upstream shipped
+> its own). Anything mentioning Graphics Hub, the Depth to Normal provider, a "Use Authored
+> Normals" toggle, a reconstruction fallback, a Video setting, or `scene_pass_layout` as the call to
+> use describes an earlier state of the tree.
+
 **Status:** landed in the mods and **verified in-game** — the back-lit-character artefacts that
 drove most of §8 are confirmed resolved (see §0). **The platform side is now UPSTREAM**: Dusklight
 2.0 (GameService 2.0 / GfxService 1.3) ships the normal snapshot itself, with the attachment in
@@ -43,11 +54,11 @@ device is torn down (`enable_normal_buffer()` sets `g_graphicsConfig.normalBuffe
 `resize_swapchain` re-creates the texture at the new size). So a null view means "not yet" at least
 as often as it means "never", and a consumer must not treat the first one as a hard failure.
 
-**Two things make it "never", and the first is a SETTING, not a hardware limit:**
+**Two things make it "never":**
 
 | Blocker | Where | Can the user fix it? |
 |---|---|---|
-| **MSAA is on** (`msaaSamples != 1`) | `aurora/lib/webgpu/gpu.cpp` `enable_normal_buffer()`, and `lib/gfx/recording.cpp` `resolve_pass`, which does not even *record* the request | **Yes** — set antialiasing to none |
+| **MSAA is on** (`msaaSamples != 1`) | `aurora/lib/webgpu/gpu.cpp` `enable_normal_buffer()`, and `lib/gfx/recording.cpp` `resolve_pass`, which does not even *record* the request | Not applicable today: the `v2.0.0` game build has no MSAA setting and always runs at sample count 1 |
 | Adapter lacks WebGPU `CoreFeaturesAndLimits` (`g_hasCoreFeatures`) — the D3D11 / OpenGL ES compatibility renderers | same two sites | No |
 
 MSAA matters more than it looks: today Dusklight never assigns `AuroraConfig::msaa` and aurora
@@ -59,7 +70,8 @@ rather than blaming the renderer; see `kNormalLatchGraceFrames` in either mod.
 Why it matters: a depth-gradient normal is a cross product of screen-space position deltas, i.e.
 the flat face normal of each rasterized triangle — faceting is inherent to the method. Authored
 normals are smooth by construction, which removes the faceting *at the source* rather than blurring
-it away afterwards. See `dusklight-ao/docs/thin-gbuffer-normals.md` for the renderer-side design.
+it away afterwards. The renderer-side design write-up, `docs/thin-gbuffer-normals.md`, exists only in
+the retired fork repository `automata-rtx/dusklight-ao`; it is not in upstream.
 
 ---
 
@@ -113,7 +125,7 @@ none of it depends on how the snapshot is requested.
 | `3cbab91`–`8cc46b9` | AO occlusion hemisphere built from geometry, not the shading normal; the rejection plane made a 4-tap ±1 in both mods (§8.11, §8.11a). |
 | `b426c4d` | Shadow map and `n·L` terms combined by multiplying visibilities instead of `max` — fixes the terminator glint (§8.12). |
 | `(earlier)` | Re-pinned to the fork's **GfxService 1.3**. Our scene-layout fork deleted in favour of upstream's; `normal_format` accessor removed; `has_normal_attachment` is the new "does this build have authored normals" (§5, §7). |
-| *(this change)* | **Re-platformed onto UPSTREAM Dusklight 2.0** (`c83ce89`), which ships its own GfxService 1.3 normal snapshot — a *different shape* from the fork's, and binary-incompatible with it (§0, §7). The fork is retired and both fork knobs are gone from `CMakeLists.txt`. VBAO and SMAA ported to the resolve pair, given lazy `layout.key`-keyed pipelines for the latch, and taught to name MSAA as the blocker it usually is. Build scoped to those two mods; the other five await porting or hook re-verification. |
+| *(this change)* | **Re-platformed onto UPSTREAM Dusklight 2.0** (`c83ce89`), which ships its own GfxService 1.3 normal snapshot — a *different shape* from the fork's, and binary-incompatible with it (§0, §7). The fork is retired and both fork knobs are gone from `CMakeLists.txt`. VBAO and SMAA ported to the resolve pair, given lazy `layout.key`-keyed pipelines for the latch, and taught to name MSAA if it is ever the blocker. Build scoped to those two mods; the other five await porting or hook re-verification. |
 | *(this change)* | Pin moved from the bare SHA `c83ce89` to the **`v2.0.0` release tag** (`e9b12054`) — five commits, **no `sdk/` diff at all**, so no ABI or header movement and no mod source change. Aurora moved `34dadd3c` → `7d4484a`, two RmlUi commits, nothing near the normal attachment. Deferred Fog's ten hook targets and the ten allowlisted source citations were each re-checked in the new tree and were unchanged. |
 
 ### Confirmed in-game by the user
@@ -271,8 +283,9 @@ provider's own 0.5, so it planted the seam nearer the horizon — precisely wher
 widest on screen. It also never fired on the reconstruction path (already camera-facing), so despite
 the general-sounding comment it only ever acted on authored normals.
 
-All of them are now deleted. The four surviving flips in the tree are all on cross-product
-reconstructions, which is the one case that needs them:
+All of them are now deleted. At the time, the four surviving flips in the tree were all on
+cross-product reconstructions, which is the one case that needs them (Graphics Hub's and VBAO's
+`reconstruct_normal` have since been removed with the provider):
 `graphics_hub/reconstruct.wgsl` `reconstruct_normal`, `vbao/vbao.wgsl` and `vbao/composite.wgsl`
 `reconstruct_normal`, and `realtime_sun_shadows/shadow.wgsl` `geometric_normal_at`.
 
@@ -291,6 +304,10 @@ it as given. A consumer that "corrects" it against the view re-creates this bug.
 
 ## 3. Coverage and the fallback
 
+> **Historical in part.** Nothing reconstructs any more: pixels with alpha 0 get full visibility in
+> VBAO, and SMAA skips the normal test there. There is no Coverage view. The coverage rule itself
+> (normals are written exactly where depth is written) is current.
+
 The renderer gates the normal write on **depth-writing draws** (`depthCompare && depthUpdate`), not
 on opaque-only. That deliberately matches the depth buffer: the same set of pixels the depth
 reconstruction already covered, depth-writing water included. Additive/blended effects that do not
@@ -308,12 +325,12 @@ should be seamless, not a visible seam.
 > away short of changing platform. The upstream equivalent of step 1–2 is below.
 
 1. **Prereq.** Install the pinned upstream game build **and** fresh `.dusk` files as a matched pair.
-   Mods failing to load outright is the symptom of getting this wrong — the GameService 2.0 major
-   bump refuses mismatched builds before any of this is observable.
+   Deferred Fog failing to load outright is the symptom of getting this wrong: the GameService 2.0
+   major bump refuses game-linked mods built against an older SDK.
 2. **First frames.** Load a scene and watch the log. Nothing should warn about missing normals: the
    first resolve legitimately returns null and both mods wait out `kNormalLatchGraceFrames` before
-   saying anything. A warning here means either MSAA is on or the renderer has no core features —
-   the message says which.
+   saying anything. A log line here (a warning from VBAO, an INFO line from SMAA) means the renderer has no
+   core features; MSAA cannot be on in the `v2.0.0` build.
    **Then check the composites are still drawing.** This is the step that catches a pipeline built
    against the one-attachment pass and not rebuilt when the normal attachment latched on (§5, §7);
    the failure is silent in-game and looks like the mod doing nothing.
@@ -399,13 +416,14 @@ effect: **VBAO's "Normals" view always reconstructed from depth**, even while th
 consuming the provider's authored normal — its help text claimed it showed "the normals the
 occlusion pass consumes", which was no longer true. It now makes the same choice `vbao.wgsl` makes
 (provider normal when flags bit 3 is set, inline reconstruction otherwise), so it cannot claim a
-source the AO is not using.
+source the AO is not using. (Since the provider was retired VBAO has no reconstruction fallback at
+all; view 2 always shows the snapshot the AO reads.)
 
 Checked and clean: SSILVB (hard service dependency, no inline reconstruction anywhere) and SMAA
 (no normal debug view; its normal is an optional edge-detection input that stands in with the
-colour snapshot). The only remaining inline depth→normal reconstructions in the repo are VBAO's
-fallback for when the provider is absent, the shadow composite's last-resort cross, and the
-provider's own — which is the point.
+colour snapshot). At the time, the only remaining inline depth→normal reconstructions were VBAO's
+fallback for when the provider was absent, the shadow composite's last-resort cross, and the
+provider's own. VBAO's fallback and the provider are gone now.
 
 **Still to do, after verification** (deliberately not in the same push, so each reverts alone):
 
@@ -430,10 +448,12 @@ exempt stage.
 **Ask the service for the layout; do not rebuild it.** `get_scene_target_layout(…)` returns a
 `GfxRenderTargetLayout` — one entry per attachment, each tagged with a `GfxAttachmentSemantic` — and
 the SDK's inline `gfx_init_color_target_states` turns that into a `WGPUColorTargetState[]` with
-every attachment the mod does not own already write-masked off. All six sites go through
-`gfx_compat::scene_pass_layout` (see `docs/normal_buffer_portability.md` §3): VBAO and SSILVB
-composites (blend + debug), SMAA neighborhood blend, Deferred Fog's fullscreen quad (and, in the
-provider era, Graphics Hub's normal debug overlay), Realtime Sun Shadows composite. The WGSL is unchanged — a fragment shader
+every attachment the mod does not own already write-masked off. The released mods build their
+scene-pass pipelines in the draw callback with `gfx_compat::scene_pass_layout_for_draw` and rebuild
+them when `gfx_compat::scene_pass_layout_key` changes: VBAO's composites, SMAA's neighborhood blend
+and Deferred Fog's fullscreen quads. The unreleased SSILVB and Realtime Sun Shadows still call the
+older `scene_pass_layout` once and must be converted before they return (see
+`docs/normal_buffer_portability.md`). The WGSL is unchanged — a fragment shader
 returning a single `@location(0)` value is valid against a pipeline whose other targets are masked.
 
 Two earlier versions of this section are worth remembering, because each shipped a silent failure.
@@ -450,7 +470,9 @@ Offscreen passes from `create_pass` (shadow-map replays, the fog config-ID repla
 single-target: they render with the game's own pipelines, which the renderer builds from the
 current pass.
 
-**Any new mod pipeline recorded into the scene pass must call `scene_pass_layout` too.**
+**Any new mod pipeline recorded into the scene pass must take its layout from
+`GfxDrawContext::layout` via `scene_pass_layout_for_draw`, and be rebuilt when the layout key
+changes.**
 
 ## 6. Platform pin and rollback
 
@@ -459,8 +481,9 @@ is no `DUSKLIGHT_SDK_STUB_URL` and no `DUSKLIGHT_AURORA_VERSION`; both were fork
 gone. `cmake/FetchDusklight.cmake` is the stock template's, byte for byte.
 
 **Moving off this pin in either direction is a matched-pair operation.** The base carries the
-**GameService 2.0** major bump, so a mod built against a 1.x SDK is refused by this host and a mod
-built against this SDK is refused by a 1.x one. Changing platform means moving the pin *and*
+**GameService 2.0** major bump, so a game-linked mod (Deferred Fog) built against a 1.x SDK is
+refused by this host and one built against this SDK is refused by a 1.x one. Service-only mods
+(VBAO, SMAA) do not import GameService and are not affected by that bump. Changing platform means moving the pin *and*
 rebuilding *and* installing the matching game build, with no overlap window where one set of `.dusk`
 files works on both. No **source** change is needed either way: every authored-normal path goes
 through `common/gfx_normal_compat.h` (which detects the two fields by member name) and the "is there
@@ -768,8 +791,8 @@ smoother as expected, but **AO appeared on flat ground that has no occluder anyw
 
 **It is not a basis problem, and this is worth stating plainly because it looks like one.** The
 provider's output really is world space: the authored normal arrives in view space and is rotated
-out with the camera service's `world_from_view`; VBAO and SSILVB rotate it straight back with the
-same service's `view_from_world`. Those are exact inverses from the same struct in the same frame,
+out with the camera service's `world_from_view`; VBAO and SSILVB (in the provider era) rotated it straight back
+with the same service's `view_from_world`. Those are exact inverses from the same struct in the same frame,
 so the round trip is lossless to ~1e-7 — waste (two 3×3 rotations per pixel), never a visible
 artifact.
 
@@ -795,10 +818,10 @@ if sp.w > 0.0 && dot(sp.xyz - pixel_position, geo_n) > 0.0 { ... }
 ```
 
 `geo_n` is the face normal from depth: a **4-tap `geometric_normal_view`, character-identical in
-both mods** — `vbao.wgsl:253` and `ssilvb.wgsl`. Keep it that way; see 8.11a for why the two copies
-diverging is not a cosmetic difference. It stays **near-inert on the reconstruction path**, where
-the shading normal is already a plane from depth and only the tap pattern differs, so the A/B across
-*Use Authored Normals* changes the shading normal and essentially nothing else.
+both mods** — `vbao.wgsl` and `ssilvb.wgsl`. Keep it that way; see 8.11a for why the two copies
+diverging is not a cosmetic difference. In the provider era it was **near-inert on the reconstruction path**, where the
+shading normal was already a plane from depth and only the tap pattern differed, so the A/B across
+*Use Authored Normals* changed the shading normal and essentially nothing else.
 
 Three traps, all hit while writing that one line:
 
@@ -840,7 +863,7 @@ feature.
 `reconstruct_normal` is not wrong; it is being asked the wrong question. Its wide taps are exactly
 what make it **silhouette-robust for shading** — it is picking a stable plane across a
 discontinuity. A per-pixel rejection plane wants the opposite: the plane of *this* pixel, however
-small the feature it belongs to. It stays as VBAO's normal fallback, and nowhere else.
+small the feature it belongs to. (It was kept as VBAO's normal fallback for a while; that fallback no longer exists.)
 
 **Rule:** the service returns a *shading* normal wherever the game supplied one. Anything asking
 "is this direction above the surface" — an AO hemisphere, a shadow-map bias — must build its own
@@ -897,6 +920,10 @@ of occlusions is only correct when the terms are alternative *estimates of the s
 are other measurements of "is something in the way").
 
 ## 9. Could a mod produce this buffer without the aurora change?
+
+> **Historical.** Written while the normal buffer existed only in our fork. Upstream Dusklight 2.0
+> now ships its own, the fork is retired, and statements below such as "the fork is deliberate" or
+> "upstream still has no normal buffer" are about that time.
 
 Investigated against **upstream `TwilitRealm/dusklight` HEAD `4504e5009`** (28 commits past our base
 `76b56cd8`, which is a clean ancestor) — `docs/modding.md`, the whole `sdk/include/mods/` tree, and
@@ -1054,7 +1081,7 @@ these notes.)
 The change was small, additive, off by default, and useful to any aurora consumer:
 
 - **aurora** (`encounter/aurora`): `AuroraConfig::enableNormalBuffer` → optional second colour target
-  + the `@location(1)` write. Documented end to end in `dusklight/docs/thin-gbuffer-normals.md`.
+  + the `@location(1)` write. Documented end to end in the fork's `docs/thin-gbuffer-normals.md` (not in upstream).
 - **Dusklight** (`TwilitRealm/dusklight`): the appended `struct_size`-guarded SDK fields (now just
   two, at GfxService 1.3 — upstream already shipped the scene-target-layout half itself), which
   is exactly the shape of change GfxService 1.1 already made for present targets. We carry it as
@@ -1094,6 +1121,8 @@ equivalent question at each re-platform is just "read the new SDK header".)*
 - **SDK source renames that touch our three game-linked mods** (`7305ef09b`):
   `mods/hook.hpp` → `mods/svc/hook.hpp`, and `mods::hook_add_pre/add_post/replace(svc_hook, fn)` →
   `mods::hook::add_pre/add_post/replace(fn)` (the service argument is now an optional overload).
-  We already use the `mods::` namespace, so `dusk::mods::` → `mods::` costs us nothing.
+  We already use the `mods::` namespace, so `dusk::mods::` → `mods::` costs us nothing. (Deferred
+  Fog still includes the deprecated `mods/hook.hpp` and the `hook_add_pre(svc_hook, fn)` form; it
+  builds with a deprecation warning.)
 - **New and free if we want it:** an `fmt` feature with `mods/svc/log.hpp` formatted logging, UI
   toasts (`push_toast`), WindowService, and GfxService present targets.

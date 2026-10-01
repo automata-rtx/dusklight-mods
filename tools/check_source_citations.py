@@ -3,8 +3,8 @@
 
 Our documentation argues from the game's and aurora's source, and it cites line numbers:
 "TP enables it globally (`d_kankyo.cpp:1257`)". Those numbers are evidence, and a re-platform
-silently invalidates every one of them - the move to upstream Dusklight 2.0 moved
-GXSetFogRangeAdj from d_kankyo.cpp:1257 to :9459, with nothing to signal it.
+silently invalidates them: the move to upstream Dusklight 2.0 broke 21 of 153, with nothing to
+signal it.
 
 There is no recorded answer for "what was line 1257 supposed to be", so this script infers one:
 a citation almost always sits next to the identifier it is evidence for, in backticks, in the

@@ -1,61 +1,63 @@
-// VBAO (Visibility Bitmask Ambient Occlusion) - fullscreen composite.
+// VBAO fullscreen composite (scene pass; multiply blend, or opaque for debug views).
 //
-// Multiplies the accumulated (or denoised, when temporal accumulation is off) AO visibility over
-// the scene. Based on Encounter's ao_mod demo composite with two additions:
-//  - DEPTH-AWARE upscale: the 4 bilinear taps are weighted by depth agreement with this pixel,
-//    so AO does not bleed across silhouettes when the AO chain runs at half resolution (a plain
-//    bilinear sample smears an object's AO onto the background behind its outline).
-//  - Contrast: a final value power that deepens/softens the occlusion falloff.
+// Multiplies the AO visibility over the scene: the temporal history when accumulation is on,
+// otherwise the last denoise output. Adds to Encounter's ao_mod composite:
+//  - depth-aware upscale: the 4 bilinear taps are weighted by depth agreement with this pixel, so
+//    a half-res AO source does not bleed across silhouettes;
+//  - black point, contrast (an exponent on visibility) and an optional distance fade.
 //
 // Debug views:
 //   1 = AO visibility as grayscale (the exact term the composite would apply)
 //   2 = the view-space scene normals the AO pass consumes, black where the scene has none
-//       (sky, billboards) - exactly the pixels vbao.wgsl leaves fully visible
-//   3 = the preprocessed depth input
+//       (sky, billboards): exactly the pixels vbao.wgsl leaves fully visible
+//   3 = the preprocessed depth as a distance gradient
 //   4 = depth staircase detector
-//   5 = GEOMETRIC normal: the face normal vbao.wgsl derives from depth for its rejection plane
+//   5 = geometric normal: the face normal vbao.wgsl derives from depth for its rejection plane
 //       (same 4-tap +/-1 construction), RGB-encoded like view 2. Magenta = degenerate (the pass
 //       falls back to the shading normal there), black = sky.
-//   6 = NORMAL AGREEMENT: dot(authored shading normal, geometric normal) banded - green > 0.95,
-//       yellow 0.8..0.95 (expected on smoothed low-poly curvature), red < 0.8, WHITE = negative
-//       (the authored normal points away from the surface the depth describes - wrong space, wrong
-//       sign or wrong frame), blue = no authored normal, magenta = degenerate geometry, black = sky.
-//       Flat ground should read green. This is the view that separates "the authored normal is
-//       wrong" from "the depth chain is wrong": the former shows red/white on flat ground with a
-//       clean view 5, the latter shows a broken view 5.
-//   7 = RAW AO: the single-frame occlusion estimate straight out of vbao.wgsl - before the spatial
-//       denoise, before accumulation, unshaped (no black point / contrast / intensity). The host
-//       binds the noisy chain texture for this view.
-//   8 = preprocessed depth MIP 3 as the view-3 gradient: the coarse level the march samples at
-//       distance. Tile or block artefacts here mean the prefilter chain, not the occlusion pass.
+//   6 = normal agreement: dot(authored shading normal, geometric normal) banded - green > 0.95,
+//       yellow 0.8..0.95 (expected on smoothed low-poly curvature), red < 0.8, white = negative
+//       (the authored normal points away from the surface the depth describes: wrong space, sign
+//       or frame), blue = no authored normal, magenta = degenerate geometry, black = sky. Flat
+//       ground should read green. Red/white on flat ground with a clean view 5 means the authored
+//       normal is wrong; a broken view 5 means the depth chain is.
+//   7 = raw AO: the host binds aoNoisy, unshaped (no black point / contrast / intensity) and
+//       before accumulation. It is the pre-denoise estimate only with 0 or 1 denoise passes; with
+//       2 or 3 the ping-pong has overwritten aoNoisy with a denoised result.
+//   8 = preprocessed depth MIP 3 as the view-3 gradient: the level the march reads for samples
+//       far (in pixels) from the centre. Tile or block artefacts here mean the prefilter chain,
+//       not the occlusion pass.
+//
+// Debug views are drawn at GFX_STAGE_FRAME_AFTER_HUD, over the finished frame and the HUD.
 
+// Mirrors AoUniforms in src/mod.cpp and the copies in the other shaders, byte for byte.
 struct Uniforms {
-    projection: mat4x4f,
-    inverse_projection: mat4x4f,
-    reproject: mat4x4f,
-    size: vec2f,        // AO chain size in pixels (may be half the render size)
+    projection: mat4x4f,          // proj_from_view
+    inverse_projection: mat4x4f,  // view_from_proj
+    reproject: mat4x4f,           // current view -> previous frame's clip space
+    size: vec2f,        // AO chain size in pixels (half the render size in Half Res)
     inv_size: vec2f,
-    depth_scale: vec2f, // input depth snapshot pixels per chain pixel (1 or 2)
-    effect_radius: f32, // fraction of view depth
-    intensity: f32,
+    depth_scale: vec2f, // render (snapshot) pixels per chain pixel: 1 or 2
+    effect_radius: f32, // near radius, fraction of view depth
+    intensity: f32,     // composite strength, 1 = 100%
     slice_count: f32,
     steps_per_side: f32,
-    thickness: f32,
-    contrast: f32,
-    temporal_alpha: f32,
-    temporal_clamp_k: f32,
-    inv_far: f32,
+    thickness: f32,     // base occluder thickness multiplier
+    contrast: f32,      // exponent applied to visibility in the composite
+    temporal_alpha: f32,   // base history blend weight, 1 / Temporal Frames
+    temporal_clamp_k: f32, // history clamp half-width, in sigmas of the 3x3 neighbourhood
+    inv_far: f32,          // 1 / far plane; normalises the depth stored in the history
     radius_max: f32,     // screen-space radius cap, fraction of viewport height
-    depth_bias: f32,     // self-occlusion bias, fraction toward the camera
+    depth_bias: f32,     // self-occlusion bias: view position scaled by (1 - depth_bias)
     thick_fade: f32,     // occluder-thickness fade range, multiple of the view radius
-    velocity_scale: f32, // accumulation shortening per pixel of screen motion
-    content_thresh: f32, // content-mismatch response threshold scale (1 = default)
-    disocc_tol: f32,     // disocclusion depth tolerance, fraction of depth
+    velocity_scale: f32, // velocity blend weight per pixel/frame of screen motion
+    content_thresh: f32, // outlier-test threshold scale (1 = 1..2.5 sigma)
+    disocc_tol: f32,     // disocclusion depth tolerance, fraction of depth (shader floor 0.015)
     black_point: f32,    // occlusion floor removed in the composite
     fade_start: f32,     // distance fade start, world units of view depth
     fade_end: f32,       // distance fade end, world units of view depth
     debug_view: u32,
-    frame_index: u32,
+    frame_index: u32,    // advances per frame while accumulating, else 0
     flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
     thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
     inv_debug_depth: f32,   // debug depth view gradient scale (1 / world units)
@@ -63,8 +65,8 @@ struct Uniforms {
     radius_ramp_start: f32, // radius ramp band start, world units of view depth
     radius_ramp_end: f32,   // radius ramp band end, world units of view depth
     denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
-    velocity_cap: f32,      // ceiling on the motion-response alpha (frame-time aware, host-set)
-    velocity_range: f32,    // motion response fades out from this view depth to 2x it (world units; 0 = never)
+    velocity_cap: f32,      // ceiling on the velocity blend weight (frame-time aware, host-set)
+    velocity_range: f32,    // velocity term fades over [this, 2x] view depth, world units; 0 = off
     _pad2: f32,
 }
 
@@ -72,8 +74,8 @@ struct Uniforms {
 @group(0) @binding(1) var preprocessed_depth: texture_2d<f32>;
 @group(0) @binding(2) var scene_depth_raw: texture_2d<f32>;
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
-// GfxService's scene normal snapshot, for debug view 2. Full render resolution, view space,
-// encoded xyz * 0.5 + 0.5 with alpha 1 where the normal is usable.
+// GfxService's scene normal snapshot, for debug views 2 and 6. Full render resolution, view
+// space, encoded xyz * 0.5 + 0.5 with alpha 1 where the normal is usable.
 @group(0) @binding(4) var scene_normal: texture_2d<f32>;
 
 struct VertexOutput {
@@ -103,10 +105,10 @@ fn load_raw_depth(pixel_coordinates: vec2<i32>) -> f32 {
     return textureLoad(scene_depth_raw, coordinates, 0i).r;
 }
 
-// Depth-aware manual bilinear: each tap's bilinear weight is multiplied by how well its depth
-// (AO-chain preprocessed depth, MIP 0) agrees with this render pixel's own raw depth. At full
-// resolution the depths match and this reduces to a plain bilinear sample; at half resolution it
-// keeps silhouettes crisp. If every tap disagrees (a 1px fringe), fall back to the nearest texel.
+// Depth-aware manual bilinear upscale of a half-res AO source: each tap's bilinear weight is
+// multiplied by how well its depth (AO-chain preprocessed depth, MIP 0) agrees with this render
+// pixel's own raw depth, which keeps silhouettes crisp. If every tap disagrees (a 1px fringe),
+// fall back to the nearest texel.
 fn sample_visibility(uv: vec2f, reference_depth: f32) -> f32 {
     let coordinates = uv * uniforms.size - 0.5;
     let base = floor(coordinates);
@@ -146,10 +148,11 @@ fn view_position_at(pixel_coordinates: vec2<i32>) -> vec3f {
     return reconstruct_view_space_position(depth, uv);
 }
 
-// Debug views 5/6: the geometric (face) normal of the depth surface at a chain pixel - a copy of
-// vbao.wgsl's geometric_normal_view (4 MIP-0 taps at +/-1, side-selected on the smaller depth
-// step, flipped to face the camera) so the view shows the plane the occlusion pass really rejects
-// against. w = 0 where the cross product is degenerate.
+// Debug views 5/6: the geometric (face) normal of the depth surface at a chain pixel, the same
+// construction as vbao.wgsl's geometric_normal_view (4 MIP-0 taps at +/-1, side-selected on the
+// smaller depth step, flipped to face the camera) so the view shows the plane the occlusion pass
+// rejects against. It uses unjittered texel centres, unlike the pass in Half Res + temporal.
+// w = 0 where the cross product is degenerate.
 fn debug_geometric_normal(pixel_coordinates: vec2<i32>, centre: vec3f) -> vec4f {
     let r = view_position_at(pixel_coordinates + vec2<i32>(1i, 0i));
     let l = view_position_at(pixel_coordinates - vec2<i32>(1i, 0i));
@@ -175,12 +178,10 @@ fn debug_depth_gradient(view_z: f32) -> vec4f {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     if uniforms.debug_view == 2u {
-        // The view-space scene normal the AO pass consumes, [-1,1] -> RGB. Sampled at this
-        // pixel's full-res position: the snapshot is full resolution even when the AO chain is
-        // half. NOTE this is 1:1 with the screen pixel, whereas vbao.wgsl samples through
-        // chain_uv(), which under halfRes + temporal is the JITTERED full-res texel (one per 2x2
-        // block per frame). The difference is deliberate - do not "align" them, or half-res loses
-        // the temporal upsampling of normal detail.
+        // The view-space scene normal, [-1,1] -> RGB, read 1:1 at this full-res pixel. vbao.wgsl
+        // instead reads through chain_uv(), which in Half Res + temporal is a jittered full-res
+        // texel per 2x2 block. The difference is deliberate: making the pass read like this view
+        // would lose the temporal upsampling of normal detail.
         let n_dims = vec2f(textureDimensions(scene_normal));
         let n_texel =
             clamp(vec2<i32>(in.uv * n_dims), vec2<i32>(0i), vec2<i32>(n_dims) - vec2<i32>(1i));
@@ -210,7 +211,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         let geo = debug_geometric_normal(pixel, centre);
         if uniforms.debug_view == 5u {
             if geo.w < 0.5 {
-                return vec4f(1.0, 0.0, 1.0, 1.0); // degenerate: the pass falls back to the shading normal
+                return vec4f(1.0, 0.0, 1.0, 1.0); // degenerate: the pass uses the shading normal
             }
             return vec4f(geo.xyz * 0.5 + 0.5, 1.0);
         }
@@ -239,8 +240,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         return vec4f(0.0, 1.0, 0.0, 1.0);
     }
     if uniforms.debug_view == 7u {
-        // Raw single-frame estimate, unshaped. The host binds the noisy chain texture here, so at
-        // full res this is a 1:1 read and at half res the depth-aware upscale.
+        // aoNoisy, unshaped (raw only with 0 or 1 denoise passes; see the header). 1:1 at full
+        // res, depth-aware upscale at half res.
         let full = vec2f(textureDimensions(scene_depth_raw));
         let reference = load_raw_depth(vec2<i32>(in.uv * full));
         var raw: f32;
@@ -280,9 +281,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
 
     let full_size = vec2f(textureDimensions(scene_depth_raw));
     let reference_depth = load_raw_depth(vec2<i32>(in.uv * full_size));
-    // The AO source is either full-res (temporal history, or full-res mode) or half-res (temporal
-    // off). At full res the reconstruction already happened in the temporal upsampler, so read it
-    // 1:1; at half res do the depth-aware bilinear upscale here.
+    // A full-size AO source (the temporal history, or the chain at full res) is read 1:1; a
+    // half-res chain (Half Res with temporal off) gets the depth-aware upscale here.
     var visibility: f32;
     if all(textureDimensions(ambient_occlusion) == vec2<u32>(full_size)) {
         let px = clamp(vec2<i32>(in.uv * full_size), vec2<i32>(0i), vec2<i32>(full_size) - 1i);
@@ -296,12 +296,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
         ((1.0 - visibility) - uniforms.black_point) / max(1.0 - uniforms.black_point, 1.0e-3),
         0.0, 1.0);
     visibility = 1.0 - occlusion;
-    // Contrast: final value power - deepens (contrast > 1) or lifts (< 1) the occlusion falloff.
+    // Contrast: an exponent on visibility; > 1 deepens the occlusion falloff, < 1 lifts it.
     visibility = pow(clamp(visibility, 0.0, 1.0), uniforms.contrast);
-    // Distance fade: fade the AO out across [fade_start, fade_end] WORLD UNITS of view depth
-    // (same scale as the radius ramp; not far-plane fractions - see vbao.wgsl). TP washes
-    // distant terrain toward fog, and full-strength AO over the haze reads as harsh shading
-    // floating on it; this drives the term back to 1 (no darkening) with distance.
+    // Distance fade: fade the AO out across [fade_start, fade_end] world units of view depth (same
+    // scale as the radius ramp). Distant terrain is already washed toward fog, and full-strength
+    // AO over it reads as harsh shading floating on the haze.
     if (uniforms.flags & 4u) != 0u && reference_depth > 0.0 {
         let view_position = reconstruct_view_space_position(reference_depth, in.uv);
         let fade = smoothstep(uniforms.fade_start, max(uniforms.fade_end, uniforms.fade_start + 1.0),

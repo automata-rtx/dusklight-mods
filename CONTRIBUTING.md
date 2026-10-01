@@ -67,15 +67,18 @@ interacts with. Never edit it.
 
 ## Prerequisites
 
-- CMake 3.26 or newer and a C++20 compiler:
+- `git`, CMake 3.26 or newer, and a C++20 compiler:
   - Linux: GCC or Clang.
-  - Windows: Visual Studio's MSVC (`cl`). CI uses the Ninja generator from a VS developer shell.
-    No clang-cl needed.
+  - Windows: Visual Studio's MSVC (`cl`), plus Ninja. No clang-cl needed.
   - macOS: Xcode command-line tools.
-- Python 3, for the tools in `tools/`.
-- Network access on the first configure. It fetches the pinned game source from
-  `github.com/TwilitRealm/dusklight` (with the `extern/aurora` submodule), a prebuilt Dawn package for
-  WebGPU headers, and on Windows/macOS/Android a link stub for the game executable.
+- Python 3.9 or newer for the tools in `tools/`, and `rg` (ripgrep) for
+  `check_japanese_naming.py`.
+- On Linux, the libX11 development package if you want to build the shader validator.
+- Network access on the first configure, roughly 250 MB. It fetches the pinned game source from
+  `github.com/TwilitRealm/dusklight` (with its `extern/aurora` submodule from `encounter/aurora`)
+  and a prebuilt Dawn package for the WebGPU headers. On Windows, macOS and Android it also
+  downloads a link stub for the game executable; Linux resolves game symbols when the mod loads and
+  needs no stub.
 
 You do **not** need the game installed to build. You do need it to test.
 
@@ -87,14 +90,21 @@ cmake --build build            # every released mod -> build/mods/<name>.dusk
 cmake --build build --target vbao_package   # one mod (deferred_fog_package, smaa_package)
 ```
 
-The build type defaults to `RelWithDebInfo` and should stay that way. On Windows a `Release` link
-strips the hook records the loader scans for, so a game-linked mod loads and silently does nothing.
-`CMakeLists.txt` sets the default before `project()` so multi-config generators get it too.
+Build `RelWithDebInfo`. On Windows a `Release` link strips the hook records the game's loader scans
+for, so a game-linked mod loads and silently does nothing; Debug is not what CI ships either.
 
-A `.dusk` file is a zip: `mod.json`, `res/`, and `lib/<platform>/mod.{so,dll,dylib}`. A local build
-contains only your own platform. CI builds all seven (Linux x86_64/aarch64, macOS arm64/x86_64,
-Windows amd64/arm64, Android aarch64) and `tools/merge_mod.py` merges them into one cross-platform
-bundle per mod.
+- **Linux and macOS**: the commands above build `RelWithDebInfo` by default. For an Intel Mac build
+  on Apple silicon add `-DCMAKE_OSX_ARCHITECTURES=x86_64` (universal binaries are not supported).
+- **Windows**: configure from a Visual Studio *Developer* prompt with Ninja, as CI does:
+  `cmake -B build -G Ninja`. The default Visual Studio generator is multi-config and builds Debug
+  unless you pass `cmake --build build --config RelWithDebInfo`.
+- **Android**: see the `android-aarch64` job in `.github/workflows/build.yml` for the NDK version
+  and toolchain arguments.
+
+A `.dusk` file is a zip: `mod.json`, `res/`, and `lib/<platform>/mod.so` (`mod.dll` on Windows).
+A local build contains only your own platform. CI builds all seven (Linux x86_64/aarch64, macOS
+arm64/x86_64, Windows amd64/arm64, Android aarch64) and `tools/merge_mod.py` merges them into one
+cross-platform bundle per mod.
 
 ## Check your change
 
@@ -104,10 +114,11 @@ targets or the docs, so these are on you.
 **Shaders.** CI only copies the `.wgsl` files into the bundle. A WGSL error builds fine, ships, and
 first appears in-game as a pipeline that fails to create, which looks like the effect being off.
 Validate locally after any shader edit. `tools/wgsl_check.cpp` compiles each file through Dawn's
-null backend and needs no GPU:
+null backend and needs no GPU. The recipe below is for Linux; it links the prebuilt Dawn that the
+configure step already fetched:
 
 ```sh
-cmake -B build && cmake --build build      # also fetches the prebuilt Dawn the validator links
+cmake -B build                             # fetches the prebuilt Dawn, among other things
 D=build/_deps/dawn_prebuilt-src
 g++ -std=c++20 -I$D/include tools/wgsl_check.cpp $D/lib/libwebgpu_dawn.a -ldl -lpthread -lX11 \
     -o build/wgsl_check
@@ -122,6 +133,11 @@ python3 tools/check_source_citations.py       # `file.cpp:LINE` citations in doc
 python3 tools/check_japanese_naming.py        # game symbols named in docs/japanese-naming.md still exist
 ```
 
+Their limits: `check_reserved_config_names.py` only sees names written as `cvarDesc.name = "..."`
+or `register_bool_option("...")`, so it does **not** check the option tables VBAO and SMAA use
+(check those by eye). `check_source_citations.py` only checks citations written as `file.ext:LINE`,
+not the short `:LINE` form, and its "drift" guesses are advisory.
+
 **In-game.** For a game-linked change, a clean compile proves very little. `DEFINE_HOOK` checks the
 function signature at compile time, but the symbol is looked up by name at load. Run it.
 
@@ -130,11 +146,14 @@ function signature at compile time, but the symbol is looked up by name at load.
 1. Install the game build that matches the pin: upstream Dusklight at the tag in
    `DUSKLIGHT_VERSION` (top-level `CMakeLists.txt`, currently `v2.0.0`). A mismatched game and mod
    build can fail to load outright.
-2. Copy the `.dusk` into the user mods folder, or start the game with `--mods <dir>` to point it at
-   a folder of your choosing (for example `build/mods`):
+2. Copy the `.dusk` into the user mods folder:
    - Windows: `%APPDATA%\TwilitRealm\Dusklight\mods`
    - Linux: `~/.local/share/TwilitRealm/Dusklight/mods`
    - macOS: `~/Library/Application Support/TwilitRealm/Dusklight/mods`
+
+   Alternatively, start the game with `--mods <dir>` (for example `--mods build/mods`) to use a
+   folder of your choosing instead of the user folder. A `mods/` folder next to the game executable
+   is also searched.
 3. In the game's Mods menu, enable the mod. After replacing a `.dusk`, the mod manager's **Reload**
    button picks up the new build without a restart.
 4. Each mod's options are in its pane in the Mods menu; the larger option sets open in a separate
@@ -152,10 +171,10 @@ Things that change what you see and are easy to forget:
 
 - **Saved settings beat new defaults.** Changing a default in code does nothing for an option you
   already moved. Reset it in the UI, or test with a clean `config.json`.
-- **MSAA disables the normal buffer.** The renderer only creates the authored-normal attachment
-  with antialiasing off. VBAO then disables itself (and says so); SMAA falls back to luma-only edges.
-- **The compatibility renderers** (D3D11, OpenGL ES) cannot carry the normal attachment at all.
-  VBAO needs D3D12, Vulkan or Metal.
+- **The compatibility renderers** (D3D11, OpenGL ES) cannot carry the authored-normal attachment.
+  VBAO then disables itself and says so in the log (it needs D3D12, Vulkan or Metal); SMAA falls
+  back to luma-only edges. The renderer would also refuse the attachment with MSAA on, but the
+  current game build never enables MSAA, so that case cannot occur today.
 - **Wolf Senses.** Deferred Fog deliberately does nothing while Wolf Link's senses are active.
 
 ## How a mod here works
@@ -210,6 +229,8 @@ If a struct is declared in several `.wgsl` files, update all of them.
 `DEFINE_HOOK(&Class::method, Name)` declares a hook target; `mods::hook_add_pre<Name>` and
 `hook_add_post<Name>` attach callbacks at init. A pre-hook can read and rewrite arguments
 (`mods::arg`, `mods::arg_ref`). Hook callbacks run on the game thread, synchronously with the game.
+Deferred Fog still includes the deprecated `<mods/hook.hpp>` (the build prints a warning about it);
+the current header is `<mods/svc/hook.hpp>`, with `mods::hook::add_pre<Name>(fn)`.
 
 The game's identifiers are the original Japanese team's names, preserved by the decompilation
 (`kankyo` = environment, `moya` = haze, `kumo` = cloud). Read them with `docs/japanese-naming.md` to
@@ -225,11 +246,11 @@ current pin):
 | :-- | :-- | :-- | :-- |
 | sky lists | 2328 | `dComIfGd_drawOpaListSky` / `XluListSky` | |
 | `GFX_STAGE_SCENE_BEGIN` | 2334 | before any world geometry | Deferred Fog opens its fog-suppression scope |
-| opaque world lists | 2344+ | terrain, objects, actors; fog applied per draw by the game | Deferred Fog suppresses per-draw fog here |
+| opaque world lists | 2344–2390 | terrain, objects, actors, grass; also some particles (`Pri0_B`) and the game's own shadows. Fog applied per draw by the game | Deferred Fog suppresses per-draw fog here |
 | `GFX_STAGE_SCENE_AFTER_TERRAIN` | 2366 | after terrain and shadows, before the main opaque list | (nothing in the released set) |
 | `GFX_STAGE_SCENE_AFTER_OPAQUE` | 2395 | all opaque world geometry is down | VBAO composites; SMAA antialiases; Deferred Fog closes its scope and arms the fog quad |
 | translucent lists | 2405 | `dComIfGd_drawXluListBG` onward | Deferred Fog draws its fog quad at the first translucent J3D shape |
-| particles, DOF, bloom | ... 2632 | the game's own post effects | Deferred Fog's fallback anchor is just before bloom |
+| particles, DOF, bloom | to 2632 | the game's own post effects; bloom at 2632 | Deferred Fog's fallback anchor is just before bloom |
 | `GFX_STAGE_FRAME_BEFORE_HUD` | 2759 | after all 3D post effects | Deferred Fog's last-resort anchor |
 | `GFX_STAGE_FRAME_AFTER_HUD` | 2820 | the last stage in the frame | VBAO's debug views (so nothing draws over them) |
 
@@ -265,7 +286,8 @@ did not appear.
   `resolved_normal`), not directly. It compiles to "no normals" on an SDK that lacks them.
 - **Never name a config var `enabled`.** The host reserves `mod.<id>.enabled` for the mod manager's
   own checkbox, so registration fails with `MOD_CONFLICT` and the whole mod fails to load. Prefix it
-  (`effectEnabled`, `fogEnabled`). `tools/check_reserved_config_names.py` catches this.
+  (`effectEnabled`, `fogEnabled`). `tools/check_reserved_config_names.py` catches this, except
+  in VBAO's and SMAA's option tables.
 - **Thread rules.** Game state, config and camera are read on the game thread only. Draw and compute
   callbacks use their payload and `wgpu*` calls, nothing else.
 - **Everything is reversed-Z**: depth 1 is near, 0 is far, and sky pixels have raw depth 0.
@@ -282,17 +304,18 @@ did not appear.
 
 | Mod | Read first | Then | Key entry points in `src/mod.cpp` |
 | :-- | :-- | :-- | :-- |
-| VBAO | `docs/vbao.md` "Pipeline" | `res/vbao.wgsl` (the estimator), `res/temporal.wgsl` | the `SCENE_AFTER_OPAQUE` stage hook, `ensure_composite_pipelines()`, the option tables in `mod_initialize` |
+| VBAO | `docs/vbao.md` "How it works" | `res/vbao.wgsl` (the estimator), `res/temporal.wgsl` | the `SCENE_AFTER_OPAQUE` stage hook, `ensure_composite_pipelines()`, the option tables in `mod_initialize` |
 | Deferred Fog | `docs/deferred_fog.md` "How it works" | `src/fog_math.h`, `res/fog.wgsl` | `on_scene_begin`, `on_shape_draw_pre`, `on_set_fog_pre`, `on_scene_after_opaque`, `push_fog_quad` |
-| SMAA | `docs/smaa.md` "Pipeline" | `res/edge_detection.wgsl`, `res/blend_weights.wgsl` | the `SCENE_AFTER_OPAQUE` stage hook, `ensure_neighborhood_pipeline()` |
+| SMAA | `docs/smaa.md` "How it works" | `res/edge_detection.wgsl`, `res/blend_weights.wgsl` | the `SCENE_AFTER_OPAQUE` stage hook, `ensure_neighborhood_pipeline()` |
 
 Open problems worth knowing about before you start:
 
 - **Deferred Fog: distant landmarks (Death Mountain, the Ganon barrier) are brighter with the mod
-  off.** Three fixes have failed. `docs/deferred_fog.md` "Known issues" has the evidence so far and
+  off.** Three fixes have failed. `docs/deferred_fog.md` "Known issue" has the evidence so far and
   what to measure next.
-- **SMAA** handles orthogonal edge patterns only; diagonal search and corner rounding are not
-  implemented.
+- **SMAA** handles orthogonal edge patterns only: edges at or near 45° get little or no smoothing,
+  and diagonal search and corner rounding are not implemented.
+- **VBAO** has a short list of minor known issues in `docs/vbao.md` "Known issues".
 
 ## Releasing
 
@@ -300,8 +323,11 @@ Open problems worth knowing about before you start:
    version.
 2. Push. CI builds every mod on seven platforms; the `mods-combined` artifact holds one
    cross-platform `.dusk` per mod, and `mods-<platform>` holds the per-platform bundles. CI runs on
-   every branch.
-3. Pushing a tag additionally creates a GitHub release with the combined `.dusk` files attached.
+   every branch and takes a few minutes.
+3. Pushing a tag additionally runs a step that creates a GitHub release with the combined `.dusk`
+   files attached. That step has never been exercised: the repo has no GitHub releases yet, and the
+   combine job does not request `contents: write` permission (the upstream template now does), so
+   check it the first time.
 
 `mod.json` notes: `description` is plain text and newlines collapse to spaces in the mod manager,
 which shows roughly two lines in its list. See `docs/editing-options.md`.
@@ -321,9 +347,17 @@ The game build is pinned by `DUSKLIGHT_VERSION` in `CMakeLists.txt`. To move:
    Its guesses are advisory; confirm each one by reading the source.
 6. Test in-game, with the matching game build installed.
 
-Mods built against an older SDK can be refused by a newer game: the host rejects structs smaller
-than its own, and a game-service major version bump refuses every older mod. Rebuild against the
-pin that matches the game.
+Compatibility between a mod build and a game build:
+
+- **Game-linked mods** (Deferred Fog) must match the game build: hooks resolve by symbol name at
+  load, and the host refuses a mod built against an older GameService major version.
+- **Service-only mods** (VBAO, SMAA) are looser. `IMPORT_SERVICE` asks for the minor version of each
+  service in the SDK they were built with, so they need a game at least that new. Some service calls
+  also check struct sizes, so build against the SDK that matches the oldest game you support.
+
+The pin is `v2.0.0`. Upstream has since tagged newer 2.0.x releases. 2.0.3 raises GfxService to 1.4
+(texture handles appended to `GfxResolvedTargets`) and adds an interpolation service, so moving the
+pin needs the steps above rather than just a version bump.
 
 ## Documentation map
 
@@ -335,8 +369,9 @@ pin that matches the game.
 | `docs/vbao.md`, `docs/deferred_fog.md`, `docs/smaa.md` | Per-mod reference: pipeline, options, debug views, known issues, history |
 | `docs/editing-options.md` | Changing a default, hiding an option, editing a description |
 | `docs/mod-api-notes.md` | Mod API pitfalls, crash symbolization, debugging lessons |
-| `docs/authored_normals.md` | How the game's authored normals reach the mods |
+| `docs/normal_buffer_portability.md` | The normal-buffer API, when normals are missing, the two `common/` headers |
+| `docs/authored_normals.md` | How the authored normals came to be, and the lessons from it (mostly history) |
 | `docs/japanese-naming.md` | Reading the game's Japanese identifiers |
 | `docs/unreleased/` | The four unreleased mods. Possibly outdated |
 | `docs/historical/` | Retired designs |
-| `CLAUDE.md` | Instructions for AI coding sessions. Mostly duplicates the above in denser form |
+| `CLAUDE.md` | Short instructions for AI coding sessions; points back to these docs |

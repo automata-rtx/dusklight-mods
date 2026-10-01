@@ -1,14 +1,17 @@
-// SMAA — pass 3: neighborhood blending (fullscreen draw into the live scene target).
+// SMAA pass 3: neighborhood blending (full-screen triangle drawn into the live scene target).
 //
-// For each pixel, gather the four blend weights that touch its boundaries (its own top/left edge
-// plus the reciprocal weights from the pixel below/right), pick the dominant axis, and pull in the
-// neighbouring colour by a sub-pixel bilinear offset. Non-edge pixels discard, leaving the live
-// target untouched (so only edges are rewritten). The colour input is the frame's resolved scene
-// snapshot, so reading it while writing the live target is hazard-free.
+// Each pixel gathers the four weights on its boundaries (its own .r/.b from BlendTex, plus .g of
+// the pixel below and .a of the pixel to the right), keeps the dominant axis, and takes one bilinear
+// tap toward each neighbour on that axis, offset by that side's weight: a tap offset by w pixels
+// mixes in w of the neighbour. With taps on both sides the two are averaged, weighted by their
+// weights. Pixels with no weight discard, so only edge pixels are rewritten.
 //
-// Runs at SCENE_AFTER_OPAQUE (before bloom / translucency), so the game's post effects operate on
-// antialiased geometry.
+// Colour is read from the frame's scene snapshot (a copy), so reading it while writing the live
+// target is safe. Drawn at SCENE_AFTER_OPAQUE, before the game's translucency and bloom.
+//
+// Debug views 1 and 2 bypass the blend and write an opaque colour to every pixel (no discard).
 
+// Mirrors SmaaUniforms in src/mod.cpp (and the copies in the other two shaders).
 struct Uniforms {
     screen_size: vec2f,
     inv_screen_size: vec2f,
@@ -56,12 +59,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     let px_i = vec2i(in.uv * uniforms.screen_size);
 
     if (uniforms.debug_view == 1u) {
-        // Edge mask: red = left edge, green = top edge.
+        // Edge mask: red = left-boundary (vertical) edge, green = top-boundary (horizontal) edge.
         let e = textureLoad(edges_tex, clamp_px(px_i), 0i).xy;
         return vec4f(e.x, e.y, 0.0, 1.0);
     }
     if (uniforms.debug_view == 2u) {
-        // Blend weights: warm = vertical (up/down), cool = horizontal (left/right).
+        // This pixel's own BlendTex values: red = r + g (vertical blending, from its top edge),
+        // green = b + a (horizontal blending, from its left edge).
         let w = textureLoad(blend_tex, clamp_px(px_i), 0i);
         let vert = w.r + w.g;
         let horiz = w.b + w.a;
@@ -89,6 +93,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     }
     bw = bw / max(sum, 1.0e-5);
 
+    // coord1 is shifted toward the right (or lower) neighbour, coord2 toward the left (or upper).
     let px = uniforms.inv_screen_size;
     let coord1 = in.uv + offset.xy * px;
     let coord2 = in.uv + offset.zw * (-px);

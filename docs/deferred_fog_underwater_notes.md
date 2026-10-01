@@ -1,10 +1,12 @@
 # Deferred Fog — underwater AO fade (DEFERRED / not implemented)
 
-Status: **investigated and designed, intentionally not built.** The user asked to shelve it
-after the design was validated but before shipping. This note captures everything needed to
-resume. Nothing in this doc is wired into the mod; `mods/deferred_fog` has no underwater code.
-(The "1.3.1" this note used to quote was a Graphics Hub version; Deferred Fog is a standalone mod
-again and its `mod.json` restarted at 1.0.0.)
+Status: **investigated and designed, intentionally not built.** The maintainer shelved it after
+the design was validated but before shipping. This note captures everything needed to resume.
+Nothing in it is wired into the mod; `mods/deferred_fog` has no underwater code.
+
+> The game-source line numbers below were taken on an earlier platform and several have drifted on
+> the `v2.0.0` pin; search for the named functions rather than trusting the numbers. The host
+> notes below have been updated for the current mod (1.0.2).
 
 ## The problem
 
@@ -59,13 +61,12 @@ like distance fog fades above-water AO.
 - **Water surface height**: `fopAcM_getWaterY(const cXyz* xz, f32* out)` returns 1 + surface Y
   when there is water at that XZ, else 0/`-inf` (`f_op_actor_mng.cpp:2327`, header
   `f_op/f_op_actor_mng.h:704`; also `fopAcM_wt_c::getWaterY()` global cache, header :899).
-  Probe at the player's position — `dComIfGp_getLinkPlayer()->current.pos` (the shadow mod uses
-  this pattern, `realtime_sun_shadows/src/mod.cpp:1461`). Player is the reliable "at the water"
+  Probe at the player's position — `dComIfGp_getLinkPlayer()->current.pos` (the unreleased shadow mod
+  uses this pattern in `mods/realtime_sun_shadows/src/mod.cpp`). Player is the reliable "at the water"
   anchor; camera eye XZ is an alternative but fails when the camera sits over the shore.
-- **World position per pixel**: reconstruct from uv + raw depth using
-  `world_from_clip = world_from_view * view_from_proj` (both in `CameraInfo`,
-  `mods/svc/camera.h:30,32`; multiply column-major like VBAO's `mat4_mul_col`). Same reversed-Z
-  depth the fog already samples.
+- **World position per pixel**: reconstruct from uv + raw depth with `CameraInfo::world_from_proj`
+  (`mods/svc/camera.h`), which is already the one-step depth-buffer → world matrix; no multiply is
+  needed. Same reversed-Z depth the fog already samples.
 
 ### Shader (res/fog.wgsl) — validated to compile (naga OK)
 
@@ -108,10 +109,10 @@ above water).
 
 - Mirror `UnderwaterUniforms` in C++ (`float world_from_clip[16]; float color[4]; float water_y,
   half_depth, max_strength, enabled;` → 96 bytes, `%16==0`).
-- Import `CameraService`; include `mods/svc/camera.h`, `f_op/f_op_actor_mng.h` (already have
-  `d/d_com_inf_game.h`).
-- In `on_scene_after_opaque` (has `stageCtx->game_view`): `get_camera` → compute
-  `g_worldFromClip = world_from_view * view_from_proj`; probe player XZ with `fopAcM_getWaterY`
+- `CameraService` is already imported (currently unused) and `mods/svc/camera.h` included; add
+  `f_op/f_op_actor_mng.h`.
+- In `on_scene_after_opaque` (has `stageCtx->game_view`): `get_camera` → take
+  `world_from_proj` as `g_worldFromClip`; probe player XZ with `fopAcM_getWaterY`
   → `g_waterY`, `g_hasWater`. Disable the term when no water or the toggle is off.
 - `push_fog_quad`: build the underwater uniform (world_from_clip, color from cvars, water_y,
   half_depth, max_strength, enabled = hasWater && toggle), `push_uniform` it (a SECOND uniform
@@ -120,7 +121,8 @@ above water).
 - Config vars (in the controls window tab): `underwaterFog` (bool, default OFF),
   `underwaterHalfDepth` (world units, ~400 default), `underwaterStrength` (0-100 %, ~70),
   `underwaterColorR/G/B` (0-255, murky teal default ~25/55/55).
-- Version → 1.4.0; shutdown resets; doc the feature + limitations.
+- Bump the version (1.0.2 → 1.1.0); reset the new state in shutdown; document the feature and its
+  limitations in `docs/deferred_fog.md`.
 
 ## Limitations / open questions to resolve when resuming
 

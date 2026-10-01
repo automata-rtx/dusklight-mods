@@ -13,33 +13,34 @@
 // storage format r16float -> r32float (core WebGPU storage format). MIP 4 moved into its own
 // entry point (core WebGPU limit is 4 storage textures per stage).
 
+// Mirrors AoUniforms in src/mod.cpp and the copies in the other shaders, byte for byte.
 struct Uniforms {
-    projection: mat4x4f,
-    inverse_projection: mat4x4f,
-    reproject: mat4x4f,
-    size: vec2f,        // AO chain size in pixels (may be half the render size)
+    projection: mat4x4f,          // proj_from_view
+    inverse_projection: mat4x4f,  // view_from_proj
+    reproject: mat4x4f,           // current view -> previous frame's clip space
+    size: vec2f,        // AO chain size in pixels (half the render size in Half Res)
     inv_size: vec2f,
-    depth_scale: vec2f, // input depth snapshot pixels per chain pixel (1 or 2)
-    effect_radius: f32, // fraction of view depth
-    intensity: f32,
+    depth_scale: vec2f, // render (snapshot) pixels per chain pixel: 1 or 2
+    effect_radius: f32, // near radius, fraction of view depth
+    intensity: f32,     // composite strength, 1 = 100%
     slice_count: f32,
     steps_per_side: f32,
-    thickness: f32,
-    contrast: f32,
-    temporal_alpha: f32,
-    temporal_clamp_k: f32,
-    inv_far: f32,
+    thickness: f32,     // base occluder thickness multiplier
+    contrast: f32,      // exponent applied to visibility in the composite
+    temporal_alpha: f32,   // base history blend weight, 1 / Temporal Frames
+    temporal_clamp_k: f32, // history clamp half-width, in sigmas of the 3x3 neighbourhood
+    inv_far: f32,          // 1 / far plane; normalises the depth stored in the history
     radius_max: f32,     // screen-space radius cap, fraction of viewport height
-    depth_bias: f32,     // self-occlusion bias, fraction toward the camera
+    depth_bias: f32,     // self-occlusion bias: view position scaled by (1 - depth_bias)
     thick_fade: f32,     // occluder-thickness fade range, multiple of the view radius
-    velocity_scale: f32, // accumulation shortening per pixel of screen motion
-    content_thresh: f32, // content-mismatch response threshold scale (1 = default)
-    disocc_tol: f32,     // disocclusion depth tolerance, fraction of depth
+    velocity_scale: f32, // velocity blend weight per pixel/frame of screen motion
+    content_thresh: f32, // outlier-test threshold scale (1 = 1..2.5 sigma)
+    disocc_tol: f32,     // disocclusion depth tolerance, fraction of depth (shader floor 0.015)
     black_point: f32,    // occlusion floor removed in the composite
     fade_start: f32,     // distance fade start, world units of view depth
     fade_end: f32,       // distance fade end, world units of view depth
     debug_view: u32,
-    frame_index: u32,
+    frame_index: u32,    // advances per frame while accumulating, else 0
     flags: u32, // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
     thick_dist_scale: f32,  // extra occluder thickness, fraction of the view-space radius
     inv_debug_depth: f32,   // debug depth view gradient scale (1 / world units)
@@ -47,8 +48,8 @@ struct Uniforms {
     radius_ramp_start: f32, // radius ramp band start, world units of view depth
     radius_ramp_end: f32,   // radius ramp band end, world units of view depth
     denoise_strength: f32,  // spatial denoise blend, 0 raw .. 1 fully blurred
-    velocity_cap: f32,      // ceiling on the motion-response alpha (frame-time aware, host-set)
-    velocity_range: f32,    // motion response fades out from this view depth to 2x it (world units; 0 = never)
+    velocity_cap: f32,      // ceiling on the velocity blend weight (frame-time aware, host-set)
+    velocity_range: f32,    // velocity term fades over [this, 2x] view depth, world units; 0 = off
     _pad2: f32,
 }
 
@@ -62,10 +63,10 @@ struct Uniforms {
 @group(0) @binding(6) var preprocessed_depth_mip3_in: texture_2d<f32>;
 @group(0) @binding(7) var preprocessed_depth_mip4: texture_storage_2d<r32float, write>;
 
-// 4-phase sub-pixel jitter within each 2x2 full-res block, for half-res temporal upsampling.
-// Active only when the chain is half-res (depth_scale 2) AND temporal accumulation is on;
-// otherwise the offset is (0,0) and sampling reduces to the fixed top-left corner (unchanged).
-// Alternating diagonals converge full-res coverage fastest.
+// 4-phase sub-pixel jitter within each 2x2 full-res block, for half-res temporal upsampling:
+// (0,0), (1,1), (1,0), (0,1), keyed off frame_index. Active only when the chain is half-res
+// (depth_scale 2) and temporal accumulation is on; otherwise the offset is (0,0), the top-left
+// texel of each block. vbao.wgsl and temporal.wgsl carry identical copies; keep them in sync.
 fn taau_jitter() -> vec2<i32> {
     if uniforms.depth_scale.x < 1.5 || (uniforms.flags & 1u) == 0u {
         return vec2<i32>(0i, 0i);
@@ -78,9 +79,9 @@ fn taau_jitter() -> vec2<i32> {
     }
 }
 
-// PORT: replaces the textureGather of the input depth with explicit loads (also handles the
-// half-resolution case, where one chain texel covers depth_scale snapshot texels). In half-res
-// temporal upsampling the sample is jittered so each frame decimates a different full-res pixel.
+// PORT: replaces the textureGather of the input depth with explicit loads. At half resolution one
+// chain texel covers 2x2 snapshot texels and takes one of them (point decimation, not an average);
+// with temporal accumulation on, the jitter picks a different one each frame.
 fn load_input_depth(pixel_coordinates: vec2<i32>) -> f32 {
     let input_size = vec2<i32>(uniforms.size * uniforms.depth_scale);
     let coordinates = clamp(

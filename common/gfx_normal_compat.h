@@ -1,64 +1,39 @@
-// Compile-time shim for the two scene-normal-buffer fields added in GfxService 1.3:
+// Compile-time shim for the two scene-normal fields GfxService 1.3 added:
 //
-//     GfxResolveDesc::normal      GfxResolvedTargets::normal
+//     GfxResolveDesc::normal       set it to ask resolve_pass for a normal snapshot
+//     GfxResolvedTargets::normal   the snapshot: the game's authored view-space normal
+//                                  (RGB10A2Unorm in aurora), xyz * 0.5 + 0.5, alpha 1 = valid
 //
-// Set the first to snapshot the game's authored vertex normals alongside depth; read the second to
-// get the resulting view. That pair is the ENTIRE normal-buffer API.
+// Always reach them through request_normal() / resolved_normal() below. Detection is by member
+// name (SFINAE), so on an SDK older than 1.3 the request is a no-op and the view is nullptr. That
+// quiet fallback is acceptable here because every consumer must already handle a null view at
+// runtime; contrast gfx_scene_pass.h, which refuses to build on an SDK it does not recognise.
 //
-// **THESE ARE UPSTREAM FIELDS NOW.** This header was written when they were fork-local to
-// automata-rtx/dusklight-ao, and its whole premise used to be "upstream has no normal snapshot, so
-// re-platforming onto it removes them". That is inverted: upstream Dusklight ships them, and the
-// fork is retired. The shim still earns its place, for two reasons that outlived the fork —
-// an SDK OLDER than 1.3 has neither field, and this is the seam that let the move to upstream be a
-// pin bump rather than a source rescue: it detects by member name, so it did not care that upstream
-// declared `normal` as a `uint32_t` appended to GfxResolveDesc where the fork had a `bool` tucked
-// into the struct's tail padding.
+// A null view has three causes, and they should not be reported the same way:
+//   not yet          The snapshot latches: the first resolve that asks enables the normal
+//                    attachment for the next frame and returns null for this one. Do not report it;
+//                    VBAO and SMAA wait kNormalLatchGraceFrames before reporting missing normals.
+//   MSAA on          aurora creates the normal buffer only when msaaSamples == 1
+//                    (enable_normal_buffer() in lib/webgpu/gpu.cpp; resolve_pass() in
+//                    lib/gfx/recording.cpp). GfxDeviceInfo::sample_count shows it. msaaSamples is
+//                    fixed at renderer init and Dusklight v2.0.0 never enables MSAA, so this case
+//                    only matters for builds that do.
+//   no core features The D3D11 / OpenGL ES compatibility renderers (no WebGPU core features)
+//                    cannot carry the attachment. Nothing the player can change.
+// While the view is null, VBAO draws no AO and SMAA falls back to luma-only edges; both pick the
+// normals up once they arrive. The latch also changes the scene pass's attachment count;
+// gfx_scene_pass.h has the pipeline rule that follows from that.
 //
-// **The snapshot LATCHES.** The first resolve that asks for normals enables the attachment for the
-// NEXT frame and hands back a null view for this one; upstream's own `mods/ao_mod` documents this
-// and simply returns. So `resolved_normal() == nullptr` means "not yet" at least as often as it
-// means "this device cannot". A consumer that treats the first null as a permanent failure will
-// announce that on every cold start — see VBAO's `kNormalLatchGraceFrames`.
+// Rules:
+//  - These accessors are safe for reading a value, never for comparing it with a live one: a shim
+//    that answers "absent" invents a difference in a comparison. A guard of exactly that kind once
+//    disabled every composite.
+//  - No SDK struct has a `normal_format` field; do not add an accessor for one. To ask whether the
+//    scene pass carries normals, use gfx_compat::ScenePassLayout::has_normal_attachment.
+//  - SFINAE works here because both fields are members of types that exist either way. A missing
+//    type or macro cannot be probed like this; see gfx_scene_pass.h.
 //
-// **A null view has THREE causes and a consumer should not report them the same way:**
-//
-//   not yet          the latch, above. Never report it.
-//   MSAA is on       aurora refuses to create the buffer unless `msaaSamples == 1`, and does not
-//                    even record the request otherwise (lib/webgpu/gpu.cpp enable_normal_buffer(),
-//                    lib/gfx/recording.cpp resolve_pass). **This is a SETTING the user can change**,
-//                    so say so — `GfxDeviceInfo::sample_count` distinguishes it, and it must be
-//                    re-queried rather than read from a copy cached at init, since MSAA can change
-//                    mid-session. Blaming the GPU here is an actively misleading diagnostic.
-//   no core features the adapter lacks WebGPU CoreFeaturesAndLimits — the D3D11 / OpenGL ES
-//                    compatibility renderers. Genuinely nothing the user can do.
-//
-// **The latch also changes the SCENE PASS's shape**, which is a separate hazard with its own fix:
-// a pipeline built before the attachment appeared no longer matches the pass and is rejected
-// silently. See gfx_scene_pass.h — build scene-pass pipelines lazily, keyed on `layout.key`.
-//
-// **`GfxDeviceInfo::normal_format` IS GONE — do not reintroduce an accessor for it.** Two earlier
-// platforms had that field and two separate bugs came out of it: the retired fork put it at an
-// offset upstream independently claimed for `WGPUInstance`, and a `GfxDrawContext::normal_format`
-// accessor that degraded to `Undefined` was compared against a live device format, so the guard
-// fired on every draw and silently disabled all six composites. To ask "does this build carry
-// authored normals", use `gfx_compat::ScenePassLayout::has_normal_attachment`
-// (`gfx_scene_pass.h`), which reads the semantic tags on the real scene layout.
-//
-// **An SDK without these two fields is a supported configuration, not an error** — unlike the
-// scene-target-layout query next door, which is an #error precisely because getting it wrong is
-// silent. Both accessors degrade to "this build has no normal buffer", and every consumer already
-// has to handle that at RUNTIME anyway: the compatibility renderers (D3D11 / OpenGL ES) cannot
-// carry the attachment, so a null view is a live case on a fully up-to-date build. A mod that
-// needs normals disables itself and says so; SMAA, which only uses them to find extra edges,
-// quietly falls back to its luma detector.
-//
-// **These accessors are safe for reading a value, never for comparing one against a live one.** A
-// shim that answers "absent" is indistinguishable from a real "absent" only in a read; in a
-// comparison it manufactures a difference that was never there.
-//
-// Detection is by member name via SFINAE, which works here because both fields are members of
-// types that exist either way. A missing TYPE or constant cannot be probed this way — see the note
-// in gfx_scene_pass.h on why that one needs the preprocessor.
+// Background: CONTRIBUTING.md "Rules that have bitten before", docs/normal_buffer_portability.md.
 
 #pragma once
 
@@ -74,9 +49,8 @@ struct has_normal : std::false_type {};
 template <class T>
 struct has_normal<T, std::void_t<decltype(std::declval<const T&>().normal)>> : std::true_type {};
 
-/// Request (or decline) the normal snapshot on a `GfxResolveDesc`. A no-op when the SDK has no
-/// such field — the resolve then simply returns colour/depth, which is what the caller's
-/// `resolved_normal() == nullptr` path already handles.
+/// Requests (or declines) the normal snapshot on a `GfxResolveDesc`. A no-op when the SDK has no
+/// such field; the resolve then returns colour/depth only and resolved_normal() gives nullptr.
 template <class T>
 inline void request_normal(T& desc, bool want) {
     if constexpr (has_normal<T>::value) {
@@ -87,9 +61,9 @@ inline void request_normal(T& desc, bool want) {
     }
 }
 
-/// The resolved authored-normal view from a `GfxResolvedTargets`, or `nullptr` when this SDK or
-/// host has no normal buffer. Callers already treat `nullptr` as "reconstruct instead", so the
-/// absent-field case needs no separate branch.
+/// The normal snapshot view from a `GfxResolvedTargets`, or `nullptr` when the SDK has no such
+/// field or the host returned none this frame. Callers must handle `nullptr` anyway (see above),
+/// so the missing-field case needs no branch of its own.
 template <class T>
 inline WGPUTextureView resolved_normal(const T& targets) {
     if constexpr (has_normal<T>::value) {

@@ -1,184 +1,256 @@
-# SMAA — Subpixel Morphological Antialiasing
+# SMAA
 
-Mod id `dev.automata.smaa` (directory `mods/smaa/`). Service-only (no game code, no hooks): stages +
-snapshots from the gfx service, config/ui/resource/log. It depends on no other mod.
-Spatial SMAA 1x — no camera jitter, no motion vectors, no temporal component (the mod API can't
-inject a jittered projection or expose a velocity buffer, so the temporal SMAA variants aren't
-reachable service-only; see "Scope / why 1x").
+Subpixel morphological antialiasing (SMAA 1x) as a post-process.
 
-**Geometric edges come from the gfx service** (GfxService 1.3 — `GfxResolveDesc::normal` →
-`GfxResolvedTargets::normal`, resolved alongside colour and depth) plus a depth
-snapshot. Edge detection unions the luma detector with a normal-angle + relative-depth discontinuity
-test, so silhouettes and creases are caught even where two flat-shaded TP surfaces have almost no
-brightness contrast.
+| | |
+| :-- | :-- |
+| Mod id | `dev.automata.smaa` (`mods/smaa/`) |
+| Version | see `mods/smaa/mod.json` (1.0.0 at the time of writing) |
+| Kind | Service-only: graphics, config, UI, resource and log services. No game code, no hooks, no dependency on other mods |
+| Runs at | `GFX_STAGE_SCENE_AFTER_OPAQUE` |
+| Passes | edge detection (compute) → blend weights (compute) → neighborhood blend (draw) |
 
-Three things about that normal are worth stating precisely:
+It is spatial only: no camera jitter, no motion vectors, no temporal component (see
+[Scope](#scope-and-differences-from-reference-smaa)). Edge detection combines the reference SMAA
+luma detector with **geometric edges** taken from the game's own surface normals and depth, which
+catch silhouettes and creases where two surfaces have little brightness contrast. That matters for
+TP's flat, low-contrast art.
 
-- It is the artist's **authored** vertex normal, not a reconstruction from depth, so it is smooth
-  across a curved surface rather than flat per triangle. Facet boundaries on low-poly geometry no
-  longer register as normal steps, which is why `normalThreshold` now defaults to **5%** (~18°)
-  where the reconstruction era needed 10% to mask that noise.
-- It is in **view space**, and that does not matter here. The test is `1 - dot(n0, n1)` between two
-  normals in the same space, and a shared rotation leaves a dot product unchanged. (It would matter
-  for a shading term. This is not one.)
-- Its alpha is **validity, not depth**. The retired provider packed raw depth into alpha; the
-  service uses that channel to mark pixels with no usable normal (sky, billboards, draws with no
-  normal attribute). Depth is therefore resolved separately, and the angle test is gated on both
-  texels being valid — a zero-vector normal would `normalize()` to NaN and compare false, silently
-  losing the edge. Those boundaries are depth discontinuities anyway, which the depth half catches.
+## Files
 
-If the scene normals are unavailable, geometric edges turn themselves off and the mod does luma-only
-SMAA, which is the reference SMAA behaviour. Same with "Geometric Edges" unticked. Two things cause
-it, and SMAA logs one INFO line naming which:
+| File | Contents |
+| :-- | :-- |
+| `src/mod.cpp` | Options and UI, per-frame stage hook (`on_scene_after_opaque`), compute callback (`on_compute`), draw callback (`on_draw`), texture management (`ensure_targets`), the lazily built blend pipeline (`ensure_neighborhood_pipeline`) |
+| `res/edge_detection.wgsl` | Pass 1 |
+| `res/blend_weights.wgsl` | Pass 2 |
+| `res/neighborhood_blend.wgsl` | Pass 3, and both debug views |
+| `res/licenses/ATTRIBUTION.txt` | Provenance (shipped in the bundle) |
+| `../../common/gfx_scene_pass.h`, `gfx_normal_compat.h` | Shared helpers: scene-pass layout, normal access |
 
-- **MSAA is on.** The renderer refuses to create the normal buffer unless antialiasing is off, and
-  does not even record the request otherwise. This one the user can fix.
-- **A compatibility renderer** (D3D11 / OpenGL ES) cannot carry the attachment at all.
-
-A third case is **not** reported and must not be: the snapshot *latches*, so the first resolve that
-asks returns null and enables normals from the next frame. SMAA waits `kNormalLatchGraceFrames`
-before saying anything, and needs no other handling — it simply runs luma-only for those frames and
-picks the normals up by itself.
+`res/SMAA Logo.png` is packaged but not wired up as an icon (`mod.json` has no `icon` key and the
+loader's default name is `res/icon.png`).
 
 ## Where it runs, and why
 
-`GFX_STAGE_SCENE_AFTER_OPAQUE` — **before** the game's bloom / translucency / DOF / post (those draw
-between `SCENE_AFTER_OPAQUE` and `FRAME_BEFORE_HUD`; see `docs/mod-api-notes.md`). So the game's post
-effects operate on antialiased geometry rather than re-processing our blended edges. This is the
-right layer for TP specifically:
+SMAA runs at `SCENE_AFTER_OPAQUE`: after all opaque world geometry, **before** the game's
+translucent geometry, particles, depth of field and bloom. So the game's own post effects work on
+an already antialiased image.
 
-- TP is **LDR throughout** (GameCube-era pipeline; no HDR tonemap stage), so edge detection on the
-  opaque scene colour is already in the perceptual/gamma space SMAA's luma thresholds expect — there
-  is no "AA must run after tonemap" constraint to push us later.
-- The **alpha-test foliage** (TP's worst aliaser) is drawn in the opaque pass, so it's present here.
-- The **scene normals** are snapshotted by the host right after the opaque lists, and the depth
-  snapshot is taken at this stage, so both describe exactly the surfaces being antialiased.
+- TP renders in LDR throughout, so the colour at this point is already in the gamma-encoded space
+  SMAA's luma thresholds expect. There is no tonemap later that AA would have to follow.
+- Alpha-tested foliage, TP's worst aliasing, is drawn in the opaque lists, so it is present here.
+- Translucent edges and the HUD are drawn later and are not antialiased, which is intended:
+  alpha-blended edges are already soft, and the HUD should not be blurred. (A few particles, drawn
+  inside the opaque phase, are in the input and do get edge-detected.)
 
-The colour input is the frame's **resolved scene snapshot** (`resolve_pass`, a copy), while the final
-blend writes the **live** target — reading a copy and writing the original is hazard-free.
+VBAO also composites at this stage. Hooks on one stage run in mod load order, and neither mod
+imports the other, so their order is not fixed. If VBAO runs first, its AO is in SMAA's colour
+input; if SMAA runs first, AO multiplies over antialiased edges. Either looks fine in practice.
 
-Trade-off of this placement: translucent/particle edges (drawn later) and the HUD are not
-antialiased. Both are intended — alpha-blended edges are already soft, and you never want to AA the
-HUD.
+## How it works
 
-## Pipeline (per frame, at `GFX_STAGE_SCENE_AFTER_OPAQUE`)
+### Per frame (game thread, `on_scene_after_opaque`)
 
-`resolve_pass` snapshots scene colour (single-sample, in `color_format`). One `push_compute` runs two
-compute passes, then one `push_draw` composites. EdgesTex and BlendTex are mod-owned `rgba8unorm`
-(storage + sampled), recreated on resize and retired for a few frames so in-flight payloads never
-reference a freed view.
+1. Return early if disabled.
+2. `resolve_pass` snapshots the scene: colour (RGBA8/BGRA8 unorm), depth (`R32Float`, reversed-Z)
+   and the authored normal (`RGB10A2Unorm`, view space, encoded `n*0.5+0.5`, alpha 1 = valid
+   normal, 0 = none). All three are requested every frame.
+3. `ensure_targets` (re)creates the two mod-owned textures on resize. Old ones are kept for a few
+   frames before release, because work already queued may still reference them.
+4. Decide whether geometric edges are available (normal **and** depth present, option on).
+5. Fill one 64-byte uniform block shared by all three passes (`push_uniform`).
+6. `push_compute` (passes 1 and 2), then `push_draw` (pass 3).
 
-1. **`edge_detection.wgsl`** (compute, 8×8) — for every pixel:
-   - **Luma edges**: the reference SMAA luma detector (Jimenez et al., MIT) with local-contrast
-     adaptation (suppresses an edge when a much stronger parallel gradient sits next to it — kills
-     doubled edges inside high-contrast texture). Catches shading / texture / alpha-test edges.
-   - **Geometric edges** (when the scene normals are available): angular difference of the authored
-     **world normal** (`1 - dot(n_c, n_neighbor)`) unioned with a **relative raw-depth** discontinuity
-     (`|Δd| / max(d, ε)`, robust across reversed-Z and to sky = 0). The normal angle catches
-     silhouettes *and* creases (continuous depth, flipping normal); the depth test catches silhouettes
-     where two near-parallel surfaces sit at different depths.
-   - Output: `EdgesTex.rg` (`.r` = edge on the pixel's left boundary, `.g` = top boundary). The pass
-     also writes `0` to `BlendTex` at the same pixel — folding the blend-target clear into edge
-     detection (the CMAA2 / iMMERSE trick), so pass 2 can write only the sparse edge pixels.
+`resolve_pass` and `push_compute` each split the game's scene render pass, which is what orders the
+compute work before the draw.
 
-2. **`blend_weights.wgsl`** (compute, 16×16) — **the CMAA2-compacted pass**, the expensive one:
-   - **Compaction**: each thread checks its pixel's edges; edge pixels `atomicAdd` their local index
-     into a `groupshared` list (256 slots). After a `workgroupBarrier`, the first `count` threads pull
-     from that packed list and do the search — so the sparse, thin edges run in **fully-occupied
-     warps** instead of one-edge-pixel-per-warp. Non-edge pixels return right after the scan. This is
-     Intel's CMAA2 deferred-processing idea (2018), applied to SMAA's dominant pass.
-   - **Search + coverage** (per edge pixel): walk the collinear run of edge pixels left/right (top
-     edge) or up/down (left edge) until it ends, capped at `maxSearchSteps`; detect the silhouette
-     turn direction at each end from the perpendicular edges; reconstruct the aliased silhouette as a
-     straight line over the run and take its signed height at the pixel centre as the coverage. No LUT
-     assets — the search is **linear** (no SearchTex) and the coverage is **analytic** (no AreaTex).
-   - Output `BlendTex.rgba`, packed as: `.r` this pixel pulls from above · `.g` the above pixel pulls
-     from this one · `.b` pulls from left · `.a` the left pixel pulls from this one. Scaled by
-     `blendStrength`.
+### Passes
 
-3. **`neighborhood_blend.wgsl`** (fullscreen draw into the live target) — gather the four boundary
-   weights that touch this pixel (its own top/left edge, plus the reciprocal weights from the pixel
-   below/right), pick the dominant axis, and pull in the neighbour colour by a **sub-pixel bilinear
-   offset** (weight ≤ 0.5 px → up to 50 % of the neighbour, exactly SMAA's mechanism). Non-edge pixels
-   **discard**, leaving the live target untouched, so only edges are rewritten. Debug views 1 (edge
-   mask) / 2 (blend weights) short-circuit here.
+| # | Pass | Shader / entry | Work size | Reads | Writes |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| 1 | Edge detection (compute) | `edge_detection.wgsl` / `edge_detection` | 8×8 workgroups | colour, normal, depth | **EdgesTex**; clears **BlendTex** to 0 |
+| 2 | Blend weights (compute) | `blend_weights.wgsl` / `blend_weights` | 16×16 workgroups | EdgesTex | BlendTex at edge pixels only |
+| 3 | Neighborhood blend (draw, fullscreen triangle into the live scene target) | `neighborhood_blend.wgsl` / `vs_main`, `fs_main` | per pixel | colour snapshot, BlendTex, EdgesTex | scene colour; non-edge pixels `discard` |
 
-### Why two separate compute passes
+Pass 3 reads the colour *snapshot* and writes the *live* target, so there is no read/write hazard.
 
-Pass 1 clears `BlendTex` (all pixels) and pass 2 overwrites the edge pixels; they run as two
-`BeginComputePass`/`End` blocks so the writes from pass 1 are ordered before pass 2's reads of
-`EdgesTex` and overwrites of `BlendTex`. (Same reason VBAO's chain is ordered — here the write-after-
-write on `BlendTex` makes the pass boundary load-bearing, not just cosmetic.)
+**Mod-owned textures** (both `rgba8unorm`, storage + sampled, render-target size):
 
-## Tunables (config vars; UI shows them in sections)
+| Texture | Channels |
+| :-- | :-- |
+| EdgesTex | `.r` = edge on this pixel's left boundary (a vertical edge), `.g` = edge on its top boundary (a horizontal edge). Values 0/1. `.ba` unused (`rg8unorm` cannot be a storage texture in core WebGPU) |
+| BlendTex | `.r` = this pixel pulls from the pixel above; `.g` = the pixel above pulls from this one; `.b` = pulls from the left; `.a` = the left pixel pulls from this one |
 
-Ints are fixed-point as noted. Every value rides one per-frame uniform block, so changing any of them
-live has no rebuild or pipeline cost.
+**Pass 1, edge detection.** Per pixel, against its left and top neighbours:
 
-| Var | Default | Meaning |
-|---|---|---|
-| `effectEnabled` | on | master toggle |
-| `blendStrength` | 100 | overall edge-blend strength, ×0.01 (0–150). Lower keeps edges crisper; higher smooths harder (and softens slightly) |
-| `edgeThreshold` | 20 | luma edge threshold, ×0.01 (0.05–0.20). Lower catches more edges (softer, can blur texture); higher is more selective. The reference SMAA default is 10, tuned for high-contrast modern rendering; against TP's flatter art that treated ordinary texture detail as an edge, and geometric edges from the authored normals now cover the silhouettes and creases a low luma threshold was compensating for |
-| `localContrast` | 200 | local-contrast adaptation factor, ×0.01 (SMAA default 2.0). Suppresses an edge dwarfed by a parallel neighbour gradient |
-| `useNormalEdges` | on | union the geometric (normal/depth) detector with luma. No effect where the scene normals are unavailable (compatibility renderers) |
-| `normalThreshold` | 5 | geometric edge: `1 - dot(normals)` threshold, ×0.01 (0.05 ≈ an 18° crease). Was 10 when the normal was reconstructed from depth and every facet boundary registered as a step; authored normals are smooth, so 5 is safe. Raise it if creases you consider shading are being antialiased |
-| `depthThreshold` | 20 | geometric edge: relative depth discontinuity, ‰ (×0.001 → 0.02). Lower catches more distant silhouettes |
-| `maxSearchSteps` | 16 | pattern search reach in pixels (4–32). Higher smooths longer near-horizontal/vertical edges, costs more per edge pixel |
-| `debugMode` | 0 | 0 off, 1 edges (red = vertical, green = horizontal), 2 weights (warm = vertical blend, cool = horizontal) |
+- *Luma edges*: BT.709 luma, edge if the difference is ≥ `edgeThreshold`. Local-contrast adaptation
+  as in reference SMAA: an edge is dropped when a neighbouring edge is more than `localContrast`
+  times stronger, which removes doubled edges inside high-contrast texture.
+- *Geometric edges* (when available): an edge if `1 - dot(n0, n1)` ≥ `normalThreshold`, or the
+  relative depth step `|d0 - d1| / max(d0, d1)` ≥ `depthThreshold`. The normal test runs only where
+  both pixels have a valid normal. Sky (depth 0) next to geometry is always an edge.
+- The result is the union (max) of the two. This pass also clears BlendTex, so pass 2 only has to
+  write edge pixels.
 
-Debug views currently draw at `SCENE_AFTER_OPAQUE` (same as the composite), so later effects (fog,
-bloom, translucency) can paint over them — fine for judging edge detection, but if that becomes a
-nuisance we can stage them to `FRAME_BEFORE_HUD` like VBAO does.
+**Pass 2, blend weights.** The expensive pass, optimised with CMAA2-style compaction: each 16×16
+workgroup first collects its edge pixels into a workgroup-shared list (atomic counter), then the
+first `count` threads process that list. Sparse edges therefore run in fully occupied waves instead
+of one useful thread per wave. Per edge pixel:
 
-## Scope / why 1x
+- Walk the run of edge pixels along the edge in both directions, up to `maxSearchSteps` each way.
+- At each end, look one row (or column) over, just past the end, for the same kind of edge: that
+  decides whether the silhouette steps up, down or not at all at that end.
+- Treat the run as a straight line between the two ends and take its height at the pixel centre as
+  the coverage (at most 0.5). Scale by `blendStrength` and store it in BlendTex.
 
-Only **spatial SMAA 1x** is reachable service-only. The temporal/subpixel variants (T2x/S2x/4x) need
-two things the service surface can't provide: a **jittered camera projection** (the camera service is
-a read-only snapshot; we can't offset the game's render matrices) and **motion vectors** (no velocity
-buffer is exposed, and depth reprojection only handles camera motion, not animated foliage/characters).
-Getting those would mean a game-linked mod with hooks — throwing away the durability that keeps this
-off the ABI treadmill. So: 1x smooths static/near-static edges well; it does not stabilise temporal
-shimmer on moving foliage (that's the subpixel case 1x is weakest at, and TP's worst aliasing).
+No lookup textures: the search is a plain linear walk (no SearchTex) and the coverage is computed
+analytically (no AreaTex).
 
-**This version handles orthogonal patterns only.** Diagonal-specific search and corner rounding
-(SMAA's most intricate extras) are deferred — the neighborhood pass still softens diagonals via the
-orthogonal weights, just less precisely at ~45°. The coverage is a from-first-principles trapezoidal
-reconstruction, chosen over reproducing iryoku's precomputed AreaTex so the whole thing is
-correct-by-construction and asset-free; it is in the SMAA family but not bit-identical to reference
-SMAA, and the exact coverage magnitude is expected to want in-game tuning.
+**Pass 3, neighborhood blend.** Gathers the four weights touching the pixel (its own top/left
+weights plus the reciprocal ones stored by the pixels below and to the right), picks the dominant
+axis, and blends toward that neighbour with a bilinear tap offset by the weight. This step matches
+reference SMAA.
 
-## Performance notes
+### Pipelines and resources
 
-The CMAA2 compaction targets the blend-weight pass, which dominates SMAA's cost (per-edge-pixel
-searches); edge detection and neighborhood blending are cheap full-screen passes. Packing sparse edges
-into full warps is where the win is — most relevant here because this effect stacks on
-VBAO/SSILVB/shadows, so shaving the dominant pass returns real budget. There's a deliberately-omitted
-CMAA2 micro-optimization (skipping workgroups with `< 4` edge pixels) that trades a sliver of quality
-on ultra-sparse edges for speed; left out so v1 never drops AA on isolated edges — a candidate if
-profiling asks for it.
+- The two compute pipelines are built in `mod_initialize`. They use automatic bind-group layout, so
+  every binding a shader declares must stay referenced by its entry point or bind-group creation
+  fails.
+- The neighborhood (draw) pipeline is built lazily on the render worker by
+  `ensure_neighborhood_pipeline`, from the live `GfxDrawContext::layout`, and rebuilt when
+  `layout.key` changes. The scene pass gains a normal attachment at runtime, and a pipeline built
+  for the old shape would be silently rejected. See `CONTRIBUTING.md`.
+- When geometric edges are off, the normal and depth bindings receive the colour snapshot as a
+  stand-in; the shader does not read them in that case.
+- Everything the mod creates is released in `mod_shutdown`.
 
-If `GfxDeviceInfo.sample_count > 1` (the scene pass already runs MSAA), SMAA is partly redundant on
-silhouettes; TP's forward port is single-sample by default — Dusklight never assigns
-`AuroraConfig::msaa` and aurora normalises `0 → 1` — which is exactly why post-process AA is worth
-having. **MSAA is also mutually exclusive with the scene normal buffer**, so on the rare build where
-it is on, SMAA loses its geometric detector at the same time as gaining hardware silhouette AA. The
-two cancel out more than they stack.
+## Geometric edges and normals
 
-## Provenance / licensing
+The normal is the artist's **authored** vertex normal, written by the renderer into a second
+colour attachment. It is smooth across curved surfaces, not flat per triangle, so facet boundaries
+on low-poly geometry do not register as edges. That is why `normalThreshold` can default to 5%
+(about 18°). It is in view space, which does not matter here: the test compares two normals in the
+same space.
 
-The SMAA algorithm (edge detection, orthogonal search, neighborhood blending) is **reimplemented from
-the MIT reference** (iryoku/smaa, Jimenez et al.). The compute compaction is **reimplemented from
-Intel's public CMAA2 description** (2018). Pascal Gilcher's proprietary iMMERSE SMAA ("All rights
-reserved") was studied only to confirm the combination of these two public techniques works well —
-**no code from it was copied**. Techniques aren't copyrightable; the specific proprietary source is,
-and was not used.
+Geometric edges switch themselves off, leaving luma-only SMAA (the reference behaviour), when:
 
-## Status
+- **the normal snapshot has not started yet.** The first request turns the normal attachment on for
+  the *next* frame and returns nothing for this one. SMAA runs luma-only for those frames and picks
+  the normals up by itself. It waits `kNormalLatchGraceFrames` (8) before logging anything, so a
+  normal start-up is silent;
+- **the renderer cannot provide normals**, as on the compatibility renderers (D3D11, OpenGL ES);
+- **the depth snapshot is unavailable** (the renderer omits depth from the resolve if it could not
+  create its depth-copy pipeline). The log line in this case still says "no scene normals";
+- **MSAA is on.** The renderer only creates the normal attachment without MSAA. The current game
+  build (Dusklight `v2.0.0`) never enables MSAA, so this cannot happen today; the code path exists
+  for builds that do.
 
-First working version, CI-green on all seven platforms (host code compiles + packages). CI does **not**
-validate WGSL or the visual result — shaders are validated by the game at pipeline-creation time, so
-shader compilation and visual correctness (especially the coverage sign/magnitude) are confirmed
-in-game. Iterate via screenshots + taste feedback per the working model in `docs/unreleased/ssilvb_plan.md` §0.
-Next candidates once the orthogonal base is confirmed: diagonal search, corner rounding, and (if
-wanted) staging debug views to `FRAME_BEFORE_HUD`.
+When one of these persists, SMAA logs one INFO line saying geometric edge detection is off and why.
+
+Unticking **Geometric Edges** stops the geometric test but not the normal and depth snapshots, which
+are still requested every frame.
+
+## Options
+
+Registered in `mod_initialize` (`intOptions[]` table plus two `register_bool_option` calls). All are
+read every frame into the uniform block, so changes apply live. Integer options are scaled on read.
+
+| Config key | UI label | Default | Range | Meaning |
+| :-- | :-- | :-- | :-- | :-- |
+| `effectEnabled` | Enabled | on | | Master switch for the stage |
+| `blendStrength` | Blend Strength | 100 | 0–150 (×0.01) | Scales every blend weight (each is at most 0.5 px at 100%, 0.75 px at 150%). Lower keeps edges crisper, higher smooths harder |
+| `edgeThreshold` | Luma Threshold | 20 | 5–20 (×0.01) | Minimum luma step that counts as an edge. Lower catches more edges and can blur texture detail. The default is the top of the range and double the SMAA reference (10), which treated ordinary texture detail in TP's flat art as edges; geometric edges cover the silhouettes a lower threshold was catching |
+| `localContrast` | Local Contrast | 200 | 100–400 (×0.01) | Drop an edge when a neighbouring edge is more than this many times stronger. Higher suppresses less. Reference SMAA uses 2.0 |
+| `useNormalEdges` | Geometric Edges | on | | Add the normal/depth detector to the luma one |
+| `normalThreshold` | Normal Threshold | 5 | 2–50 (×0.01) | Edge if `1 - dot(n0, n1)` is at least this. 2% ≈ 11.5°, 5% ≈ 18°, 10% ≈ 26° |
+| `depthThreshold` | Depth Threshold | 20 | 1–200 (×0.001) | Edge if the relative raw-depth step is at least this. Lower catches more distant silhouettes |
+| `maxSearchSteps` | Max Search Steps | 16 | 4–32 | Pixels searched in each direction along an edge. Higher handles longer near-horizontal/vertical edges and costs more per edge pixel |
+| `debugMode` | Debug View | 0 | 0–2 | See below |
+
+## Debug views
+
+Drawn by pass 3 at `SCENE_AFTER_OPAQUE`, opaque and full-screen. Translucents, bloom, fog and the
+HUD still draw over them.
+
+| `debugMode` | View | Red | Green |
+| :-- | :-- | :-- | :-- |
+| 1 | Edges | vertical edge (left boundary) | horizontal edge (top boundary) |
+| 2 | Weights | vertical blending (from top edges, `r + g`) | horizontal blending (from left edges, `b + a`) |
+
+Yellow means both. The Weights view shows the pixel's own BlendTex texel, which is at most 0.5 per
+channel at 100% strength, so it looks dim.
+
+## Scope and differences from reference SMAA
+
+- **Spatial 1x only.** The temporal and subpixel variants (T2x, S2x, 4x) need a jittered projection
+  matrix and motion vectors. The camera service cannot offset the projection matrix and there is no
+  velocity buffer, so they are out of reach for a service-only mod. 1x smooths static edges well;
+  it does not stabilise shimmer on moving foliage.
+- **Orthogonal patterns only.** Diagonal search and corner rounding are not implemented. Shallow
+  edges (long horizontal or vertical runs) are handled well, but edges at or near 45° get little or
+  no blending: a staircase of 1-pixel runs with opposite end steps yields a zero weight. The
+  `corner_rounding` uniform field is reserved and always 0.
+- **Coverage is analytic, not table-driven.** It is in the SMAA family but not bit-identical to the
+  reference. In particular:
+  - end detection looks for the same kind of edge one row/column over, where reference SMAA tests
+    the crossing edges;
+  - L-shapes ramp across the whole run, where the reference ramps across the half nearest the
+    corner;
+  - U-shapes (both ends turning the same way) get a flat weight across the run, where the reference
+    uses a tent that falls to 0 in the middle.
+
+  Both of the last two blur somewhat more than the reference.
+- **Not done:** CMAA2's optional skip of workgroups with fewer than 4 edge pixels. It trades a little
+  quality on isolated edges for speed, and is a candidate if profiling asks for it.
+
+## Troubleshooting
+
+Log lines (the game console, prefixed with the mod id):
+
+| Line | Meaning |
+| :-- | :-- |
+| `smaa ready` | Initialised |
+| `SMAA chain executed OK` | The compute passes ran once. It does not prove the final draw happened |
+| `scene colour snapshot unavailable; SMAA disabled` | `resolve_pass` returned no colour. Logged once; the stage keeps retrying every frame |
+| `geometric edge detection off: ...` | Luma-only from now on; the text names MSAA or "no scene normals" |
+
+- The render worker cannot log. If the neighborhood pipeline fails to build, the draw is skipped
+  silently. A WGSL error usually shows up as a device error from the host rather than a mod log
+  line, so run `tools/wgsl_check` after any shader edit (see `CONTRIBUTING.md`).
+- Use the Edges view first: missing edges are a pass 1 problem; edges present but no visible
+  smoothing points at pass 2 or 3.
+
+## Known issues
+
+- Edges at or near 45° get little or no smoothing (see Scope above).
+- Unticking **Geometric Edges** still requests the normal and depth snapshots every frame, so it
+  saves shader work but not the copies.
+- The `no scene normals` log line is also used when only the depth snapshot is missing.
+- The `SMAA disabled` warning is logged once, but the stage keeps retrying and resumes on its own.
+- `DrawPayload::debug_view` is written but never read; the shader uses the uniform's copy.
+- At the screen border the edge search keeps counting the clamped border pixel, so a run that
+  reaches the border is treated as continuing up to `maxSearchSteps`. Minor.
+
+## Changing things
+
+- New uniform field: update `SmaaUniforms` in `mod.cpp` **and** the `Uniforms` struct in all three
+  shaders, and keep the size `static_assert` (64 bytes, a multiple of 16) true.
+- Payloads (`ComputePayload`, `DrawPayload`) must stay trivially copyable and at most 128 bytes.
+- Compute bindings must stay statically referenced (automatic layout, see above).
+- Defaults live in `intOptions[]` and the two `register_bool_option` calls; the read site's fallback
+  should match. See `docs/editing-options.md`.
+
+## Provenance
+
+The SMAA algorithm (edge detection, orthogonal search, neighborhood blending) is reimplemented in
+WGSL from the published paper and the MIT reference (iryoku/smaa, Jimenez et al.). The compute
+compaction in pass 2 is reimplemented from Intel's public CMAA2 description (Strugar, 2018). Pascal Gilcher's iMMERSE SMAA, which is proprietary, was read only to confirm the
+combination of the two public techniques is sound; no code from it is used. See
+`mods/smaa/res/licenses/ATTRIBUTION.txt`.
+
+## History
+
+- 1.0.0 is the first release. Before the 1.0.0 version reset, the mod had reached 1.1.0 internally.
+- `edgeThreshold` defaults to 20 rather than the reference 10 after in-game feedback.
+- `normalThreshold` was 10 while normals were reconstructed from depth (every triangle facet
+  registered as a crease). Authored normals made 5 safe.

@@ -1,26 +1,26 @@
-// VBAO — Visibility Bitmask Ambient Occlusion.
+// VBAO — Visibility Bitmask Ambient Occlusion. Service-only: no game headers, no hooks.
 //
-// A quality-focused evolution of Encounter's ao_mod demo: the same gfx-service compute chain (depth MIP
-// prefilter -> occlusion -> edge-aware spatial denoise -> composite), with
-//  - VBAO: a 32-sector visibility-bitmask occlusion estimator (Therrien et al. 2022) in place of the
-//    classic horizon tracker: separated occluders, gaps and thin geometry (grass) are handled
-//    correctly instead of overdarkening behind the nearest occluder;
-//  - TEMPORAL ACCUMULATION: the sampling noise advances every frame and a reprojected history
-//    buffer averages the estimates into a clean, stable result. Two history candidates per pixel
-//    (camera-reprojected, and static at the pixel's own position) scored on depth AND the normal
-//    the history stores stand in for per-object motion vectors; a depth-relative disocclusion
-//    reject, a neighbourhood clamp, a sigma-normalised outlier test and a depth-faded,
-//    frame-time-capped velocity response control ghosting. With accumulation disabled the
-//    spatial denoiser alone remains as the single-frame fallback;
-//  - a depth-aware composite upscale (no AO bleed across silhouettes at half resolution);
-//  - thickness and contrast controls, and a depth-proportional sampling radius;
-//  - AUTHORED NORMALS: the shading normal is the game's own view-space vertex normal, resolved
-//    alongside depth (GfxResolveDesc::normal -> GfxResolvedTargets::normal), so the occlusion
-//    hemisphere follows smooth curvature instead of the flat per-triangle facets a depth gradient
-//    returns by construction. No reconstructed SHADING normal remains (the depth-derived geometric
-//    plane that rejects below-surface samples is a different thing and stays). It needs a
-//    core-features device: the D3D11 and OpenGL ES backends cannot carry the attachment, and VBAO
-//    disables itself there with a one-time log line.
+// Built on Encounter's ao_mod demo and its gfx-service compute chain, with these changes:
+//  - Occlusion: a 32-sector visibility bitmask per slice (Therrien, Levesque and Gilet, 2023,
+//    arXiv:2301.11376) instead of a horizon tracker, so gaps, separated occluders and thin geometry
+//    such as grass do not overdarken.
+//  - Temporal accumulation: the sampling noise changes every frame and a camera-reprojected history
+//    averages the estimates. See res/temporal.wgsl and docs/vbao.md "Temporal accumulation".
+//  - Shading normal: the game's authored view-space normal, resolved alongside depth
+//    (GfxResolveDesc::normal -> GfxResolvedTargets::normal). There is no depth-reconstructed
+//    fallback. Without normals (the D3D11 / OpenGL ES compatibility renderers) VBAO disables itself
+//    and logs once.
+//  - Depth-aware upscale in the composite, black point / contrast / distance fade, and a radius
+//    that ramps with view depth.
+//
+// Per frame, at GFX_STAGE_SCENE_AFTER_OPAQUE (game thread): resolve depth + normals, push the
+// uniforms, push one compute task (depth MIP prefilter -> occlusion -> 0-3 denoise passes ->
+// temporal accumulation), then push the multiply composite into the scene pass. A selected debug
+// view replaces the composite and is drawn at GFX_STAGE_FRAME_AFTER_HUD. The compute and draw
+// callbacks run later on the render worker: they use their payload, the mod's own pipelines and
+// wgpu calls, and must never touch game state.
+//
+// "Enhanced AO" is the mod's former name; it survives in pipeline labels and log lines.
 //
 // The framework WGSL in res/ derives from Bevy Engine's SSAO (MIT OR Apache-2.0) and Intel
 // XeGTAO (MIT); see res/licenses/ and the headers of each shader.
@@ -122,9 +122,9 @@ WGPURenderPipeline g_compositeDebugPipeline = nullptr;
 WGPUBindGroupLayout g_compositeLayout = nullptr;
 WGPUBindGroupLayout g_compositeDebugLayout = nullptr;
 
-// AO chain targets, recreated when the render size (or halfRes) changes. Old sets are retired
-// for a few frames instead of released immediately: payloads embedding their views may still
-// be in flight on the render worker.
+// AO chain targets, recreated when the chain size changes (render size or Half Res). Old sets are
+// kept for 4 frames before release, because payloads holding their views may still be in flight
+// on the render worker.
 struct AoTargets {
     uint32_t width = 0;   // AO chain resolution (half the render size in Half Res)
     uint32_t height = 0;
@@ -139,8 +139,8 @@ struct AoTargets {
     WGPUTextureView depthDifferencesView = nullptr;
     WGPUTexture aoFinal = nullptr;
     WGPUTextureView aoFinalView = nullptr;
-    // Temporal accumulation ping-pong: rgba16float (accumulated AO, normalized view depth,
-    // octahedral view-space normal).
+    // Temporal accumulation ping-pong, full render resolution: rgba16float (accumulated AO,
+    // view depth / far plane, octahedral view-space normal).
     WGPUTexture history[2] = {};
     WGPUTextureView historyViews[2] = {};
 };
@@ -160,56 +160,32 @@ float g_prevProjFromWorld[16] = {};
 
 bool g_warnedNoInputs = false;
 
-// THE NORMAL SNAPSHOT LATCHES ON, so an early null means "not yet", not "never".
+// The normal snapshot latches: the first resolve_pass that asks for normals returns a null view and
+// enables the normal attachment from the next frame on (upstream mods/ao_mod says the same). A null
+// view in the first frames therefore means "not yet". Only a run longer than
+// kNormalLatchGraceFrames is reported, once.
 //
-// Asking for normals through GfxResolveDesc::normal enables the attachment for the NEXT frame; the
-// resolve that first asks returns a null view. Upstream's own reference consumer says so and simply
-// returns (mods/ao_mod/src/mod.cpp, "The first request enables normals next frame; unsupported
-// devices keep returning null"). The retired fork API had no latch — the host snapshotted every
-// frame whether or not anyone asked — so this is new behaviour, and treating the first null as a
-// hard failure would fire the "device cannot do this" warning on every cold start and on every
-// return from a menu that tore the pass down.
-//
-// A device that genuinely cannot carry the attachment keeps returning null forever, and that is
-// worth one log line. So: count consecutive frames of asking-and-getting-null, and only warn once
-// the count is past the handful of frames the latch could plausibly take.
-//
-// TWO THINGS BLOCK THE LATCH PERMANENTLY, and the first is a SETTING, not a device limit:
-//
-//   MSAA on          aurora refuses to create the normal buffer unless msaaSamples == 1, and
-//                    resolve_pass does not even record the request in that case (see
-//                    aurora lib/webgpu/gpu.cpp enable_normal_buffer() and
-//                    lib/gfx/recording.cpp resolve_pass). So with MSAA enabled the view is null
-//                    forever on hardware that is otherwise perfectly capable.
-//   no core features the adapter lacks WebGPU's CoreFeaturesAndLimits (the compatibility
-//                    renderers), so the attachment cannot exist at all.
-//
-// The message must separate those: "your GPU can't" is wrong and unactionable when the real answer
-// is "turn MSAA off". GfxDeviceInfo::sample_count reports the live scene-pass sample count, so we
-// re-query it at warn time rather than trusting the copy cached at init - the user can change MSAA
-// mid-session.
+// Two conditions keep the view null for good:
+//  - no WebGPU core features (the D3D11 / OpenGL ES compatibility renderers);
+//  - MSAA: aurora only creates the normal buffer at 1 sample (enable_normal_buffer() in
+//    lib/webgpu/gpu.cpp; resolve_pass in lib/gfx/recording.cpp does not record the request).
+//    This game build never enables MSAA (aurora treats an unset sample count as 1); the MSAA
+//    branch of the warning is kept for builds that do. It reads the sample count from a fresh
+//    get_device_info call.
 constexpr uint32_t kNormalLatchGraceFrames = 8;
 uint32_t g_normalWaitFrames = 0;
 bool g_loggedChain = false;
 float g_loggedFarPlane = 1.0f;  // last far plane reported to the log (world-unit calibration)
 
-// Frame-time-aware ceiling on the temporal velocity response (see temporal.wgsl's header).
+// Frame-time-aware ceiling on the temporal velocity term (temporal.wgsl).
 //
-// The velocity term is `screen motion in pixels PER FRAME * motionResponse`, so the same camera pan
-// drives it twice as hard at 30 fps as at 60 and five times as hard as at 144. At the default
-// response it reached a full history reset (blend weight 1.0) on any ordinary pan below ~100 fps,
-// and a full reset shows the raw single-frame estimate whose sampling pattern advances every frame.
-// Whether that reads as flicker is a question of how long each frame is on screen: at 144 Hz the
-// eye fuses it, at 30-60 Hz it does not. So the ceiling is `kVelocityFusionFrameTime / frame time`:
-// a full reset stays available above 250 fps, 144 fps allows ~0.58, 60 fps ~0.24 (at least a
-// four-frame average during pans) and 30 fps ~0.12, where the term falls below the base blend
-// weight and is inert. It caps ONLY the velocity term; the disocclusion and content rejects keep
-// their full authority because they answer "is this history from the same surface", not "how
-// visible is per-frame noise".
-//
-// This was the first of the 1.1.0 temporal changes; the response itself also fades with view depth
-// (motionRange). The whole sequence and the field results are in docs/vbao.md "Temporal
-// accumulation: history and diagnostics".
+// That term is screen motion in pixels per frame * motionResponse, so one camera pan drives it
+// harder the lower the frame rate. A blend weight near 1 displays the raw single-frame estimate,
+// whose sampling pattern changes every frame: the eye fuses that at high refresh rates and sees
+// flicker at 30-60 fps. The ceiling is kVelocityFusionFrameTime / frame time: a full reset above
+// 250 fps, ~0.58 at 144 fps, ~0.24 at 60 fps, ~0.12 at 30 fps (below the default base weight of
+// 1/8, so the term has no effect there). Only the velocity term is capped; the disocclusion and
+// content rejects are not. See docs/vbao.md "Temporal accumulation".
 constexpr float kVelocityFusionFrameTime = 0.004f; // seconds: 250 fps and above allow a full reset
 constexpr float kFrameDtMin = 0.001f;              // clamp for the raw interval (spikes, hitches)
 constexpr float kFrameDtMax = 0.100f;
@@ -222,10 +198,9 @@ std::chrono::steady_clock::time_point g_lastFrameTimeLog{};
 float g_smoothedFrameDt = 1.0f / 60.0f;            // EMA of the stage-hook interval (seconds)
 float g_loggedFrameDt = 0.0f;                      // last interval reported to the log
 
-// Game thread, once per rendered frame: advance the frame-interval estimate and return the velocity
-// ceiling for this frame. Measured on the stage hook itself (one call per rendered frame) rather
-// than from any game clock, so it stays service-only and follows whatever the port presents -
-// 30 fps with interpolation off, the capped/uncapped rate with it on.
+// Game thread, once per rendered frame: advance the frame-interval estimate and return this frame's
+// velocity ceiling. Measured between calls of the stage hook rather than from a game clock, so it
+// stays service-only and follows the rate frames are actually rendered at.
 float update_velocity_cap() {
     const auto now = std::chrono::steady_clock::now();
     bool measured = false;
@@ -246,8 +221,8 @@ float update_velocity_cap() {
     g_frameTimeValid = true;
     g_lastStageTime = now;
     const float cap = std::clamp(kVelocityFusionFrameTime / g_smoothedFrameDt, 0.0f, 1.0f);
-    // Calibration aid, once per material change (>25%) rather than per frame: lets a report of
-    // "flickers in motion" be read against the frame rate it happened at.
+    // Log when the smoothed interval moves by more than 25% (at most every 2 s), so a report of
+    // flicker in motion can be read against the frame rate it happened at.
     if (measured && std::fabs(g_smoothedFrameDt - g_loggedFrameDt) > g_loggedFrameDt * 0.25f &&
         std::chrono::duration<float>(now - g_lastFrameTimeLog).count() > kFrameDtLogInterval)
     {
@@ -261,12 +236,12 @@ float update_velocity_cap() {
     }
     return cap;
 }
+// Set by the render worker after the first complete chain; mod_update logs it once.
 std::atomic g_chainExecuted{false};
 
-// One line at init naming the GPU and backend this instance runs on, so a report can be read
-// against the hardware it came from. Resolved through get_proc_address rather than linked, because
-// the SDK link stub is only guaranteed to carry the entry points the SDK itself uses; if the host
-// does not export these two the line is simply skipped.
+// One line at init naming the GPU and backend, so a report can be read against the hardware it came
+// from. The two entry points are looked up through get_proc_address rather than linked; if the host
+// does not export them the line is skipped.
 void log_adapter_info() {
     if (g_deviceInfo.adapter == nullptr) {
         return;
@@ -316,34 +291,35 @@ void log_adapter_info() {
     }
 }
 
-// Mirror of the WGSL Uniforms struct (keep in sync with res/*.wgsl).
+// Important: mirrors the `Uniforms` struct in all five res/*.wgsl files byte for byte. Change every
+// copy together and keep the size a multiple of 16.
 struct AoUniforms {
-    float projection[16];
-    float inverse_projection[16];
-    float reproject[16];
-    float size[2];
+    float projection[16];          // proj_from_view (column-major)
+    float inverse_projection[16];  // view_from_proj
+    float reproject[16];           // current view -> previous frame's clip space
+    float size[2];                 // AO chain size in pixels (half the render size in Half Res)
     float inv_size[2];
-    float depth_scale[2];
-    float effect_radius;
-    float intensity;
+    float depth_scale[2];          // render (snapshot) pixels per chain pixel: 1 or 2
+    float effect_radius;           // near radius, fraction of view depth
+    float intensity;               // composite strength, 1 = 100%
     float slice_count;
     float steps_per_side;
-    float thickness;
-    float contrast;
-    float temporal_alpha;
-    float temporal_clamp_k;
-    float inv_far;
-    float radius_max;
-    float depth_bias;
-    float thick_fade;
-    float velocity_scale;
-    float content_thresh;
-    float disocc_tol;
-    float black_point;
-    float fade_start;
-    float fade_end;
+    float thickness;               // base occluder thickness multiplier
+    float contrast;                // exponent applied to visibility in the composite
+    float temporal_alpha;          // base history blend weight, 1 / Temporal Frames
+    float temporal_clamp_k;        // history clamp half-width, in sigmas of the 3x3 neighbourhood
+    float inv_far;                 // 1 / far plane; normalises the depth stored in the history
+    float radius_max;    // screen-space radius cap, fraction of viewport height
+    float depth_bias;    // self-occlusion bias: view position scaled by (1 - depth_bias)
+    float thick_fade;    // occluder-thickness fade range, multiple of the view radius
+    float velocity_scale;  // velocity blend weight per pixel/frame of screen motion
+    float content_thresh;  // outlier-test threshold scale (1 = 1..2.5 sigma)
+    float disocc_tol;      // disocclusion depth tolerance, fraction of depth (shader floor 0.015)
+    float black_point;     // occlusion floor removed in the composite
+    float fade_start;      // distance fade start, world units of view depth
+    float fade_end;        // distance fade end, world units of view depth
     uint32_t debug_view;
-    uint32_t frame_index;
+    uint32_t frame_index;  // advances per frame while accumulating, else 0
     uint32_t flags; // bit 0 = temporal enabled, bit 1 = history valid, bit 2 = distance fade
     float thick_dist_scale;  // extra occluder thickness, fraction of the view-space radius
     float inv_debug_depth;   // debug depth view gradient scale (1 / world units)
@@ -351,8 +327,8 @@ struct AoUniforms {
     float radius_ramp_start; // radius ramp band start, world units of view depth
     float radius_ramp_end;   // radius ramp band end, world units of view depth
     float denoise_strength;  // spatial denoise blend, 0 raw .. 1 fully blurred
-    float velocity_cap;      // ceiling on the motion-response alpha (frame-time aware, host-set)
-    float velocity_range;    // motion response fades out from this view depth to 2x it (world units; 0 = never)
+    float velocity_cap;      // ceiling on the velocity blend weight (frame-time aware, host-set)
+    float velocity_range;    // velocity term fades over [this, 2x] view depth, world units; 0 = off
     float _pad2;
 };
 static_assert(sizeof(AoUniforms) % 16 == 0);
@@ -369,8 +345,8 @@ struct ComputePayload {
     WGPUTextureView sceneNormal;  // GfxService scene normal snapshot (view space)
     uint32_t uniform_offset;
     uint32_t uniform_size;
-    // Resolutions are packed (hi 16 = width, lo 16 = height) to keep the payload within the
-    // 128-byte inline cap after adding sceneNormal. Render resolutions are well under 65535.
+    // Resolutions are packed (hi 16 = width, lo 16 = height) so the payload fits the 128-byte
+    // GFX_INLINE_DRAW_PAYLOAD_SIZE exactly. Render resolutions are well under 65535.
     uint32_t chainSize;      // AO chain (half) resolution, packed
     uint32_t fullSize;       // full render resolution, packed
     uint32_t run_temporal;
@@ -380,10 +356,10 @@ static_assert(sizeof(ComputePayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
 static_assert(std::is_trivially_copyable_v<ComputePayload>);
 
 struct CompositePayload {
-    WGPUTextureView aoSource;           // accumulated (temporal) or denoised (fallback) AO
-    WGPUTextureView preprocessedDepth;  // the Depth debug view reads it back
-    WGPUTextureView sceneDepth;         // raw snapshot: depth-aware upscale + bypass debug views
-    WGPUTextureView sceneNormal;        // scene normal snapshot, for the Normals debug view
+    WGPUTextureView aoSource;           // history, last denoise output, or aoNoisy (view 7)
+    WGPUTextureView preprocessedDepth;  // all MIPs: upscale weights and the depth debug views
+    WGPUTextureView sceneDepth;         // raw snapshot: reference depth, staircase view
+    WGPUTextureView sceneNormal;        // scene normal snapshot, for debug views 2 and 6
     uint32_t uniform_offset;
     uint32_t uniform_size;
     uint32_t debug_view;
@@ -391,14 +367,10 @@ struct CompositePayload {
 static_assert(sizeof(CompositePayload) <= GFX_INLINE_DRAW_PAYLOAD_SIZE);
 static_assert(std::is_trivially_copyable_v<CompositePayload>);
 
-// Debug views draw at FRAME_AFTER_HUD instead of SCENE_AFTER_OPAQUE so nothing layered on after
-// the opaque scene obscures them - bloom, translucency, and Deferred Fog's quad all land before
-// this point. AFTER the HUD specifically, rather than before it: that is the last stage in the
-// frame, so it needs no cooperation from any other mod. (This used to be FRAME_BEFORE_HUD, which
-// shares a stage with Deferred Fog's fog quad and therefore depended on hook registration order -
-// VBAO carried an optional import of dev.automata.deferred_fog purely to force that order. Moving
-// one stage later removes the coupling outright.) The payload is staged here between the two
-// stages (game thread only; its views live for the frame).
+// A debug view is staged by the SCENE_AFTER_OPAQUE hook and drawn at FRAME_AFTER_HUD, the last
+// stage of the frame, so translucency, bloom, other mods' passes (Deferred Fog's quad) and the HUD
+// cannot cover it, with no dependency on another mod's hook order. Game thread only; the payload's
+// views stay valid for the rest of the frame.
 CompositePayload g_pendingDebugDraw{};
 bool g_debugDrawPending = false;
 
@@ -418,9 +390,8 @@ bool get_bool_option(ConfigVarHandle handle, bool fallback) {
     return value;
 }
 
-// Horizon slices x marched steps per slice side. The bitmask estimator carves 32 sectors per
-// slice, so it converges with fewer slices than a plain horizon tracker at equal quality.
-// Quality 4 = Custom: the raw slice/step settings are used directly.
+// Slices per pixel and marched steps per slice side for each Quality preset.
+// Quality 4 = Custom: the Custom Slices / Custom Steps settings are used directly.
 void quality_counts(int64_t quality, float& sliceCount, float& stepsPerSide) {
     switch (std::clamp<int64_t>(quality, 0, 4)) {
     case 0:
@@ -497,7 +468,7 @@ bool build_composite_pipeline(const gfx_compat::ScenePassLayout& sceneLayout, bo
         return false;
     }
 
-    // Multiply blend
+    // Multiply blend: scene colour *= AO; scene alpha untouched.
     WGPUBlendState blendState{
         .color =
             {
@@ -512,13 +483,10 @@ bool build_composite_pipeline(const gfx_compat::ScenePassLayout& sceneLayout, bo
                 .dstFactor = WGPUBlendFactor_One,
             },
     };
-    // The pipeline has to describe the scene pass's attachments, whatever they currently are. On a
-    // device that carries the scene normals the pass has a SECOND, renderer-owned colour target,
-    // and a one-target pipeline is rejected outright; on the compatibility renderers it has one.
-    // The layout is handed in from the DRAW CONTEXT rather than queried here, because the pass can
-    // change shape mid-run — see ensure_composite_pipelines. Every target the mod does not own
-    // comes back write-masked off, so this composite writes scene colour only and leaves the game's
-    // normals untouched.
+    // The pipeline must match the scene pass's attachments as they are now. Once the normal buffer
+    // is on, the pass has a second, renderer-owned colour target and a one-target pipeline is
+    // rejected. The layout comes from the draw context (see ensure_composite_pipelines). Targets
+    // the mod does not own come back write-masked off, so only scene colour is written.
     gfx_compat::ScenePassLayout layout = sceneLayout;
     if (blend) {
         layout.color_targets[0].blend = &blendState;
@@ -528,7 +496,8 @@ bool build_composite_pipeline(const gfx_compat::ScenePassLayout& sceneLayout, bo
     fragment.entryPoint = {"fs_main", WGPU_STRLEN};
     fragment.targetCount = layout.color_target_count;
     fragment.targets = layout.color_targets;
-    // Depth state must match the EFB pass despite never touching depth.
+    // The depth format must match the scene pass even though the composite neither tests nor
+    // writes depth.
     WGPUDepthStencilState depthStencil = WGPU_DEPTH_STENCIL_STATE_INIT;
     depthStencil.format = layout.depth_format;
     depthStencil.depthWriteEnabled = WGPUOptionalBool_False;
@@ -616,9 +585,8 @@ bool ensure_targets(uint32_t width, uint32_t height, uint32_t fullWidth, uint32_
         return outTexture != nullptr;
     };
 
-    // The AO chain runs at chain (half) res; the temporal history is full render res so the
-    // half-res estimate can be reconstructed into it (temporal upsampling). At full res the two
-    // sizes coincide.
+    // The AO chain runs at chain resolution; the temporal history is always full render
+    // resolution so a half-res estimate can be reconstructed into it (temporal upsampling).
     bool ok = createStorageTexture("Enhanced AO preprocessed depth", WGPUTextureFormat_R32Float, 5,
                   width, height, g_targets.preprocessedDepth) &&
               createStorageTexture(
@@ -627,8 +595,8 @@ bool ensure_targets(uint32_t width, uint32_t height, uint32_t fullWidth, uint32_
                   width, height, g_targets.depthDifferences) &&
               createStorageTexture(
                   "Enhanced AO final", WGPUTextureFormat_R32Float, 1, width, height, g_targets.aoFinal) &&
-              // (ao, depth, octahedral normal .xy) - 8 bytes/pixel, same as the rg32float it
-              // replaced; the normal is the temporal pass's second surface-identity test.
+              // (ao, depth / far, octahedral normal .xy), 8 bytes per pixel; the normal is the
+              // temporal pass's second surface-identity test.
               createStorageTexture("Enhanced AO history 0", WGPUTextureFormat_RGBA16Float, 1,
                   fullWidth, fullHeight, g_targets.history[0]) &&
               createStorageTexture("Enhanced AO history 1", WGPUTextureFormat_RGBA16Float, 1,
@@ -670,7 +638,7 @@ constexpr uint32_t div_ceil(uint32_t numerator, uint32_t denominator) {
     return (numerator + denominator - 1) / denominator;
 }
 
-// Render worker thread: the AO chain as one compute pass (preprocess, occlusion, denoise, and
+// Render worker thread: the AO chain as one compute pass (depth prefilter, occlusion, denoise, and
 // optionally temporal accumulation).
 void on_compute(
     ModContext*, const GfxComputeContext* ctx, const void* payload, size_t payloadSize, void*) {
@@ -728,8 +696,9 @@ void on_compute(
                           textureEntry(2, data.aoNoisy),
                           textureEntry(3, data.depthDifferences), uniformEntry(4),
                           textureEntry(5, data.sceneNormal)});
-    // Denoise ping-pongs aoNoisy <-> aoFinal; the last-written buffer feeds temporal/composite
-    // (the game thread computes the same parity for the composite payload).
+    // Denoise ping-pongs aoNoisy -> aoFinal -> aoNoisy -> aoFinal; the last-written buffer feeds
+    // temporal/composite (the game thread computes the same parity for the composite payload).
+    // From the second pass on, aoNoisy no longer holds the raw estimate.
     const uint32_t denoisePasses = std::min(data.denoise_passes, 3u);
     WGPUBindGroup denoiseGroups[3] = {};
     bool denoiseOk = true;
@@ -745,8 +714,8 @@ void on_compute(
         denoisePasses == 0 ? data.aoNoisy : ((denoisePasses % 2u) != 0u ? data.aoFinal : data.aoNoisy);
     WGPUBindGroup temporalGroup = nullptr;
     if (data.run_temporal != 0) {
-        // binding 3 (raw_depth) reuses the full-res scene depth snapshot (data.depth), which the
-        // preprocess pass also consumes as its input.
+        // Binding 3 (raw_depth) is the full-res scene depth snapshot, the same texture the
+        // prefilter reads.
         temporalGroup = makeBindGroup(g_temporalLayout,
             {textureEntry(0, denoisedView), textureEntry(1, data.historyIn),
                 textureEntry(2, data.preprocessedDepthMips[0]), textureEntry(3, data.depth),
@@ -791,8 +760,7 @@ void on_compute(
         }
     }
     if (temporalGroup != nullptr) {
-        // The temporal pass runs at full render resolution (it reconstructs the half-res estimate
-        // into the full-res history).
+        // The temporal pass runs at full render resolution.
         wgpuComputePassEncoderSetPipeline(pass, g_temporalPipeline);
         wgpuComputePassEncoderSetBindGroup(pass, 0, temporalGroup, 0, nullptr);
         wgpuComputePassEncoderDispatchWorkgroups(
@@ -828,22 +796,14 @@ void release_composite_pipelines() {
     g_sceneLayoutValid = false;
 }
 
-// THE SCENE PASS CHANGES SHAPE WHILE THE GAME RUNS, so the composite pipelines cannot be built once
-// at init and kept.
+// Builds the composite pipelines for the pass this draw is recorded into, and rebuilds them when
+// GfxDrawContext::layout.key changes (as the SDK header asks).
 //
-// Asking for the authored normals does not take effect immediately: the renderer notes the request
-// and turns the normal attachment on ONE FRAME LATER (aurora lib/gfx/recording.cpp — the request
-// sets a flag, and the following frame's pass creation honours it). From that frame on the scene
-// pass has a second colour attachment, and a pipeline built against the one-target layout is
-// rejected by WebGPU. Nothing logs; the composite simply stops appearing. This mod builds its
-// pipelines here instead, keyed on GfxDrawContext::layout.key, which is what the SDK header means
-// by "rebuild pipelines if GfxDrawContext.layout key changes" — and it is what upstream's own
-// reference consumer (mods/ao_mod) does, building no scene pipeline at init at all.
-//
-// The key only moves when the pass genuinely changes, so the steady state is one comparison per
-// draw. If a future stage ever records into a DIFFERENTLY shaped pass, this would rebuild twice a
-// frame rather than misbehave — visible as a framerate cliff, and the fix would be a small
-// per-key cache rather than a redesign.
+// Important: the scene pass changes shape at runtime. The first normal request makes aurora add a
+// normal attachment from the next frame on (lib/gfx/recording.cpp), and a pipeline built for the
+// old one-target layout is rejected without any log, so the composite silently disappears. That is
+// why nothing here is built at init; upstream mods/ao_mod does the same. Both the composite and
+// the debug-view draw come through here; the steady state is one key comparison per draw.
 bool ensure_composite_pipelines(const GfxDrawContext& ctx) {
     const uint64_t key = gfx_compat::scene_pass_layout_key(ctx);
     if (g_sceneLayoutValid && key == g_sceneLayoutKey && g_compositePipeline != nullptr &&
@@ -868,7 +828,7 @@ bool ensure_composite_pipelines(const GfxDrawContext& ctx) {
     return true;
 }
 
-// Render worker thread: composite the AO over the scene (or show it, in debug view).
+// Render worker thread: multiply the AO over the scene, or draw a debug view opaquely.
 void on_draw(
     ModContext*, const GfxDrawContext* ctx, const void* payload, size_t payloadSize, void*) {
     if (payloadSize != sizeof(CompositePayload) || ctx == nullptr ||
@@ -916,7 +876,7 @@ void on_draw(
     wgpuBindGroupRelease(bindGroup);
 }
 
-// Game thread, after opaque scene draws and before translucent/fog overlay lists.
+// Game thread, after the opaque lists and before the translucent lists.
 void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) {
     tick_retired_targets();
     // Sampled before the early-outs so the interval estimate follows every rendered frame.
@@ -940,18 +900,19 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     GfxResolveDesc resolveDesc = GFX_RESOLVE_DESC_INIT;
     resolveDesc.color = false;
     resolveDesc.depth = true;
-    // The game's authored view-space normals come back alongside depth from the same resolve.
-    // Both go through common/gfx_normal_compat.h rather than touching GfxResolveDesc::normal and
-    // GfxResolvedTargets::normal directly: the shim detects them by member name, so an SDK without
-    // them degrades to "this build has no normal buffer" instead of failing to compile.
+    // resolve_pass snapshots depth and the authored view-space normals as the scene pass stands at
+    // this call, then ends that pass and continues on a new one that loads its contents; the
+    // composite pushed below lands in the continuation. The normal fields go through
+    // common/gfx_normal_compat.h, which detects them by member name, so an SDK without them builds
+    // as "no normal buffer" instead of failing to compile.
     gfx_compat::request_normal(resolveDesc, true);
     GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
     const bool resolveOk = svc_gfx->resolve_pass(mod_ctx, &resolveDesc, &resolved) == MOD_OK;
     const WGPUTextureView sceneNormalView =
         resolveOk ? gfx_compat::resolved_normal(resolved) : nullptr;
     if (!resolveOk || resolved.depth == nullptr || sceneNormalView == nullptr) {
-        // See kNormalLatchGraceFrames: the first frames after asking legitimately have no normal
-        // view, so only a run of them means the device cannot supply one.
+        // See kNormalLatchGraceFrames: the first frames after asking have no normal view by
+        // design, so only a longer run means the device cannot supply one.
         if (resolveOk && resolved.depth != nullptr) {
             ++g_normalWaitFrames;
         }
@@ -979,10 +940,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
                     "compatibility renderers cannot provide scene normals)");
             }
         }
-        // Invalidate the temporal state exactly as the disabled path does. On a device without
-        // scene normals this branch is taken EVERY frame, so leaving a stale history and camera
-        // around would hand the first frame after any recovery a reprojection from whenever the
-        // mod last ran.
+        // Invalidate the temporal state as the disabled path does, so the first frame after the
+        // inputs return does not reproject from a stale history and camera.
         g_historyValid = false;
         g_prevCameraValid = false;
         return;
@@ -1008,7 +967,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     std::memcpy(uniforms.projection, camera.proj_from_view, sizeof(uniforms.projection));
     std::memcpy(
         uniforms.inverse_projection, camera.view_from_proj, sizeof(uniforms.inverse_projection));
-    // Reprojection: current view-space position -> previous frame's clip space.
+    // Reprojection: current view-space position -> previous frame's clip space. Without a previous
+    // camera it is the current projection (the history is invalid then anyway).
     if (g_prevCameraValid) {
         mat4_mul_col(g_prevProjFromWorld, camera.world_from_view, uniforms.reproject);
     } else {
@@ -1020,19 +980,19 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.inv_size[1] = 1.0f / uniforms.size[1];
     uniforms.depth_scale[0] = static_cast<float>(resolved.width) / uniforms.size[0];
     uniforms.depth_scale[1] = static_cast<float>(resolved.height) / uniforms.size[1];
-    // Percent/permille settings -> shader values. Every one of these rides the per-frame uniform
-    // block, so changing them live has no rebuild or pipeline cost.
+    // Settings -> shader values. All of them go through the per-frame uniform block, so changing
+    // them live costs no pipeline rebuild. Most are percent (/100); radius, radiusFar, thickDist
+    // and depthBias are per-mille (/1000); distances are world units.
     const auto percent = [](ConfigVarHandle cvar, int64_t fallback, int64_t lo, int64_t hi) {
         return static_cast<float>(std::clamp<int64_t>(get_int_option(cvar, fallback), lo, hi)) /
                100.0f;
     };
-    // Depth-proportional radius: the setting is a permille of the view distance (100 = 10%).
+    // Radius as a fraction of view depth; the setting is per-mille (100 = 10%).
     uniforms.effect_radius =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarRadius, 200), 25, 800)) /
         1000.0f;
     // Far radius (same scale, 0 = off) ramps in across [rampStart, rampEnd] world units of view
-    // depth. World units, not far-plane fractions: TP's far plane is per-stage and far beyond
-    // the visible field, so fractions of it are scene-dependent and absurdly compressed.
+    // depth. World units rather than far-plane fractions, because the far plane varies per stage.
     uniforms.radius_far =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarRadiusFar, 800), 0, 800)) /
         1000.0f;
@@ -1046,15 +1006,16 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.black_point = percent(g_cvarBlackPoint, 3, 0, 30);
     uniforms.radius_max = percent(g_cvarRadiusMax, 40, 10, 100);
     uniforms.thick_fade = percent(g_cvarThickFade, 150, 50, 400);
-    // Radius-proportional occluder thickness floor: restores mid/far occlusion that the
-    // log-scaled base thickness starves (the value is per-mille of the view radius).
+    // Extra occluder thickness proportional to the view-space radius (per-mille). The base
+    // thickness grows only logarithmically with the radius, which thins out mid/far occlusion.
     uniforms.thick_dist_scale =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarThickDist, 60), 0, 100)) /
         1000.0f;
     uniforms.inv_debug_depth =
         1.0f / static_cast<float>(
                    std::clamp<int64_t>(get_int_option(g_cvarDebugDepthRange, 3300), 500, 100000));
-    // Self-occlusion bias in permille toward the camera (4 = the 0.996 factor).
+    // Self-occlusion bias: the view position is pulled toward the camera by this per-mille of its
+    // depth (1 = x0.999).
     uniforms.depth_bias =
         static_cast<float>(std::clamp<int64_t>(get_int_option(g_cvarDepthBias, 4), 0, 20)) /
         1000.0f;
@@ -1066,10 +1027,9 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.temporal_clamp_k = percent(g_cvarTemporalClamp, 200, 100, 300);
     uniforms.velocity_scale = percent(g_cvarMotionResponse, 100, 0, 100);
     // World units of view depth: the motion response is full up to this depth and gone at twice
-    // it. The raw single-frame estimate is dense and clean close to the camera (constant pixel
-    // radius = fine world sampling) and sparse at distance (the same pixel radius spans a huge
-    // world radius), so shortening the accumulation costs nothing on a character and everything
-    // on a far landmark. 0 disables the fade.
+    // it (0 = no fade). Close up the screen-space search spans a small world radius and the
+    // single-frame estimate is already clean; far away it spans a large one, the estimate is
+    // sparse, and it needs the accumulation even in motion.
     uniforms.velocity_range = static_cast<float>(
         std::clamp<int64_t>(get_int_option(g_cvarMotionRange, 5000), 0, 200000));
     uniforms.velocity_cap = velocityCap;
@@ -1081,8 +1041,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     uniforms.fade_end = static_cast<float>(
         std::clamp<int64_t>(get_int_option(g_cvarFadeEnd, 40000), 500, 200000));
     uniforms.inv_far = camera.far_plane > 1.0f ? 1.0f / camera.far_plane : 1.0f / 200000.0f;
-    // Calibration aid for the world-unit distance settings above: log the stage's far plane
-    // whenever it changes materially (once per change, not per frame).
+    // Reference for the world-unit distance settings: log the far plane when it changes by >1%.
     if (camera.far_plane > 1.0f &&
         std::fabs(camera.far_plane - g_loggedFarPlane) > g_loggedFarPlane * 0.01f)
     {
@@ -1095,8 +1054,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const uint32_t debugMode =
         static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 8));
     uniforms.debug_view = debugMode;
-    // The noise advances per frame only while accumulating; pinned otherwise (the spatial
-    // denoiser alone then sees a stable pattern, matching the single-frame fallback).
+    // The noise (and the half-res jitter) advances per frame only while accumulating; without
+    // accumulation it is pinned, so the spatial denoiser sees a stable pattern.
     uniforms.frame_index = temporal ? g_frameIndex : 0u;
     uniforms.flags =
         (temporal ? 1u : 0u) | (g_historyValid ? 2u : 0u) | (distanceFade ? 4u : 0u);
@@ -1139,9 +1098,9 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     const WGPUTextureView denoisedView = denoisePasses == 0
         ? g_targets.aoNoisyView
         : ((denoisePasses % 2u) != 0u ? g_targets.aoFinalView : g_targets.aoNoisyView);
-    // Debug view 7 reads the raw single-frame estimate straight out of the occlusion pass
-    // (pre-denoise, pre-accumulation); every other view and the real composite read the chain's
-    // final output.
+    // Debug view 7 reads aoNoisy, which holds the raw single-frame estimate only with 0 or 1
+    // denoise passes; from 2 passes on the ping-pong has overwritten it with a denoised result.
+    // Every other view and the real composite read the chain's final output.
     const WGPUTextureView aoSourceView = debugMode == 7u
         ? g_targets.aoNoisyView
         : (temporal ? g_targets.historyViews[writeIdx] : denoisedView);
@@ -1150,9 +1109,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
         resolved.depth, computePayload.sceneNormal, uniformRange.offset, uniformRange.size,
         debugMode};
     if (debugMode != 0) {
-        // Debug views draw at FRAME_AFTER_HUD, the last stage in the frame, so deferred fog,
-        // translucency, bloom and the HUD are all already down (all payload views stay valid for
-        // the rest of the frame).
+        // Staged for on_frame_after_hud (see g_pendingDebugDraw); the debug view replaces the
+        // composite for this frame.
         g_pendingDebugDraw = drawPayload;
         g_debugDrawPending = true;
     } else {
@@ -1168,8 +1126,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext* stageCtx, void*) 
     g_prevCameraValid = true;
 }
 
-// Game thread, after the full 3D scene: push the staged debug-view draw, unobscured by
-// everything the scene layered on after the opaque pass.
+// Game thread, GFX_STAGE_FRAME_AFTER_HUD (the last stage of the frame): push the staged debug-view
+// draw over the finished frame, HUD included.
 void on_frame_after_hud(ModContext*, const GfxStageContext*, void*) {
     if (!g_debugDrawPending) {
         return;
@@ -1256,18 +1214,17 @@ ModResult build_controls_tab(
         "distant landmarks gain broad occlusion depth. 0 disables (constant Radius).",
         0, 800, 25, nullptr);
     add_number(left, "Far Radius Start", g_cvarRadiusRampStart,
-        "View distance in world units where the radius starts ramping toward Far Radius (the "
-        "shadow mod's Coverage uses the same scale). The log prints the stage's camera far "
-        "plane for reference.",
+        "View distance in world units where the radius starts ramping toward Far Radius. The "
+        "log prints the stage's camera far plane for reference.",
         0, 200000, 500, nullptr);
     add_number(left, "Far Radius End", g_cvarRadiusRampEnd,
         "View distance in world units where the ramp reaches Far Radius.",
         500, 200000, 500, nullptr);
     add_number(left, "Max Screen Radius", g_cvarRadiusMax,
-        "Hard cap on the screen-space search radius, as a share of screen height. The search "
-        "radius is constant in screen space, so at normal Radius values it sits well under this "
-        "cap and the setting has no visible effect - it only engages to bound sampling cost when "
-        "Radius is pushed very high.",
+        "Hard cap on the screen-space search radius, as a share of screen height. The on-screen "
+        "radius grows as Far Radius ramps in, so at default settings this cap limits Far Radius "
+        "at long range (beyond roughly 4,600 world units at a 60-degree field of view). Raise it "
+        "to let Far Radius take full effect at distance.",
         10, 100, 5, "%");
     add_number(left, "Thickness", g_cvarThickness,
         "How thick occluders are treated. Higher darkens the deepest part of contacts and "
@@ -1370,12 +1327,13 @@ ModResult build_controls_tab(
         "Agreement: how well the scene normal agrees with that face normal - green good, yellow "
         "the tilt smoothed low-poly curvature is expected to have, red poor, WHITE pointing away "
         "from the surface (a wrong-space or wrong-frame normal), blue no scene normal. Flat ground "
-        "should read green.<br/>Raw AO: the single-frame estimate before denoise and accumulation, "
-        "unshaped.<br/>Depth MIP 3: the coarse prefiltered depth the march samples at distance."
-        "<br/>Debug views draw over the finished frame (after fog and bloom), so other effects "
-        "never obscure them. When reporting broken AO, screenshots of AO, Normals, Geo Normal, "
-        "Normal Agreement and Raw AO from the same spot, standing still, pin down which stage is "
-        "wrong.",
+        "should read green.<br/>Raw AO: the single-frame estimate, unshaped and before "
+        "accumulation and denoise. With Denoise Passes at 2 or 3 it shows a denoised result "
+        "instead.<br/>Depth MIP 3: the coarse prefiltered depth the march reads for samples far "
+        "from the pixel.<br/>Debug views draw over the finished frame (after fog, bloom and the "
+        "HUD), so other effects never obscure them. When reporting broken AO, screenshots of AO, "
+        "Normals, Geo Normal, Normal Agreement and Raw AO from the same spot, standing still, pin "
+        "down which stage is wrong.",
         kDebugOptions, 9);
     add_number(left, "Debug Depth Range", g_cvarDebugDepthRange,
         "Distance scale of the Depth debug view's gradient, in world units: the view fades "
@@ -1540,10 +1498,8 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
     {
         return mods::set_error(error, MOD_ERROR, "failed to create AO compute pipelines");
     }
-    // The composite pipelines are deliberately NOT built here. They depend on the scene pass's
-    // attachment layout, which changes at runtime once this mod's own normal request takes effect,
-    // so they are built on first draw and rebuilt whenever the layout key moves — see
-    // ensure_composite_pipelines.
+    // The composite pipelines are not built here: they depend on the scene pass layout, which
+    // changes at runtime once the normal request takes effect. See ensure_composite_pipelines.
 
     GfxComputeTypeDesc computeDesc = GFX_COMPUTE_TYPE_DESC_INIT;
     computeDesc.label = "Enhanced AO chain";
@@ -1622,8 +1578,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     releaseLayout(g_vbaoLayout);
     releaseLayout(g_denoiseLayout);
     releaseLayout(g_temporalLayout);
-    // Also clears the cached scene-layout key, so a reload rebuilds against whatever shape the pass
-    // has then rather than trusting a key from the previous run.
+    // Also clears the cached layout key, so a reload rebuilds against the pass as it is then.
     release_composite_pipelines();
     g_cvarEnabled = g_cvarQuality = g_cvarCustomSlices = g_cvarCustomSteps = 0;
     g_cvarRadius = g_cvarRadiusFar = g_cvarRadiusRampStart = g_cvarRadiusRampEnd = 0;

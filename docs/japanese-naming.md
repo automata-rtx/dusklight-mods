@@ -6,8 +6,8 @@ symbol names**. Every identifier our game-linked mods hook, read or include is a
 Japanese word written in Latin letters, an abbreviation of one, or English spelled
 by ear.
 
-That is not trivia for this repo. **Effect Remover, Realtime Sun Shadows and Graphics
-Hub's Deferred Fog are entirely built out of these names** — `drawCloudShadow`,
+That is not trivia for this repo. **Deferred Fog, and the unreleased Effect Remover and
+Realtime Sun Shadows, are entirely built out of these names** — `drawCloudShadow`,
 `mMoyaMode`, `dKy_bg_MAxx_proc`, `mpVrkumoPacket`, `dKy_Indoor_check`,
 `dComIfGd_drawOpaListBG`. Reading one of them as English has already put a wrong
 sentence into our own documentation (§4.1).
@@ -74,11 +74,12 @@ CMake configure, so after any `cmake -B build` the whole game source is sitting
 there and is greppable. If you only want to read it — no build — clone it directly:
 
 ```sh
-DUSKLIGHT_VERSION=$(sed -n 's/.*set(DUSKLIGHT_VERSION "\([0-9a-f]*\)").*/\1/p' CMakeLists.txt)
+DUSKLIGHT_VERSION=$(sed -n 's/.*set(DUSKLIGHT_VERSION "\([^"]*\)").*/\1/p' CMakeLists.txt)
 mkdir -p dusklight && git -C dusklight init --quiet
 git -C dusklight remote add origin https://github.com/TwilitRealm/dusklight.git
 git -C dusklight fetch --depth=1 origin "$DUSKLIGHT_VERSION"
 git -C dusklight checkout --quiet FETCH_HEAD
+git -C dusklight submodule update --init --depth=1 extern/aurora   # the renderer, for aurora citations
 ```
 
 That is the same repository and the same commit `cmake/FetchDusklight.cmake` uses, so a
@@ -155,8 +156,8 @@ rg -n 'genSlider\("|genLabel\("|genCheckBox\("' dusklight/src/d/d_kankyo.cpp | r
 
 ## 3. Glossary — every game name our mods touch
 
-Glossed because these are the names in `mods/effect_remover/src/mod.cpp`,
-`mods/realtime_sun_shadows/src/mod.cpp` and `mods/graphics_hub/src/mod.cpp`.
+Glossed because these are the names in `mods/deferred_fog/src/mod.cpp` and in the unreleased
+`mods/effect_remover/src/mod.cpp` and `mods/realtime_sun_shadows/src/mod.cpp`.
 
 ### Prefixes
 
@@ -400,8 +401,9 @@ So "the game's fog" is not one configuration. **Water surfaces are deliberately 
 to black or white while everything else is fogged to the palette colour**, and the
 selector is a material name. That black is applied to the water's *own* colour before it is
 blended over the riverbed — which is what makes deep water darken with distance, and why a
-deferred fullscreen pass cannot reproduce it. See `docs/deferred_fog.md`, "Blended draws inside
-the opaque lists". Deferred Fog reverts to vanilla on "mixed fog configs"; this
+deferred fullscreen pass cannot reproduce it. See `docs/deferred_fog.md`, "Limitations".
+Deferred Fog handles "mixed fog configs" with a per-pixel replay (or, in Vanilla mode, by
+handing the frame back to the game); this
 says the mixed case is not an edge case, it is the game's design for a whole material
 class, and it is identifiable by name rather than by inspecting state.
 
@@ -474,7 +476,7 @@ The reason it matters to us is a draw-path fact, not a naming one, but the name 
 you there: `dBgp_c::modelMaterial_c::drawSimple` (`:20`) calls `mpMaterial->loadSharedDL()` and
 then walks the shape's matrix groups calling `J3DShapeDraw::draw()` **directly** — never
 `J3DShape::drawFast`. Any mod that intercepts J3D drawing at `drawFast` silently misses it. See
-`docs/deferred_fog.md`, "Draw paths that do not go through `J3DShape::drawFast`".
+`docs/deferred_fog.md`, "Capture and suppression".
 
 ---
 

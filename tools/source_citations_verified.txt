@@ -14,7 +14,7 @@
 # To re-verify after a pin bump: for each line, grep the tree for the described construct and
 # confirm the number, then update the pin column. Do not simply bump the pin.
 #
-# Last re-verified at the c83ce89 -> v2.0.0 bump: all ten lines re-read in the new tree and
+# Last re-verified at the c83ce89 -> v2.0.0 bump: every line re-read in the new tree and
 # unchanged, which is consistent with d_kankyo.cpp not appearing in that range's diffstat.
 
 d_kankyo.cpp:2423            v2.0.0  mFogDensity = -1 in the wolf's enhanced-senses state
