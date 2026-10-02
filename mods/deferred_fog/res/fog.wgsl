@@ -14,8 +14,9 @@
 // Blending: (SrcAlpha, OneMinusSrcAlpha) on colour with fogZ in alpha reproduces aurora's mix();
 // alpha is left untouched (Zero, One), as forward fog leaves it.
 //
-// Sky pixels (raw depth 0) are skipped: the sky draws before the suppression scope opens and keeps
-// its own forward fog.
+// Sky pixels are skipped: the sky lists draw before the suppression scope opens and keep their own
+// forward fog. A pixel is the sky's when its raw depth is 0 (cleared) or still equals the sky-depth
+// snapshot mod.cpp takes when the scope opens (see is_sky).
 
 // GX fog range adjustment ("XFog"; see FogRangeAdj in mod.cpp): a per-column multiplier on the fog
 // term, applied before the start-Z bias c is subtracted, because a pixel near the screen edge is
@@ -68,6 +69,7 @@ struct MixedFogUniforms {
 }
 
 @group(0) @binding(0) var scene_depth: texture_2d<f32>;
+@group(0) @binding(4) var sky_depth: texture_2d<f32>;
 @group(0) @binding(1) var<uniform> uniforms: FogUniforms;
 // fs_mixed only:
 @group(0) @binding(2) var config_ids: texture_2d<f32>;
@@ -91,6 +93,19 @@ fn scene_depth_at(uv: vec2f) -> f32 {
     let size = vec2<i32>(textureDimensions(scene_depth));
     let texel = clamp(vec2<i32>(uv * vec2f(size)), vec2<i32>(0i), size - 1i);
     return textureLoad(scene_depth, texel, 0i).r;
+}
+
+// Whether nothing after the sky lists wrote this pixel's depth. Some sky draws write depth (the
+// drifting clouds do while the sun is on screen); the world drawn later either replaces it or is
+// hidden behind it. Both snapshots are copies of the same depth buffer made the same way, so an
+// untouched pixel compares exactly equal.
+fn is_sky(uv: vec2f, depth: f32) -> bool {
+    if depth <= 0.0 {
+        return true;
+    }
+    let size = vec2<i32>(textureDimensions(sky_depth));
+    let texel = clamp(vec2<i32>(uv * vec2f(size)), vec2<i32>(0i), size - 1i);
+    return textureLoad(sky_depth, texel, 0i).r == depth;
 }
 
 // The range-adjust multiplier, the same function aurora's build_fog_range_lut bakes per column:
@@ -138,8 +153,8 @@ fn fog_z_for(a: f32, b: f32, c: f32, fog_type: u32, depth: f32, range_mul: f32) 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     let depth = scene_depth_at(in.uv);
-    if depth <= 0.0 {
-        // Sky / cleared pixels keep their own (forward) fog.
+    if is_sky(in.uv, depth) {
+        // The sky keeps its own (forward) fog.
         if uniforms.debug_mode != 0u {
             return vec4f(0.0, 0.0, 0.0, 1.0);
         }
@@ -194,7 +209,7 @@ fn config_index_at(uv: vec2f) -> u32 {
 @fragment
 fn fs_mixed(in: VertexOutput) -> @location(0) vec4f {
     let depth = scene_depth_at(in.uv);
-    if depth <= 0.0 {
+    if is_sky(in.uv, depth) {
         if mixed.debug_mode != 0u {
             return vec4f(0.0, 0.0, 0.0, 1.0);
         }

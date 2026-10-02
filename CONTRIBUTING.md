@@ -245,7 +245,7 @@ current pin):
 | Point | Line | What happens | Used by |
 | :-- | :-- | :-- | :-- |
 | sky lists | 2328 | `dComIfGd_drawOpaListSky` / `XluListSky` | |
-| `GFX_STAGE_SCENE_BEGIN` | 2334 | before any world geometry | Deferred Fog opens its fog-suppression scope |
+| `GFX_STAGE_SCENE_BEGIN` | 2334 | before any world geometry | Deferred Fog snapshots the sky's depth and opens its fog-suppression scope |
 | opaque world lists | 2344–2390 | terrain, objects, actors, grass; also some particles (`Pri0_B`) and the game's own shadows. Fog applied per draw by the game | Deferred Fog suppresses per-draw fog here |
 | `GFX_STAGE_SCENE_AFTER_TERRAIN` | 2366 | after terrain and shadows, before the main opaque list | (nothing in the released set) |
 | `GFX_STAGE_SCENE_AFTER_OPAQUE` | 2395 | all opaque world geometry is down | VBAO composites; SMAA antialiases; Deferred Fog closes its scope and arms the fog pass |

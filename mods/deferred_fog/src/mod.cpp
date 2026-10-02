@@ -6,8 +6,9 @@
 // mod's GFX_STAGE_SCENE_AFTER_OPAQUE work and before anything the game draws or copies later.
 //
 // One frame (game thread, except on_draw):
-//   GFX_STAGE_SCENE_BEGIN         on_scene_begin opens the capture scope, unless the mod is off,
-//                                 Wolf Senses is active or a hook is missing.
+//   GFX_STAGE_SCENE_BEGIN         on_scene_begin snapshots the depth the sky lists left and opens
+//                                 the capture scope, unless the mod is off, Wolf Senses is active
+//                                 or a hook is missing.
 //   opaque world lists            the capture hooks record each draw's fog configuration and
 //                                 switch its fog off.
 //   GFX_STAGE_SCENE_AFTER_OPAQUE  on_scene_after_opaque closes the scope and arms the fog pass.
@@ -18,7 +19,8 @@
 //                                 function every frame directly after the SCENE_AFTER_OPAQUE stage,
 //                                 before the translucent lists, every framebuffer copy and bloom.
 //   render worker                 on_draw records the pass. res/fog.wgsl evaluates aurora's fog
-//                                 formula with coefficients from src/fog_math.h.
+//                                 formula with coefficients from src/fog_math.h, and leaves alone
+//                                 every pixel whose depth is still the sky lists'.
 //
 // Every game hook is required: if any fails to attach, the mod stays inactive and the game draws
 // its own fog. Reference: docs/deferred_fog.md.
@@ -37,6 +39,7 @@
 #include "d/d_com_inf_game.h"
 #include "dolphin/gf/GFPixel.h"
 #include "dolphin/gx/GXAurora.h"
+#include "dolphin/gx/GXBump.h"
 #include "dolphin/gx/GXGeometry.h"
 #include "dolphin/gx/GXGet.h"
 #include "dolphin/gx/GXLighting.h"
@@ -94,7 +97,7 @@ DEFINE_HOOK(dComIfGd_drawXluListBG, XluListBGDraw);
 // ---------------------------------------------------------------------------------------------
 
 ConfigVarHandle g_cvarEnabled = 0;        // fogEnabled, default on
-ConfigVarHandle g_cvarSkipUnfogged = 0;   // fogSkipUnfogged, default off
+ConfigVarHandle g_cvarSkipUnfogged = 0;   // fogSkipUnfogged, default on
 ConfigVarHandle g_cvarDeferInSenses = 0;  // fogDeferInSenses, default off
 ConfigVarHandle g_cvarDebugView = 0;      // fogDebug, default 0
 ConfigVarHandle g_cvarLogConfigs = 0;     // fogLogConfigs, default off
@@ -290,9 +293,10 @@ bool material_owns_depth(J3DMaterial* material) {
     return z != nullptr && z->getCompareEnable() != 0 && z->getUpdateEnable() != 0;
 }
 
-// Whether the alpha test passes everything. The replay draws without textures and with the alpha
-// test off, so an alpha-tested material would be stamped as its whole primitive rather than its
-// cutout. calcAlphaCmpID packs (comp0 << 5) + (op << 3) + comp1; GX_ALWAYS is 7.
+// Whether the alpha test passes everything. The replay's flat stamp draws without textures and with
+// the alpha test off, so it would stamp an alpha-tested material as its whole primitive rather than
+// its cutout; a fog-off one is marked through its own alpha instead (plan_alpha_mark).
+// calcAlphaCmpID packs (comp0 << 5) + (op << 3) + comp1; GX_ALWAYS is 7.
 bool material_alpha_test_passes_all(J3DMaterial* material) {
     J3DPEBlock* pe = material != nullptr ? material->getPEBlock() : nullptr;
     const J3DAlphaComp* comp = pe != nullptr ? pe->getAlphaComp() : nullptr;
@@ -301,6 +305,44 @@ bool material_alpha_test_passes_all(J3DMaterial* material) {
     }
     constexpr uint16_t kAlways = 7;
     return ((comp->mID >> 5) & 7) == kAlways && (comp->mID & 7) == kAlways;
+}
+
+// How the replay marks a fog-off, alpha-tested material through its own alpha
+// (stamp_no_fog_through_alpha). Read from the material's blocks, which its display list was built
+// from.
+struct AlphaMark {
+    uint8_t stageCount = 0;                // the material's TEV stages; the mark stage follows them
+    GXTevAlphaArg alphaSource = GX_CA_APREV;  // the register its last stage writes alpha to
+    GXBool alphaClamp = GX_TRUE;           // that stage's clamp setting
+    uint8_t colorChanCount = 0;            // its colour channels
+    uint8_t matAlpha = 255;                // its material colour's alpha, which ALPHA0 may read
+};
+
+// False when the material cannot be marked: it sets no alpha test of its own, has no TEV stages
+// to read, or already uses all 16.
+bool plan_alpha_mark(J3DMaterial* material, AlphaMark& out) {
+    J3DPEBlock* pe = material != nullptr ? material->getPEBlock() : nullptr;
+    J3DTevBlock* tev = material != nullptr ? material->getTevBlock() : nullptr;
+    if (pe == nullptr || pe->getAlphaComp() == nullptr || tev == nullptr) {
+        return false;
+    }
+    const uint8_t stages = tev->getTevStageNum();
+    const J3DTevStage* last = stages > 0 ? tev->getTevStage(stages - 1) : nullptr;
+    if (last == nullptr || stages >= GX_MAX_TEVSTAGE) {
+        return false;
+    }
+    // J3DTevStage keeps the stage's alpha combiner as the GX register does: mTevAlphaOp holds the
+    // output register in bits 6-7 and the clamp in bit 3.
+    static constexpr GXTevAlphaArg kOutputRegisterAlpha[4] = {
+        GX_CA_APREV, GX_CA_A0, GX_CA_A1, GX_CA_A2};
+    out.stageCount = stages;
+    out.alphaSource = kOutputRegisterAlpha[(last->mTevAlphaOp >> 6) & 3];
+    out.alphaClamp = ((last->mTevAlphaOp >> 3) & 1) != 0 ? GX_TRUE : GX_FALSE;
+    J3DColorBlock* color = material->getColorBlock();
+    const J3DGXColor* matColor = color != nullptr ? color->getMatColor(0) : nullptr;
+    out.colorChanCount = color != nullptr ? color->getColorChanNum() : 0;
+    out.matAlpha = matColor != nullptr ? matColor->a : 255;
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -324,6 +366,15 @@ bool g_warnedDepthFailure = false;
 // This frame's configuration-ID buffer, borrowed from the gfx service; valid this frame only.
 WGPUTextureView g_configIdView = nullptr;
 
+// The depth buffer as the sky lists left it, snapshotted at GFX_STAGE_SCENE_BEGIN; valid this frame
+// only. The sky lists draw before the scope opens and keep their own fog, and some of them write
+// depth: while the sun is on screen, drawVrkumo first draws the drifting clouds (kumo: cloud) as
+// depth-only shapes, and dKyr_sun_move reads depth back around the sun (dComIfGd_peekZ) to judge
+// how much of it is hidden. The fog pass leaves every pixel whose depth still equals this snapshot
+// to the sky's own fog.
+WGPUTextureView g_skyDepthView = nullptr;
+bool g_warnedSkyDepthFailure = false;
+
 // The world viewport width in the game's logical coordinates, for the range-adjustment centre.
 float g_viewportWidth = 640.0f;
 
@@ -332,12 +383,14 @@ uint32_t g_capturedDrawCount = 0;   // draws whose fog was captured and suppress
 uint32_t g_sharedDlFogCount = 0;    // ... of those, map-unit (dBgp_c) material draws
 uint32_t g_fogOffCount = 0;         // draws whose material has fog switched off (MaterialFog::Off)
 uint32_t g_fogOffNoDepth = 0;       // ... of those, draws that write no depth
-uint32_t g_fogOffAlphaTested = 0;   // ... draws that write depth but are alpha-tested
+uint32_t g_fogOffAlphaTested = 0;   // ... draws that write depth, marked through their alpha
+uint32_t g_fogOffUnmarkable = 0;    // ... draws that write depth but cannot be marked
 uint32_t g_overUnityCount = 0;      // draws with an additive or subtractive blend
 uint32_t g_overUnityNoDepth = 0;    // ... of those, draws that write no depth
 
+// Fog-off draws Skip Unfogged can mark: those that write depth, with or without an alpha test.
 uint32_t fog_off_markable() {
-    return g_fogOffCount - g_fogOffNoDepth - g_fogOffAlphaTested;
+    return g_fogOffCount - g_fogOffNoDepth - g_fogOffUnmarkable;
 }
 
 // The configuration the grass and flower packets drew with this frame. They load their material
@@ -351,12 +404,12 @@ uint32_t g_selfDrawnIndex = 0;
 // True inside dBgp_c::modelMaterial_c::drawSimple (see on_material_shared_dl_post).
 bool g_inBgpMaterial = false;
 
-char g_statusText[192] = "Waiting for the first frame";
+char g_statusText[224] = "Waiting for the first frame";
 
 // The configuration-ID buffer is used when the frame has more than one configuration, or when
 // Skip Unfogged has fog-off draws to mark. The replay and the fog pass both ask this one function.
 bool needs_id_buffer() {
-    return g_frameConfigCount > 1 || (g_skipUnfogged && g_fogOffCount > 0);
+    return g_frameConfigCount > 1 || (g_skipUnfogged && fog_off_markable() > 0);
 }
 
 // Wolf Senses replaces every environment fog with black fog over a short range
@@ -392,10 +445,15 @@ bool capture_material_fog(J3DMaterial* material) {
     }
     if (state == MaterialFog::Off) {
         ++g_fogOffCount;
+        AlphaMark mark;
         if (!ownsDepth) {
             ++g_fogOffNoDepth;
-        } else if (!material_alpha_test_passes_all(material)) {
+        } else if (material_alpha_test_passes_all(material)) {
+            // marked with the flat stamp
+        } else if (plan_alpha_mark(material, mark)) {
             ++g_fogOffAlphaTested;
+        } else {
+            ++g_fogOffUnmarkable;
         }
     }
     if (state != MaterialFog::Live) {
@@ -421,8 +479,12 @@ constexpr uint32_t kNoFogSlot = 8;
 static_assert(kNoFogSlot >= kMaxFogConfigs, "the no-fog slot must not collide with a real one");
 static_assert((kNoFogSlot + 1) * 24 <= 255, "the no-fog slot must fit in the red channel");
 
+constexpr u8 slot_red(uint32_t slot) {
+    return static_cast<u8>((slot + 1) * 24);
+}
+
 void stamp_replay_id(uint32_t slot) {
-    const auto red = static_cast<u8>((slot + 1) * 24);
+    const u8 red = slot_red(slot);
     GXSetColorUpdate(GX_TRUE);
     GXSetNumTevStages(1);
     GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
@@ -436,6 +498,34 @@ void stamp_replay_id(uint32_t slot) {
     GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, GXColor{0, 0, 0, 0});
 }
 
+// Marks a fog-off, alpha-tested material with the no-fog slot where its alpha test passes, so only
+// its visible cutout is marked and the replay's depth matches the frame's. The material's display
+// list has already set its textures, TEV stages, alpha test and Z mode; this keeps all of them and
+// appends one stage that outputs the no-fog colour with the alpha the material's last stage wrote,
+// unchanged. The colour comes from channel COLOR0, switched to its material colour register. That
+// register is shared with ALPHA0, whose own setting is left as the material set it, so its alpha
+// keeps the material's value.
+void stamp_no_fog_through_alpha(const AlphaMark& mark) {
+    const auto stage = static_cast<GXTevStageID>(GX_TEVSTAGE0 + mark.stageCount);
+    if (mark.colorChanCount == 0) {
+        GXSetNumChans(1);
+    }
+    GXSetChanCtrl(
+        GX_COLOR0, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
+    GXSetChanMatColor(GX_COLOR0, GXColor{slot_red(kNoFogSlot), 0, 0, mark.matAlpha});
+    GXSetNumTevStages(static_cast<u8>(mark.stageCount + 1));
+    GXSetTevOrder(stage, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+    GXSetTevDirect(stage);
+    GXSetTevSwapMode(stage, GX_TEV_SWAP0, GX_TEV_SWAP0);
+    GXSetTevColorIn(stage, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_RASC);
+    GXSetTevColorOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+    GXSetTevAlphaIn(stage, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, mark.alphaSource);
+    GXSetTevAlphaOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, mark.alphaClamp, GX_TEVPREV);
+    GXSetColorUpdate(GX_TRUE);
+    GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_COPY);
+    GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, GXColor{0, 0, 0, 0});
+}
+
 // Replay, one material draw: stamp its slot, the no-fog slot, or (the barrier) nothing.
 void replay_stamp_material(J3DMaterial* material) {
     FogConfig config;
@@ -446,11 +536,16 @@ void replay_stamp_material(J3DMaterial* material) {
         GXSetColorUpdate(GX_FALSE);
         return;
     }
-    if (state == MaterialFog::Off && g_skipUnfogged && material_owns_depth(material) &&
-        material_alpha_test_passes_all(material))
-    {
-        stamp_replay_id(kNoFogSlot);
-        return;
+    if (state == MaterialFog::Off && g_skipUnfogged && material_owns_depth(material)) {
+        if (material_alpha_test_passes_all(material)) {
+            stamp_replay_id(kNoFogSlot);
+            return;
+        }
+        AlphaMark mark;
+        if (plan_alpha_mark(material, mark)) {
+            stamp_no_fog_through_alpha(mark);
+            return;
+        }
     }
     stamp_replay_id(state == MaterialFog::Live ? lookup_frame_config(config) : 0u);
 }
@@ -669,6 +764,7 @@ constexpr uint32_t kFogTypeRangeAdj = 0x10u;
 // this frame.
 struct DrawPayload {
     WGPUTextureView sceneDepth;
+    WGPUTextureView skyDepth;
     WGPUTextureView configIds;
     uint32_t uniform_offset;
     uint32_t uniform_size;
@@ -803,7 +899,7 @@ void on_draw(
     }
     DrawPayload data;
     std::memcpy(&data, payload, sizeof(data));
-    if (data.sceneDepth == nullptr) {
+    if (data.sceneDepth == nullptr || data.skyDepth == nullptr) {
         return;
     }
 
@@ -812,21 +908,23 @@ void on_draw(
     const FogPipeline& p = mixed ? (debug ? g_mixedDebugPipeline : g_mixedPipeline)
                                  : (debug ? g_mainDebugPipeline : g_mainPipeline);
 
-    // Bindings as declared in res/fog.wgsl: 0 depth, 1 FogUniforms (fs_main); 2 configuration IDs,
-    // 3 MixedFogUniforms (fs_mixed).
-    WGPUBindGroupEntry entries[3] = {
-        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    // Bindings as declared in res/fog.wgsl: 0 scene depth and 4 sky depth (both); 1 FogUniforms
+    // (fs_main); 2 configuration IDs and 3 MixedFogUniforms (fs_mixed).
+    WGPUBindGroupEntry entries[4] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT,
+        WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
     entries[0].binding = 0;
     entries[0].textureView = data.sceneDepth;
-    entries[1].binding = mixed ? 3 : 1;
-    entries[1].buffer = ctx->uniform_buffer;
-    entries[1].offset = data.uniform_offset;
-    entries[1].size = data.uniform_size;
-    entries[2].binding = 2;
-    entries[2].textureView = data.configIds;
+    entries[1].binding = 4;
+    entries[1].textureView = data.skyDepth;
+    entries[2].binding = mixed ? 3 : 1;
+    entries[2].buffer = ctx->uniform_buffer;
+    entries[2].offset = data.uniform_offset;
+    entries[2].size = data.uniform_size;
+    entries[3].binding = 2;
+    entries[3].textureView = data.configIds;
     WGPUBindGroupDescriptor bindDesc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bindDesc.layout = p.layout;
-    bindDesc.entryCount = mixed ? 3 : 2;
+    bindDesc.entryCount = mixed ? 4 : 3;
     bindDesc.entries = entries;
     WGPUBindGroup bindGroup = wgpuDeviceCreateBindGroup(ctx->device, &bindDesc);
     if (bindGroup == nullptr) {
@@ -869,6 +967,9 @@ void fill_entry(const FogConfig& config, float color[4], float& a, float& b, flo
 // Snapshots the scene depth and pushes the fog draw: fs_mixed with the configuration-ID buffer when
 // the frame needs it and the replay produced it, otherwise fs_main with slot 0.
 void push_fog_quad() {
+    if (g_skyDepthView == nullptr) {
+        return;  // the scope does not open without it (on_scene_begin)
+    }
     GfxResolveDesc desc = GFX_RESOLVE_DESC_INIT;
     desc.color = false;
     desc.depth = true;
@@ -906,7 +1007,7 @@ void push_fog_quad() {
             return;
         }
         const DrawPayload payload{
-            resolved.depth, g_configIdView, range.offset, range.size, debugMode};
+            resolved.depth, g_skyDepthView, g_configIdView, range.offset, range.size, debugMode};
         svc_gfx->push_draw(mod_ctx, g_drawType, &payload, sizeof(payload));
         return;
     }
@@ -922,8 +1023,8 @@ void push_fog_quad() {
     if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &range) != MOD_OK) {
         return;
     }
-    const DrawPayload payload{
-        resolved.depth, nullptr, range.offset, range.size, uniforms.debug_mode};
+    const DrawPayload payload{resolved.depth, g_skyDepthView, nullptr, range.offset, range.size,
+        uniforms.debug_mode};
     svc_gfx->push_draw(mod_ctx, g_drawType, &payload, sizeof(payload));
 }
 
@@ -983,22 +1084,24 @@ void update_status_line() {
     }
     std::snprintf(g_statusText, sizeof(g_statusText),
         "Deferring fog (%u draws, %u config%s%s%s; %u shared-DL, %u fog-off "
-        "(%u markable/%u no-Z/%u alpha), %u additive/%u no-Z)",
+        "(%u markable, %u by alpha/%u no-Z/%u unmarkable), %u additive/%u no-Z)",
         g_capturedDrawCount, g_frameConfigCount, g_frameConfigCount == 1 ? "" : "s", merged,
         needs_id_buffer() && g_configIdView == nullptr ? ", replay failed" : "",
-        g_sharedDlFogCount, g_fogOffCount, fog_off_markable(), g_fogOffNoDepth, g_fogOffAlphaTested,
-        g_overUnityCount, g_overUnityNoDepth);
+        g_sharedDlFogCount, g_fogOffCount, fog_off_markable(), g_fogOffAlphaTested,
+        g_fogOffNoDepth, g_fogOffUnmarkable, g_overUnityCount, g_overUnityNoDepth);
 }
 
-// GFX_STAGE_SCENE_BEGIN, after the sky lists: resets the frame and opens the capture scope.
+// GFX_STAGE_SCENE_BEGIN, after the sky lists: resets the frame, snapshots the sky's depth and opens
+// the capture scope.
 void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
     g_frameConfigCount = 0;
     g_mergedDrawCount = 0;
     g_capturedDrawCount = 0;
     g_sharedDlFogCount = 0;
-    g_fogOffCount = g_fogOffNoDepth = g_fogOffAlphaTested = 0;
+    g_fogOffCount = g_fogOffNoDepth = g_fogOffAlphaTested = g_fogOffUnmarkable = 0;
     g_overUnityCount = g_overUnityNoDepth = 0;
     g_configIdView = nullptr;
+    g_skyDepthView = nullptr;
     g_quadArmed = false;
     g_inBgpMaterial = false;
     g_inSelfDrawnPacket = false;
@@ -1017,7 +1120,7 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
         std::snprintf(g_statusText, sizeof(g_statusText), "Off: the game's own fog is used");
         return;
     }
-    g_skipUnfogged = get_bool_option(g_cvarSkipUnfogged, false);
+    g_skipUnfogged = get_bool_option(g_cvarSkipUnfogged, true);
     g_sensesExempt = wolf_senses_active() && !get_bool_option(g_cvarDeferInSenses, false);
     if (g_sensesExempt != g_wasSensesExempt) {
         svc_log->info(mod_ctx, g_sensesExempt ? "Wolf Senses: the game's own fog is used"
@@ -1030,6 +1133,23 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
             g_statusText, sizeof(g_statusText), "Wolf Senses: the game's own fog is used");
         return;
     }
+    // Without the sky's depth the fog pass would fog whatever the sky lists drew depth for, so the
+    // scope stays closed and the game draws its own fog this frame.
+    GfxResolveDesc desc = GFX_RESOLVE_DESC_INIT;
+    desc.color = false;
+    desc.depth = true;
+    GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
+    if (svc_gfx->resolve_pass(mod_ctx, &desc, &resolved) != MOD_OK || resolved.depth == nullptr) {
+        g_lastFrameDeferred = false;
+        if (!g_warnedSkyDepthFailure) {
+            g_warnedSkyDepthFailure = true;
+            svc_log->warn(mod_ctx, "sky depth snapshot failed; such frames use the game's own fog");
+        }
+        std::snprintf(g_statusText, sizeof(g_statusText),
+            "Sky depth snapshot failed: the game's own fog is used");
+        return;
+    }
+    g_skyDepthView = resolved.depth;
     g_scopeActive = true;
 }
 
@@ -1081,8 +1201,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
         char line[128];
         if (replaying) {
             std::snprintf(line, sizeof(line),
-                "per-pixel replay on: %u fog configurations, %u fog-off draws in view",
-                g_frameConfigCount, g_fogOffCount);
+                "per-pixel replay on: %u fog configurations, %u markable fog-off draws in view",
+                g_frameConfigCount, g_skipUnfogged ? fog_off_markable() : 0u);
         } else {
             std::snprintf(line, sizeof(line), "per-pixel replay off");
         }
@@ -1146,9 +1266,9 @@ void add_status_line(UiElementHandle parent) {
     control.help_rml =
         "What the fog pass did this frame.<br/><b>Deferring fog</b>: how many draws had their fog "
         "taken over and how many fog configurations they used, then counts used for diagnosis. "
-        "More than one configuration runs a per-pixel replay of the world.<br/><b>Inactive</b>: a "
-        "game function this mod needs could not be hooked in this game build, so the game's own "
-        "fog is used.";
+        "More than one configuration, or a fog-off surface for Skip Unfogged to mark, runs a "
+        "per-pixel replay of the world.<br/><b>Inactive</b>: a game function this mod needs could "
+        "not be hooked in this game build, so the game's own fog is used.";
     control.binding = UI_BINDING_CALLBACKS;
     control.get = status_get;
     control.set = status_set;
@@ -1160,14 +1280,15 @@ ModResult build_controls_tab(
     ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle, void*, ModError*) {
     add_toggle(left, "Enabled", kEnabledHelp, g_cvarEnabled);
 
-    add_toggle(left, "Skip Unfogged Geometry (experimental)",
-        "The game draws some materials with fog switched off, so they keep full brightness at any "
-        "distance. The fog pass cannot tell that from depth and fogs them like everything else. "
-        "With this on, those surfaces are marked in a per-pixel buffer and left unfogged.<br/>Only "
-        "surfaces that write their own depth and have no alpha test can be marked: the Status "
-        "line's <i>markable</i> count shows how many draws in view qualify.<br/>Runs the "
-        "per-pixel replay, one extra pass over the world's geometry, in every frame with any "
-        "fog-off draw (the Status line's <i>fog-off</i> count).",
+    add_toggle(left, "Skip Unfogged Geometry",
+        "The game draws some materials with fog switched off, so they keep their own colour at any "
+        "distance. The fog pass cannot tell that from depth, so with this on those surfaces are "
+        "marked in a per-pixel buffer and left unfogged, as the game draws them. Off: they are "
+        "fogged like everything else.<br/>A surface can be marked if it writes its own depth: the "
+        "Status line's <i>markable</i> count shows how many draws in view qualify. An alpha-tested "
+        "one is marked through its own alpha, so only its visible part is marked.<br/>Runs the "
+        "per-pixel replay, one extra pass over the world's geometry, in every frame with a "
+        "markable draw.",
         g_cvarSkipUnfogged);
 
     static const char* kDebugViews[] = {"Off", "Fog Factor", "Config IDs"};
@@ -1175,11 +1296,12 @@ ModResult build_controls_tab(
     control.kind = UI_CONTROL_SELECT;
     control.label = "Debug View";
     control.help_rml =
-        "Replaces the image with what the fog pass computes. Sky pixels are black.<br/><b>Fog "
-        "Factor</b>: the amount of fog per pixel (white = full fog).<br/><b>Config IDs</b>: which "
-        "fog configuration each pixel uses, one gray level each (white = the last), on frames that "
-        "run the per-pixel replay; otherwise the same as Fog Factor.<br/>Red in either view: "
-        "pixels Skip Unfogged leaves unfogged.";
+        "Replaces the image with what the fog pass computes. Black: pixels left to the sky's own "
+        "fog (the sky, and the clouds drawn with it).<br/><b>Fog Factor</b>: the amount of fog per "
+        "pixel (white = full fog).<br/><b>Config IDs</b>: which fog configuration each pixel uses, "
+        "one gray level each (white = the last), on frames that run the per-pixel replay; "
+        "otherwise the same as Fog Factor.<br/>Red in either view: pixels Skip Unfogged leaves "
+        "unfogged.";
     control.binding = UI_BINDING_CONFIG_VAR;
     control.config_var = g_cvarDebugView;
     control.options = kDebugViews;
@@ -1317,7 +1439,7 @@ ModResult init(ModError* error) {
     }
     // Defaults are the second argument; see docs/editing-options.md.
     if (register_bool("fogEnabled", true, g_cvarEnabled) != MOD_OK ||
-        register_bool("fogSkipUnfogged", false, g_cvarSkipUnfogged) != MOD_OK ||
+        register_bool("fogSkipUnfogged", true, g_cvarSkipUnfogged) != MOD_OK ||
         register_bool("fogDeferInSenses", false, g_cvarDeferInSenses) != MOD_OK ||
         register_int("fogDebug", 0, g_cvarDebugView) != MOD_OK ||
         register_bool("fogLogConfigs", false, g_cvarLogConfigs) != MOD_OK)
@@ -1364,12 +1486,13 @@ void shutdown() {
     g_scopeActive = g_quadArmed = g_replayActive = g_skipUnfogged = false;
     g_sensesExempt = g_wasSensesExempt = g_wasReplaying = false;
     g_lastFrameDeferred = g_warnedReplayFailure = g_warnedDepthFailure = false;
+    g_warnedSkyDepthFailure = false;
     g_inBgpMaterial = g_inSelfDrawnPacket = g_selfDrawnIndexValid = false;
     g_selfDrawnIndex = 0;
     g_frameConfigCount = g_mergedDrawCount = g_capturedDrawCount = g_sharedDlFogCount = 0;
-    g_fogOffCount = g_fogOffNoDepth = g_fogOffAlphaTested = 0;
+    g_fogOffCount = g_fogOffNoDepth = g_fogOffAlphaTested = g_fogOffUnmarkable = 0;
     g_overUnityCount = g_overUnityNoDepth = 0;
-    g_configIdView = nullptr;
+    g_configIdView = g_skyDepthView = nullptr;
     g_viewportWidth = 640.0f;
     g_lastLogSignature[0] = '\0';
     std::snprintf(g_statusText, sizeof(g_statusText), "Waiting for the first frame");

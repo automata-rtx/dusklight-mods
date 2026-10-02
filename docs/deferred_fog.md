@@ -6,7 +6,7 @@ ambient occlusion darken the surfaces *under* the fog instead of darkening the f
 | | |
 | :-- | :-- |
 | Mod id | `dev.automata.deferred_fog` (`mods/deferred_fog/`) |
-| Version | `2.0.0-a`, a test build (see `mods/deferred_fog/mod.json`) |
+| Version | `2.0.0-b`, a test build (see `mods/deferred_fog/mod.json`) |
 | Kind | **Game-linked**: includes game headers, calls game functions and hooks ten of them. It must be built against the game build it runs on |
 | Game build | Dusklight `v2.0.0` |
 
@@ -42,7 +42,7 @@ Controls** button. The controls window repeats Enabled and holds the rest.
 | Config key | UI label | Default | Meaning |
 | :-- | :-- | :-- | :-- |
 | `fogEnabled` | Enabled | on | Off: the game draws its own fog |
-| `fogSkipUnfogged` | Skip Unfogged Geometry (experimental) | off | Leave unfogged the pixels of materials the game draws with fog switched off. Runs the configuration-ID replay in every frame with any fog-off draw. See [Limitations](#limitations) |
+| `fogSkipUnfogged` | Skip Unfogged Geometry | on | Leave unfogged the pixels of materials the game draws with fog switched off, as the game does. Runs the configuration-ID replay in every frame with a markable fog-off draw. See [Skip Unfogged](#skip-unfogged) |
 | `fogDebug` | Debug View | 0 | 0 off, 1 Fog Factor, 2 Config IDs. See [Debug views](#debug-views) |
 | `fogLogConfigs` | Log Fog Configs | off | Log the frame's fog configurations when their number, any start or end distance, or configuration 0's type or colour changes |
 | `fogDeferInSenses` | Defer Fog During Wolf Senses (diagnostic) | off | Take over the fog during Wolf Senses as well. For examination only; see [Wolf Senses](#wolf-senses) |
@@ -55,17 +55,17 @@ defaults are the second argument of the `register_bool` / `register_int` calls i
 Rebuilt every frame in `on_scene_after_opaque`. The working state reads:
 
 ```
-Deferring fog (N draws, K configs[, M merged][, replay failed]; A shared-DL, B fog-off (P markable/Z no-Z/T alpha), C additive/D no-Z)
+Deferring fog (N draws, K configs[, M merged][, replay failed]; A shared-DL, B fog-off (P markable, T by alpha/Z no-Z/U unmarkable), C additive/D no-Z)
 ```
 
 | Field | Meaning |
 | :-- | :-- |
 | `N draws` | Draws whose fog was captured and switched off this frame (each J3D shape, map-unit material and direct fog-setter call counts once) |
-| `K configs` | Distinct fog configurations this frame. More than 1 runs the configuration-ID replay (so does Skip Unfogged with any fog-off draw) |
+| `K configs` | Distinct fog configurations this frame. More than 1 runs the configuration-ID replay (so does Skip Unfogged with any markable fog-off draw) |
 | `M merged` | Draws whose configuration did not fit in the 8-entry table; they use configuration 0 |
 | `replay failed` | The replay could not run; the frame used configuration 0 everywhere |
 | `A shared-DL` | Of the N draws, map-unit (`dBgp_c`) material draws |
-| `B fog-off (P markable / Z no-Z / T alpha)` | Draws whose material has fog switched off; of those, how many Skip Unfogged can mark, how many write no depth and how many are alpha-tested |
+| `B fog-off (P markable, T by alpha / Z no-Z / U unmarkable)` | Draws whose material has fog switched off. `P` of them write their own depth and Skip Unfogged can mark them, `T` of those through their own alpha (they are alpha-tested). `Z` write no depth. `U` write depth but cannot be marked (no alpha test of their own, or all 16 TEV stages in use). `P + Z + U = B` |
 | `C additive / D no-Z` | Draws with an additive or subtractive blend (see [Limitations](#limitations)); of those, how many write no depth |
 
 The counts cover the draws that pass through the capture hooks: J3D shapes, map units and the fog
@@ -79,12 +79,13 @@ Other states:
 | `Off: the game's own fog is used` | Enabled is off |
 | `Wolf Senses: the game's own fog is used` | Wolf Link's senses are active |
 | `No fogged draws in view` | Nothing in the opaque world set fog this frame |
+| `Sky depth snapshot failed: the game's own fog is used` | The depth snapshot at `SCENE_BEGIN` failed, so the scope stayed closed this frame; see [The sky](#the-sky) |
 | `Inactive: <function> could not be hooked in this game build; the game's own fog is used` | A required hook failed to attach at load; see [Hooks](#hooks) |
 
 ### Debug views
 
-Both replace the image with what the fog pass computes, drawn opaque. Sky pixels (depth 0) are
-black.
+Both replace the image with what the fog pass computes, drawn opaque. Pixels left to the sky's own
+fog are black: depth 0, and depth the sky lists wrote, such as the clouds' (see [The sky](#the-sky)).
 
 | `fogDebug` | View | Shows |
 | :-- | :-- | :-- |
@@ -99,9 +100,10 @@ scene, the fog pass did not draw this frame; an all-black view means it drew and
 - `ready` on load, or `inactive: a required game hook is missing` together with one
   `could not hook <function> in this game build` error per missing hook.
 - `Wolf Senses: the game's own fog is used` and `Wolf Senses over: deferring fog`.
-- `per-pixel replay on: K fog configurations, B fog-off draws in view` and `per-pixel replay off`
-  when the replay starts or stops running.
-- One-time warnings: `configuration-ID replay failed; such frames use one fog configuration` and
+- `per-pixel replay on: K fog configurations, P markable fog-off draws in view` and
+  `per-pixel replay off` when the replay starts or stops running (`P` is 0 with Skip Unfogged off).
+- One-time warnings: `sky depth snapshot failed; such frames use the game's own fog`,
+  `configuration-ID replay failed; such frames use one fog configuration` and
   `depth snapshot failed; no fog pass this frame`.
 - With Log Fog Configs on, the configuration table when it changes.
 
@@ -116,7 +118,7 @@ each step.
 | Line | Game | This mod |
 | :-- | :-- | :-- |
 | 2328 | Sky lists | Untouched; the sky keeps the game's fog |
-| 2334 | `GFX_STAGE_SCENE_BEGIN` | `on_scene_begin` opens the capture scope |
+| 2334 | `GFX_STAGE_SCENE_BEGIN` | `on_scene_begin` snapshots the depth the sky lists left and opens the capture scope |
 | 2344–2390 | Opaque world lists, `Pri0_B` particles, the game's shadows | Each draw's fog is captured and switched off |
 | 2395 | `GFX_STAGE_SCENE_AFTER_OPAQUE` | VBAO and SMAA composite. `on_scene_after_opaque` closes the scope, arms the fog pass and runs the replay if needed |
 | 2405 | `dComIfGd_drawXluListBG`: the translucent lists begin | **`on_xlu_list_bg_pre` pushes the fog pass** |
@@ -171,6 +173,21 @@ of the span, near is within 1 and far within 1% + 1 (`config_matches`). The firs
 frame is configuration 0. The table holds 8; a draw whose configuration does not fit uses
 configuration 0 and is counted as `merged`.
 
+### The sky
+
+The sky lists draw before the scope opens, so they keep the game's fog, and the fog pass must leave
+their pixels alone. Most of the sky writes no depth, but not all of it: while the sun is on screen,
+`drawVrkumo` draws the drifting clouds (*kumo*, 雲 cloud) twice, first as depth-only shapes cut out by
+their texture's alpha, then in colour without depth. `dKyr_sun_move` reads that depth back around
+the sun (`dComIfGd_peekZ`) to judge how much of it is hidden. World geometry behind a cloud's depth
+then fails the depth test, so in the game those pixels show the cloud.
+
+`on_scene_begin` therefore snapshots the depth buffer as the sky lists left it (`resolve_pass`) when
+it opens the scope. In `fog.wgsl`, `is_sky` treats a pixel as the sky's when its depth is 0 or
+still equals that snapshot: nothing drawn after the sky replaced it. Both snapshots are copies of the
+same buffer made the same way, so an untouched pixel compares exactly equal. If the snapshot fails,
+the scope stays closed and the game draws its own fog that frame.
+
 ### One configuration
 
 If the frame used one configuration, `push_fog_quad` snapshots the depth buffer and draws one
@@ -192,9 +209,31 @@ pixel's configuration.
   colours. A pixel with green or blue above 0.03, or a red value outside a valid slot, takes the
   **fallback configuration**: the one the grass and flower packets drew with this frame, or
   configuration 0 if there were none.
-- Red 216 (C++ `kNoFogSlot` = 8) means "leave this pixel unfogged", written by Skip Unfogged.
+- Red 216 (C++ `kNoFogSlot` = 8) means "leave this pixel unfogged", written by Skip Unfogged
+  (below).
 - If the replay cannot run, the frame uses configuration 0 everywhere. The game's fog is already off
   for that frame, so this is the closest available result. The Status line shows `replay failed`.
+
+### Skip Unfogged
+
+A material's fog block can have type 0 (`GX_FOG_NONE`): the game then draws it with no fog at any
+distance, while the fog pass would fog it like everything else. With Skip Unfogged on (the default),
+the replay writes the no-fog mark (red 216) for such a material instead of a configuration, and the
+fog pass leaves the marked pixels alone. A frame with a markable fog-off draw runs the replay even
+with one configuration.
+
+- Only a material that writes its own depth is marked. One that writes none does not own its
+  pixels' depth, and marking it would unfog the surface behind it.
+- A material without an alpha test is marked with the replay's usual flat stamp.
+- An alpha-tested material is marked through its own alpha, so only the pixels its alpha test keeps
+  are marked and the replay's depth matches the frame's (`stamp_no_fog_through_alpha`). Its display
+  list has already set its textures, TEV stages, alpha test and Z mode; the replay keeps all of them
+  and appends one TEV stage. That stage outputs the mark colour from colour channel 0 (switched to
+  its material-colour register) and copies the alpha the material's last stage wrote, from that
+  stage's output register and with its clamp setting. The material-colour register is shared with
+  the alpha channel, so its alpha keeps the material's value (`plan_alpha_mark`).
+- A material that sets no alpha test of its own, or already uses all 16 TEV stages, cannot be marked
+  this way; it is counted as `unmarkable` and fogged.
 
 ### Exemptions
 
@@ -272,8 +311,8 @@ its own fog. The log names each missing hook and the Status line names the first
 `dev.automata.deferred_fog` (`include/deferred_fog_service.h`) has one call, `get_state`. Its
 `deferring` field is true when the frame armed the fog pass at `SCENE_AFTER_OPAQUE`. Before that
 stage in a frame it holds the previous frame's value, and it stays true if the depth snapshot then
-fails. It is false while the mod is off, inactive or leaving Wolf Senses to the game, and in a frame
-with no fogged draws. A mod that composites at `SCENE_AFTER_OPAQUE` is
+fails. It is false while the mod is off, inactive or leaving Wolf Senses to the game, in a frame
+whose sky-depth snapshot failed, and in a frame with no fogged draws. A mod that composites at `SCENE_AFTER_OPAQUE` is
 already under the fog without importing it, and an overlay that must sit on top of the fog can draw
 at `GFX_STAGE_FRAME_AFTER_HUD`. Importing the service only matters for ordering inside one stage:
 hooks on a stage run in registration order, which follows load order, and an import makes the
@@ -289,17 +328,16 @@ What one fullscreen pass over the finished opaque image cannot reproduce exactly
   - a see-through opaque-list surface that writes depth fogs what is behind it at its own, nearer,
     depth;
   - a surface that writes no depth is fogged at the depth of what is behind it, and over the sky
-    (depth 0) not at all.
+    not at all.
 - **Additive and subtractive blends.** The game fogs a draw's colour before blending it. For layers
   with blend factors (sᵢ, dᵢ), the game and the fog pass differ by `f·F·(K − 1)` where
   `K = Σᵢ sᵢ·Π_{j>i} dⱼ`. An ordinary alpha blend over an opaque surface has `K = 1`, no difference.
   An additive blend (destination factor 1) or `GX_BM_SUBTRACT` gives `K ≠ 1`. The `additive`
   counter shows such draws. Leaving them on the game's fog does not help: the fog pass still fogs
   their pixels, so they would be fogged twice.
-- **Materials with fog switched off.** A material's fog block can have type 0 (`GX_FOG_NONE`); the
-  game then draws it unfogged at any distance, while the fog pass fogs it. Skip Unfogged marks such
-  pixels, but only for materials that write their own depth (otherwise it would unfog what is behind
-  them) and have no alpha test (the replay draws cutouts solid).
+- **Materials with fog switched off.** Skip Unfogged leaves them unfogged only where they write
+  their own depth and can be marked (see [Skip Unfogged](#skip-unfogged)); the `no-Z` and
+  `unmarkable` ones are fogged. With Skip Unfogged off, all of them are fogged.
 - **Draws the capture does not see.** `Pri0_B` particles and the game's shadows draw inside the
   scope through `GXSetFog`, so their fog is switched off like everything else, but they are not in
   the Status counts and not replayed.
@@ -320,9 +358,10 @@ count shows that a mechanism is present in the view, not that it is what a given
 
 | Reading | Meaning |
 | :-- | :-- |
-| `fog-off` > 0, `markable` > 0 | Skip Unfogged can mark those draws; turning it on shows whether they are the difference |
-| `fog-off` > 0, `markable` = 0, `alpha` > 0 | Alpha-tested fog-off materials; the mark would need the material's own alpha in the replay |
+| `fog-off` > 0, `markable` > 0 | Skip Unfogged marks those draws; red in the debug views shows where. Turning it off shows whether they are the difference |
+| `fog-off` > 0, `unmarkable` > 0 | Fog-off materials that write depth but cannot be marked (no alpha test of their own, or 16 TEV stages) |
 | `fog-off` > 0, `no-Z` > 0 | Fog-off materials that write no depth; marking them would unfog what is behind them |
+| A surface the game leaves unfogged is fogged, and is not red with Skip Unfogged on | It is not a fog-off material the replay reaches: check whether it draws in the sky lists (black in the debug views) or through a path the capture does not see |
 | `additive` > `no-Z` | Additive blends on depth-owning geometry |
 | `additive` = `no-Z` > 0 | Additive blends that own no depth; one pass cannot correct them |
 | `replay failed` or `merged` | The frame fell back to configuration 0 in places |
@@ -335,6 +374,8 @@ count shows that a mechanism is present in the view, not that it is what a given
   `SCENE_AFTER_OPAQUE` stage.
 - Every hook is required. Keep `install_hooks` all-or-nothing.
 - Keep `needs_id_buffer()` as the single test for both building and using the replay.
+- The scope opens only with the sky-depth snapshot in hand; without it the fog pass would fog what
+  the sky lists drew depth for.
 - Keep `is_barrier_fog` an exact match.
 - Do not leave blended draws on the game's fog (see [Limitations](#limitations)).
 - The uniform structs (`FogUniforms` 112 bytes, `MixedFogUniforms` 336 bytes, `FogRangeUniform`
