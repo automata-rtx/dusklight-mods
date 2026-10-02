@@ -12,7 +12,7 @@ build it (see `CONTRIBUTING.md`, or `self_editing_guide.md` to do it all in the 
 | :-- | :-- | :-- |
 | **VBAO** | Two tables in `mod_initialize`: `boolOptions[]` and `intOptions[]`, one line per option | `intOptions\[\]` |
 | **SMAA** | `intOptions[]` for the numbers; its two switches are literal arguments to `register_bool_option(...)` | `intOptions\[\]`, `register_bool_option("` |
-| **Deferred Fog** | One block per option in `init()`; the default is the `default_bool` / `default_int` line in it | `cvarDesc.name = "` |
+| **Deferred Fog** | One `register_bool("name", default, handle)` or `register_int(...)` call per option in `init()`; the default is the second argument | `register_bool("`, `register_int("` |
 
 A table line looks like this:
 
@@ -59,17 +59,18 @@ control back is a one-line revert.
   // add_number(left, "Depth Bias", g_cvarDepthBias, "...", 0, 20, 1, nullptr);
   ```
 
-- **Deferred Fog**: each control is a short block in `build_controls_tab` ending in
-  `add_control(left, control);`. Comment out that last line, or the whole block.
+- **Deferred Fog**: in `build_controls_tab` each toggle is one `add_toggle(left, ...)` call;
+  comment out every line of it, up to its closing `);`. The Debug View selector is a short block
+  ending in `add_control(left, control);`; commenting out that last line is enough.
 
-The **Enabled** toggle appears twice in each mod: in the mod's pane (`build_section` or
-`build_panel`) and in the controls window. Hide both if you hide one.
+The **Enabled** toggle appears twice in each mod: in the mod's pane (`build_panel`) and in the
+controls window. Hide both if you hide one.
 
 ## Remove an option completely
 
 Only if you also want the setting gone from the config file:
 
-1. Remove its line from the option table (or its registration block).
+1. Remove its line from the option table (or its `register_*` call).
 2. Remove its UI control.
 3. Remove the `ConfigVarHandle g_cvarThing` global and every `get_*_option(g_cvarThing, ...)` read.
    The compiler will point at each one.
@@ -109,9 +110,10 @@ mods/<mod>/res/banner.png
 ```
 
 Those are the paths the loader looks for by default. To use other names, set `"icon"` / `"banner"`
-in `mod.json` to a path inside the bundle. VBAO and Deferred Fog do this; SMAA ships
-`res/SMAA Logo.png` but sets no `icon` key, so it currently shows no icon. Anything under `res/` is
-packaged automatically.
+in `mod.json` to a path inside the bundle. VBAO does this. Deferred Fog ships
+`res/Deferred Fog Logo.png` and `res/Deferred Fog Banner.png`, and SMAA ships `res/SMAA Logo.png`,
+but neither sets `icon` or `banner`, so they currently show none. Anything under `res/` is packaged
+automatically.
 
 ---
 

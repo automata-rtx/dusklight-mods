@@ -1,90 +1,79 @@
-# Deferred Fog — underwater AO fade (DEFERRED / not implemented)
+# Deferred Fog: underwater fog term (design, not built)
 
-Status: **investigated and designed, intentionally not built.** The maintainer shelved it after
-the design was validated but before shipping. This note captures everything needed to resume.
-Nothing in it is wired into the mod; `mods/deferred_fog` has no underwater code.
-
-> The game-source line numbers below were taken on an earlier platform and several have drifted on
-> the `v2.0.0` pin; search for the named functions rather than trusting the numbers. The host
-> notes below have been updated for the current mod (1.0.2).
+A designed feature for Deferred Fog that is **not implemented**: nothing in `mods/deferred_fog`
+does any of this. This note holds what is needed to build it.
 
 ## The problem
 
-With VBAO on, ambient occlusion darkens submerged (underwater) terrain and that darkening does
-**not** fade with distance the way above-water AO does. Above water, deferred fog washes distant
-terrain toward the fog color, which softens the AO into the aerial perspective — the effect the
-user likes. Underwater, the lakebed keeps sharp AO even far out over a large deep lake, so the
-occlusion reads as harsh dark patches under the water instead of fading.
+With VBAO on, ambient occlusion darkens submerged terrain, and seen from above the water that
+darkening does not fade with distance the way above-water AO fades into the fog. Over a large deep
+lake the lakebed keeps sharp AO far out, so the occlusion reads as dark patches under the water.
 
-The user's constraints: they want a **deferred-fog-style solution** (re-apply a missing
-attenuation after AO), not a crude AO mask/height-fade (which was tried on the old aurora fork
-and looked poor).
+The fix must re-apply a missing attenuation after AO, in the style of the deferred fog. Masking or
+fading the AO by height is not the goal.
 
-## Investigation findings (definitive — from the game source in the fetched dusklight/ tree)
+## What the game does
 
-1. **There is no separate underwater fog on the terrain.** The engine programs one global stage
-   fog (`g_env_light.mFogNear`/`mFogFar`/`fog_col`, `d_kankyo.h:351,372,373`) onto ALL geometry
-   via `GXSetFog` (`d_kankyo.cpp:9388`, `GxFogSet_Sub`). Submerged lakebed and dry shore share
-   the same fog. There is no "this poly is below the water plane → different fog" branch.
-   → So there is **nothing to capture and re-apply** here; the deferred-fog capture path is not
-   the fix.
+Checked against the game source at the `v2.0.0` pin.
 
-2. **The engine's only "underwater" treatment is gated on the CAMERA being submerged**, not on
-   the geometry. `dKy_camera_water_in_status_check()` / `g_env_light.camera_water_in_status`
-   (set in `d_camera.cpp:1303-1310`; getter/setter `d_kankyo.cpp:7344-7346`;
-   field `d_kankyo.h:854`) drives a palette/fog swap (`d_kankyo.cpp:7344-7346`), an underwater
-   color multiply (`water_in_col_ratio_*`, `water_in_light_col`, gated at 2300-2307), and the
-   full-screen distortion overlay (`dKy_undwater_filter_draw`, `d_kankyo.cpp:8125-8177`). All of
-   it is skipped in the above-water-looking-down case.
+1. **No fog setter distinguishes geometry below the water.** The global fog comes from
+   `g_env_light.mFogNear`, `mFogFar` and `fog_col` through `GxFog_set` → `GxFogSet_Sub` →
+   `GXSetFog`. Room fog goes through `dKy_GxFog_tevstr_set`. Neither looks at the water plane:
+   submerged terrain gets the same fog as the terrain around it. So there is no underwater fog to
+   capture and re-apply; it has to be synthesized.
+2. **The game's underwater treatment depends on the camera, not on the geometry.**
+   `g_env_light.camera_water_in_status` is set by the camera when its eye is below the water surface
+   (`dCamera_c`, `getWaterSurfaceHeight`). It selects the underwater palette (`pselect_id[8]` /
+   `[9]`, except in `D_MN08D` and `D_MN01A`), the underwater light-colour ratio
+   (`water_in_col_ratio_*`), and the full-screen underwater filter (`dKy_undwater_filter_draw`, in
+   the 2D-screen list). None of it applies while the camera is above the water looking down.
+3. **The haze over submerged terrain, seen from above, is the water surface itself.** Water actors
+   such as `daLv3Water_c::Draw` and `daGrdWater_c::Draw` draw their surface translucent in the
+   `XluListDarkBG` list with BTK-animated materials, plus a second model in the Invisible list
+   (`daLv3Water_c` gives it a screen-projected texture matrix). Nothing in their draw code depends on
+   the depth of water beneath, so the surface does not deepen its tint with the water column. Distant
+   lakebed looks softer only because more ordinary stage fog accumulates over farther terrain.
 
-3. **The submerged "haze" seen from above is purely the flat translucent water surface.** The
-   water models (`daLv3Water_c::Draw` `d_a_obj_lv3Water.cpp:336`; `daGrdWater_c::Draw`
-   `d_a_obj_groundwater.cpp:264`) draw translucent into `XluListDarkBG` with **material-driven,
-   BTK-animated alpha — NOT depth-driven**. The `C_MTXLightPerspective`/`setEffectMtx` block is
-   a projected reflection texgen, not a scene-depth read. So the water does not deepen its tint
-   with the water column; distant lakebed looks softer only because more of that flat tint plus
-   the ordinary stage fog accumulate over farther terrain.
+So the feature synthesizes the missing depth attenuation. The deferred fog pass is the place for
+it: it runs after every mod's `SCENE_AFTER_OPAQUE` composite, over the opaque scene, before the
+water surfaces draw.
 
-Conclusion: to fade underwater AO we must **synthesize** the missing depth attenuation
-ourselves. The deferred-fog pass is the right place (it runs after AO, over the opaque scene).
+## Design: a synthesized underwater term
 
-## Proposed design — synthesized underwater fog
+Add a term to the fog pass: for opaque pixels below the water surface, an extra fog that deepens
+with the **water-column depth** (surface height − pixel world height), composited with the stage
+fog. Because the pass runs after AO, this fades the lakebed's AO the way distance fog fades
+above-water AO.
 
-Add an "underwater fog" term to the existing deferred-fog fullscreen pass: for opaque pixels
-below the water surface, apply an extra fog that deepens with the **water-column depth**
-(surface Y − pixel world Y), composited WITH the normal stage fog. Because the fog pass runs
-after every mod's `SCENE_AFTER_OPAQUE` composite, this fades the AO on distant lakebed exactly
-like distance fog fades above-water AO.
+### Inputs
 
-### Inputs (all confirmed available)
+- **Water surface height.** `fopAcM_getWaterY(const cXyz* pos, f32* waterY)`
+  (`f_op/f_op_actor_mng.h`) returns 1 and writes the surface height when there is water at that
+  position, otherwise returns 0 and writes −∞. Probe at the player's position,
+  `dComIfGp_getLinkPlayer()->current.pos`: the player is the reliable anchor at the water. The camera
+  eye is an alternative but fails when the camera is over the shore.
+- **World position per pixel.** `CameraService::get_camera` (`mods/svc/camera.h`) with the stage
+  context's `game_view` returns `CameraInfo::world_from_proj`, the one-step depth-buffer → world
+  matrix. The pass already samples the same reversed-Z depth.
 
-- **Water surface height**: `fopAcM_getWaterY(const cXyz* xz, f32* out)` returns 1 + surface Y
-  when there is water at that XZ, else 0/`-inf` (`f_op_actor_mng.cpp:2327`, header
-  `f_op/f_op_actor_mng.h:704`; also `fopAcM_wt_c::getWaterY()` global cache, header :899).
-  Probe at the player's position — `dComIfGp_getLinkPlayer()->current.pos` (the unreleased shadow mod
-  uses this pattern in `mods/realtime_sun_shadows/src/mod.cpp`). Player is the reliable "at the water"
-  anchor; camera eye XZ is an alternative but fails when the camera sits over the shore.
-- **World position per pixel**: reconstruct from uv + raw depth with `CameraInfo::world_from_proj`
-  (`mods/svc/camera.h`), which is already the one-step depth-buffer → world matrix; no multiply is
-  needed. Same reversed-Z depth the fog already samples.
+### Shader (`res/fog.wgsl`)
 
-### Shader (res/fog.wgsl) — validated to compile (naga OK)
-
-New `UnderwaterUniforms` at **binding 4**, referenced by BOTH `fs_main` and `fs_mixed` (binding
-4 collides with neither the single path's 0/1 nor the mixed path's 0/2/3):
+A new `UnderwaterUniforms` at **binding 4**, used by both `fs_main` and `fs_mixed` (it collides with
+neither's bindings 0–3):
 
 ```
 struct UnderwaterUniforms {
     world_from_clip: mat4x4f,
-    color: vec4f,      // water color the terrain fades toward (rgb)
+    color: vec4f,      // water colour the terrain fades toward (rgb)
     water_y: f32,
-    half_depth: f32,   // water-column depth at which haze reaches 50%
-    max_strength: f32, // cap 0..1
+    half_depth: f32,   // water-column depth at which the term reaches 50%
+    max_strength: f32, // cap, 0..1
     enabled: f32,
 }
 ```
 
-Helper composites base stage fog with the underwater term as one src-over (color, alpha):
+A helper composites the stage fog `(base_rgb, base_f)` with the underwater term as one src-over
+`(colour, alpha)`:
 
 ```
 fn apply_underwater(base_rgb, base_f, uv, depth) -> vec4f {
@@ -101,44 +90,41 @@ fn apply_underwater(base_rgb, base_f, uv, depth) -> vec4f {
 }
 ```
 
-Call it in `fs_main` and `fs_mixed` right after the base `fog_z` is computed; return `(o.rgb,
-o.a)`; in the fog-factor debug view return `o.a` (combined factor). Sky early-outs stay (sky is
-above water).
+Call it in `fs_main` and `fs_mixed` right after the stage fog factor is computed, return
+`(o.rgb, o.a)`, and in the Fog Factor debug view return `o.a`. The sky early-outs stay (the sky is
+above the water). Validate the shader with `build/wgsl_check` (`CONTRIBUTING.md` "Check your
+change").
 
-### Host (src/mod.cpp)
+### Host (`src/mod.cpp`)
 
-- Mirror `UnderwaterUniforms` in C++ (`float world_from_clip[16]; float color[4]; float water_y,
-  half_depth, max_strength, enabled;` → 96 bytes, `%16==0`).
-- `CameraService` is already imported (currently unused) and `mods/svc/camera.h` included; add
-  `f_op/f_op_actor_mng.h`.
-- In `on_scene_after_opaque` (has `stageCtx->game_view`): `get_camera` → take
-  `world_from_proj` as `g_worldFromClip`; probe player XZ with `fopAcM_getWaterY`
-  → `g_waterY`, `g_hasWater`. Disable the term when no water or the toggle is off.
-- `push_fog_quad`: build the underwater uniform (world_from_clip, color from cvars, water_y,
-  half_depth, max_strength, enabled = hasWater && toggle), `push_uniform` it (a SECOND uniform
-  range beside the fog/mixed one), and add binding 4 to BOTH bind groups in `on_draw`.
-- `DrawPayload`: add `uw_offset` / `uw_size` (payload stays < 128 B).
-- Config vars (in the controls window tab): `underwaterFog` (bool, default OFF),
-  `underwaterHalfDepth` (world units, ~400 default), `underwaterStrength` (0-100 %, ~70),
-  `underwaterColorR/G/B` (0-255, murky teal default ~25/55/55).
-- Bump the version (1.0.2 → 1.1.0); reset the new state in shutdown; document the feature and its
-  limitations in `docs/deferred_fog.md`.
+- Mirror `UnderwaterUniforms` in C++: `float world_from_clip[16]; float color[4]; float water_y,
+  half_depth, max_strength, enabled;` (96 bytes, a multiple of 16), with `static_assert`s.
+- Import `CameraService` and include `mods/svc/camera.h` and `f_op/f_op_actor_mng.h`.
+- In `on_scene_after_opaque`, call `get_camera` with `stageCtx->game_view` and keep
+  `world_from_proj`; probe the player's position with `fopAcM_getWaterY`. Disable the term when
+  there is no water or the option is off.
+- In `push_fog_quad`, build and `push_uniform` the underwater block as a second uniform range, add
+  its offset and size to `DrawPayload` (it stays well under 128 bytes), and add binding 4 to both
+  bind groups in `on_draw`.
+- Options in the controls window: `underwaterFog` (bool, default off), `underwaterHalfDepth` (world
+  units, about 400), `underwaterStrength` (0–100 %, about 70), `underwaterColorR/G/B` (0–255, a murky
+  teal around 25/55/55).
+- Reset the new state in `shutdown`, and document the feature and its limits in
+  `docs/deferred_fog.md`.
 
-## Limitations / open questions to resolve when resuming
+## Limitations and open questions
 
-- **Flat water plane assumption**: one `water_y` per frame from a single probe. Fine for a lake;
-  wrong for sloped rivers, waterfalls, or multiple water bodies at different heights in view. A
-  robust version would capture per-pixel water-surface depth by replaying the water actors into
-  a depth buffer (same replay machinery as the config-ID pass) and compare view-space depths —
-  heavier but exact, and it also fixes the multi-level case.
-- **Probe location**: player XZ works when the player is at the water; a scene viewed from a
-  distant hill (player/camera not over water) gets no term. Per-pixel water depth (above) also
-  removes this limitation.
-- **Color/tuning**: fading toward the fog color would brighten deep water (wrong); a dedicated
-  murky water color is needed. Values are pure taste — must be tuned in-game.
-- **Interaction with the water surface**: the synthesized fog darkens/tints the lakebed BEFORE
-  the translucent water draws over it. Verify it reads correctly through the water tint rather
-  than double-tinting; may want the underwater color close to the water tint.
-- **Cost**: adds a second small uniform + world reconstruction per fog pixel — negligible. The
-  per-pixel-water-depth variant adds one water-actor replay per frame (streaming budget, like
-  the config-ID replay).
+- **Flat water plane.** One `water_y` per frame from one probe is right for a lake, wrong for sloped
+  rivers, waterfalls, or several water bodies at different heights in view. A per-pixel water depth,
+  made by replaying the water actors into a depth buffer (the same machinery as the
+  configuration-ID replay) and comparing view-space depths, is exact and handles every case, at the
+  cost of one more replay per frame.
+- **Probe location.** A view of water from a distant hill, with the player away from the water, gets
+  no term. A per-pixel water depth removes this limit too.
+- **Colour.** Fading toward the fog colour would brighten deep water, so the term needs its own murky
+  water colour. The values are a matter of taste and need tuning in-game.
+- **The water surface draws on top.** The term tints the lakebed before the translucent water draws
+  over it. Check that it reads correctly through the water's own tint rather than doubling it; the
+  underwater colour may need to sit close to the water tint.
+- **Cost.** One more small uniform and a world-position reconstruction per fog pixel: negligible. The
+  per-pixel-water-depth variant adds a water-actor replay per frame.

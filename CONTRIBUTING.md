@@ -44,7 +44,7 @@ Every mod has the same shape:
 ```
 mods/<name>/
   CMakeLists.txt   add_mod(...) call: FEATURES, sources, mod.json, res dir
-  mod.json         id, display name, version, description, icon/banner paths
+  mod.json         id, display name, version, description, optional icon/banner paths
   src/mod.cpp      all host code: config vars, UI, pipelines, stage hooks, game hooks
   res/*.wgsl       shaders, loaded at runtime through the resource service
   res/licenses/    third-party attribution shipped inside the bundle
@@ -226,11 +226,11 @@ If a struct is declared in several `.wgsl` files, update all of them.
 
 ### Game hooks (Deferred Fog)
 
-`DEFINE_HOOK(&Class::method, Name)` declares a hook target; `mods::hook_add_pre<Name>` and
-`hook_add_post<Name>` attach callbacks at init. A pre-hook can read and rewrite arguments
-(`mods::arg`, `mods::arg_ref`). Hook callbacks run on the game thread, synchronously with the game.
-Deferred Fog still includes the deprecated `<mods/hook.hpp>` (the build prints a warning about it);
-the current header is `<mods/svc/hook.hpp>`, with `mods::hook::add_pre<Name>(fn)`.
+`DEFINE_HOOK(&Class::method, Name)` declares a hook target; `mods::hook::add_pre<Name>` and
+`mods::hook::add_post<Name>` from `<mods/svc/hook.hpp>` attach callbacks at init. A pre-hook can
+read and rewrite arguments (`mods::arg`, `mods::arg_ref`). Hook callbacks run on the game thread,
+synchronously with the game. Deferred Fog requires every one of its hooks: if any fails to attach,
+it stays inactive and the game draws its own fog (`install_hooks`).
 
 The game's identifiers are the original Japanese team's names, preserved by the decompilation
 (`kankyo` = environment, `moya` = haze, `kumo` = cloud). Read them with `docs/japanese-naming.md` to
@@ -248,19 +248,20 @@ current pin):
 | `GFX_STAGE_SCENE_BEGIN` | 2334 | before any world geometry | Deferred Fog opens its fog-suppression scope |
 | opaque world lists | 2344–2390 | terrain, objects, actors, grass; also some particles (`Pri0_B`) and the game's own shadows. Fog applied per draw by the game | Deferred Fog suppresses per-draw fog here |
 | `GFX_STAGE_SCENE_AFTER_TERRAIN` | 2366 | after terrain and shadows, before the main opaque list | (nothing in the released set) |
-| `GFX_STAGE_SCENE_AFTER_OPAQUE` | 2395 | all opaque world geometry is down | VBAO composites; SMAA antialiases; Deferred Fog closes its scope and arms the fog quad |
-| translucent lists | 2405 | `dComIfGd_drawXluListBG` onward | Deferred Fog draws its fog quad at the first translucent J3D shape |
-| particles, DOF, bloom | to 2632 | the game's own post effects; bloom at 2632 | Deferred Fog's fallback anchor is just before bloom |
-| `GFX_STAGE_FRAME_BEFORE_HUD` | 2759 | after all 3D post effects | Deferred Fog's last-resort anchor |
+| `GFX_STAGE_SCENE_AFTER_OPAQUE` | 2395 | all opaque world geometry is down | VBAO composites; SMAA antialiases; Deferred Fog closes its scope and arms the fog pass |
+| translucent lists | 2405 | `dComIfGd_drawXluListBG` onward | Deferred Fog draws its fog pass from a pre-hook on `dComIfGd_drawXluListBG` |
+| particles, depth of field, framebuffer copies, 2D-screen filters, bloom | to 2632 | the game's own post effects. They read or redraw the frame; bloom (2632) works from the last framebuffer copy | (they all see the fogged frame) |
+| `GFX_STAGE_FRAME_BEFORE_HUD` | 2759 | after all 3D post effects | (nothing in the released set) |
 | `GFX_STAGE_FRAME_AFTER_HUD` | 2820 | the last stage in the frame | VBAO's debug views (so nothing draws over them) |
 
 Consequences:
 
 - VBAO and SMAA composite at `SCENE_AFTER_OPAQUE`, before the game's translucency, bloom and depth
   of field, so those effects work on the already-occluded, already-antialiased image.
-- Deferred Fog applies the fog after that, so AO darkens the surface under the fog rather than
-  darkening the fog colour. That ordering comes from the stages, not from the mods knowing about
-  each other. No mod in the build imports another.
+- Deferred Fog applies the fog after that and before everything the game draws or copies later, so
+  AO darkens the surface under the fog rather than darkening the fog colour, and the game's own
+  post effects see the fogged image. That ordering comes from the frame, not from the mods knowing
+  about each other. No mod in the build imports another.
 - Within one stage, hooks run in registration order, which follows load order. There is no priority
   field.
 
@@ -305,14 +306,15 @@ did not appear.
 | Mod | Read first | Then | Key entry points in `src/mod.cpp` |
 | :-- | :-- | :-- | :-- |
 | VBAO | `docs/vbao.md` "How it works" | `res/vbao.wgsl` (the estimator), `res/temporal.wgsl` | the `SCENE_AFTER_OPAQUE` stage hook, `ensure_composite_pipelines()`, the option tables in `mod_initialize` |
-| Deferred Fog | `docs/deferred_fog.md` "How it works" | `src/fog_math.h`, `res/fog.wgsl` | `on_scene_begin`, `on_shape_draw_pre`, `on_set_fog_pre`, `on_scene_after_opaque`, `push_fog_quad` |
+| Deferred Fog | `docs/deferred_fog.md` "How it works" | `src/fog_math.h`, `res/fog.wgsl` | `on_scene_begin`, `on_shape_draw_pre`, `on_set_fog_pre`, `on_scene_after_opaque`, `on_xlu_list_bg_pre`, `push_fog_quad`, `install_hooks` |
 | SMAA | `docs/smaa.md` "How it works" | `res/edge_detection.wgsl`, `res/blend_weights.wgsl` | the `SCENE_AFTER_OPAQUE` stage hook, `ensure_neighborhood_pipeline()` |
 
 Open problems worth knowing about before you start:
 
-- **Deferred Fog: distant landmarks (Death Mountain, the Ganon barrier) are brighter with the mod
-  off.** Three fixes have failed. `docs/deferred_fog.md` "Known issues" has the evidence so far and
-  what to measure next.
+- **Deferred Fog** is a single fullscreen pass over the finished opaque image, so a few cases cannot
+  match the game exactly (one depth per pixel, additive blends, materials with fog off).
+  `docs/deferred_fog.md` "Limitations" lists them, and "Diagnosing a difference from vanilla" says
+  how to tell them apart in a view.
 - **SMAA** handles orthogonal edge patterns only: edges at or near 45° get little or no smoothing,
   and diagonal search and corner rounding are not implemented.
 - **VBAO** has a short list of minor known issues in `docs/vbao.md` "Known issues".
@@ -320,7 +322,9 @@ Open problems worth knowing about before you start:
 ## Releasing
 
 1. Bump `version` in the mod's `mod.json`. Each mod is versioned independently; there is no shared
-   version.
+   version. The game parses it as `MAJOR.MINOR.PATCH`, optionally followed by `-prerelease` and/or
+   `+build` (for example `2.0.0-a`). Anything else, such as `2.0.0a`, makes the mod manager refuse
+   to install the package, and a parseable older copy of the same mod wins over it.
 2. Push. CI builds every mod on seven platforms; the `mods-combined` artifact holds one
    cross-platform `.dusk` per mod, and `mods-<platform>` holds the per-platform bundles. CI runs on
    every branch and takes a few minutes.
@@ -342,7 +346,9 @@ The game build is pinned by `DUSKLIGHT_VERSION` in `CMakeLists.txt`. To move:
 3. Read `dusklight/sdk/include/mods/svc/gfx.h` and the other service headers you use. A green build
    does not prove the API kept its shape.
 4. Re-verify Deferred Fog's hook targets: take every `DEFINE_HOOK` line in
-   `mods/deferred_fog/src/mod.cpp` and confirm each symbol still exists in the new tree.
+   `mods/deferred_fog/src/mod.cpp` and confirm each symbol still exists in the new tree. Also
+   confirm that `dComIfGd_drawXluListBG` is still an out-of-line function and that `mDoGph_Painter`
+   still calls it directly after the `SCENE_AFTER_OPAQUE` stage: the fog pass is drawn from it.
 5. Run `python3 tools/check_source_citations.py` and fix the line numbers it reports as drifted.
    Its guesses are advisory; confirm each one by reading the source.
 6. Test in-game, with the matching game build installed.
@@ -366,7 +372,7 @@ pin needs the steps above rather than just a version bump.
 | `README.md` | Users: what the mods do, how to install them |
 | `CONTRIBUTING.md` | This file |
 | `docs/README.md` | Index of every doc, with what each is for and whether it is current |
-| `docs/vbao.md`, `docs/deferred_fog.md`, `docs/smaa.md` | Per-mod reference: pipeline, options, debug views, known issues, history |
+| `docs/vbao.md`, `docs/deferred_fog.md`, `docs/smaa.md` | Per-mod reference: pipeline, options, debug views, limitations and known issues |
 | `docs/editing-options.md` | Changing a default, hiding an option, editing a description |
 | `docs/mod-api-notes.md` | Mod API pitfalls, crash symbolization, debugging lessons |
 | `docs/normal_buffer_portability.md` | The normal-buffer API, when normals are missing, the two `common/` headers |

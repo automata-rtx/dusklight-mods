@@ -63,17 +63,16 @@ SMAA's two switches are not in a table. Search for `register_bool_option("`:
 register_bool_option("useNormalEdges", true, g_cvarUseNormalEdges, error)   // the true -> false
 ```
 
-### Deferred Fog: a registration block
+### Deferred Fog: a registration call
 
-Search for the option name, for example `"fogEnabled"`, and change the `default_*` line under it:
+Search for the option name, for example `"fogEnabled"`. The default is the second argument:
 
 ```cpp
-    cvarDesc.name = "fogEnabled";
-    cvarDesc.type = CONFIG_VAR_BOOL;
-    cvarDesc.default_bool = true;      //  <-- change to false
+    if (register_bool("fogEnabled", true, g_cvarEnabled) != MOD_OK ||   //  <-- true or false
+        register_int("fogDebug", 0, g_cvarDebugView) != MOD_OK ||       //  <-- a whole number
 ```
 
-Each block has a `// DEFAULT` comment just above it, so searching for `DEFAULT` jumps between them.
+All five are together in `init()`.
 
 ### Rules
 
@@ -99,12 +98,12 @@ Do Recipe A, then stop showing the control so nobody changes it. Controls are ad
     // add_number(left, "Depth Bias", g_cvarDepthBias, ...
 ```
 
-In VBAO and SMAA one control is one call, which may continue over the next few lines; comment out
-every line of that call, up to its closing `);`. In Deferred Fog each control is a short block ending
-in `add_control(left, control);`; commenting out that last line is enough.
+One control is one call, which may continue over the next few lines; comment out every line of that
+call, up to its closing `);`. The one exception is Deferred Fog's Debug View selector, a short block
+ending in `add_control(left, control);`; commenting out that last line is enough.
 
 The **Enabled** switch appears twice per mod: in the controls window and in the mod's own pane
-(`build_panel`, or `build_section` in Deferred Fog). Hide both if you hide one.
+(`build_panel`). Hide both if you hide one.
 
 ### B2: replace the option with a constant
 
@@ -121,8 +120,10 @@ registration in place is harmless and cannot break the build.
 ## Recipe C: edit the name or description
 
 Open `mods/<mod-name>/mod.json` and edit `"name"` or `"description"`, or bump `"version"` (for
-example `1.0.2` → `1.0.3`) so the mod manager shows that you installed a newer build. Keep the
-description to one paragraph; line breaks are not displayed.
+example `1.0.2` → `1.0.3`) so the mod manager shows that you installed a newer build. A version
+must be three numbers, optionally followed by a dash and a label for a test build (`2.0.0-a`);
+`2.0.0a` is refused when installing. Keep the description to one paragraph; line breaks are not
+displayed.
 
 ---
 
@@ -152,5 +153,5 @@ description to one paragraph; line breaks are not displayed.
 - **SMAA** (`mods/smaa/src/mod.cpp`): `effectEnabled`, `blendStrength`, `edgeThreshold`,
   `localContrast`, `useNormalEdges`, `normalThreshold`, `depthThreshold`, `maxSearchSteps`,
   `debugMode`.
-- **Deferred Fog** (`mods/deferred_fog/src/mod.cpp`): `fogEnabled`, `fogMixedMode`,
-  `fogSkipUnfogged`, `fogDeferInSenses`, `fogDebug`, `fogLogConfigs`.
+- **Deferred Fog** (`mods/deferred_fog/src/mod.cpp`): `fogEnabled`, `fogSkipUnfogged`,
+  `fogDeferInSenses`, `fogDebug`, `fogLogConfigs`.

@@ -190,6 +190,12 @@ Glossed because these are the names in `mods/deferred_fog/src/mod.cpp` and in th
 | tsuki | 月 | moon | 「月の調整パラメータ」 (`d_kankyo.cpp:7728`); `setSunpos` also writes `moon_pos` |
 | vectle | *(English by ear)* | **vector** | `dKyr_get_vectle_calc` — do not "fix" |
 | Schejule | *(English by ear)* | **schedule** | do not "fix" |
+| undwater | *(English by ear)* | **underwater** | `dKy_undwater_filter_draw`, the full-screen underwater filter, drawn in the 2D-screen list after the frame is copied — do not "fix"; a search for "underwater" misses it |
+| captue | *(English by ear)* | **capture** | `retry_captue_frame`, the framebuffer copy that bloom and the screen effects read — do not "fix" |
+| houwa kasan | 飽和加算 | saturating addition: the game's name for **bloom** | the CPU-timer label 「飽和加算フィルター」 marks the bloom draw in `mDoGph_Painter`; 「飽和加算設定」 heads the bloom panel |
+| saido gensan | 彩度減算 | **saturation subtraction** (desaturation) | the slider label for `mSaturateSubtractA` and its R/G/B siblings, the colour of bloom's desaturation pass, set per palette |
+| *(katakana English)* | フレームバッファキャプチャー | **framebuffer capture** | the CPU-timer labels on the `retry_captue_frame` calls in `mDoGph_Painter` (「…２回目」, 「…３回目」: 2nd, 3rd time) |
+| kanzen touei-you sukuriin | 完全投影用スクリーン | "screen for complete projection" | the 2D-screen list, `dComIfGd_drawXluList2DScreen`, where screen-sized models such as the underwater filter draw |
 
 **Celestial Orbit's vocabulary, and one trap in it.** That mod retilts the sun and moon
 path by post-hooking `dScnKy_env_light_c::setSunpos()` (`d_kankyo.cpp:1666`), which writes
@@ -378,12 +384,11 @@ a content classification the game already made.
 
 ### 4.5 The game already runs a per-material fog override, keyed on the same codes
 
-Found while reading §4.1's neighbourhood, and it lands on Deferred Fog (a standalone mod —
-Graphics Hub, which used to host it, is retired).
+This lands on Deferred Fog.
 
-`setLightTevColorType_MAJI_sub` (`d_kankyo.cpp:4231`) is the per-material light/TEV/fog
-setup every BG material goes through. Its fog block (`:4432-4487`) does not simply apply
-the environment fog: at `:4466-4479` it reads the material's **authored**
+`setLightTevColorType_MAJI_sub` (`d_kankyo.cpp:4226`) is the per-material light/TEV/fog
+setup every BG material goes through. Its fog block (`:4427-4482`) does not simply apply
+the environment fog: at `:4461-4473` it reads the material's **authored**
 `J3DFogInfo::mType` and treats two values as sentinels —
 
 | authored `mType` | what the game does |
@@ -393,19 +398,20 @@ the environment fog: at `:4466-4479` it reads the material's **authored**
 | anything else | uses `tevstr_p->FogCol`, the environment fog colour |
 
 — and `dKy_bg_MAxx_proc` **writes exactly those two values**, by polygon code
-(`d_kankyo.cpp:11376-11408`): `MA09` gets `mType = 6`, the rest of the water family gets
+(`d_kankyo.cpp:11374-11384`): `MA09` gets `mType = 6`, the rest of the water family gets
 `mType = 7`. Start/end Z come from the tevstr and near/far from the view, so the *range*
 is shared while the *colour* is not.
 
 So "the game's fog" is not one configuration. **Water surfaces are deliberately fogged
 to black or white while everything else is fogged to the palette colour**, and the
 selector is a material name. That black is applied to the water's *own* colour before it is
-blended over the riverbed — which is what makes deep water darken with distance, and why a
-deferred fullscreen pass cannot reproduce it. See `docs/deferred_fog.md`, "Limitations".
-Deferred Fog handles "mixed fog configs" with a per-pixel replay (or, in Vanilla mode, by
-handing the frame back to the game); this
-says the mixed case is not an edge case, it is the game's design for a whole material
-class, and it is identifiable by name rather than by inspecting state.
+blended over the riverbed — which is what makes deep water darken with distance. Water drawn in
+the translucent lists keeps that fog, because Deferred Fog's pass runs before them; where such a
+material draws inside the capture scope, one fullscreen pass cannot reproduce it exactly (see
+`docs/deferred_fog.md`, "Limitations"). Deferred Fog handles frames with several fog
+configurations with a per-pixel replay; this says the mixed case is not an edge case, it is the
+game's design for a whole material class, and it is identifiable by name rather than by
+inspecting state.
 
 **Settled — the sentinel is a live per-frame override, not an asset property.** The call
 order is visible at the room-terrain draw site, two adjacent lines:
@@ -417,7 +423,7 @@ d_a_bg.cpp:339   dKy_bg_MAxx_proc(bg_model);                                    
 
 The translation runs **first** and the polygon-code pass runs **second**, so the type the
 translation writes is immediately overwritten. The same order holds at the other call
-sites (e.g. `d_a_obj_groundwater.cpp:265-269`).
+sites (e.g. `d_a_obj_groundwater.cpp:270-273`).
 
 Two consequences worth having straight:
 
@@ -435,11 +441,9 @@ remaining five were not traced.
 
 ---
 
-### 4.6 `XFog` is the fog **range adjustment**, and it is on everywhere — **DOC CORRECTED**
+### 4.6 `XFog` is the fog **range adjustment**, and it is on everywhere
 
-Found while auditing Deferred Fog for vanilla accuracy.
-
-`GxXFog_set` (`d_kankyo.cpp:9463`), `dKyd_xfog_table_set` (`d_kankyo_data.cpp:775`) and
+`GxXFog_set` (`d_kankyo.cpp:9457`), `dKyd_xfog_table_set` (`d_kankyo_data.cpp:775`) and
 `S_xfog_table_data` (`:766`) are authored names, and the *X* is the **screen x axis** — this
 is GX's fog range adjustment, the per-column multiplier the hardware applies to the fog term
 because a pixel at the screen edge is genuinely further from the eye than a centre pixel at the
@@ -455,20 +459,17 @@ What the reading found:
   `GXSetFogRangeAdj(GX_DISABLE, ...)` directly, but they carry no fog anyway, and every world
   fog set re-arms it.
 - Every path that sets fog re-arms it. `GxXFog_set()` runs immediately after each of the three
-  direct setters (`:9416`, `:9438`, `:9460`), and `setLightTevColorType_MAJI_sub` copies the
-  same globals into every BG material's `J3DFogInfo` (`:4481-4484`) so `J3DFog::load()` re-issues
-  it per material.
+  direct setters (`:9410`, `:9432`, `:9454`), and `setLightTevColorType_MAJI_sub` copies the
+  same globals into the `J3DFogInfo` of each BG material it processes (`:4476-4479`) so
+  `J3DFog::load()` re-issues it per material.
 - Aurora implements it: its fog-range LUT builder bakes one multiplier per target column and
   the generated fragment shader applies it to `a / (b − z)` *before* subtracting `c`.
 
-`docs/deferred_fog.md` asserted the opposite — that the game sets range adjustment but aurora
-ignores it, "so the deferred pass correctly ignores it too". That was false on this pin, and it
-is why the deferred pass flattened a horizontal gradient vanilla has for as long as it did. The
-mod now reproduces it.
+Deferred Fog reproduces it per pixel (`mods/deferred_fog/res/fog.wgsl`).
 
 ### 4.7 `dBgp_c` is "bg **parts**" — map units, and they do not draw like anything else
 
-Also from the Deferred Fog audit. `dBgS`/`dBgW` are the **collision** system; `dBgp_c`
+`dBgS`/`dBgW` are the **collision** system; `dBgp_c`
 (`d_bg_parts.cpp`) is unrelated to them despite the shared prefix — it is the shared, instanced
 **map units** a stage is assembled from, which in the field is most of the distant scenery.
 

@@ -46,15 +46,19 @@ and `docs/authored_normals.md` (the normal buffer), `docs/japanese-naming.md` (g
 - **VBAO 1.1.1 "Normal Repair"** (branch `claude/vbao-amd-flickering-xbualq`) was a failed
   experiment and is intentionally unmerged. Do not merge or revive it.
 
-## Deferred Fog's open issue: read before touching it
+## Deferred Fog: read before touching it
 
-Distant landmarks (Death Mountain, the Ganon barrier) look brighter with the mod **off**. Three fixes
-have shipped and failed; the maintainer has parked it. **Do not propose a fourth mechanism from the
-Status-line counters alone.** Twice a per-frame counter correctly showed that a mechanism was
-*present* in the view without showing it was what the view *looks like*. The next step needs
-per-pixel evidence (the Fog Factor and Config IDs debug views) plus the `markable / no-Z / alpha`
-breakdown that was never captured. The evidence, the failed fixes and the decision table are in
-`docs/deferred_fog.md` "Known issues".
+- **The fog pass is drawn only from the pre-hook on `dComIfGd_drawXluListBG`**, which
+  `mDoGph_Painter` calls directly after `GFX_STAGE_SCENE_AFTER_OPAQUE`. That puts it before the
+  translucent lists, every framebuffer copy, the 2D-screen filters and bloom (which reads the last
+  copy, not the screen). Never place it by whatever happens to be drawn first, and add no fallback
+  placement.
+- **Every hook is required.** If any fails to attach, the mod stays inactive and the game draws its
+  own fog. Keep `install_hooks` all-or-nothing.
+- **For a visual difference from vanilla, get per-pixel evidence before proposing a cause** (the Fog
+  Factor and Config IDs debug views). A per-frame Status count shows that a mechanism is *present*
+  in the view, not that it is what the view *looks like*. Method: `docs/deferred_fog.md`
+  "Diagnosing a difference from vanilla".
 
 ## Hard constraints
 
@@ -79,6 +83,8 @@ Each of these has caused a silent failure (green build, effect missing in-game).
   does not recognise. After any pin bump, read the new SDK header; a green build proves nothing.
 - **Never name a config var `enabled`** (the host reserves it; the mod fails to load).
   `tools/check_reserved_config_names.py` does not see names in VBAO's and SMAA's option tables.
+- **`mod.json` `version` must parse as `MAJOR.MINOR.PATCH`**, optionally with `-prerelease` and/or
+  `+build` (`2.0.0-a`). The mod manager refuses anything else (`2.0.0a`) at install.
 - **Uniform structs are mirrored C++ ↔ WGSL**, byte for byte, size a multiple of 16; keep the
   `static_assert`s. Every shader that declares the struct must be updated.
 - **Threads**: stage hooks and game hooks run on the game thread; draw/compute callbacks run on the

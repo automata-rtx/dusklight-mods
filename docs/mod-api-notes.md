@@ -65,9 +65,10 @@ actually caused problems here. `CONTRIBUTING.md` has the short version.
 
 - `DEFINE_HOOK(&Class::method, Alias)` declares a target from a member-function pointer: the
   compiler checks the signature, and the loader resolves the symbol by name when the mod loads.
-  Attach callbacks with `mods::hook::add_pre<Alias>(fn)` / `add_post` from `<mods/svc/hook.hpp>`.
-  Deferred Fog still uses the older `mods::hook_add_pre<Alias>(svc_hook, fn)` from the deprecated
-  `<mods/hook.hpp>`, which builds with a deprecation warning.
+  Attach callbacks with `mods::hook::add_pre<Alias>(fn)` / `add_post` from `<mods/svc/hook.hpp>`
+  (Deferred Fog passes the service explicitly: `mods::hook::add_pre<Alias>(svc_hook, fn)`). A hook
+  is installed only when a callback is first attached, so its failure shows up as the `add_pre` /
+  `add_post` result.
 - `DEFINE_HOOK_SYMBOL("name", signature, Alias)` hooks by symbol name instead, and needs the game's
   symbol manifest; without one the hook service returns `MOD_UNSUPPORTED`. Prefer `DEFINE_HOOK`.
 - On Windows only functions and `DUSK_GAME_DATA`-annotated data are reachable through the import

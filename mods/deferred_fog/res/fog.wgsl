@@ -44,8 +44,9 @@ struct FogUniforms {
     range: FogRange,
 }
 
-// Mixed-configuration mode (fs_mixed): a per-pixel config-ID buffer, made by replaying the opaque
-// lists with each draw forced to a flat colour, selects one of up to 8 captured configs. The ID is
+// Several configurations (fs_mixed, used whenever the frame runs the replay): a per-pixel config-ID
+// buffer, made by replaying the opaque lists with each draw forced to a flat colour, selects one of
+// up to 8 captured configs. The ID is
 // (index + 1) * 24 in red, so configs 0..7 use 24..192; anything else decodes as unstamped and
 // takes mixed.fallback_index. Red 216 (index 8, decoded as slot 9) is the "no fog" sentinel; see
 // config_index_at.

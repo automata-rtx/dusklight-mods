@@ -8,7 +8,7 @@ these mods use it, and the rules that have caused silent failures.
 | Doc | What it covers | Read it when |
 | :-- | :-- | :-- |
 | `vbao.md` | VBAO: per-frame pipeline, every option, debug views, the temporal design and its field history | working on AO |
-| `deferred_fog.md` | Deferred Fog: how fog is suppressed and re-applied, hooks, options, debug views, the open Death Mountain problem, Wolf Senses | working on fog |
+| `deferred_fog.md` | Deferred Fog: where in the frame the fog is re-applied and why, how it is captured and suppressed, hooks, options, debug views, limitations, Wolf Senses | working on fog |
 | `deferred_fog_underwater_notes.md` | A designed but **unbuilt** Deferred Fog feature: fading AO on submerged terrain | picking that feature up |
 | `smaa.md` | SMAA: pipeline, options, debug views, scope and limits | working on antialiasing |
 | `editing-options.md` | Changing a default, hiding an option, editing a mod description, adding an icon | making a small tuning change |

@@ -1,12 +1,12 @@
 /*
  * Deferred Fog service, "dev.automata.deferred_fog".
  *
- * Reports whether Deferred Fog is deferring the current frame's fog. It provides no other data.
+ * Reports whether Deferred Fog is applying this frame's fog itself. It provides no other data.
  *
- * Ordering needs no import in the usual cases. A mod compositing at GFX_STAGE_SCENE_AFTER_OPAQUE
- * is always ahead of the fog quad, which Deferred Fog pushes after that stage (at the first
- * translucent J3D draw, else just before the game's bloom, else at GFX_STAGE_FRAME_BEFORE_HUD).
- * To draw on top of the fog, draw at GFX_STAGE_FRAME_AFTER_HUD, as VBAO's debug views do.
+ * Ordering needs no import in the usual cases. Deferred Fog draws its fog pass from a pre-hook on
+ * dComIfGd_drawXluListBG, which the game calls directly after GFX_STAGE_SCENE_AFTER_OPAQUE, so a
+ * mod compositing at SCENE_AFTER_OPAQUE is always under the fog. To draw on top of the fog, draw at
+ * GFX_STAGE_FRAME_AFTER_HUD, as VBAO's debug views do.
  *
  * Importing the service matters only for ordering within one stage. Stage hooks have no priority
  * field: within a stage they run in slot order, which follows registration order, and registration
@@ -15,7 +15,7 @@
  * `deferring` value must run after Deferred Fog's, so its mod must import this service.
  *
  * Import it with IMPORT_OPTIONAL_SERVICE: Deferred Fog is a separate install, and without it the
- * game simply uses its own forward fog.
+ * game uses its own fog.
  */
 
 #ifndef DEFERRED_FOG_SERVICE_H
@@ -29,12 +29,11 @@
 
 typedef struct DeferredFogState {
     uint32_t struct_size;
-    /* True when this frame's fog quad was armed at SCENE_AFTER_OPAQUE. False when the mod is
-     * disabled, during Wolf Senses (the game's own fog is used), in a frame with no fogged draws,
-     * and in Vanilla mixed-scene mode while the scene uses several fog configurations, so it can
-     * change from frame to frame. Updated at SCENE_AFTER_OPAQUE; earlier in the frame it holds the
-     * previous frame's value. It stays true if the quad later fails to draw (for example, a failed
-     * depth resolve). */
+    /* True when this frame's fog pass was armed at SCENE_AFTER_OPAQUE. False while the mod is off,
+     * inactive (a required game hook is missing) or leaving Wolf Senses to the game, and in a
+     * frame with no fogged draws, so it can change from frame to frame. Updated at
+     * SCENE_AFTER_OPAQUE; earlier in the frame it holds the previous frame's value. It stays true
+     * if the fog pass then fails to draw (a failed depth snapshot). */
     bool deferring;
 } DeferredFogState;
 

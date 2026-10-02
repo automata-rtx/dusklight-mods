@@ -28,3 +28,4 @@ d_kankyo.cpp:7749            v2.0.0  genLabel("■ 胞子の調整パラメー�
 d_a_obj_ganonwall2.cpp:112-116  v2.0.0  the barrier actor's literal fog triple
 ui.h:363                     v2.0.0  pane_add_text
 d_kankyo.cpp:1257            v2.0.0  g_env_light.mFogAdjEnable = true (XFog enabled globally; the GXSetFogRangeAdj CALL is at 9459, which is what makes the checker flag this)
+d_kankyo.cpp:1666            v2.0.0  void dScnKy_env_light_c::setSunpos() (the paragraph also names sun_pos, which the checker picks as the anchor)

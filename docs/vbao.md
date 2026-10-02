@@ -58,7 +58,9 @@ neighbours as a bright rim. Debug view 2 shows them black.
 **Deferred Fog.** Without Deferred Fog, the game has already fogged each surface when VBAO
 composites, so AO darkens the fog itself and distant occlusion reads as grime on the haze. With it,
 the fog is re-applied after VBAO and the AO sits under the fog. The two mods do not know about each
-other; the ordering comes from the stages (Deferred Fog draws its fog after `SCENE_AFTER_OPAQUE`).
+other; the ordering comes from the frame: Deferred Fog draws its fog at the start of the translucent
+lists, directly after `SCENE_AFTER_OPAQUE`, so the game's later framebuffer copies, screen filters
+and bloom all see the AO under the fog.
 
 **SMAA** also runs at `SCENE_AFTER_OPAQUE`. Their relative order follows mod load order and is not
 fixed; either order looks fine.

@@ -1122,7 +1122,6 @@ equivalent question at each re-platform is just "read the new SDK header".)*
   `mods/hook.hpp` → `mods/svc/hook.hpp`, and `mods::hook_add_pre/add_post/replace(svc_hook, fn)` →
   `mods::hook::add_pre/add_post/replace(fn)` (the service argument is now an optional overload).
   We already use the `mods::` namespace, so `dusk::mods::` → `mods::` costs us nothing. (Deferred
-  Fog still includes the deprecated `mods/hook.hpp` and the `hook_add_pre(svc_hook, fn)` form; it
-  builds with a deprecation warning.)
+  Fog uses `mods/svc/hook.hpp` with `mods::hook::add_pre/add_post(svc_hook, fn)`.)
 - **New and free if we want it:** an `fmt` feature with `mods/svc/log.hpp` formatted logging, UI
   toasts (`push_toast`), WindowService, and GfxService present targets.
