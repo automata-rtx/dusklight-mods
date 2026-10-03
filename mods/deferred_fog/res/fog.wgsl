@@ -50,7 +50,7 @@ struct FogUniforms {
 // up to 8 captured configs. The ID is
 // (index + 1) * 24 in red, so configs 0..7 use 24..192; anything else decodes as unstamped and
 // takes mixed.fallback_index. Red 216 (index 8, decoded as slot 9) is the "no fog" sentinel; see
-// config_index_at.
+// stamped_index_at.
 struct MixedFogEntry {
     color: vec4f,
     a: f32,
@@ -62,8 +62,8 @@ struct MixedFogEntry {
 struct MixedFogUniforms {
     configs: array<MixedFogEntry, 8>,
     count: u32,
-    debug_mode: u32, // 1 = combined fog factor, 2 = config-ID visualization
-    fallback_index: u32, // config for pixels the ID replay could not stamp (see config_index_at)
+    debug_mode: u32, // 1 = combined fog factor, 2 = config-ID visualization, 3 = replay coverage
+    fallback_index: u32, // config for pixels the ID replay could not stamp (see stamped_index_at)
     _pad1: f32,
     range: FogRange, // shared by every config; each config opts in via its fog_type bit 0x10
 }
@@ -173,27 +173,29 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     return vec4f(uniforms.color.rgb, fog_z);
 }
 
-// Returns this pixel's config index from the ID buffer, or NO_FOG_INDEX.
+// Returns this pixel's config index from the ID buffer, NO_FOG_INDEX, or UNSTAMPED.
 //
 // The replay's flat-ID override writes (id, 0, 0). Geometry it cannot reach (the self-drawing
 // packets: grass, flowers, dMdl_c models, 3D lines, and any other direct GX drawing) rasterizes lit
-// colours, which almost always have non-zero green or blue. Rejecting those sends such pixels to
-// mixed.fallback_index (the config the grass and flower packets drew with) instead of whichever
-// config their red channel happens to decode to, which would flicker with the lighting. Pure-red
-// unstamped geometry could still alias.
+// colours, which almost always have non-zero green or blue. Rejecting those as UNSTAMPED sends such
+// pixels to mixed.fallback_index (the config the grass and flower packets drew with) instead of
+// whichever config their red channel happens to decode to, which would flicker with the lighting.
+// Pure-red unstamped geometry could still alias.
 //
-// The Ganon barrier writes no colour in the replay, so its pixels carry the config behind it.
+// The Ganon barrier and fog-off draws that write no depth write nothing in the replay, so their
+// pixels carry the config of the surface behind them.
 // Slot 9 (red 216, kNoFogSlot in mod.cpp) is the "no fog in vanilla" sentinel. It is checked before
 // the `slot <= count` test, which would reject it, and cannot collide with a real config (slots
 // 1..8, red 24..192).
 const NO_FOG_INDEX: u32 = 0xFFFFFFFFu;
+const UNSTAMPED: u32 = 0xFFFFFFFEu;
 
-fn config_index_at(uv: vec2f) -> u32 {
+fn stamped_index_at(uv: vec2f) -> u32 {
     let size = vec2<i32>(textureDimensions(config_ids));
     let texel = clamp(vec2<i32>(uv * vec2f(size)), vec2<i32>(0i), size - 1i);
     let c = textureLoad(config_ids, texel, 0i);
     if c.g > 0.03 || c.b > 0.03 {
-        return mixed.fallback_index;
+        return UNSTAMPED;
     }
     let v = i32(round(c.r * 255.0));
     let slot = (v + 12i) / 24i;
@@ -203,7 +205,7 @@ fn config_index_at(uv: vec2f) -> u32 {
     if slot >= 1i && u32(slot) <= mixed.count && abs(v - slot * 24i) <= 4i {
         return u32(slot) - 1u;
     }
-    return mixed.fallback_index;
+    return UNSTAMPED;
 }
 
 @fragment
@@ -216,15 +218,23 @@ fn fs_mixed(in: VertexOutput) -> @location(0) vec4f {
         return vec4f(0.0);
     }
 
-    let index = config_index_at(in.uv);
+    let stamped = stamped_index_at(in.uv);
     // Checked before the config-ID visualization below, where NO_FOG_INDEX would clip to white and
     // read as the highest config.
-    if index == NO_FOG_INDEX {
+    if stamped == NO_FOG_INDEX {
         if mixed.debug_mode != 0u {
-            return vec4f(1.0, 0.0, 0.0, 1.0);  // red in either debug view = left unfogged
+            return vec4f(1.0, 0.0, 0.0, 1.0);  // red in every debug view = left unfogged
         }
         return vec4f(0.0);
     }
+    if mixed.debug_mode == 3u {
+        // Replay coverage: blue = nothing the replay draws, green = a stamped config.
+        if stamped == UNSTAMPED {
+            return vec4f(0.0, 0.25, 1.0, 1.0);
+        }
+        return vec4f(0.0, 0.8, 0.2, 1.0);
+    }
+    let index = select(stamped, mixed.fallback_index, stamped == UNSTAMPED);
     if mixed.debug_mode == 2u {
         // Config-ID visualization: one gray level per config.
         let value = (f32(index) + 1.0) / max(f32(mixed.count), 1.0);

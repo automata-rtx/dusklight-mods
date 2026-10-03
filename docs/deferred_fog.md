@@ -6,7 +6,7 @@ ambient occlusion darken the surfaces *under* the fog instead of darkening the f
 | | |
 | :-- | :-- |
 | Mod id | `dev.automata.deferred_fog` (`mods/deferred_fog/`) |
-| Version | `2.0.0-b`, a test build (see `mods/deferred_fog/mod.json`) |
+| Version | `2.0.0-c`, a test build (see `mods/deferred_fog/mod.json`) |
 | Kind | **Game-linked**: includes game headers, calls game functions and hooks ten of them. It must be built against the game build it runs on |
 | Game build | Dusklight `v2.0.0` |
 
@@ -43,7 +43,7 @@ Controls** button. The controls window repeats Enabled and holds the rest.
 | :-- | :-- | :-- | :-- |
 | `fogEnabled` | Enabled | on | Off: the game draws its own fog |
 | `fogSkipUnfogged` | Skip Unfogged Geometry | on | Leave unfogged the pixels of materials the game draws with fog switched off, as the game does. Runs the configuration-ID replay in every frame with a markable fog-off draw. See [Skip Unfogged](#skip-unfogged) |
-| `fogDebug` | Debug View | 0 | 0 off, 1 Fog Factor, 2 Config IDs. See [Debug views](#debug-views) |
+| `fogDebug` | Debug View | 0 | 0 off, 1 Fog Factor, 2 Config IDs, 3 Replay Coverage. See [Debug views](#debug-views) |
 | `fogLogConfigs` | Log Fog Configs | off | Log the frame's fog configurations when their number, any start or end distance, or configuration 0's type or colour changes |
 | `fogDeferInSenses` | Defer Fog During Wolf Senses (diagnostic) | off | Take over the fog during Wolf Senses as well. For examination only; see [Wolf Senses](#wolf-senses) |
 
@@ -84,15 +84,18 @@ Other states:
 
 ### Debug views
 
-Both replace the image with what the fog pass computes, drawn opaque. Pixels left to the sky's own
-fog are black: depth 0, and depth the sky lists wrote, such as the clouds' (see [The sky](#the-sky)).
+Each replaces the image with what the fog pass computes, drawn opaque where the fog pass draws.
+Anything the game draws after that point (translucent geometry, particles) still draws over it.
+Pixels left to the sky's own fog are black: depth 0, and depth the sky lists wrote, such as the
+clouds' (see [The sky](#the-sky)).
 
 | `fogDebug` | View | Shows |
 | :-- | :-- | :-- |
 | 1 | Fog Factor | The fog amount per pixel (white = full fog) |
 | 2 | Config IDs | One gray level per fog configuration (white = the last), on frames that run the configuration-ID replay; otherwise Fog Factor. A frame that runs the replay only for Skip Unfogged has one configuration and shows white |
+| 3 | Replay Coverage | What the configuration-ID replay recorded per pixel: green = a fog configuration, blue = nothing the replay draws (grass, flowers, particles and other directly drawn geometry; such pixels take the fallback configuration). Runs the replay every frame while selected |
 
-In both, **red** pixels are ones Skip Unfogged leaves unfogged. If a debug view shows the normal
+In every view, **red** pixels are ones Skip Unfogged leaves unfogged. If a debug view shows the normal
 scene, the fog pass did not draw this frame; an all-black view means it drew and computed no fog.
 
 ### Log messages
@@ -211,6 +214,10 @@ pixel's configuration.
   configuration 0 if there were none.
 - Red 216 (C++ `kNoFogSlot` = 8) means "leave this pixel unfogged", written by Skip Unfogged
   (below).
+- Some draws write nothing (`stamp_nothing`), so their pixels keep the ID of the surface whose depth
+  the fog pass uses there: the barrier (below) and fog-off draws that write no depth. They use a
+  blend that keeps the destination rather than switching colour writes off, because J3D materials
+  reload the blend mode but not the colour-update switch.
 - If the replay cannot run, the frame uses configuration 0 everywhere. The game's fog is already off
   for that frame, so this is the closest available result. The Status line shows `replay failed`.
 
@@ -223,7 +230,9 @@ fog pass leaves the marked pixels alone. A frame with a markable fog-off draw ru
 with one configuration.
 
 - Only a material that writes its own depth is marked. One that writes none does not own its
-  pixels' depth, and marking it would unfog the surface behind it.
+  pixels' depth, and marking it would unfog the surface behind it. It writes nothing in the replay
+  instead, so a fog-off glow or swirl layered over a marked surface leaves that surface's mark in
+  place.
 - A material without an alpha test is marked with the replay's usual flat stamp.
 - An alpha-tested material is marked through its own alpha, so only the pixels its alpha test keeps
   are marked and the replay's depth matches the frame's (`stamp_no_fog_through_alpha`). Its display
@@ -241,7 +250,7 @@ with one configuration.
   draw in the opaque lists and set their material fog to black over 1000..250000 every frame.
   Deferring it would put the dome's black fog on the castle and trees behind it. The mod recognises
   that **exact** triple (`is_barrier_fog`) and leaves those draws on the game's fog; in the replay
-  they write no colour, so their pixels take the configuration behind them. The match must stay
+  they write nothing, so their pixels take the configuration behind them. The match must stay
   exact: the game's black-fog water materials (polygon codes MA03, MA17, MA19 and MA20) are also
   black with a far end, and must be deferred.
 - **Wolf Senses.** See below.
@@ -354,13 +363,16 @@ count shows that a mechanism is present in the view, not that it is what a given
    haze in vanilla but is gray-white here is a fog-off or depth-ownership difference; one that is
    *more* fogged than the fog colour in vanilla points at an additive blend.
 3. **Config IDs**: which configuration each pixel resolves to.
-4. **Log Fog Configs**: the configurations themselves.
+4. **Replay Coverage**: whether the replay recorded a configuration (green), the no-fog mark (red)
+   or nothing (blue) for each pixel.
+5. **Log Fog Configs**: the configurations themselves.
 
 | Reading | Meaning |
 | :-- | :-- |
 | `fog-off` > 0, `markable` > 0 | Skip Unfogged marks those draws; red in the debug views shows where. Turning it off shows whether they are the difference |
 | `fog-off` > 0, `unmarkable` > 0 | Fog-off materials that write depth but cannot be marked (no alpha test of their own, or 16 TEV stages) |
-| `fog-off` > 0, `no-Z` > 0 | Fog-off materials that write no depth; marking them would unfog what is behind them |
+| `fog-off` > 0, `no-Z` > 0 | Fog-off materials that write no depth. They write nothing in the replay; the surface behind them decides the fog |
+| A surface is blue in Replay Coverage | Its depth comes from something the replay does not draw (a particle, a shadow, a directly drawn packet); it takes the fallback configuration |
 | A surface the game leaves unfogged is fogged, and is not red with Skip Unfogged on | It is not a fog-off material the replay reaches: check whether it draws in the sky lists (black in the debug views) or through a path the capture does not see |
 | `additive` > `no-Z` | Additive blends on depth-owning geometry |
 | `additive` = `no-Z` > 0 | Additive blends that own no depth; one pass cannot correct them |

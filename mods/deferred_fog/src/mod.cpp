@@ -195,7 +195,7 @@ bool config_matches(const FogConfig& a, const FogConfig& b) {
 // The Hyrule Castle barrier (d_a_obj_ganonwall, d_a_obj_ganonwall2) is a translucent dome drawn in
 // the opaque lists. Every Draw() it sets its material fog to black over 1000..250000. Deferring
 // that fog would put the dome's black fog on the castle behind it, so the barrier keeps its own
-// fog: its draws are neither suppressed nor registered, and the replay writes no colour for it, so
+// fog: its draws are neither suppressed nor registered, and the replay writes nothing for it, so
 // its pixels take the configuration of whatever is behind the dome.
 //
 // The test must be this exact triple. The materials the game fogs black by polygon code (the water
@@ -356,6 +356,7 @@ bool g_scopeActive = false;      // SCENE_BEGIN .. SCENE_AFTER_OPAQUE: capturing
 bool g_quadArmed = false;        // SCENE_AFTER_OPAQUE .. dComIfGd_drawXluListBG
 bool g_replayActive = false;     // replay_config_ids is re-drawing the opaque lists
 bool g_skipUnfogged = false;     // fogSkipUnfogged, read once per frame
+uint32_t g_debugView = 0;        // fogDebug, read once per frame: 0 off, 1..3 the debug views
 bool g_sensesExempt = false;
 bool g_wasSensesExempt = false;
 bool g_wasReplaying = false;
@@ -406,10 +407,14 @@ bool g_inBgpMaterial = false;
 
 char g_statusText[224] = "Waiting for the first frame";
 
-// The configuration-ID buffer is used when the frame has more than one configuration, or when
-// Skip Unfogged has fog-off draws to mark. The replay and the fog pass both ask this one function.
+// The configuration-ID buffer is used when the frame has more than one configuration, when Skip
+// Unfogged has fog-off draws to mark, or when the Replay Coverage debug view shows the buffer. The
+// replay and the fog pass both ask this one function.
+constexpr uint32_t kDebugReplayCoverage = 3;
+
 bool needs_id_buffer() {
-    return g_frameConfigCount > 1 || (g_skipUnfogged && fog_off_markable() > 0);
+    return g_frameConfigCount > 1 || (g_skipUnfogged && fog_off_markable() > 0) ||
+           g_debugView == kDebugReplayCoverage;
 }
 
 // Wolf Senses replaces every environment fog with black fog over a short range
@@ -526,17 +531,32 @@ void stamp_no_fog_through_alpha(const AlphaMark& mark) {
     GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, GXColor{0, 0, 0, 0});
 }
 
-// Replay, one material draw: stamp its slot, the no-fog slot, or (the barrier) nothing.
+// Writes nothing for this draw, so its pixels keep the ID of the draw that owns their depth. Done
+// with a blend that keeps the destination rather than by switching colour writes off: every J3D
+// material reloads its blend mode but not the colour-update switch (J3DGDSetBlendMode masks it
+// out), so the state cannot outlive the draw into a following draw the hooks do not restamp.
+void stamp_nothing() {
+    GXSetBlendMode(GX_BM_BLEND, GX_BL_ZERO, GX_BL_ONE, GX_LO_COPY);
+    GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, GXColor{0, 0, 0, 0});
+}
+
+// Replay, one material draw: stamp its slot, the no-fog slot, or nothing.
 void replay_stamp_material(J3DMaterial* material) {
     FogConfig config;
     const MaterialFog state = material_fog(material, config);
     if (state == MaterialFog::Live && is_barrier_fog(config)) {
-        // No colour write, so the slot of whatever is behind the dome stays in the buffer. The next
-        // stamp turns colour writes back on.
-        GXSetColorUpdate(GX_FALSE);
+        stamp_nothing();  // the dome's pixels take the configuration of whatever is behind it
         return;
     }
-    if (state == MaterialFog::Off && g_skipUnfogged && material_owns_depth(material)) {
+    const bool ownsDepth = material_owns_depth(material);
+    if (state == MaterialFog::Off && !ownsDepth) {
+        // A fog-off draw that writes no depth (a glow or swirl layered over other geometry) has no
+        // configuration of its own to stamp, and stamping one would replace the ID of the surface
+        // whose depth the fog pass uses there, including that surface's no-fog mark.
+        stamp_nothing();
+        return;
+    }
+    if (state == MaterialFog::Off && g_skipUnfogged && ownsDepth) {
         if (material_alpha_test_passes_all(material)) {
             stamp_replay_id(kNoFogSlot);
             return;
@@ -981,8 +1001,7 @@ void push_fog_quad() {
         }
         return;
     }
-    const auto debugMode =
-        static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0, 2));
+    const uint32_t debugMode = g_debugView;
     GfxRange range{0, 0};
 
     if (needs_id_buffer() && g_configIdView != nullptr) {
@@ -1019,7 +1038,7 @@ void push_fog_quad() {
         return;
     }
     uniforms.range = build_fog_range(g_frameConfigs[0].adj);
-    uniforms.debug_mode = std::min(debugMode, 1u);  // fs_main has no configuration-ID view
+    uniforms.debug_mode = std::min(debugMode, 1u);  // fs_main has no configuration-ID buffer
     if (svc_gfx->push_uniform(mod_ctx, &uniforms, sizeof(uniforms), &range) != MOD_OK) {
         return;
     }
@@ -1121,6 +1140,8 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
         return;
     }
     g_skipUnfogged = get_bool_option(g_cvarSkipUnfogged, true);
+    g_debugView = static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0,
+        static_cast<int64_t>(kDebugReplayCoverage)));
     g_sensesExempt = wolf_senses_active() && !get_bool_option(g_cvarDeferInSenses, false);
     if (g_sensesExempt != g_wasSensesExempt) {
         svc_log->info(mod_ctx, g_sensesExempt ? "Wolf Senses: the game's own fog is used"
@@ -1291,21 +1312,24 @@ ModResult build_controls_tab(
         "markable draw.",
         g_cvarSkipUnfogged);
 
-    static const char* kDebugViews[] = {"Off", "Fog Factor", "Config IDs"};
+    static const char* kDebugViews[] = {"Off", "Fog Factor", "Config IDs", "Replay Coverage"};
     UiControlDesc control = UI_CONTROL_DESC_INIT;
     control.kind = UI_CONTROL_SELECT;
     control.label = "Debug View";
     control.help_rml =
-        "Replaces the image with what the fog pass computes. Black: pixels left to the sky's own "
-        "fog (the sky, and the clouds drawn with it).<br/><b>Fog Factor</b>: the amount of fog per "
-        "pixel (white = full fog).<br/><b>Config IDs</b>: which fog configuration each pixel uses, "
-        "one gray level each (white = the last), on frames that run the per-pixel replay; "
-        "otherwise the same as Fog Factor.<br/>Red in either view: pixels Skip Unfogged leaves "
-        "unfogged.";
+        "Replaces the image with what the fog pass computes; anything the game draws later (such "
+        "as translucent objects) still draws over it. Black: pixels left to the sky's own fog (the "
+        "sky, and the clouds drawn with it).<br/><b>Fog Factor</b>: the amount of fog per pixel "
+        "(white = full fog).<br/><b>Config IDs</b>: which fog configuration each pixel uses, one "
+        "gray level each (white = the last), on frames that run the per-pixel replay; otherwise "
+        "the same as Fog Factor.<br/><b>Replay Coverage</b>: what the per-pixel replay recorded, "
+        "and runs it every frame: green = a fog configuration, blue = nothing the replay draws "
+        "(grass, flowers, particles and other directly drawn geometry), which takes the grass and "
+        "flower configuration.<br/>Red in every view: pixels Skip Unfogged leaves unfogged.";
     control.binding = UI_BINDING_CONFIG_VAR;
     control.config_var = g_cvarDebugView;
     control.options = kDebugViews;
-    control.option_count = 3;
+    control.option_count = 4;
     add_control(left, control);
 
     add_toggle(left, "Log Fog Configs",
@@ -1484,6 +1508,7 @@ void shutdown() {
     g_hooksOk = false;
     g_missingHook = nullptr;
     g_scopeActive = g_quadArmed = g_replayActive = g_skipUnfogged = false;
+    g_debugView = 0;
     g_sensesExempt = g_wasSensesExempt = g_wasReplaying = false;
     g_lastFrameDeferred = g_warnedReplayFailure = g_warnedDepthFailure = false;
     g_warnedSkyDepthFailure = false;
