@@ -9,6 +9,12 @@ PC/mobile port. Built on the official [Dusklight mod template](https://github.co
 | **Deferred Fog** | `deferred_fog.dusk` | Removes the game's fog from the opaque world while it draws and re-applies the same fog afterwards in one pass. AO then darkens the world *under* the fog instead of darkening the fog itself. Install it alongside VBAO. Hooks game code, so it must match the game build |
 | **SMAA** | `smaa.dusk` | Post-process antialiasing (SMAA 1x). Detects edges from brightness and from the game's surface normals and depth, so it also catches silhouettes and creases with little brightness contrast. Runs before the game's bloom and translucency. Works across game updates without a rebuild |
 
+**On this branch** (`claude/reshade-bridge-*`) CI builds only **ReShade Bridge**: `reshade_bridge.dusk`
+plus a ReShade add-on, `dusklight_reshade_bridge.addon64`, which together run an installed ReShade's
+effects inside the game's frame (under the HUD, before the game's own post-processing, with the
+game's depth). Windows, Direct3D 12 and ReShade with full add-on support only; first iteration,
+untested in-game. Setup: `docs/reshade_bridge.md`. The mods in the table are built on main.
+
 Each `.dusk` is a single cross-platform bundle for Windows (x64, arm64), macOS (arm64, x64), Linux
 (x64, arm64) and Android (arm64).
 

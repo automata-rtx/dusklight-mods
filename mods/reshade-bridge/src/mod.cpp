@@ -82,6 +82,15 @@ struct CameraDepth {
 // Diagnostics (game thread).
 uint64_t g_recorded[drb::kPointCount] = {};
 uint32_t g_lastSize[2] = {};
+bool g_warnedFormat[drb::kPointCount] = {};
+
+const char* const kPointNames[] = {
+    "Before transparency",
+    "Before particles & post-processing",
+    "Before HUD",
+    "After HUD",
+};
+static_assert(std::size(kPointNames) == drb::kPointCount);
 
 bool get_bool_option(ConfigVarHandle handle, bool fallback) {
     bool value = fallback;
@@ -179,6 +188,13 @@ void run_point(uint32_t point, bool color, bool convertDepth) {
     rsb::PointTargets* t = nullptr;
     if (color && resolved.color != nullptr) {
         t = g_gpu.ensure_point(point, resolved.width, resolved.height, resolved.color_format);
+        if (t == nullptr && !g_warnedFormat[point]) {
+            g_warnedFormat[point] = true;
+            const std::string m = std::string("ReShade Bridge: cannot hand over the frame at '") + kPointNames[point] +
+                                  "' (colour format " + std::to_string(static_cast<uint32_t>(resolved.color_format)) +
+                                  ", " + std::to_string(resolved.width) + "x" + std::to_string(resolved.height) + ")";
+            svc_log->warn(mod_ctx, m.c_str());
+        }
     }
     if (t != nullptr) {
         p.flags |= rsb::kRecordColor;
@@ -235,14 +251,6 @@ void on_after_hud(ModContext*, const GfxStageContext*, void*) {
 }
 
 // --- UI -------------------------------------------------------------------------------------------
-
-const char* const kPointNames[] = {
-    "Before transparency",
-    "Before particles & post-processing",
-    "Before HUD",
-    "After HUD",
-};
-static_assert(std::size(kPointNames) == drb::kPointCount);
 
 std::string status_text() {
 #ifndef _WIN32
@@ -469,6 +477,7 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
     g_panelStatus = 0;
     g_want = 0;
     std::fill(std::begin(g_recorded), std::end(g_recorded), 0);
+    std::fill(std::begin(g_warnedFormat), std::end(g_warnedFormat), false);
     return MOD_OK;
 }
 }

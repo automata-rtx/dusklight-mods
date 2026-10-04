@@ -7,6 +7,12 @@ specific to AI sessions.** Read `CONTRIBUTING.md` before changing code, and the 
 changing a mod. If this file disagrees with the docs or the code, the code wins, then the docs; fix
 whichever is wrong in the same change.
 
+**This branch (`claude/reshade-bridge-*`) builds only the ReShade Bridge** (`mods/reshade-bridge/`,
+doc `docs/reshade_bridge.md`): a game-linked Dusklight mod plus a ReShade add-on (`.addon64`, built
+by the windows-amd64 CI leg and shipped in `mods-combined`), which together run an installed
+ReShade's techniques at chosen points inside the frame. First iteration, untested in-game. The
+released mods below keep main's sources here, unbuilt; work on them on main.
+
 | Released mod | Kind | Doc |
 | :-- | :-- | :-- |
 | `mods/vbao/` — visibility-bitmask ambient occlusion | service-only | `docs/vbao.md` |
@@ -133,8 +139,9 @@ within ±40 lines, so an OK verdict can still be wrong. Prefer naming functions 
 - **The pin**: `DUSKLIGHT_VERSION` in `CMakeLists.txt` = `v2.0.0` (`e9b12054`) from
   `DUSKLIGHT_REPOSITORY` = upstream `TwilitRealm/dusklight`. GameService 2.0, GfxService 1.3,
   aurora `7d4484a`. Pinning a tag is deliberate: it names a build users can install.
-- **Which mods build** is the `add_subdirectory` list in `CMakeLists.txt`: vbao, smaa, deferred_fog.
-- **Compatibility**: game-linked mods (Deferred Fog) must match the game build (symbol resolution at
+- **Which mods build** is the `add_subdirectory` list in `CMakeLists.txt`: on main vbao, smaa,
+  deferred_fog; on this branch reshade-bridge only.
+- **Compatibility**: game-linked mods (Deferred Fog, ReShade Bridge) must match the game build (symbol resolution at
   load; GameService major version). Service-only mods need a host whose services are at least the
   minor versions they were built against. Build against the SDK that matches the game.
 - **Upstream has moved on**: `v2.0.1`–`v2.0.3` exist; 2.0.3 raises GfxService to 1.4 (texture
