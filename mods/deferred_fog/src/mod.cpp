@@ -104,10 +104,11 @@ DEFINE_HOOK(dComIfGd_drawXluListBG, XluListBGDraw);
 // ---------------------------------------------------------------------------------------------
 
 ConfigVarHandle g_cvarEnabled = 0;        // fogEnabled, default on
-ConfigVarHandle g_cvarSkipUnfogged = 0;   // fogSkipUnfogged, default on
+ConfigVarHandle g_cvarSkipUnfogged = 0;   // fogSkipUnfogged, default off
 ConfigVarHandle g_cvarDeferInSenses = 0;  // fogDeferInSenses, default off
 ConfigVarHandle g_cvarDebugView = 0;      // fogDebug, default 0
 ConfigVarHandle g_cvarLogConfigs = 0;     // fogLogConfigs, default off
+ConfigVarHandle g_cvarSeeThrough = 0;     // fogSeeThrough, default 0 (SeeThroughMode)
 
 int64_t get_int_option(ConfigVarHandle handle, int64_t fallback) {
     int64_t value = fallback;
@@ -391,6 +392,14 @@ bool g_quadArmed = false;        // SCENE_AFTER_OPAQUE .. dComIfGd_drawXluListBG
 bool g_replayActive = false;     // replay_config_ids is re-drawing the opaque lists
 bool g_skipUnfogged = false;     // fogSkipUnfogged, read once per frame
 uint32_t g_debugView = 0;        // fogDebug, read once per frame: 0 off, 1..3 the debug views
+
+// fogSeeThrough, read once per frame: what happens to see-through layers (is_see_through_layer).
+enum class SeeThroughMode : uint32_t {
+    AfterFog = 0,  // held back and drawn after the fog pass with their own fog
+    InPlace = 1,   // drawn where the game draws them, their fog captured like any other draw
+    Hidden = 2,    // held back and not drawn (diagnostic: shows which surfaces are held back)
+};
+SeeThroughMode g_seeThroughMode = SeeThroughMode::AfterFog;
 bool g_sensesExempt = false;
 bool g_wasSensesExempt = false;
 bool g_wasReplaying = false;
@@ -835,7 +844,9 @@ bool was_held_back(const J3DMatPacket* packet) {
 // pass. The replay skips the same packets, so they take no part in which configuration the pixels
 // behind them get.
 HookAction on_mat_packet_draw_pre(ModContext*, void* args, void*, void*) {
-    if (g_drawingHeldBack || (!g_scopeActive && !g_replayActive)) {
+    if (g_drawingHeldBack || (!g_scopeActive && !g_replayActive) ||
+        g_seeThroughMode == SeeThroughMode::InPlace)
+    {
         return HOOK_CONTINUE;
     }
     auto* packet = mods::arg<J3DMatPacket*>(args, 0);
@@ -856,12 +867,15 @@ HookAction on_mat_packet_draw_pre(ModContext*, void* args, void*, void*) {
 
 // Draws the held-back layers in their original order, as drawOpaDrawList would. The scope is
 // closed, so each draws with its own fog over the fogged image, depth-tested against the opaque
-// world.
+// world. The Hidden diagnostic drops them instead.
 void draw_held_back_layers() {
     if (!g_heldBackPending) {
         return;
     }
     g_heldBackPending = false;
+    if (g_seeThroughMode == SeeThroughMode::Hidden) {
+        return;
+    }
     J3DShape::resetVcdVatCache();
     j3dSys.setDrawModeOpaTexEdge();
     g_drawingHeldBack = true;
@@ -1242,10 +1256,21 @@ void log_fog_configs() {
     }
 }
 
+const char* see_through_label() {
+    switch (g_seeThroughMode) {
+    case SeeThroughMode::InPlace:
+        return "held back (drawn in place)";
+    case SeeThroughMode::Hidden:
+        return "hidden";
+    default:
+        return "held back";
+    }
+}
+
 void update_status_line() {
     if (g_frameConfigCount == 0) {
         std::snprintf(g_statusText, sizeof(g_statusText),
-            "No fogged draws in view (%u see-through held back)", g_heldBackCount);
+            "No fogged draws in view (%u see-through %s)", g_heldBackCount, see_through_label());
         return;
     }
     char merged[32] = "";
@@ -1257,12 +1282,13 @@ void update_status_line() {
         std::snprintf(overflow, sizeof(overflow), " (+%u in place)", g_heldBackOverflow);
     }
     std::snprintf(g_statusText, sizeof(g_statusText),
-        "Deferring fog (%u draws, %u config%s%s%s; %u see-through held back%s; %u shared-DL, "
+        "Deferring fog (%u draws, %u config%s%s%s; %u see-through %s%s; %u shared-DL, "
         "%u fog-off (%u markable, %u by alpha/%u no-Z/%u unmarkable), %u additive/%u no-Z)",
         g_capturedDrawCount, g_frameConfigCount, g_frameConfigCount == 1 ? "" : "s", merged,
         needs_id_buffer() && g_configIdView == nullptr ? ", replay failed" : "", g_heldBackCount,
-        overflow, g_sharedDlFogCount, g_fogOffCount, fog_off_markable(), g_fogOffAlphaTested,
-        g_fogOffNoDepth, g_fogOffUnmarkable, g_overUnityCount, g_overUnityNoDepth);
+        see_through_label(), overflow, g_sharedDlFogCount, g_fogOffCount, fog_off_markable(),
+        g_fogOffAlphaTested, g_fogOffNoDepth, g_fogOffUnmarkable, g_overUnityCount,
+        g_overUnityNoDepth);
 }
 
 // GFX_STAGE_SCENE_BEGIN, after the sky lists: resets the frame, snapshots the sky's depth and opens
@@ -1296,7 +1322,9 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
         std::snprintf(g_statusText, sizeof(g_statusText), "Off: the game's own fog is used");
         return;
     }
-    g_skipUnfogged = get_bool_option(g_cvarSkipUnfogged, true);
+    g_skipUnfogged = get_bool_option(g_cvarSkipUnfogged, false);
+    g_seeThroughMode = static_cast<SeeThroughMode>(
+        std::clamp<int64_t>(get_int_option(g_cvarSeeThrough, 0), 0, 2));
     g_debugView = static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0,
         static_cast<int64_t>(kDebugReplayCoverage)));
     g_sensesExempt = wolf_senses_active() && !get_bool_option(g_cvarDeferInSenses, false);
@@ -1463,16 +1491,33 @@ ModResult build_controls_tab(
     ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle, void*, ModError*) {
     add_toggle(left, "Enabled", kEnabledHelp, g_cvarEnabled);
 
-    add_toggle(left, "Skip Unfogged Geometry",
+    add_toggle(left, "Skip Unfogged Geometry (experimental)",
         "The game draws some materials with fog switched off, so they keep their own colour at any "
         "distance. The fog pass cannot tell that from depth, so with this on those surfaces are "
         "marked in a per-pixel buffer and left unfogged, as the game draws them. Off: they are "
-        "fogged like everything else.<br/>A surface can be marked if it writes its own depth: the "
+        "fogged like everything else. Experimental: it has left surfaces unfogged that the game "
+        "fogs.<br/>A surface can be marked if it writes its own depth: the "
         "Status line's <i>markable</i> count shows how many draws in view qualify. An alpha-tested "
         "one is marked through its own alpha, so only its visible part is marked.<br/>Runs the "
         "per-pixel replay, one extra pass over the world's geometry, in every frame with a "
         "markable draw.",
         g_cvarSkipUnfogged);
+
+    static const char* kSeeThroughModes[] = {"Draw After Fog", "Draw In Place", "Hide"};
+    UiControlDesc seeThrough = UI_CONTROL_DESC_INIT;
+    seeThrough.kind = UI_CONTROL_SELECT;
+    seeThrough.label = "See-Through Layers (diagnostic)";
+    seeThrough.help_rml =
+        "Model layers that blend with what is behind them or write no depth (domes, glows, "
+        "decals).<br/><b>Draw After Fog</b>: held back and drawn after the fog pass with their own "
+        "fog, as the game composites them over a fogged image.<br/><b>Draw In Place</b>: drawn "
+        "where the game draws them; the fog pass then fogs their pixels with whatever is behind "
+        "them.<br/><b>Hide</b>: held back and not drawn, to show which surfaces are held back.";
+    seeThrough.binding = UI_BINDING_CONFIG_VAR;
+    seeThrough.config_var = g_cvarSeeThrough;
+    seeThrough.options = kSeeThroughModes;
+    seeThrough.option_count = 3;
+    add_control(left, seeThrough);
 
     static const char* kDebugViews[] = {"Off", "Fog Factor", "Config IDs", "Replay Coverage"};
     UiControlDesc control = UI_CONTROL_DESC_INIT;
@@ -1630,10 +1675,11 @@ ModResult init(ModError* error) {
     }
     // Defaults are the second argument; see docs/editing-options.md.
     if (register_bool("fogEnabled", true, g_cvarEnabled) != MOD_OK ||
-        register_bool("fogSkipUnfogged", true, g_cvarSkipUnfogged) != MOD_OK ||
+        register_bool("fogSkipUnfogged", false, g_cvarSkipUnfogged) != MOD_OK ||
         register_bool("fogDeferInSenses", false, g_cvarDeferInSenses) != MOD_OK ||
         register_int("fogDebug", 0, g_cvarDebugView) != MOD_OK ||
-        register_bool("fogLogConfigs", false, g_cvarLogConfigs) != MOD_OK)
+        register_bool("fogLogConfigs", false, g_cvarLogConfigs) != MOD_OK ||
+        register_int("fogSeeThrough", 0, g_cvarSeeThrough) != MOD_OK)
     {
         return mods::set_error(error, MOD_ERROR, "could not register options");
     }
@@ -1669,7 +1715,8 @@ void shutdown() {
     svc_resource->free(mod_ctx, &g_shaderSource);
     release_pipelines();
     g_cvarEnabled = g_cvarSkipUnfogged = g_cvarDeferInSenses = g_cvarDebugView = 0;
-    g_cvarLogConfigs = 0;
+    g_cvarLogConfigs = g_cvarSeeThrough = 0;
+    g_seeThroughMode = SeeThroughMode::AfterFog;
     g_drawType = g_sceneBeginHook = g_sceneAfterOpaqueHook = 0;
     g_controlsWindow = 0;
     g_hooksOk = false;

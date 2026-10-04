@@ -6,7 +6,7 @@ ambient occlusion darken the surfaces *under* the fog instead of darkening the f
 | | |
 | :-- | :-- |
 | Mod id | `dev.automata.deferred_fog` (`mods/deferred_fog/`) |
-| Version | `2.0.0-f`, a test build (see `mods/deferred_fog/mod.json`) |
+| Version | `2.0.0-g`, a test build (see `mods/deferred_fog/mod.json`) |
 | Kind | **Game-linked**: includes game headers, calls game functions and hooks eleven of them. It must be built against the game build it runs on |
 | Game build | Dusklight `v2.0.0` |
 
@@ -43,9 +43,10 @@ Controls** button. The controls window repeats Enabled and holds the rest.
 | Config key | UI label | Default | Meaning |
 | :-- | :-- | :-- | :-- |
 | `fogEnabled` | Enabled | on | Off: the game draws its own fog |
-| `fogSkipUnfogged` | Skip Unfogged Geometry | on | Leave unfogged the pixels of materials the game draws with fog switched off, as the game does. Runs the configuration-ID replay in every frame with a markable fog-off draw. See [Skip Unfogged](#skip-unfogged) |
+| `fogSkipUnfogged` | Skip Unfogged Geometry (experimental) | off | Leave unfogged the pixels of materials the game draws with fog switched off, as the game does. Runs the configuration-ID replay in every frame with a markable fog-off draw. Experimental: it has left surfaces unfogged that the game fogs. See [Skip Unfogged](#skip-unfogged) |
 | `fogDebug` | Debug View | 0 | 0 off, 1 Fog Factor, 2 Config IDs, 3 Replay Coverage. See [Debug views](#debug-views) |
 | `fogLogConfigs` | Log Fog Configs | off | Log the frame's fog configurations when their number, any start or end distance, or configuration 0's type or colour changes |
+| `fogSeeThrough` | See-Through Layers (diagnostic) | 0 | What happens to see-through layers: 0 Draw After Fog, 1 Draw In Place (no hold-back), 2 Hide (held back and not drawn, to show which surfaces are held back). See [See-through layers](#see-through-layers) |
 | `fogDeferInSenses` | Defer Fog During Wolf Senses (diagnostic) | off | Take over the fog during Wolf Senses as well. For examination only; see [Wolf Senses](#wolf-senses) |
 
 Config keys are stored as `mod.dev.automata.deferred_fog.<key>` in the game's `config.json`. The
@@ -56,7 +57,7 @@ defaults are the second argument of the `register_bool` / `register_int` calls i
 Rebuilt every frame in `on_scene_after_opaque`. The working state reads:
 
 ```
-Deferring fog (N draws, K configs[, M merged][, replay failed]; H see-through held back[ (+O in place)]; A shared-DL, B fog-off (P markable, T by alpha/Z no-Z/U unmarkable), C additive/D no-Z)
+Deferring fog (N draws, K configs[, M merged][, replay failed]; H see-through held back|hidden[ (+O in place)]; A shared-DL, B fog-off (P markable, T by alpha/Z no-Z/U unmarkable), C additive/D no-Z)
 ```
 
 | Field | Meaning |
@@ -200,7 +201,9 @@ packets, so they take no part in which configuration the pixels behind them get.
 drawn every frame they were held back, whether or not the fog pass ran.
 
 The list holds 512 packets; a layer that does not fit is drawn in place, as before this mechanism
-(`+O in place` on the Status line). Map units (`dBgp_c`) and the self-drawing packets do not draw
+(`+O in place` on the Status line). The See-Through Layers option (`fogSeeThrough`) switches the
+mechanism for comparison: Draw In Place turns it off, and Hide holds the layers back without
+drawing them, which shows which surfaces they are. Map units (`dBgp_c`) and the self-drawing packets do not draw
 through `J3DMatPacket::draw` and are not held back.
 
 ### The sky
@@ -258,7 +261,7 @@ pixel's configuration.
 ### Skip Unfogged
 
 A material's fog block can have type 0 (`GX_FOG_NONE`): the game then draws it with no fog at any
-distance, while the fog pass would fog it like everything else. With Skip Unfogged on (the default),
+distance, while the fog pass would fog it like everything else. With Skip Unfogged on (off by default; experimental),
 the replay writes the no-fog mark (red 216) for such a material instead of a configuration, and the
 fog pass leaves the marked pixels alone. A frame with a markable fog-off draw runs the replay even
 with one configuration.
@@ -412,7 +415,8 @@ count shows that a mechanism is present in the view, not that it is what a given
 | `fog-off` > 0, `no-Z` > 0 | Fog-off materials that write no depth. They write nothing in the replay; the surface behind them decides the fog |
 | A surface is blue in Replay Coverage | Its depth comes from something the replay does not draw (a particle, a shadow, a directly drawn packet); it takes the fallback configuration |
 | A surface the game leaves unfogged is fogged, and is not red with Skip Unfogged on | It is not a fog-off material the replay reaches: check whether it draws in the sky lists (black in the debug views) or through a path the capture does not see |
-| `see-through held back` rises with a surface in view | That surface is drawn after the fog pass with its own fog; a remaining difference there is not the fog pass's |
+| A surface disappears with See-Through Layers set to Hide | It is a held-back layer. Compare Draw After Fog with Draw In Place to see whether holding it back is the difference |
+| `see-through held back` rises with a surface in view | That surface is drawn after the fog pass with its own fog; a difference that remains with Draw After Fog is in how it is drawn late (state it inherited from the draws before it in the game's order) |
 | `additive` > 0 | Additive or subtractive blends that are not held back (map units, other paths) |
 | `replay failed` or `merged` | The frame fell back to configuration 0 in places |
 

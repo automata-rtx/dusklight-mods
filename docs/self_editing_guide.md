@@ -72,7 +72,7 @@ Search for the option name, for example `"fogEnabled"`. The default is the secon
         register_int("fogDebug", 0, g_cvarDebugView) != MOD_OK ||       //  <-- a whole number
 ```
 
-All five are together in `init()`.
+All six are together in `init()`.
 
 ### Rules
 
@@ -154,4 +154,4 @@ displayed.
   `localContrast`, `useNormalEdges`, `normalThreshold`, `depthThreshold`, `maxSearchSteps`,
   `debugMode`.
 - **Deferred Fog** (`mods/deferred_fog/src/mod.cpp`): `fogEnabled`, `fogSkipUnfogged`,
-  `fogDeferInSenses`, `fogDebug`, `fogLogConfigs`.
+  `fogDeferInSenses`, `fogDebug`, `fogLogConfigs`, `fogSeeThrough`.
