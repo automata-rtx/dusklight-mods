@@ -237,10 +237,6 @@ uint32_t register_frame_config(const FogConfig& config) {
     return 0;
 }
 
-uint32_t lookup_frame_config(const FogConfig& config) {
-    const uint32_t found = find_frame_config(config);
-    return found == kMaxFogConfigs ? 0 : found;
-}
 
 // ---------------------------------------------------------------------------------------------
 // Material fog
@@ -476,10 +472,10 @@ bool capture_material_fog(J3DMaterial* material) {
 // ---------------------------------------------------------------------------------------------
 
 // The replay draws every opaque shape in a flat colour that encodes its configuration: red =
-// (slot + 1) * 24, green and blue 0, so slots 0..7 write 24..192. kNoFogSlot writes 216: "the game
-// draws this pixel with no fog" (Skip Unfogged). res/fog.wgsl decodes red to a slot within +-4 and
-// sends any pixel with green or blue above 0.03 (lit geometry the replay could not recolour) to the
-// grass and flower configuration.
+// (slot + 1) * 24, green 0, so slots 0..7 write 24..192. kNoFogSlot writes 216: "the game draws
+// this pixel with no fog" (Skip Unfogged). res/fog.wgsl decodes red to a slot within +-4 and sends
+// any pixel with green or blue above 0.03 (lit geometry the replay could not recolour) to the grass
+// and flower configuration.
 constexpr uint32_t kNoFogSlot = 8;
 static_assert(kNoFogSlot >= kMaxFogConfigs, "the no-fog slot must not collide with a real one");
 static_assert((kNoFogSlot + 1) * 24 <= 255, "the no-fog slot must fit in the red channel");
@@ -488,8 +484,18 @@ constexpr u8 slot_red(uint32_t slot) {
     return static_cast<u8>((slot + 1) * 24);
 }
 
-void stamp_replay_id(uint32_t slot) {
+// Why a draw got its slot, for the Replay Coverage debug view only. Written to blue as reason * 2,
+// at most 6/255, below the 0.03 the fog pass treats as unstamped, so the fog itself ignores it.
+enum class StampReason : u8 {
+    OwnConfig = 0,      // the draw's own configuration
+    Merged = 1,         // its configuration did not fit in the table: slot 0
+    FogOffFogged = 2,   // fog-off, but not marked (Skip Unfogged off, or unmarkable): slot 0
+    NoFogBlock = 3,     // no fog block; it inherits whatever fog was set last: slot 0
+};
+
+void stamp_replay_id(uint32_t slot, StampReason reason = StampReason::OwnConfig) {
     const u8 red = slot_red(slot);
+    const auto blue = static_cast<u8>(static_cast<u8>(reason) * 2);
     GXSetColorUpdate(GX_TRUE);
     GXSetNumTevStages(1);
     GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
@@ -497,7 +503,7 @@ void stamp_replay_id(uint32_t slot) {
     GXSetNumChans(1);
     GXSetChanCtrl(
         GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
-    GXSetChanMatColor(GX_COLOR0A0, GXColor{red, 0, 0, 255});
+    GXSetChanMatColor(GX_COLOR0A0, GXColor{red, 0, blue, 255});
     GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_COPY);
     GXSetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
     GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, GXColor{0, 0, 0, 0});
@@ -567,7 +573,17 @@ void replay_stamp_material(J3DMaterial* material) {
             return;
         }
     }
-    stamp_replay_id(state == MaterialFog::Live ? lookup_frame_config(config) : 0u);
+    if (state == MaterialFog::Live) {
+        const uint32_t slot = find_frame_config(config);
+        if (slot == kMaxFogConfigs) {
+            stamp_replay_id(0, StampReason::Merged);
+        } else {
+            stamp_replay_id(slot);
+        }
+        return;
+    }
+    stamp_replay_id(0, state == MaterialFog::Off ? StampReason::FogOffFogged
+                                                 : StampReason::NoFogBlock);
 }
 
 // The opaque lists the scope covers, without the Pri0_B particles and the game's shadows that are
@@ -1323,9 +1339,12 @@ ModResult build_controls_tab(
         "(white = full fog).<br/><b>Config IDs</b>: which fog configuration each pixel uses, one "
         "gray level each (white = the last), on frames that run the per-pixel replay; otherwise "
         "the same as Fog Factor.<br/><b>Replay Coverage</b>: what the per-pixel replay recorded, "
-        "and runs it every frame: green = a fog configuration, blue = nothing the replay draws "
-        "(grass, flowers, particles and other directly drawn geometry), which takes the grass and "
-        "flower configuration.<br/>Red in every view: pixels Skip Unfogged leaves unfogged.";
+        "and runs it every frame. Green: the draw's own fog configuration. Yellow: its "
+        "configuration did not fit in the table of 8 and uses the main one. Cyan: a fog-off "
+        "surface that is not marked, fogged with the main configuration. Magenta: a draw with no "
+        "fog block, fogged with the main configuration. Blue: nothing the replay draws (grass, "
+        "flowers, particles and other directly drawn geometry), which takes the grass and flower "
+        "configuration.<br/>Red in every view: pixels Skip Unfogged leaves unfogged.";
     control.binding = UI_BINDING_CONFIG_VAR;
     control.config_var = g_cvarDebugView;
     control.options = kDebugViews;
