@@ -10,8 +10,11 @@
 file(GLOB _reshadefx_sources CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/reshadefx/*.cpp)
 add_library(reshade_port_reshadefx STATIC ${_reshadefx_sources})
 target_include_directories(reshade_port_reshadefx PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/reshadefx)
-target_compile_features(reshade_port_reshadefx PRIVATE cxx_std_20)
+# C++17, as ReShade builds it: the preprocessor relies on path::u8string() returning std::string
+# (C++20 changed it to std::u8string; only the Windows build uses it, so only MSVC notices).
 set_target_properties(reshade_port_reshadefx PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
     POSITION_INDEPENDENT_CODE ON
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON)

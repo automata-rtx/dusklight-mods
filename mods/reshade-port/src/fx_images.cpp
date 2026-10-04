@@ -1,6 +1,7 @@
 #include "fx_images.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
