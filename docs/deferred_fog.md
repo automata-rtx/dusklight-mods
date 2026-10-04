@@ -6,8 +6,8 @@ ambient occlusion darken the surfaces *under* the fog instead of darkening the f
 | | |
 | :-- | :-- |
 | Mod id | `dev.automata.deferred_fog` (`mods/deferred_fog/`) |
-| Version | `2.0.0-e`, a test build (see `mods/deferred_fog/mod.json`) |
-| Kind | **Game-linked**: includes game headers, calls game functions and hooks ten of them. It must be built against the game build it runs on |
+| Version | `2.0.0-f`, a test build (see `mods/deferred_fog/mod.json`) |
+| Kind | **Game-linked**: includes game headers, calls game functions and hooks eleven of them. It must be built against the game build it runs on |
 | Game build | Dusklight `v2.0.0` |
 
 **Why it exists.** The game fogs each opaque draw while drawing it. A mod that composites over the
@@ -29,7 +29,8 @@ No other mod depends on it and it depends on none: the ordering comes from the f
 | `include/deferred_fog_service.h` | The exported `dev.automata.deferred_fog` service |
 
 Key functions in `mod.cpp`: `on_scene_begin`, `on_set_fog_pre`, `on_shape_draw_pre`,
-`on_material_shared_dl_post`, `on_scene_after_opaque`, `replay_config_ids`, `on_xlu_list_bg_pre`,
+`on_material_shared_dl_post`, `on_mat_packet_draw_pre`, `on_scene_after_opaque`,
+`replay_config_ids`, `on_xlu_list_bg_pre`, `draw_held_back_layers`,
 `push_fog_quad`, `on_draw`, `ensure_fog_pipelines`, `install_hooks`.
 
 ## Using it
@@ -55,7 +56,7 @@ defaults are the second argument of the `register_bool` / `register_int` calls i
 Rebuilt every frame in `on_scene_after_opaque`. The working state reads:
 
 ```
-Deferring fog (N draws, K configs[, M merged][, replay failed]; A shared-DL, B fog-off (P markable, T by alpha/Z no-Z/U unmarkable), C additive/D no-Z)
+Deferring fog (N draws, K configs[, M merged][, replay failed]; H see-through held back[ (+O in place)]; A shared-DL, B fog-off (P markable, T by alpha/Z no-Z/U unmarkable), C additive/D no-Z)
 ```
 
 | Field | Meaning |
@@ -64,6 +65,7 @@ Deferring fog (N draws, K configs[, M merged][, replay failed]; A shared-DL, B f
 | `K configs` | Distinct fog configurations this frame. More than 1 runs the configuration-ID replay (so does Skip Unfogged with any markable fog-off draw) |
 | `M merged` | Draws whose configuration did not fit in the 8-entry table; they use configuration 0 |
 | `replay failed` | The replay could not run; the frame used configuration 0 everywhere |
+| `H see-through held back` | J3D material draws held back as see-through layers and drawn after the fog pass (see [See-through layers](#see-through-layers)). `+O in place`: layers drawn in place because the list of 512 was full |
 | `A shared-DL` | Of the N draws, map-unit (`dBgp_c`) material draws |
 | `B fog-off (P markable, T by alpha / Z no-Z / U unmarkable)` | Draws whose material has fog switched off. `P` of them write their own depth and Skip Unfogged can mark them, `T` of those through their own alpha (they are alpha-tested). `Z` write no depth. `U` write depth but cannot be marked (no alpha test of their own, or all 16 TEV stages in use). `P + Z + U = B` |
 | `C additive / D no-Z` | Draws with an additive or subtractive blend (see [Limitations](#limitations)); of those, how many write no depth |
@@ -78,7 +80,7 @@ Other states:
 | `Waiting for the first frame` | No world frame has been drawn since the mod loaded |
 | `Off: the game's own fog is used` | Enabled is off |
 | `Wolf Senses: the game's own fog is used` | Wolf Link's senses are active |
-| `No fogged draws in view` | Nothing in the opaque world set fog this frame |
+| `No fogged draws in view (H see-through held back)` | Nothing in the opaque world set fog this frame |
 | `Sky depth snapshot failed: the game's own fog is used` | The depth snapshot at `SCENE_BEGIN` failed, so the scope stayed closed this frame; see [The sky](#the-sky) |
 | `Inactive: <function> could not be hooked in this game build; the game's own fog is used` | A required hook failed to attach at load; see [Hooks](#hooks) |
 
@@ -95,7 +97,9 @@ clouds' (see [The sky](#the-sky)).
 | 2 | Config IDs | One gray level per fog configuration (white = the last), on frames that run the configuration-ID replay; otherwise Fog Factor. A frame that runs the replay only for Skip Unfogged has one configuration and shows white |
 | 3 | Replay Coverage | What the configuration-ID replay recorded per pixel, and why. Green: the draw's own fog configuration. Orange: the same, on a see-through (blended) surface that writes depth, so the pixel's fog also lands on what shows through it. Yellow: its configuration did not fit in the table and uses configuration 0 (`merged`). Cyan: a fog-off draw that writes depth but is not marked (Skip Unfogged off, or `unmarkable`), stamped as configuration 0. Magenta: a draw with no fog block, stamped as configuration 0. Blue: nothing the replay draws (grass, flowers, particles and other directly drawn geometry), which takes the fallback configuration. Runs the replay every frame while selected |
 
-In every view, **red** pixels are ones Skip Unfogged leaves unfogged. If a debug view shows the normal
+Held-back see-through layers draw after the fog pass, so they appear over every debug view in their
+normal colours, as translucent geometry does. In every view, **red** pixels are ones Skip Unfogged
+leaves unfogged. If a debug view shows the normal
 scene, the fog pass did not draw this frame; an all-black view means it drew and computed no fog.
 
 ### Log messages
@@ -122,9 +126,9 @@ each step.
 | :-- | :-- | :-- |
 | 2328 | Sky lists | Untouched; the sky keeps the game's fog |
 | 2334 | `GFX_STAGE_SCENE_BEGIN` | `on_scene_begin` snapshots the depth the sky lists left and opens the capture scope |
-| 2344–2390 | Opaque world lists, `Pri0_B` particles, the game's shadows | Each draw's fog is captured and switched off |
+| 2344–2390 | Opaque world lists, `Pri0_B` particles, the game's shadows | Each draw's fog is captured and switched off; see-through J3D layers are held back |
 | 2395 | `GFX_STAGE_SCENE_AFTER_OPAQUE` | VBAO and SMAA composite. `on_scene_after_opaque` closes the scope, arms the fog pass and runs the replay if needed |
-| 2405 | `dComIfGd_drawXluListBG`: the translucent lists begin | **`on_xlu_list_bg_pre` pushes the fog pass** |
+| 2405 | `dComIfGd_drawXluListBG`: the translucent lists begin | **`on_xlu_list_bg_pre` pushes the fog pass, then draws the held-back layers** |
 | 2405–2432 | Translucent lists and their particles | Drawn over the fogged image with the game's own fog |
 | 2452 | Motion blur (when active): blends the last framebuffer copy over the frame | |
 | 2461 | Depth of field (`drawDepth2`): copies the frame and the Z buffer whenever the player exists | |
@@ -176,6 +180,29 @@ of the span, near is within 1 and far within 1% + 1 (`config_matches`). The firs
 frame is configuration 0. The table holds 8; a draw whose configuration does not fit uses
 configuration 0 and is counted as `merged`.
 
+### See-through layers
+
+The game draws some see-through surfaces in the opaque lists: domes, glows, the base of a twilight
+portal. It composites each over geometry that is already fogged, with the layer's own fog. One fog
+pass after the opaque world cannot reproduce that. It would fog the layer's pixels again with the
+fog of whatever is behind (or, over the sky, not at all), and a fog-off layer marked by Skip
+Unfogged would unfog what shows through it.
+
+So the mod holds such layers back. A J3D material that is depth-tested and either blends with what
+is behind it (`GX_BM_BLEND` or `GX_BM_SUBTRACT`) or writes no depth is a see-through layer
+(`is_see_through_layer`). One drawn without the depth test stays in place: drawn late, it would
+cover opaque geometry the game drew over it. Inside the scope, the pre-hook on `J3DMatPacket::draw`, which loads one
+material and draws every shape that uses it, records such a packet and skips it
+(`on_mat_packet_draw_pre`). After the fog pass, `draw_held_back_layers` draws the recorded packets
+in their original order. The scope is closed by then, so each draws with its own fog over the
+fogged image, depth-tested against the opaque world, as in the game. The replay skips the same
+packets, so they take no part in which configuration the pixels behind them get. The layers are
+drawn every frame they were held back, whether or not the fog pass ran.
+
+The list holds 512 packets; a layer that does not fit is drawn in place, as before this mechanism
+(`+O in place` on the Status line). Map units (`dBgp_c`) and the self-drawing packets do not draw
+through `J3DMatPacket::draw` and are not held back.
+
 ### The sky
 
 The sky lists draw before the scope opens, so they keep the game's fog, and the fog pass must leave
@@ -207,7 +234,7 @@ game's camera, forcing every shape to a flat colour that encodes its configurati
 pixel's configuration.
 
 - The replay draws the six opaque lists (BG, DarkBG, Middle, main, Dark, Packet), not the `Pri0_B`
-  particles or the game's shadows.
+  particles, the game's shadows or the held-back see-through layers.
 - Draws the replay cannot recolour (grass, flowers and other self-drawing packets) render their lit
   colours. A pixel with green or blue above 0.03, or a red value outside a valid slot, takes the
   **fallback configuration**: the one the grass and flower packets drew with this frame, or
@@ -236,10 +263,10 @@ the replay writes the no-fog mark (red 216) for such a material instead of a con
 fog pass leaves the marked pixels alone. A frame with a markable fog-off draw runs the replay even
 with one configuration.
 
-- Only a material that writes its own depth is marked. One that writes none does not own its
-  pixels' depth, and marking it would unfog the surface behind it. It writes nothing in the replay
-  instead, so a fog-off glow or swirl layered over a marked surface leaves that surface's mark in
-  place.
+- Only a material that writes its own depth is marked. A J3D material that writes none, or blends,
+  is a see-through layer and is held back (above), so it keeps its own fog-off look over the fogged
+  surface behind it. A map-unit material that writes no depth writes nothing in the replay, so the
+  surface behind it decides the fog.
 - A material without an alpha test is marked with the replay's usual flat stamp.
 - An alpha-tested material is marked through its own alpha, so only the pixels its alpha test keeps
   are marked and the replay's depth matches the frame's (`stamp_no_fog_through_alpha`). Its display
@@ -255,9 +282,10 @@ with one configuration.
 
 - **The Hyrule Castle barrier.** Both barrier actors (`d_a_obj_ganonwall`, `d_a_obj_ganonwall2`)
   draw in the opaque lists and set their material fog to black over 1000..250000 every frame.
-  Deferring it would put the dome's black fog on the castle and trees behind it. The mod recognises
-  that **exact** triple (`is_barrier_fog`) and leaves those draws on the game's fog; in the replay
-  they write nothing, so their pixels take the configuration behind them. The match must stay
+  Deferring it would put the dome's black fog on the castle and trees behind it. A barrier material
+  that is a see-through layer is held back like any other. One that reaches the capture is
+  recognised by that **exact** triple (`is_barrier_fog`) and left on the game's fog; in the replay
+  it writes nothing, so its pixels take the configuration behind them. The match must stay
   exact: the game's black-fog water materials (polygon codes MA03, MA17, MA19 and MA20) are also
   black with a far end, and must be deferred.
 - **Wolf Senses.** See below.
@@ -307,7 +335,7 @@ factor in alpha; the target's alpha is kept, as the game's fog does not change a
 
 ### Hooks
 
-The mod hooks ten game functions, all of them required:
+The mod hooks eleven game functions, all of them required:
 
 | Hook | Purpose |
 | :-- | :-- |
@@ -316,6 +344,7 @@ The mod hooks ten game functions, all of them required:
 | `dBgp_c::modelMaterial_c::drawSimple` (pre/post) | Bracket map-unit drawing |
 | `J3DMaterial`, `J3DPatchedMaterial`, `J3DLockedMaterial` `::loadSharedDL` (post) | Capture map-unit material fog; stamp the replay |
 | `dGrass_packet_c::draw`, `dFlower_packet_c::draw` (pre/post) | Record the grass and flower configuration |
+| `J3DMatPacket::draw` (pre) | Hold back see-through layers; skip them in the replay |
 | `dComIfGd_drawXluListBG` (pre) | Push the fog pass |
 
 `install_hooks` attempts all of them. If any fails to attach (a game build this mod was not compiled
@@ -338,19 +367,19 @@ importer load later. Nothing imports it today.
 
 What one fullscreen pass over the finished opaque image cannot reproduce exactly:
 
-- **One depth per pixel.** The game fogs each fragment at its own depth; the fog pass fogs each pixel
-  at the depth the depth buffer holds. They differ wherever the surface that owns the depth is not
-  the one the colour comes from:
-  - a see-through opaque-list surface that writes depth fogs what is behind it at its own, nearer,
-    depth;
-  - a surface that writes no depth is fogged at the depth of what is behind it, and over the sky
+- **Held-back layers draw after all opaque geometry**, not between it. A held-back layer that
+  writes depth therefore no longer hides opaque geometry the game drew behind it later in the
+  frame; that geometry now shows through it.
+- **See-through surfaces that are not held back** (map units, self-drawing packets, layers drawn
+  without the depth test): the game fogs
+  each fragment at its own depth before blending, the fog pass fogs each pixel once at the depth
+  the depth buffer holds.
+  - A see-through surface that writes depth fogs what is behind it at its own, nearer, depth.
+  - A surface that writes no depth is fogged at the depth of what is behind it, and over the sky
     not at all.
-- **Additive and subtractive blends.** The game fogs a draw's colour before blending it. For layers
-  with blend factors (sᵢ, dᵢ), the game and the fog pass differ by `f·F·(K − 1)` where
-  `K = Σᵢ sᵢ·Π_{j>i} dⱼ`. An ordinary alpha blend over an opaque surface has `K = 1`, no difference.
-  An additive blend (destination factor 1) or `GX_BM_SUBTRACT` gives `K ≠ 1`. The `additive`
-  counter shows such draws. Leaving them on the game's fog does not help: the fog pass still fogs
-  their pixels, so they would be fogged twice.
+  - For blend factors (sᵢ, dᵢ) the two differ by `f·F·(K − 1)` where `K = Σᵢ sᵢ·Π_{j>i} dⱼ`: an
+    additive blend (destination factor 1) or `GX_BM_SUBTRACT` gives `K ≠ 1`. The `additive` counter
+    shows such draws.
 - **Materials with fog switched off.** Skip Unfogged leaves them unfogged only where they write
   their own depth and can be marked (see [Skip Unfogged](#skip-unfogged)); the `no-Z` and
   `unmarkable` ones are fogged. With Skip Unfogged off, all of them are fogged.
@@ -383,8 +412,8 @@ count shows that a mechanism is present in the view, not that it is what a given
 | `fog-off` > 0, `no-Z` > 0 | Fog-off materials that write no depth. They write nothing in the replay; the surface behind them decides the fog |
 | A surface is blue in Replay Coverage | Its depth comes from something the replay does not draw (a particle, a shadow, a directly drawn packet); it takes the fallback configuration |
 | A surface the game leaves unfogged is fogged, and is not red with Skip Unfogged on | It is not a fog-off material the replay reaches: check whether it draws in the sky lists (black in the debug views) or through a path the capture does not see |
-| `additive` > `no-Z` | Additive blends on depth-owning geometry |
-| `additive` = `no-Z` > 0 | Additive blends that own no depth; one pass cannot correct them |
+| `see-through held back` rises with a surface in view | That surface is drawn after the fog pass with its own fog; a remaining difference there is not the fog pass's |
+| `additive` > 0 | Additive or subtractive blends that are not held back (map units, other paths) |
 | `replay failed` or `merged` | The frame fell back to configuration 0 in places |
 
 ## Changing this mod: rules
@@ -398,7 +427,10 @@ count shows that a mechanism is present in the view, not that it is what a given
 - The scope opens only with the sky-depth snapshot in hand; without it the fog pass would fog what
   the sky lists drew depth for.
 - Keep `is_barrier_fog` an exact match.
-- Do not leave blended draws on the game's fog (see [Limitations](#limitations)).
+- Do not leave blended draws on the game's fog in place: the fog pass would still fog their pixels.
+  Hold them back (`is_see_through_layer`) instead.
+- Held-back layers must be drawn in every frame they were held back: `draw_held_back_layers` runs
+  from `on_xlu_list_bg_pre` whether or not the fog pass did.
 - The uniform structs (`FogUniforms` 112 bytes, `MixedFogUniforms` 336 bytes, `FogRangeUniform`
   64 bytes) are mirrored in `fog.wgsl`; keep the `static_assert`s true.
 - After a pin bump, re-check every `DEFINE_HOOK` target by name in the new tree (see

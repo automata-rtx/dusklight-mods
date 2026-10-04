@@ -55,6 +55,9 @@ and `docs/authored_normals.md` (the normal buffer), `docs/japanese-naming.md` (g
   placement.
 - **Every hook is required.** If any fails to attach, the mod stays inactive and the game draws its
   own fog. Keep `install_hooks` all-or-nothing.
+- **See-through J3D layers are held back** (skipped in the opaque world, drawn after the fog pass
+  with their own fog). Whatever is held back must be drawn that frame; `draw_held_back_layers` runs
+  from `on_xlu_list_bg_pre` unconditionally.
 - **The replay overrides GX state after a material's display list has loaded it.** Set every field
   of a packed GX register (`set_gen_mode`, both stages of a TEV-order pair), never one: aurora's
   API rebuilds the register from its own copy, which display lists do not update, and a stale

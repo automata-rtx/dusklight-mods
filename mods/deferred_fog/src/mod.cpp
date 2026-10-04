@@ -10,14 +10,17 @@
 //                                 the capture scope, unless the mod is off, Wolf Senses is active
 //                                 or a hook is missing.
 //   opaque world lists            the capture hooks record each draw's fog configuration and
-//                                 switch its fog off.
+//                                 switch its fog off. See-through J3D materials (they blend, or
+//                                 write no depth) are held back instead (on_mat_packet_draw_pre).
 //   GFX_STAGE_SCENE_AFTER_OPAQUE  on_scene_after_opaque closes the scope and arms the fog pass.
 //                                 When the frame used several configurations (or Skip Unfogged has
 //                                 fog-off draws to mark), it replays the opaque lists into a
 //                                 per-pixel configuration-ID buffer.
-//   dComIfGd_drawXluListBG        on_xlu_list_bg_pre pushes the fog pass. mDoGph_Painter calls this
-//                                 function every frame directly after the SCENE_AFTER_OPAQUE stage,
-//                                 before the translucent lists, every framebuffer copy and bloom.
+//   dComIfGd_drawXluListBG        on_xlu_list_bg_pre pushes the fog pass, then draws the held-back
+//                                 layers with their own fog, as the game composites them over a
+//                                 fogged image. mDoGph_Painter calls this function every frame
+//                                 directly after the SCENE_AFTER_OPAQUE stage, before the
+//                                 translucent lists, every framebuffer copy and bloom.
 //   render worker                 on_draw records the pass. res/fog.wgsl evaluates aurora's fog
 //                                 formula with coefficients from src/fog_math.h, and leaves alone
 //                                 every pixel whose depth is still the sky lists'.
@@ -31,6 +34,7 @@
 #include "fog_math.h"
 
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
+#include "JSystem/J3DGraphBase/J3DPacket.h"
 #include "JSystem/J3DGraphBase/J3DShape.h"
 #include "d/actor/d_a_player.h"
 #include "d/actor/d_flower.h"
@@ -90,6 +94,8 @@ DEFINE_HOOK(&J3DLockedMaterial::loadSharedDL, LockedMaterialSharedDL);
 // The grass and flower packets, whose pixels the configuration-ID replay cannot label.
 DEFINE_HOOK(&dGrass_packet_c::draw, GrassPacketDraw);
 DEFINE_HOOK(&dFlower_packet_c::draw, FlowerPacketDraw);
+// See-through layers: held back during the opaque world and drawn after the fog pass.
+DEFINE_HOOK(&J3DMatPacket::draw, MatPacketDraw);
 // Where the fog pass is drawn.
 DEFINE_HOOK(dComIfGd_drawXluListBG, XluListBGDraw);
 
@@ -290,9 +296,7 @@ bool material_owns_depth(J3DMaterial* material) {
     return z != nullptr && z->getCompareEnable() != 0 && z->getUpdateEnable() != 0;
 }
 
-// Whether a draw blends with what is behind it (a see-through surface). Counted only for the Replay
-// Coverage debug view: one that also writes depth has the pixel fogged at its depth, behind-colour
-// included.
+// Whether a draw blends with what is behind it (a see-through surface).
 bool material_blends(J3DMaterial* material) {
     J3DPEBlock* pe = material != nullptr ? material->getPEBlock() : nullptr;
     const J3DBlend* blend = pe != nullptr ? pe->getBlend() : nullptr;
@@ -301,6 +305,23 @@ bool material_blends(J3DMaterial* material) {
     }
     const GXBlendMode mode = blend->getBlendMode();
     return mode == GX_BM_BLEND || mode == GX_BM_SUBTRACT;
+}
+
+// A see-through layer: a material that blends with what is behind it, or writes no depth. The game
+// composites such a layer over geometry that is already fogged, with the layer's own fog. One fog
+// pass after the opaque world cannot reproduce that: it would fog the layer's pixels again with
+// the fog of whatever is behind (or, over the sky, not at all), and a fog-off layer marked by Skip
+// Unfogged would unfog what shows through it. Such J3D materials are therefore held back and drawn
+// after the fog pass (on_mat_packet_draw_pre). Only depth-tested layers qualify: one drawn without
+// the depth test would, drawn late, cover opaque geometry the game drew over it, so it stays in
+// place. A material without a Z-mode block is not one either.
+bool is_see_through_layer(J3DMaterial* material) {
+    J3DPEBlock* pe = material != nullptr ? material->getPEBlock() : nullptr;
+    const J3DZMode* z = pe != nullptr ? pe->getZMode() : nullptr;
+    if (z == nullptr || z->getCompareEnable() == 0) {
+        return false;
+    }
+    return material_blends(material) || z->getUpdateEnable() == 0;
 }
 
 // Whether the alpha test passes everything. The replay's flat stamp draws without textures and with
@@ -418,7 +439,17 @@ uint32_t g_selfDrawnIndex = 0;
 // True inside dBgp_c::modelMaterial_c::drawSimple (see on_material_shared_dl_post).
 bool g_inBgpMaterial = false;
 
-char g_statusText[224] = "Waiting for the first frame";
+// See-through layers held back this frame, in draw order (on_mat_packet_draw_pre). The packets
+// belong to the frame's draw lists and stay valid until the frame ends. A layer that does not fit
+// is drawn in place, as it would be without this mod's hold-back.
+constexpr uint32_t kMaxHeldBack = 512;
+J3DMatPacket* g_heldBack[kMaxHeldBack] = {};
+uint32_t g_heldBackCount = 0;
+uint32_t g_heldBackOverflow = 0;  // see-through layers drawn in place because the list was full
+bool g_heldBackPending = false;   // held back and not yet drawn
+bool g_drawingHeldBack = false;   // draw_held_back_layers is drawing them
+
+char g_statusText[256] = "Waiting for the first frame";
 
 // The configuration-ID buffer is used when the frame has more than one configuration, when Skip
 // Unfogged has fog-off draws to mark, or when the Replay Coverage debug view shows the buffer. The
@@ -788,6 +819,57 @@ HookAction on_self_drawn_packet_pre(ModContext*, void*, void*, void*) {
 
 void on_self_drawn_packet_post(ModContext*, void*, void*, void*) {
     g_inSelfDrawnPacket = false;
+}
+
+bool was_held_back(const J3DMatPacket* packet) {
+    if (g_heldBackOverflow == 0) {
+        return true;  // every see-through layer in the scope was held back
+    }
+    J3DMatPacket* const* begin = g_heldBack;
+    J3DMatPacket* const* end = begin + g_heldBackCount;
+    return std::find(begin, end, packet) != end;
+}
+
+// J3DMatPacket::draw loads a material and draws every shape that uses it. Inside the scope, a
+// see-through layer's packet is recorded and skipped; draw_held_back_layers draws it after the fog
+// pass. The replay skips the same packets, so they take no part in which configuration the pixels
+// behind them get.
+HookAction on_mat_packet_draw_pre(ModContext*, void* args, void*, void*) {
+    if (g_drawingHeldBack || (!g_scopeActive && !g_replayActive)) {
+        return HOOK_CONTINUE;
+    }
+    auto* packet = mods::arg<J3DMatPacket*>(args, 0);
+    if (packet == nullptr || !is_see_through_layer(packet->getMaterial())) {
+        return HOOK_CONTINUE;
+    }
+    if (g_replayActive) {
+        return was_held_back(packet) ? HOOK_SKIP_ORIGINAL : HOOK_CONTINUE;
+    }
+    if (g_heldBackCount == kMaxHeldBack) {
+        ++g_heldBackOverflow;
+        return HOOK_CONTINUE;
+    }
+    g_heldBack[g_heldBackCount++] = packet;
+    g_heldBackPending = true;
+    return HOOK_SKIP_ORIGINAL;
+}
+
+// Draws the held-back layers in their original order, as drawOpaDrawList would. The scope is
+// closed, so each draws with its own fog over the fogged image, depth-tested against the opaque
+// world.
+void draw_held_back_layers() {
+    if (!g_heldBackPending) {
+        return;
+    }
+    g_heldBackPending = false;
+    J3DShape::resetVcdVatCache();
+    j3dSys.setDrawModeOpaTexEdge();
+    g_drawingHeldBack = true;
+    for (uint32_t i = 0; i < g_heldBackCount; ++i) {
+        g_heldBack[i]->draw();
+    }
+    g_drawingHeldBack = false;
+    J3DShape::resetVcdVatCache();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1162,19 +1244,24 @@ void log_fog_configs() {
 
 void update_status_line() {
     if (g_frameConfigCount == 0) {
-        std::snprintf(g_statusText, sizeof(g_statusText), "No fogged draws in view");
+        std::snprintf(g_statusText, sizeof(g_statusText),
+            "No fogged draws in view (%u see-through held back)", g_heldBackCount);
         return;
     }
     char merged[32] = "";
     if (g_mergedDrawCount > 0) {
         std::snprintf(merged, sizeof(merged), ", %u merged", g_mergedDrawCount);
     }
+    char overflow[32] = "";
+    if (g_heldBackOverflow > 0) {
+        std::snprintf(overflow, sizeof(overflow), " (+%u in place)", g_heldBackOverflow);
+    }
     std::snprintf(g_statusText, sizeof(g_statusText),
-        "Deferring fog (%u draws, %u config%s%s%s; %u shared-DL, %u fog-off "
-        "(%u markable, %u by alpha/%u no-Z/%u unmarkable), %u additive/%u no-Z)",
+        "Deferring fog (%u draws, %u config%s%s%s; %u see-through held back%s; %u shared-DL, "
+        "%u fog-off (%u markable, %u by alpha/%u no-Z/%u unmarkable), %u additive/%u no-Z)",
         g_capturedDrawCount, g_frameConfigCount, g_frameConfigCount == 1 ? "" : "s", merged,
-        needs_id_buffer() && g_configIdView == nullptr ? ", replay failed" : "",
-        g_sharedDlFogCount, g_fogOffCount, fog_off_markable(), g_fogOffAlphaTested,
+        needs_id_buffer() && g_configIdView == nullptr ? ", replay failed" : "", g_heldBackCount,
+        overflow, g_sharedDlFogCount, g_fogOffCount, fog_off_markable(), g_fogOffAlphaTested,
         g_fogOffNoDepth, g_fogOffUnmarkable, g_overUnityCount, g_overUnityNoDepth);
 }
 
@@ -1189,6 +1276,8 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
     g_overUnityCount = g_overUnityNoDepth = 0;
     g_configIdView = nullptr;
     g_skyDepthView = nullptr;
+    g_heldBackCount = g_heldBackOverflow = 0;
+    g_heldBackPending = g_drawingHeldBack = false;
     g_quadArmed = false;
     g_inBgpMaterial = false;
     g_inSelfDrawnPacket = false;
@@ -1306,12 +1395,15 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
 // Pre-hook on dComIfGd_drawXluListBG. mDoGph_Painter calls it every frame directly after
 // GFX_STAGE_SCENE_AFTER_OPAQUE, so the fog pass lands after every mod's work at that stage and
 // before the translucent lists, the depth-of-field and framebuffer copies, the 2D-screen filters
-// (such as the underwater one) and bloom, all of which read or redraw the frame.
+// (such as the underwater one) and bloom, all of which read or redraw the frame. The held-back
+// see-through layers follow the fog pass, and are drawn even when it is not (nothing else would
+// draw them).
 HookAction on_xlu_list_bg_pre(ModContext*, void*, void*, void*) {
     if (g_quadArmed) {
         g_quadArmed = false;
         push_fog_quad();
     }
+    draw_held_back_layers();
     return HOOK_CONTINUE;
 }
 
@@ -1356,7 +1448,9 @@ void add_status_line(UiElementHandle parent) {
         "What the fog pass did this frame.<br/><b>Deferring fog</b>: how many draws had their fog "
         "taken over and how many fog configurations they used, then counts used for diagnosis. "
         "More than one configuration, or a fog-off surface for Skip Unfogged to mark, runs a "
-        "per-pixel replay of the world.<br/><b>Inactive</b>: a game function this mod needs could "
+        "per-pixel replay of the world. <i>See-through held back</i>: model layers that blend "
+        "with what is behind them or write no depth, drawn after the fog pass with their own fog, "
+        "as the game composites them.<br/><b>Inactive</b>: a game function this mod needs could "
         "not be hooked in this game build, so the game's own fog is used.";
     control.binding = UI_BINDING_CALLBACKS;
     control.get = status_get;
@@ -1502,6 +1596,7 @@ void install_hooks() {
     require_post<GrassPacketDraw>(on_self_drawn_packet_post, "dGrass_packet_c::draw");
     require_pre<FlowerPacketDraw>(on_self_drawn_packet_pre, "dFlower_packet_c::draw");
     require_post<FlowerPacketDraw>(on_self_drawn_packet_post, "dFlower_packet_c::draw");
+    require_pre<MatPacketDraw>(on_mat_packet_draw_pre, "J3DMatPacket::draw");
     require_pre<XluListBGDraw>(on_xlu_list_bg_pre, "dComIfGd_drawXluListBG");
     g_hooksOk = g_missingHook == nullptr;
     if (!g_hooksOk) {
@@ -1585,6 +1680,8 @@ void shutdown() {
     g_lastFrameDeferred = g_warnedReplayFailure = g_warnedDepthFailure = false;
     g_warnedSkyDepthFailure = false;
     g_inBgpMaterial = g_inSelfDrawnPacket = g_selfDrawnIndexValid = false;
+    g_heldBackCount = g_heldBackOverflow = 0;
+    g_heldBackPending = g_drawingHeldBack = false;
     g_selfDrawnIndex = 0;
     g_frameConfigCount = g_mergedDrawCount = g_capturedDrawCount = g_sharedDlFogCount = 0;
     g_fogOffCount = g_fogOffNoDepth = g_fogOffAlphaTested = g_fogOffUnmarkable = 0;

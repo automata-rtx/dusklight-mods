@@ -246,10 +246,10 @@ current pin):
 | :-- | :-- | :-- | :-- |
 | sky lists | 2328 | `dComIfGd_drawOpaListSky` / `XluListSky` | |
 | `GFX_STAGE_SCENE_BEGIN` | 2334 | before any world geometry | Deferred Fog snapshots the sky's depth and opens its fog-suppression scope |
-| opaque world lists | 2344–2390 | terrain, objects, actors, grass; also some particles (`Pri0_B`) and the game's own shadows. Fog applied per draw by the game | Deferred Fog suppresses per-draw fog here |
+| opaque world lists | 2344–2390 | terrain, objects, actors, grass; also some particles (`Pri0_B`) and the game's own shadows. Fog applied per draw by the game | Deferred Fog suppresses per-draw fog here, and holds back see-through J3D layers |
 | `GFX_STAGE_SCENE_AFTER_TERRAIN` | 2366 | after terrain and shadows, before the main opaque list | (nothing in the released set) |
 | `GFX_STAGE_SCENE_AFTER_OPAQUE` | 2395 | all opaque world geometry is down | VBAO composites; SMAA antialiases; Deferred Fog closes its scope and arms the fog pass |
-| translucent lists | 2405 | `dComIfGd_drawXluListBG` onward | Deferred Fog draws its fog pass from a pre-hook on `dComIfGd_drawXluListBG` |
+| translucent lists | 2405 | `dComIfGd_drawXluListBG` onward | Deferred Fog draws its fog pass from a pre-hook on `dComIfGd_drawXluListBG`, then the see-through layers it held back |
 | particles, depth of field, framebuffer copies, 2D-screen filters, bloom | to 2632 | the game's own post effects. They read or redraw the frame; bloom (2632) works from the last framebuffer copy | (they all see the fogged frame) |
 | `GFX_STAGE_FRAME_BEFORE_HUD` | 2759 | after all 3D post effects | (nothing in the released set) |
 | `GFX_STAGE_FRAME_AFTER_HUD` | 2820 | the last stage in the frame | VBAO's debug views (so nothing draws over them) |
