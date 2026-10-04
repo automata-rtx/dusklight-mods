@@ -55,8 +55,12 @@ and `docs/authored_normals.md` (the normal buffer), `docs/japanese-naming.md` (g
   placement.
 - **Every hook is required.** If any fails to attach, the mod stays inactive and the game draws its
   own fog. Keep `install_hooks` all-or-nothing.
+- **The replay overrides GX state after a material's display list has loaded it.** Set every field
+  of a packed GX register (`set_gen_mode`, both stages of a TEV-order pair), never one: aurora's
+  API rebuilds the register from its own copy, which display lists do not update, and a stale
+  field crashed the game (`docs/mod-api-notes.md`, "Changing GX state on top of a display list").
 - **For a visual difference from vanilla, get per-pixel evidence before proposing a cause** (the Fog
-  Factor and Config IDs debug views). A per-frame Status count shows that a mechanism is *present*
+  Factor, Config IDs and Replay Coverage debug views). A per-frame Status count shows that a mechanism is *present*
   in the view, not that it is what the view *looks like*. Method: `docs/deferred_fog.md`
   "Diagnosing a difference from vanilla".
 

@@ -73,6 +73,17 @@ actually caused problems here. `CONTRIBUTING.md` has the short version.
   symbol manifest; without one the hook service returns `MOD_UNSUPPORTED`. Prefer `DEFINE_HOOK`.
 - On Windows only functions and `DUSK_GAME_DATA`-annotated data are reachable through the import
   library; an un-annotated data reference fails at link time.
+- **Changing GX state on top of a display list.** Aurora's GX API keeps its own copy of the
+  registers that pack several settings (`genMode`: texture-coordinate, channel, TEV-stage and
+  indirect-stage counts and the cull mode; TEV orders, stored in stage pairs; the alpha-combiner
+  register, which also holds the swap selection). A setter changes one field of that copy and writes
+  the whole register. Display lists (every J3D material) write these registers through the FIFO,
+  and the decoder updates the render state but not the API's copy. So after a material has loaded,
+  a single `GXSetNumTevStages`, `GXSetNumChans` or `GXSetTevOrder` puts back stale values for the
+  register's other fields: a wrong cull mode, or a texture-coordinate count or stage order that no
+  longer matches what the stages sample, which aurora rejects as a fatal error (`unhandled tcg src
+  21`). Set every field of such a register; Deferred Fog's `set_gen_mode` and
+  `stamp_no_fog_through_alpha` show how.
 
 ## Config and UI
 

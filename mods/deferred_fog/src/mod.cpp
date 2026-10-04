@@ -40,6 +40,7 @@
 #include "dolphin/gf/GFPixel.h"
 #include "dolphin/gx/GXAurora.h"
 #include "dolphin/gx/GXBump.h"
+#include "dolphin/gx/GXCull.h"
 #include "dolphin/gx/GXGeometry.h"
 #include "dolphin/gx/GXGet.h"
 #include "dolphin/gx/GXLighting.h"
@@ -289,6 +290,19 @@ bool material_owns_depth(J3DMaterial* material) {
     return z != nullptr && z->getCompareEnable() != 0 && z->getUpdateEnable() != 0;
 }
 
+// Whether a draw blends with what is behind it (a see-through surface). Counted only for the Replay
+// Coverage debug view: one that also writes depth has the pixel fogged at its depth, behind-colour
+// included.
+bool material_blends(J3DMaterial* material) {
+    J3DPEBlock* pe = material != nullptr ? material->getPEBlock() : nullptr;
+    const J3DBlend* blend = pe != nullptr ? pe->getBlend() : nullptr;
+    if (blend == nullptr) {
+        return false;
+    }
+    const GXBlendMode mode = blend->getBlendMode();
+    return mode == GX_BM_BLEND || mode == GX_BM_SUBTRACT;
+}
+
 // Whether the alpha test passes everything. The replay's flat stamp draws without textures and with
 // the alpha test off, so it would stamp an alpha-tested material as its whole primitive rather than
 // its cutout; a fog-off one is marked through its own alpha instead (plan_alpha_mark).
@@ -312,6 +326,7 @@ struct AlphaMark {
     GXBool alphaClamp = GX_TRUE;           // that stage's clamp setting
     uint8_t colorChanCount = 0;            // its colour channels
     uint8_t matAlpha = 255;                // its material colour's alpha, which ALPHA0 may read
+    J3DTevOrderInfo lastOrder{};           // its last stage's order (stamp_no_fog_through_alpha)
 };
 
 // False when the material cannot be marked: it sets no alpha test of its own, has no TEV stages
@@ -324,9 +339,11 @@ bool plan_alpha_mark(J3DMaterial* material, AlphaMark& out) {
     }
     const uint8_t stages = tev->getTevStageNum();
     const J3DTevStage* last = stages > 0 ? tev->getTevStage(stages - 1) : nullptr;
-    if (last == nullptr || stages >= GX_MAX_TEVSTAGE) {
+    const J3DTevOrder* lastOrder = stages > 0 ? tev->getTevOrder(stages - 1) : nullptr;
+    if (last == nullptr || lastOrder == nullptr || stages >= GX_MAX_TEVSTAGE) {
         return false;
     }
+    out.lastOrder = *lastOrder;
     // J3DTevStage keeps the stage's alpha combiner as the GX register does: mTevAlphaOp holds the
     // output register in bits 6-7 and the clamp in bit 3.
     static constexpr GXTevAlphaArg kOutputRegisterAlpha[4] = {
@@ -484,23 +501,47 @@ constexpr u8 slot_red(uint32_t slot) {
     return static_cast<u8>((slot + 1) * 24);
 }
 
-// Why a draw got its slot, for the Replay Coverage debug view only. Written to blue as reason * 2,
-// at most 6/255, below the 0.03 the fog pass treats as unstamped, so the fog itself ignores it.
+// Why a draw got its slot, for the Replay Coverage debug view only. Written to blue as reason/255,
+// at most 7/255, below the 0.03 the fog pass treats as unstamped, so the fog itself ignores it.
 enum class StampReason : u8 {
-    OwnConfig = 0,      // the draw's own configuration
-    Merged = 1,         // its configuration did not fit in the table: slot 0
-    FogOffFogged = 2,   // fog-off, but not marked (Skip Unfogged off, or unmarkable): slot 0
-    NoFogBlock = 3,     // no fog block; it inherits whatever fog was set last: slot 0
+    OwnConfig = 0,       // the draw's own configuration
+    OwnConfigBlended = 1,  // the same, on a see-through surface that writes depth
+    Merged = 2,          // its configuration did not fit in the table: slot 0
+    FogOffFogged = 3,    // fog-off, but not marked (Skip Unfogged off, or unmarkable): slot 0
+    NoFogBlock = 4,      // no fog block; it inherits whatever fog was set last: slot 0
 };
 
-void stamp_replay_id(uint32_t slot, StampReason reason = StampReason::OwnConfig) {
+// The GX API keeps its own copy of some registers that pack several settings, and changing one
+// setting writes the whole copy back. A material's display list sets those registers without
+// updating the copy, so in the replay one setting changed through the API would put back stale
+// values for the others. For genMode (texture-coordinate, colour-channel, TEV-stage and
+// indirect-stage counts, and the cull mode) that meant the replay drew with another draw's cull
+// mode, and with a texture-coordinate count that might not cover what the material's stages
+// sample, which aurora rejects ("unhandled tcg src", a crash). Every genMode field is therefore set
+// here: the counts given, the rest as J3DMaterial::makeDisplayList sets them.
+void set_gen_mode(J3DMaterial* material, u8 colorChans, u8 tevStages) {
+    J3DTexGenBlock* texGen = material != nullptr ? material->getTexGenBlock() : nullptr;
+    J3DIndBlock* ind = material != nullptr ? material->getIndBlock() : nullptr;
+    J3DColorBlock* color = material != nullptr ? material->getColorBlock() : nullptr;
+    GXSetNumTexGens(static_cast<u8>(texGen != nullptr ? texGen->getTexGenNum() : 0));
+    GXSetNumChans(colorChans);
+    GXSetNumTevStages(tevStages);
+    GXSetNumIndStages(ind != nullptr ? ind->getIndTexStageNum() : 0);
+    GXSetCullMode(static_cast<GXCullMode>(color != nullptr ? color->getCullMode() : GX_CULL_BACK));
+}
+
+void stamp_replay_id(
+    J3DMaterial* material, uint32_t slot, StampReason reason = StampReason::OwnConfig) {
     const u8 red = slot_red(slot);
-    const auto blue = static_cast<u8>(static_cast<u8>(reason) * 2);
+    const auto blue = static_cast<u8>(reason);
     GXSetColorUpdate(GX_TRUE);
-    GXSetNumTevStages(1);
+    set_gen_mode(material, 1, 1);
+    // Stage 0 is set in full: its swap and indirect settings live in registers the material's
+    // display list wrote and the API's copies do not track.
     GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
     GXSetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
-    GXSetNumChans(1);
+    GXSetTevSwapMode(GX_TEVSTAGE0, GX_TEV_SWAP0, GX_TEV_SWAP0);
+    GXSetTevDirect(GX_TEVSTAGE0);
     GXSetChanCtrl(
         GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
     GXSetChanMatColor(GX_COLOR0A0, GXColor{red, 0, blue, 255});
@@ -516,15 +557,24 @@ void stamp_replay_id(uint32_t slot, StampReason reason = StampReason::OwnConfig)
 // unchanged. The colour comes from channel COLOR0, switched to its material colour register. That
 // register is shared with ALPHA0, whose own setting is left as the material set it, so its alpha
 // keeps the material's value.
-void stamp_no_fog_through_alpha(const AlphaMark& mark) {
+//
+// TEV orders are stored in pairs (stages 0-1, 2-3, ...) and GXSetTevOrder writes the API's copy of
+// the pair, which the display list did not update. When the new stage is the second of a pair, the
+// material's last stage is therefore written first, from its TEV block, or the copy would replace
+// it with another draw's texture and coordinate.
+void stamp_no_fog_through_alpha(J3DMaterial* material, const AlphaMark& mark) {
     const auto stage = static_cast<GXTevStageID>(GX_TEVSTAGE0 + mark.stageCount);
-    if (mark.colorChanCount == 0) {
-        GXSetNumChans(1);
-    }
+    set_gen_mode(material, std::max<u8>(mark.colorChanCount, 1),
+        static_cast<u8>(mark.stageCount + 1));
     GXSetChanCtrl(
         GX_COLOR0, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
     GXSetChanMatColor(GX_COLOR0, GXColor{slot_red(kNoFogSlot), 0, 0, mark.matAlpha});
-    GXSetNumTevStages(static_cast<u8>(mark.stageCount + 1));
+    if ((mark.stageCount & 1) != 0) {
+        GXSetTevOrder(static_cast<GXTevStageID>(stage - 1),
+            static_cast<GXTexCoordID>(mark.lastOrder.mTexCoord),
+            static_cast<GXTexMapID>(mark.lastOrder.mTexMap),
+            static_cast<GXChannelID>(mark.lastOrder.mColorChan));
+    }
     GXSetTevOrder(stage, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
     GXSetTevDirect(stage);
     GXSetTevSwapMode(stage, GX_TEV_SWAP0, GX_TEV_SWAP0);
@@ -564,26 +614,28 @@ void replay_stamp_material(J3DMaterial* material) {
     }
     if (state == MaterialFog::Off && g_skipUnfogged && ownsDepth) {
         if (material_alpha_test_passes_all(material)) {
-            stamp_replay_id(kNoFogSlot);
+            stamp_replay_id(material, kNoFogSlot);
             return;
         }
         AlphaMark mark;
         if (plan_alpha_mark(material, mark)) {
-            stamp_no_fog_through_alpha(mark);
+            stamp_no_fog_through_alpha(material, mark);
             return;
         }
     }
     if (state == MaterialFog::Live) {
         const uint32_t slot = find_frame_config(config);
         if (slot == kMaxFogConfigs) {
-            stamp_replay_id(0, StampReason::Merged);
+            stamp_replay_id(material, 0, StampReason::Merged);
         } else {
-            stamp_replay_id(slot);
+            stamp_replay_id(material, slot,
+                ownsDepth && material_blends(material) ? StampReason::OwnConfigBlended
+                                                       : StampReason::OwnConfig);
         }
         return;
     }
-    stamp_replay_id(0, state == MaterialFog::Off ? StampReason::FogOffFogged
-                                                 : StampReason::NoFogBlock);
+    stamp_replay_id(material, 0,
+        state == MaterialFog::Off ? StampReason::FogOffFogged : StampReason::NoFogBlock);
 }
 
 // The opaque lists the scope covers, without the Pri0_B particles and the game's shadows that are
@@ -1339,8 +1391,9 @@ ModResult build_controls_tab(
         "(white = full fog).<br/><b>Config IDs</b>: which fog configuration each pixel uses, one "
         "gray level each (white = the last), on frames that run the per-pixel replay; otherwise "
         "the same as Fog Factor.<br/><b>Replay Coverage</b>: what the per-pixel replay recorded, "
-        "and runs it every frame. Green: the draw's own fog configuration. Yellow: its "
-        "configuration did not fit in the table of 8 and uses the main one. Cyan: a fog-off "
+        "and runs it every frame. Green: the draw's own fog configuration. Orange: the same, on a "
+        "see-through surface that writes depth. Yellow: its configuration did not fit in the "
+        "table of 8 and uses the main one. Cyan: a fog-off "
         "surface that is not marked, fogged with the main configuration. Magenta: a draw with no "
         "fog block, fogged with the main configuration. Blue: nothing the replay draws (grass, "
         "flowers, particles and other directly drawn geometry), which takes the grass and flower "

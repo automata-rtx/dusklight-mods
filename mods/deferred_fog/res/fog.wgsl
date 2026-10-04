@@ -208,7 +208,7 @@ fn stamped_index_at(uv: vec2f) -> u32 {
     return UNSTAMPED;
 }
 
-// Replay Coverage debug view. mod.cpp writes why a draw got its slot into blue as reason * 2/255
+// Replay Coverage debug view. mod.cpp writes why a draw got its slot into blue as reason/255
 // (StampReason), below the 0.03 that marks a pixel unstamped.
 fn replay_coverage_color(uv: vec2f, stamped: u32) -> vec4f {
     if stamped == UNSTAMPED {
@@ -216,11 +216,12 @@ fn replay_coverage_color(uv: vec2f, stamped: u32) -> vec4f {
     }
     let size = vec2<i32>(textureDimensions(config_ids));
     let texel = clamp(vec2<i32>(uv * vec2f(size)), vec2<i32>(0i), size - 1i);
-    let reason = u32(round(textureLoad(config_ids, texel, 0i).b * 255.0 / 2.0));
+    let reason = u32(round(textureLoad(config_ids, texel, 0i).b * 255.0));
     switch reason {
-        case 1u: { return vec4f(1.0, 0.85, 0.0, 1.0); }  // yellow: merged into slot 0
-        case 2u: { return vec4f(0.0, 0.9, 0.9, 1.0); }   // cyan: fog-off, not marked
-        case 3u: { return vec4f(0.9, 0.0, 0.9, 1.0); }   // magenta: no fog block
+        case 1u: { return vec4f(1.0, 0.5, 0.0, 1.0); }   // orange: own config, see-through
+        case 2u: { return vec4f(1.0, 0.85, 0.0, 1.0); }  // yellow: merged into slot 0
+        case 3u: { return vec4f(0.0, 0.9, 0.9, 1.0); }   // cyan: fog-off, not marked
+        case 4u: { return vec4f(0.9, 0.0, 0.9, 1.0); }   // magenta: no fog block
         default: { return vec4f(0.0, 0.8, 0.2, 1.0); }   // green: its own configuration
     }
 }

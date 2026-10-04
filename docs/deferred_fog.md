@@ -6,7 +6,7 @@ ambient occlusion darken the surfaces *under* the fog instead of darkening the f
 | | |
 | :-- | :-- |
 | Mod id | `dev.automata.deferred_fog` (`mods/deferred_fog/`) |
-| Version | `2.0.0-d`, a test build (see `mods/deferred_fog/mod.json`) |
+| Version | `2.0.0-e`, a test build (see `mods/deferred_fog/mod.json`) |
 | Kind | **Game-linked**: includes game headers, calls game functions and hooks ten of them. It must be built against the game build it runs on |
 | Game build | Dusklight `v2.0.0` |
 
@@ -93,7 +93,7 @@ clouds' (see [The sky](#the-sky)).
 | :-- | :-- | :-- |
 | 1 | Fog Factor | The fog amount per pixel (white = full fog) |
 | 2 | Config IDs | One gray level per fog configuration (white = the last), on frames that run the configuration-ID replay; otherwise Fog Factor. A frame that runs the replay only for Skip Unfogged has one configuration and shows white |
-| 3 | Replay Coverage | What the configuration-ID replay recorded per pixel, and why. Green: the draw's own fog configuration. Yellow: its configuration did not fit in the table and uses configuration 0 (`merged`). Cyan: a fog-off draw that writes depth but is not marked (Skip Unfogged off, or `unmarkable`), stamped as configuration 0. Magenta: a draw with no fog block, stamped as configuration 0. Blue: nothing the replay draws (grass, flowers, particles and other directly drawn geometry), which takes the fallback configuration. Runs the replay every frame while selected |
+| 3 | Replay Coverage | What the configuration-ID replay recorded per pixel, and why. Green: the draw's own fog configuration. Orange: the same, on a see-through (blended) surface that writes depth, so the pixel's fog also lands on what shows through it. Yellow: its configuration did not fit in the table and uses configuration 0 (`merged`). Cyan: a fog-off draw that writes depth but is not marked (Skip Unfogged off, or `unmarkable`), stamped as configuration 0. Magenta: a draw with no fog block, stamped as configuration 0. Blue: nothing the replay draws (grass, flowers, particles and other directly drawn geometry), which takes the fallback configuration. Runs the replay every frame while selected |
 
 In every view, **red** pixels are ones Skip Unfogged leaves unfogged. If a debug view shows the normal
 scene, the fog pass did not draw this frame; an all-black view means it drew and computed no fog.
@@ -214,8 +214,13 @@ pixel's configuration.
   configuration 0 if there were none.
 - Red 216 (C++ `kNoFogSlot` = 8) means "leave this pixel unfogged", written by Skip Unfogged
   (below).
-- Blue carries why the draw got its slot (`StampReason`, as `reason × 2/255`), read only by the
+- Blue carries why the draw got its slot (`StampReason`, as `reason/255`), read only by the
   Replay Coverage debug view. It stays below the 0.03 that marks a pixel unstamped.
+- Each stamp changes GX state after the material's display list has loaded it, so it sets every
+  field of the packed registers it touches: all of `genMode` (`set_gen_mode`: counts, and the
+  material's own cull mode, so the replay draws the same faces as the frame) and both stages of a
+  TEV-order pair. Aurora's GX API rebuilds those registers from its own copy, which display lists
+  do not update (`docs/mod-api-notes.md`).
 - Some draws write nothing (`stamp_nothing`), so their pixels keep the ID of the surface whose depth
   the fog pass uses there: the barrier (below) and fog-off draws that write no depth. They use a
   blend that keeps the destination rather than switching colour writes off, because J3D materials
@@ -366,8 +371,9 @@ count shows that a mechanism is present in the view, not that it is what a given
    *more* fogged than the fog colour in vanilla points at an additive blend.
 3. **Config IDs**: which configuration each pixel resolves to.
 4. **Replay Coverage**: per pixel, whether the replay recorded the draw's own configuration
-   (green), configuration 0 for a reason (yellow merged, cyan fog-off not marked, magenta no fog
-   block), the no-fog mark (red) or nothing (blue).
+   (green, or orange on a see-through surface that writes depth), configuration 0 for a reason
+   (yellow merged, cyan fog-off not marked, magenta no fog block), the no-fog mark (red) or nothing
+   (blue).
 5. **Log Fog Configs**: the configurations themselves.
 
 | Reading | Meaning |
