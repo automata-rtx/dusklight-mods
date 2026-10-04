@@ -1,0 +1,7 @@
+{
+  "id": "dev.automata.reshade_port",
+  "name": "ReShade Port",
+  "version": "0.1.0",
+  "author": "automata.",
+  "description": "Runs ReShade effects inside the game's frame: under the HUD, under the game's own post-processing, with the game's real depth."
+}

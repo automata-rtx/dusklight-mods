@@ -8,6 +8,7 @@ PC/mobile port. Built on the official [Dusklight mod template](https://github.co
 | **VBAO** | `vbao.dusk` | Ambient occlusion using a per-slice visibility bitmask (Therrien et al. 2023), so gaps between occluders and thin geometry such as grass do not over-darken the way horizon-based AO does. Temporal accumulation, half-resolution upsampling, an edge-aware denoiser, and a large set of options. Uses the game's own surface normals. Works across game updates without a rebuild |
 | **Deferred Fog** | `deferred_fog.dusk` | Removes the game's fog from the opaque world while it draws and re-applies the same fog afterwards in one pass. AO then darkens the world *under* the fog instead of darkening the fog itself. Install it alongside VBAO. Hooks game code, so it must match the game build |
 | **SMAA** | `smaa.dusk` | Post-process antialiasing (SMAA 1x). Detects edges from brightness and from the game's surface normals and depth, so it also catches silhouettes and creases with little brightness contrast. Runs before the game's bloom and translucency. Works across game updates without a rebuild |
+| **ReShade Port** *(first iteration, untested)* | `reshade_port.dusk` | Runs your ReShade effects (`.fx`) inside the game's frame: under the HUD and under the game's own blur, depth of field and bloom, with the game's real depth. Each technique can be placed at one of four points in the frame. Effects go in the mod's data folder; see `docs/reshade_port.md`. Hooks game code, so it must match the game build |
 
 Each `.dusk` is a single cross-platform bundle for Windows (x64, arm64), macOS (arm64, x64), Linux
 (x64, arm64) and Android (arm64).
@@ -33,9 +34,10 @@ Metal renderers provide. On the compatibility renderers (D3D11, OpenGL ES) VBAO 
 says so in the log; SMAA keeps working using brightness edges only. Nothing needs to be enabled for
 the normals; the first frame or two after start-up simply run without them.
 
-**Matching the game build.** Deferred Fog hooks game functions by name when it loads, so it must be
-built for the exact game version you run; a mismatch can stop it loading. VBAO and SMAA only use
-the mod API, so they keep working on newer game builds that still provide the same API.
+**Matching the game build.** Deferred Fog and ReShade Port hook game functions by name when they
+load, so they must be built for the exact game version you run; a mismatch can stop them loading.
+VBAO and SMAA only use the mod API, so they keep working on newer game builds that still provide the
+same API.
 
 ## Known issues
 

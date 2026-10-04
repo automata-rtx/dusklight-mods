@@ -12,6 +12,7 @@ whichever is wrong in the same change.
 | `mods/vbao/` — visibility-bitmask ambient occlusion | service-only | `docs/vbao.md` |
 | `mods/deferred_fog/` — the game's fog re-applied after the opaque world | game-linked | `docs/deferred_fog.md` |
 | `mods/smaa/` — SMAA 1x post-process antialiasing | service-only | `docs/smaa.md` |
+| `mods/reshade-port/` — ReShade `.fx` effects at chosen points of the frame (first iteration, untested in-game) | game-linked | `docs/reshade_port.md` |
 
 Four more mods (SSILVB, Realtime Sun Shadows, Celestial Orbit, Effect Remover) are **not built or
 released**. Their docs are in `docs/unreleased/`, marked as possibly outdated; start at
@@ -133,8 +134,9 @@ within ±40 lines, so an OK verdict can still be wrong. Prefer naming functions 
 - **The pin**: `DUSKLIGHT_VERSION` in `CMakeLists.txt` = `v2.0.0` (`e9b12054`) from
   `DUSKLIGHT_REPOSITORY` = upstream `TwilitRealm/dusklight`. GameService 2.0, GfxService 1.3,
   aurora `7d4484a`. Pinning a tag is deliberate: it names a build users can install.
-- **Which mods build** is the `add_subdirectory` list in `CMakeLists.txt`: vbao, smaa, deferred_fog.
-- **Compatibility**: game-linked mods (Deferred Fog) must match the game build (symbol resolution at
+- **Which mods build** is the `add_subdirectory` list in `CMakeLists.txt`: vbao, smaa, deferred_fog,
+  reshade-port.
+- **Compatibility**: game-linked mods (Deferred Fog, ReShade Port) must match the game build (symbol resolution at
   load; GameService major version). Service-only mods need a host whose services are at least the
   minor versions they were built against. Build against the SDK that matches the game.
 - **Upstream has moved on**: `v2.0.1`–`v2.0.3` exist; 2.0.3 raises GfxService to 1.4 (texture

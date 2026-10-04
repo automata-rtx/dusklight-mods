@@ -11,6 +11,7 @@ these mods use it, and the rules that have caused silent failures.
 | `deferred_fog.md` | Deferred Fog: how fog is suppressed and re-applied, hooks, options, debug views, the open Death Mountain problem, Wolf Senses | working on fog |
 | `deferred_fog_underwater_notes.md` | A designed but **unbuilt** Deferred Fog feature: fading AO on submerged terrain | picking that feature up |
 | `smaa.md` | SMAA: pipeline, options, debug views, scope and limits | working on antialiasing |
+| `reshade_port.md` | ReShade Port (first iteration, untested in-game): running ReShade `.fx` effects at chosen points of the frame; the WGSL compiler, validation device, depth conversion, limitations, offline checkers | working on the ReShade port or testing it |
 | `editing-options.md` | Changing a default, hiding an option, editing a mod description, adding an icon | making a small tuning change |
 | `self_editing_guide.md` | The same tasks done entirely in the GitHub web editor, no local build | you have no build environment |
 | `mod-api-notes.md` | Mod API pitfalls, crash symbolization, debugging lessons | before touching uniforms, threads or render code; when something crashes |

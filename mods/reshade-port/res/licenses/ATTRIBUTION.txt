@@ -1,0 +1,25 @@
+ReShade Port for Dusklight - provenance
+=======================================
+
+ReShade FX compiler
+-------------------
+The effect preprocessor, lexer, parser and symbol table are ReShade's own
+(https://github.com/crosire/reshade, tag v6.8.0), copyright 2014 Patrick Mours,
+used under the BSD 3-Clause license reproduced in RESHADE-BSD-3.txt. A few
+portability patches are listed in third_party/reshadefx/VENDORED.md in the
+source repository.
+
+The WGSL code generator, the runtime that executes effects on the game's
+WebGPU device and the in-game interface are this mod's own. They follow the
+behaviour of ReShade's runtime (pass order, render-target and mipmap rules,
+uniform layout, preset format) so that effects written for ReShade run
+unchanged; no ReShade runtime source is included.
+
+This mod is not made by or affiliated with the ReShade project. ReShade
+effects are not included; users supply their own.
+
+stb
+---
+stb_image and stb_image_resize2 by Sean Barrett and contributors (MIT or
+public domain), and the stb_image_dds DDS loader (public domain). See
+STB-LICENSE.txt.

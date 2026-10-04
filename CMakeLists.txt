@@ -50,9 +50,11 @@ add_subdirectory("${DUSKLIGHT_DIR}/sdk" dusklight-sdk EXCLUDE_FROM_ALL)
 add_subdirectory(mods/vbao)
 add_subdirectory(mods/smaa)
 add_subdirectory(mods/deferred_fog)
+add_subdirectory(mods/reshade-port)
 
-# deferred_fog is game-linked: after any pin bump, re-check its ten DEFINE_HOOK targets by name in
-# the new tree and test it in-game; a clean compile does not prove the hooks resolve.
+# deferred_fog and reshade-port are game-linked: after any pin bump, re-check their DEFINE_HOOK
+# targets by name in the new tree (deferred_fog has ten, reshade-port one) and test in-game; a clean
+# compile does not prove the hooks resolve.
 
 # Unreleased mods, kept out of the build until ported to this platform (docs/unreleased/README.md):
 #   ssilvb, realtime_sun_shadows  still use the retired depth_to_normal service (their include path
