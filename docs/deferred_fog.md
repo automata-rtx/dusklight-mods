@@ -6,7 +6,7 @@ ambient occlusion darken the surfaces *under* the fog instead of darkening the f
 | | |
 | :-- | :-- |
 | Mod id | `dev.automata.deferred_fog` (`mods/deferred_fog/`) |
-| Version | `2.0.0-g`, a test build (see `mods/deferred_fog/mod.json`) |
+| Version | `2.0.0-h`, a test build (see `mods/deferred_fog/mod.json`) |
 | Kind | **Game-linked**: includes game headers, calls game functions and hooks eleven of them. It must be built against the game build it runs on |
 | Game build | Dusklight `v2.0.0` |
 
@@ -29,9 +29,9 @@ No other mod depends on it and it depends on none: the ordering comes from the f
 | `include/deferred_fog_service.h` | The exported `dev.automata.deferred_fog` service |
 
 Key functions in `mod.cpp`: `on_scene_begin`, `on_set_fog_pre`, `on_shape_draw_pre`,
-`on_material_shared_dl_post`, `on_mat_packet_draw_pre`, `on_scene_after_opaque`,
-`replay_config_ids`, `on_xlu_list_bg_pre`, `draw_held_back_layers`,
-`push_fog_quad`, `on_draw`, `ensure_fog_pipelines`, `install_hooks`.
+`on_material_shared_dl_post`, `on_mat_packet_draw_pre`, `is_terrain_overlay`,
+`on_scene_after_opaque`, `replay_config_ids`, `restore_packet_state`, `on_xlu_list_bg_pre`,
+`draw_held_back_layers`, `push_fog_quad`, `on_draw`, `ensure_fog_pipelines`, `install_hooks`.
 
 ## Using it
 
@@ -46,7 +46,6 @@ Controls** button. The controls window repeats Enabled and holds the rest.
 | `fogSkipUnfogged` | Skip Unfogged Geometry (experimental) | off | Leave unfogged the pixels of materials the game draws with fog switched off, as the game does. Runs the configuration-ID replay in every frame with a markable fog-off draw. Experimental: it has left surfaces unfogged that the game fogs. See [Skip Unfogged](#skip-unfogged) |
 | `fogDebug` | Debug View | 0 | 0 off, 1 Fog Factor, 2 Config IDs, 3 Replay Coverage. See [Debug views](#debug-views) |
 | `fogLogConfigs` | Log Fog Configs | off | Log the frame's fog configurations when their number, any start or end distance, or configuration 0's type or colour changes |
-| `fogSeeThrough` | See-Through Layers (diagnostic) | 0 | What happens to see-through layers: 0 Draw After Fog, 1 Draw In Place (no hold-back), 2 Hide (held back and not drawn, to show which surfaces are held back). See [See-through layers](#see-through-layers) |
 | `fogDeferInSenses` | Defer Fog During Wolf Senses (diagnostic) | off | Take over the fog during Wolf Senses as well. For examination only; see [Wolf Senses](#wolf-senses) |
 
 Config keys are stored as `mod.dev.automata.deferred_fog.<key>` in the game's `config.json`. The
@@ -57,7 +56,7 @@ defaults are the second argument of the `register_bool` / `register_int` calls i
 Rebuilt every frame in `on_scene_after_opaque`. The working state reads:
 
 ```
-Deferring fog (N draws, K configs[, M merged][, replay failed]; H see-through held back|hidden[ (+O in place)]; A shared-DL, B fog-off (P markable, T by alpha/Z no-Z/U unmarkable), C additive/D no-Z)
+Deferring fog (N draws, K configs[, M merged][, replay failed]; H see-through held back[ (+O in place)]; A shared-DL, B fog-off (P markable, T by alpha/Z no-Z/U unmarkable), C additive/D no-Z)
 ```
 
 | Field | Meaning |
@@ -200,10 +199,23 @@ fogged image, depth-tested against the opaque world, as in the game. The replay 
 packets, so they take no part in which configuration the pixels behind them get. The layers are
 drawn every frame they were held back, whether or not the fog pass ran.
 
+**Overlays on the terrain stay in place** (`is_terrain_overlay`). A layer drawn late inherits
+whatever the draw before it left in the GPU state its material does not set itself, which in the
+game's order is the state the terrain draw before it left. GX light 1 is one such piece of state:
+`setLightTevColorType_MAJI_sub` gives terrain materials their own lights in slots 0 and 2–7, never
+1. Slot 1 holds the effect light nearest the camera, loaded globally (`dKy_setLight_nowroom_common`
+→ `dKy_GlobalLight_set`) by each room, map unit and grass draw with its own room and light ratio.
+Held back, a road drawn over the terrain came out darker than in the game. The terrain materials
+`dKy_bg_MAxx_proc` treats as ground, by the polygon code at name positions 3..6 (`MA00`, `MA01`,
+`MA04`, `MA16`: the materials that carry the cloud shadow), are therefore never held back. While the
+camera is above water it turns `MA01` into an overlay that writes no depth (`l_zmodeUpDisable`).
+Such an overlay lies on the terrain under it, under the same room fog, so both layers have the same
+fog factor *f* and `a·fog(O) + (1 − a)·fog(G) = fog(a·O + (1 − a)·G)`: the fog pass fogs the
+composite exactly as the game fogs each layer. In the replay it is drawn like any other material and
+stamps its own configuration, the same as the terrain's.
+
 The list holds 512 packets; a layer that does not fit is drawn in place, as before this mechanism
-(`+O in place` on the Status line). The See-Through Layers option (`fogSeeThrough`) switches the
-mechanism for comparison: Draw In Place turns it off, and Hide holds the layers back without
-drawing them, which shows which surfaces they are. Map units (`dBgp_c`) and the self-drawing packets do not draw
+(`+O in place` on the Status line). Map units (`dBgp_c`) and the self-drawing packets do not draw
 through `J3DMatPacket::draw` and are not held back.
 
 ### The sky
@@ -246,15 +258,25 @@ pixel's configuration.
   (below).
 - Blue carries why the draw got its slot (`StampReason`, as `reason/255`), read only by the
   Replay Coverage debug view. It stays below the 0.03 that marks a pixel unstamped.
-- Each stamp changes GX state after the material's display list has loaded it, so it sets every
-  field of the packed registers it touches: all of `genMode` (`set_gen_mode`: counts, and the
-  material's own cull mode, so the replay draws the same faces as the frame) and both stages of a
-  TEV-order pair. Aurora's GX API rebuilds those registers from its own copy, which display lists
-  do not update (`docs/mod-api-notes.md`).
+- Each stamp is a small display list (`StampList`), written the way J3D materials program the GPU,
+  sent after the material's display list has loaded it. It never goes through the GX API: aurora's
+  API keeps its own copy of the registers that pack several settings and rebuilds a whole register
+  from that copy when one setting changes, and display lists do not update the copy
+  (`docs/mod-api-notes.md`). The stamp sets every field of the packed registers it touches: all of
+  `genMode` (`put_gen_mode`: counts, and the material's own cull mode, so the replay draws the same
+  faces as the frame) and both stages of a TEV-order pair.
+- **The replay leaves no trace.** After a stamped draw, the post-hooks on `J3DMatPacket::draw` and
+  `dBgp_c::modelMaterial_c::drawSimple` re-issue the draw's own display lists
+  (`restore_packet_state`; the material's shared display list for a map unit) and switch its fog off
+  as the capture did, so each draw ends with the GPU as the same draw left it in the frame. The
+  replay draws the frame's own lists in the frame's order, so it ends with the state the opaque
+  world ended with, and nothing is reset afterwards. Ending it with `J3DSys::reinitGX` (as 2.0.0-g
+  did) left J3D defaults under everything the game drew later in the frame (a null texture in every
+  texture slot, alpha writes off, black ambient colours), and the held-back layers drawn right after
+  it lost their look: with Skip Unfogged on, the fake light shafts disappeared.
 - Some draws write nothing (`stamp_nothing`), so their pixels keep the ID of the surface whose depth
   the fog pass uses there: the barrier (below) and fog-off draws that write no depth. They use a
-  blend that keeps the destination rather than switching colour writes off, because J3D materials
-  reload the blend mode but not the colour-update switch.
+  blend that keeps the destination.
 - If the replay cannot run, the frame uses configuration 0 everywhere. The game's fog is already off
   for that frame, so this is the closest available result. The Status line shows `replay failed`.
 
@@ -344,10 +366,10 @@ The mod hooks eleven game functions, all of them required:
 | :-- | :-- |
 | `GXSetFog`, `GFSetFog` (pre) | Capture direct fog setters |
 | `J3DShape::drawFast` (pre) | Capture material fog; stamp the replay |
-| `dBgp_c::modelMaterial_c::drawSimple` (pre/post) | Bracket map-unit drawing |
+| `dBgp_c::modelMaterial_c::drawSimple` (pre/post) | Bracket map-unit drawing; restore a stamped replay draw's state |
 | `J3DMaterial`, `J3DPatchedMaterial`, `J3DLockedMaterial` `::loadSharedDL` (post) | Capture map-unit material fog; stamp the replay |
 | `dGrass_packet_c::draw`, `dFlower_packet_c::draw` (pre/post) | Record the grass and flower configuration |
-| `J3DMatPacket::draw` (pre) | Hold back see-through layers; skip them in the replay |
+| `J3DMatPacket::draw` (pre/post) | Hold back see-through layers; skip them in the replay; restore a stamped replay draw's state |
 | `dComIfGd_drawXluListBG` (pre) | Push the fog pass |
 
 `install_hooks` attempts all of them. If any fails to attach (a game build this mod was not compiled
@@ -415,8 +437,8 @@ count shows that a mechanism is present in the view, not that it is what a given
 | `fog-off` > 0, `no-Z` > 0 | Fog-off materials that write no depth. They write nothing in the replay; the surface behind them decides the fog |
 | A surface is blue in Replay Coverage | Its depth comes from something the replay does not draw (a particle, a shadow, a directly drawn packet); it takes the fallback configuration |
 | A surface the game leaves unfogged is fogged, and is not red with Skip Unfogged on | It is not a fog-off material the replay reaches: check whether it draws in the sky lists (black in the debug views) or through a path the capture does not see |
-| A surface disappears with See-Through Layers set to Hide | It is a held-back layer. Compare Draw After Fog with Draw In Place to see whether holding it back is the difference |
-| `see-through held back` rises with a surface in view | That surface is drawn after the fog pass with its own fog; a difference that remains with Draw After Fog is in how it is drawn late (state it inherited from the draws before it in the game's order) |
+| `see-through held back` rises with a surface in view | That surface is drawn after the fog pass with its own fog. A difference in its shading (not its fog) is state it inherited from the draws before it, which differ from the game's order: see the terrain-overlay exception in [See-through layers](#see-through-layers) |
+| A difference appears only with Skip Unfogged on | The replay runs in that frame; it must leave the GPU state as the opaque world left it (see the replay section) |
 | `additive` > 0 | Additive or subtractive blends that are not held back (map units, other paths) |
 | `replay failed` or `merged` | The frame fell back to configuration 0 in places |
 
@@ -435,6 +457,11 @@ count shows that a mechanism is present in the view, not that it is what a given
   Hold them back (`is_see_through_layer`) instead.
 - Held-back layers must be drawn in every frame they were held back: `draw_held_back_layers` runs
   from `on_xlu_list_bg_pre` whether or not the fog pass did.
+- Do not hold back an overlay that lies on the surface under it with the same fog: in place it is
+  exact, and drawn late it inherits other draws' state (`is_terrain_overlay`).
+- The replay must leave no trace: stamp with display lists, restore each stamped draw's own
+  display lists after it, and never reset GX state afterwards (no `J3DSys::reinitGX`, no GX API
+  calls on packed registers).
 - The uniform structs (`FogUniforms` 112 bytes, `MixedFogUniforms` 336 bytes, `FogRangeUniform`
   64 bytes) are mirrored in `fog.wgsl`; keep the `static_assert`s true.
 - After a pin bump, re-check every `DEFINE_HOOK` target by name in the new tree (see

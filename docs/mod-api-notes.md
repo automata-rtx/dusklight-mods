@@ -82,8 +82,15 @@ actually caused problems here. `CONTRIBUTING.md` has the short version.
   a single `GXSetNumTevStages`, `GXSetNumChans` or `GXSetTevOrder` puts back stale values for the
   register's other fields: a wrong cull mode, or a texture-coordinate count or stage order that no
   longer matches what the stages sample, which aurora rejects as a fatal error (`unhandled tcg src
-  21`). Set every field of such a register; Deferred Fog's `set_gen_mode` and
-  `stamp_no_fog_through_alpha` show how.
+  21`). The API calls also change the copy under the game's own later API calls. Write such state
+  as a display list instead, every field of each packed register, as Deferred Fog's stamps do
+  (`StampList`, `put_gen_mode`, `stamp_no_fog_through_alpha`).
+- **Leave no trace in a redraw of the game's lists.** State a redraw changes is inherited by
+  everything the game draws later in the frame. Undo each change after the draw it was for, by
+  re-issuing that draw's own display lists (Deferred Fog's `restore_packet_state`), and do not end
+  with `J3DSys::reinitGX`: it leaves J3D defaults (a null texture in all eight texture slots, alpha
+  writes off, black ambient colours, no fog) that the game never had there. Deferred Fog's
+  configuration-ID replay ending that way made held-back layers drawn after it lose their look.
 
 ## Config and UI
 

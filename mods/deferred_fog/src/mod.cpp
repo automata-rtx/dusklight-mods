@@ -11,11 +11,13 @@
 //                                 or a hook is missing.
 //   opaque world lists            the capture hooks record each draw's fog configuration and
 //                                 switch its fog off. See-through J3D materials (they blend, or
-//                                 write no depth) are held back instead (on_mat_packet_draw_pre).
+//                                 write no depth) are held back instead (on_mat_packet_draw_pre),
+//                                 except overlays on the terrain (is_terrain_overlay).
 //   GFX_STAGE_SCENE_AFTER_OPAQUE  on_scene_after_opaque closes the scope and arms the fog pass.
 //                                 When the frame used several configurations (or Skip Unfogged has
 //                                 fog-off draws to mark), it replays the opaque lists into a
-//                                 per-pixel configuration-ID buffer.
+//                                 per-pixel configuration-ID buffer, and leaves the GPU state as
+//                                 the opaque world left it.
 //   dComIfGd_drawXluListBG        on_xlu_list_bg_pre pushes the fog pass, then draws the held-back
 //                                 layers with their own fog, as the game composites them over a
 //                                 fogged image. mDoGph_Painter calls this function every frame
@@ -33,6 +35,7 @@
 #include "deferred_fog_service.h"
 #include "fog_math.h"
 
+#include "JSystem/J3DGraphAnimator/J3DModel.h"
 #include "JSystem/J3DGraphBase/J3DMaterial.h"
 #include "JSystem/J3DGraphBase/J3DPacket.h"
 #include "JSystem/J3DGraphBase/J3DShape.h"
@@ -45,6 +48,7 @@
 #include "dolphin/gx/GXAurora.h"
 #include "dolphin/gx/GXBump.h"
 #include "dolphin/gx/GXCull.h"
+#include "dolphin/gx/GXDispList.h"
 #include "dolphin/gx/GXGeometry.h"
 #include "dolphin/gx/GXGet.h"
 #include "dolphin/gx/GXLighting.h"
@@ -108,7 +112,6 @@ ConfigVarHandle g_cvarSkipUnfogged = 0;   // fogSkipUnfogged, default off
 ConfigVarHandle g_cvarDeferInSenses = 0;  // fogDeferInSenses, default off
 ConfigVarHandle g_cvarDebugView = 0;      // fogDebug, default 0
 ConfigVarHandle g_cvarLogConfigs = 0;     // fogLogConfigs, default off
-ConfigVarHandle g_cvarSeeThrough = 0;     // fogSeeThrough, default 0 (SeeThroughMode)
 
 int64_t get_int_option(ConfigVarHandle handle, int64_t fallback) {
     int64_t value = fallback;
@@ -392,14 +395,6 @@ bool g_quadArmed = false;        // SCENE_AFTER_OPAQUE .. dComIfGd_drawXluListBG
 bool g_replayActive = false;     // replay_config_ids is re-drawing the opaque lists
 bool g_skipUnfogged = false;     // fogSkipUnfogged, read once per frame
 uint32_t g_debugView = 0;        // fogDebug, read once per frame: 0 off, 1..3 the debug views
-
-// fogSeeThrough, read once per frame: what happens to see-through layers (is_see_through_layer).
-enum class SeeThroughMode : uint32_t {
-    AfterFog = 0,  // held back and drawn after the fog pass with their own fog
-    InPlace = 1,   // drawn where the game draws them, their fog captured like any other draw
-    Hidden = 2,    // held back and not drawn (diagnostic: shows which surfaces are held back)
-};
-SeeThroughMode g_seeThroughMode = SeeThroughMode::AfterFog;
 bool g_sensesExempt = false;
 bool g_wasSensesExempt = false;
 bool g_wasReplaying = false;
@@ -551,43 +546,129 @@ enum class StampReason : u8 {
     NoFogBlock = 4,      // no fog block; it inherits whatever fog was set last: slot 0
 };
 
-// The GX API keeps its own copy of some registers that pack several settings, and changing one
-// setting writes the whole copy back. A material's display list sets those registers without
-// updating the copy, so in the replay one setting changed through the API would put back stale
-// values for the others. For genMode (texture-coordinate, colour-channel, TEV-stage and
-// indirect-stage counts, and the cull mode) that meant the replay drew with another draw's cull
-// mode, and with a texture-coordinate count that might not cover what the material's stages
-// sample, which aurora rejects ("unhandled tcg src", a crash). Every genMode field is therefore set
-// here: the counts given, the rest as J3DMaterial::makeDisplayList sets them.
-void set_gen_mode(J3DMaterial* material, u8 colorChans, u8 tevStages) {
+// The stamps are written as small display lists, as J3D materials program the GPU, never through
+// GX API calls. The API keeps its own copy of registers that pack several settings (genMode, the
+// TEV-order pairs, the alpha combiner with its swap selection, the blend register) and rebuilds
+// the whole register from that copy when one setting changes; display lists write the registers
+// and leave the copy alone. Stamping through the API would combine our settings with stale ones
+// (another draw's cull mode, or a texture-coordinate count that does not cover what the stages
+// sample, which aurora rejects as a fatal error), and would leave the copy changed under the
+// game's own API calls for the rest of the frame.
+class StampList {
+public:
+    void bp(u32 regval) {
+        put8(0x61);  // GX_LOAD_BP_REG
+        put32(regval);
+    }
+    void bp_mask(u32 mask) { bp(0xFE000000u | (mask & 0x00FFFFFFu)); }
+    void xf(u16 addr, u32 value) {
+        put8(0x10);  // GX_LOAD_XF_REG, one value
+        put16(0);
+        put16(addr);
+        put32(value);
+    }
+    void call() {
+        while (m_size % 32 != 0) {
+            put8(0);  // GX_NOP
+        }
+        GXCallDisplayList(m_data, m_size);  // copied into the FIFO before it returns
+        m_size = 0;
+    }
+
+private:
+    void put8(u32 v) {
+        if (m_size < sizeof(m_data)) {
+            m_data[m_size++] = static_cast<u8>(v);
+        }
+    }
+    void put16(u32 v) {
+        put8(v >> 8);
+        put8(v);
+    }
+    void put32(u32 v) {
+        put16(v >> 16);
+        put16(v);
+    }
+    alignas(32) u8 m_data[256] = {};
+    u32 m_size = 0;
+};
+StampList g_stampList;
+
+// Set by every stamp; the post-hooks on J3DMatPacket::draw and dBgp_c::modelMaterial_c::drawSimple
+// then re-issue the material's own display lists (restore_packet_state), so the GPU state after a
+// stamped draw is what it was after the same draw in the frame.
+bool g_stampedInPacket = false;
+
+// genMode as J3DGDSetGenMode writes it (the same mask), with the material's own texture-coordinate
+// and indirect-stage counts and cull mode, so the replay draws the same faces as the frame; and the
+// XF colour-channel count, as J3DGDSetNumChans writes it.
+void put_gen_mode(StampList& dl, J3DMaterial* material, u32 colorChans, u32 tevStages) {
+    static constexpr u32 kCullToHw[4] = {0, 2, 1, 3};
     J3DTexGenBlock* texGen = material != nullptr ? material->getTexGenBlock() : nullptr;
     J3DIndBlock* ind = material != nullptr ? material->getIndBlock() : nullptr;
     J3DColorBlock* color = material != nullptr ? material->getColorBlock() : nullptr;
-    GXSetNumTexGens(static_cast<u8>(texGen != nullptr ? texGen->getTexGenNum() : 0));
-    GXSetNumChans(colorChans);
-    GXSetNumTevStages(tevStages);
-    GXSetNumIndStages(ind != nullptr ? ind->getIndTexStageNum() : 0);
-    GXSetCullMode(static_cast<GXCullMode>(color != nullptr ? color->getCullMode() : GX_CULL_BACK));
+    const u32 texGens = texGen != nullptr ? texGen->getTexGenNum() : 0;
+    const u32 indStages = ind != nullptr ? ind->getIndTexStageNum() : 0;
+    const u32 cull = color != nullptr ? color->getCullMode() : GX_CULL_BACK;
+    dl.bp_mask(0x07FC3F);
+    dl.bp(texGens | colorChans << 4 | (tevStages - 1) << 10 | kCullToHw[cull & 3] << 14 |
+          indStages << 16);
+    dl.xf(0x1009, colorChans);
+}
+
+// One half of a TEV-order register, as J3DGDSetTevOrder encodes it.
+u32 tev_order_half(u32 texCoord, u32 texMap, u32 channel) {
+    static constexpr u32 kChannelToHw[16] = {0, 1, 0, 1, 0, 1, 7, 5, 6, 0, 0, 0, 0, 0, 0, 7};
+    const u32 coord = texCoord >= GX_MAX_TEXCOORD ? GX_TEXCOORD0 : texCoord;
+    const u32 enable = (texMap & 0xFF) != GX_TEXMAP_NULL ? 1 : 0;
+    return (texMap & 7) | coord << 3 | enable << 6 | kChannelToHw[channel & 0xF] << 7;
+}
+
+// A stage that outputs colour argument `colorD` and alpha argument `alphaD` unchanged (a = b = c =
+// zero, add, no bias, scale 1, into PREV), with swap table 0 and no indirect texturing.
+void put_pass_stage(StampList& dl, u32 stage, u32 colorD, u32 alphaD, u32 alphaClamp) {
+    dl.bp((0xC0 + 2 * stage) << 24 | colorD | GX_CC_ZERO << 4 | GX_CC_ZERO << 8 |
+          GX_CC_ZERO << 12 | 1u << 19);
+    dl.bp((0xC1 + 2 * stage) << 24 | alphaD << 4 | GX_CA_ZERO << 7 | GX_CA_ZERO << 10 |
+          GX_CA_ZERO << 13 | alphaClamp << 19);
+    dl.bp((0x10 + stage) << 24);  // IND_CMD: direct
+}
+
+// The colour channel lit by nothing: material colour from its register (0x400 is GXSetChanCtrl's
+// encoding of lighting off, both sources from registers, no attenuation).
+constexpr u32 kUnlitChannel = 0x400;
+
+void put_mat_color(StampList& dl, GXColor c) {
+    dl.xf(0x100C, static_cast<u32>(c.r) << 24 | static_cast<u32>(c.g) << 16 |
+                      static_cast<u32>(c.b) << 8 | c.a);
+}
+
+// Blend register as J3DGDSetBlendMode writes it (the same mask: colour and alpha update are left
+// as they are).
+void put_blend(StampList& dl, bool blend, u32 srcFactor, u32 dstFactor) {
+    dl.bp_mask(0x00FFE3);
+    dl.bp(0x41u << 24 | (blend ? 1u : 0u) | dstFactor << 5 | srcFactor << 8 | GX_LO_COPY << 12);
+}
+
+void put_no_fog(StampList& dl) {
+    dl.bp(0xF1u << 24);  // fog type none
 }
 
 void stamp_replay_id(
     J3DMaterial* material, uint32_t slot, StampReason reason = StampReason::OwnConfig) {
-    const u8 red = slot_red(slot);
-    const auto blue = static_cast<u8>(reason);
-    GXSetColorUpdate(GX_TRUE);
-    set_gen_mode(material, 1, 1);
-    // Stage 0 is set in full: its swap and indirect settings live in registers the material's
-    // display list wrote and the API's copies do not track.
-    GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
-    GXSetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
-    GXSetTevSwapMode(GX_TEVSTAGE0, GX_TEV_SWAP0, GX_TEV_SWAP0);
-    GXSetTevDirect(GX_TEVSTAGE0);
-    GXSetChanCtrl(
-        GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
-    GXSetChanMatColor(GX_COLOR0A0, GXColor{red, 0, blue, 255});
-    GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_COPY);
-    GXSetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
-    GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, GXColor{0, 0, 0, 0});
+    StampList& dl = g_stampList;
+    put_gen_mode(dl, material, 1, 1);
+    dl.bp(0x28u << 24 | tev_order_half(GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0) |
+          tev_order_half(GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR_NULL) << 12);
+    put_pass_stage(dl, 0, GX_CC_RASC, GX_CA_RASA, 1);
+    dl.xf(0x100E, kUnlitChannel);  // COLOR0
+    dl.xf(0x1010, kUnlitChannel);  // ALPHA0
+    put_mat_color(dl, GXColor{slot_red(slot), 0, static_cast<u8>(reason), 255});
+    put_blend(dl, false, GX_BL_ONE, GX_BL_ZERO);
+    dl.bp(0xF3u << 24 | GX_ALWAYS << 16 | GX_ALWAYS << 19);  // alpha test passes everything
+    put_no_fog(dl);
+    dl.call();
+    g_stampedInPacket = true;
 }
 
 // Marks a fog-off, alpha-tested material with the no-fog slot where its alpha test passes, so only
@@ -596,44 +677,61 @@ void stamp_replay_id(
 // appends one stage that outputs the no-fog colour with the alpha the material's last stage wrote,
 // unchanged. The colour comes from channel COLOR0, switched to its material colour register. That
 // register is shared with ALPHA0, whose own setting is left as the material set it, so its alpha
-// keeps the material's value.
-//
-// TEV orders are stored in pairs (stages 0-1, 2-3, ...) and GXSetTevOrder writes the API's copy of
-// the pair, which the display list did not update. When the new stage is the second of a pair, the
-// material's last stage is therefore written first, from its TEV block, or the copy would replace
-// it with another draw's texture and coordinate.
+// keeps the material's value. TEV orders are stored in pairs, so a new stage that is the second of
+// a pair is written together with the material's last stage, from its TEV block.
 void stamp_no_fog_through_alpha(J3DMaterial* material, const AlphaMark& mark) {
-    const auto stage = static_cast<GXTevStageID>(GX_TEVSTAGE0 + mark.stageCount);
-    set_gen_mode(material, std::max<u8>(mark.colorChanCount, 1),
-        static_cast<u8>(mark.stageCount + 1));
-    GXSetChanCtrl(
-        GX_COLOR0, GX_DISABLE, GX_SRC_REG, GX_SRC_REG, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
-    GXSetChanMatColor(GX_COLOR0, GXColor{slot_red(kNoFogSlot), 0, 0, mark.matAlpha});
-    if ((mark.stageCount & 1) != 0) {
-        GXSetTevOrder(static_cast<GXTevStageID>(stage - 1),
-            static_cast<GXTexCoordID>(mark.lastOrder.mTexCoord),
-            static_cast<GXTexMapID>(mark.lastOrder.mTexMap),
-            static_cast<GXChannelID>(mark.lastOrder.mColorChan));
+    StampList& dl = g_stampList;
+    const u32 stage = mark.stageCount;
+    put_gen_mode(dl, material, std::max<u32>(mark.colorChanCount, 1), stage + 1);
+    const u32 mine = tev_order_half(GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+    if ((stage & 1) != 0) {
+        const u32 last = tev_order_half(
+            mark.lastOrder.mTexCoord, mark.lastOrder.mTexMap, mark.lastOrder.mColorChan);
+        dl.bp((0x28 + stage / 2) << 24 | last | mine << 12);
+    } else {
+        const u32 unused = tev_order_half(GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR_NULL);
+        dl.bp((0x28 + stage / 2) << 24 | mine | unused << 12);
     }
-    GXSetTevOrder(stage, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
-    GXSetTevDirect(stage);
-    GXSetTevSwapMode(stage, GX_TEV_SWAP0, GX_TEV_SWAP0);
-    GXSetTevColorIn(stage, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_RASC);
-    GXSetTevColorOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
-    GXSetTevAlphaIn(stage, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, mark.alphaSource);
-    GXSetTevAlphaOp(stage, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, mark.alphaClamp, GX_TEVPREV);
-    GXSetColorUpdate(GX_TRUE);
-    GXSetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_COPY);
-    GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, GXColor{0, 0, 0, 0});
+    put_pass_stage(dl, stage, GX_CC_RASC, mark.alphaSource, mark.alphaClamp ? 1 : 0);
+    dl.xf(0x100E, kUnlitChannel);  // COLOR0 only
+    put_mat_color(dl, GXColor{slot_red(kNoFogSlot), 0, 0, mark.matAlpha});
+    put_blend(dl, false, GX_BL_ONE, GX_BL_ZERO);
+    put_no_fog(dl);
+    dl.call();
+    g_stampedInPacket = true;
 }
 
-// Writes nothing for this draw, so its pixels keep the ID of the draw that owns their depth. Done
-// with a blend that keeps the destination rather than by switching colour writes off: every J3D
-// material reloads its blend mode but not the colour-update switch (J3DGDSetBlendMode masks it
-// out), so the state cannot outlive the draw into a following draw the hooks do not restamp.
+// Writes nothing for this draw, so its pixels keep the ID of the draw that owns their depth: a
+// blend that keeps the destination.
 void stamp_nothing() {
-    GXSetBlendMode(GX_BM_BLEND, GX_BL_ZERO, GX_BL_ONE, GX_LO_COPY);
-    GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, GXColor{0, 0, 0, 0});
+    StampList& dl = g_stampList;
+    put_blend(dl, true, GX_BL_ZERO, GX_BL_ONE);
+    put_no_fog(dl);
+    dl.call();
+    g_stampedInPacket = true;
+}
+
+// In the frame, a draw whose fog was captured ends with its fog switched off
+// (capture_material_fog); the restored replay draw ends the same way.
+void end_as_captured(J3DMaterial* material) {
+    FogConfig config;
+    if (material_fog(material, config) == MaterialFog::Live && !is_barrier_fog(config)) {
+        GXSetFog(GX_FOG_NONE, 0.0f, 0.0f, 0.0f, 0.0f, GXColor{0, 0, 0, 0});
+    }
+}
+
+// Re-issues a stamped packet's display lists in the order J3DMatPacket::draw issues them (the
+// material's, then each shape packet's), leaving the GPU as the same draw left it in the frame.
+void restore_packet_state(J3DMatPacket* packet) {
+    packet->callDL();
+    for (auto* shape = packet->getShapePacket(); shape != nullptr;
+         shape = static_cast<J3DShapePacket*>(shape->getNextPacket()))
+    {
+        if (shape->getDisplayListObj() != nullptr) {
+            shape->getDisplayListObj()->callDL();
+        }
+    }
+    end_as_captured(packet->getMaterial());
 }
 
 // Replay, one material draw: stamp its slot, the no-fog slot, or nothing.
@@ -697,7 +795,7 @@ bool draw_lists_ready() {
 
 // Re-draws the opaque lists into an offscreen pass with the game's camera, every shape forced to
 // its slot colour by the capture hooks (g_replayActive), and keeps the colour as this frame's
-// configuration-ID buffer. Restores the viewport, scissor and J3D state it changes.
+// configuration-ID buffer. Restores the viewport, scissor and J3D model it changes.
 bool replay_config_ids(uint32_t width, uint32_t height) {
     f32 viewport[6];
     GXGetViewportv(viewport);
@@ -711,20 +809,19 @@ bool replay_config_ids(uint32_t width, uint32_t height) {
     GXSetViewport(0.0f, 0.0f, static_cast<f32>(width), static_cast<f32>(height), 0.0f, 1.0f);
     GXSetViewportRender(0.0f, 0.0f, static_cast<f32>(width), static_cast<f32>(height), 0.0f, 1.0f);
     GXSetScissorRender(0, 0, width, height);
-    GXSetColorUpdate(GX_TRUE);
-    GXSetAlphaUpdate(GX_TRUE);
-    GXSetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
 
+    // The replay issues the frame's own draws in the frame's order, and every stamp is undone after
+    // its draw (restore_packet_state), so the GPU state it ends with is the state the opaque world
+    // ended with. Nothing is reset afterwards: J3DSys::reinitGX would leave J3D defaults (a null
+    // texture in every texture slot, alpha writes off, black ambient colours, no fog) under
+    // everything the game draws later in the frame.
     J3DModel* savedModel = j3dSys.getModel();
     j3dSys.setModel(nullptr);
     g_replayActive = true;
     draw_opaque_scene_lists();
     g_replayActive = false;
     j3dSys.setModel(savedModel);
-    j3dSys.reinitGX();
     J3DShape::resetVcdVatCache();
-    GXSetColorUpdate(GX_TRUE);
-    GXSetAlphaUpdate(GX_TRUE);
     GXSetViewport(viewport[0], viewport[1], viewport[2], viewport[3], viewport[4], viewport[5]);
     GXSetScissor(scissor[0], scissor[1], scissor[2], scissor[3]);
 
@@ -802,11 +899,26 @@ HookAction on_shape_draw_pre(ModContext*, void* args, void*, void*) {
 // material's own fog never reaches their geometry, and the GXSetFog hook captures what does.
 HookAction on_bgp_draw_simple_pre(ModContext*, void*, void*, void*) {
     g_inBgpMaterial = true;
+    g_stampedInPacket = false;
     return HOOK_CONTINUE;
 }
 
-void on_bgp_draw_simple_post(ModContext*, void*, void*, void*) {
+// After a stamped map-unit draw, re-issues the material's shared display list, the only state
+// drawSimple sends besides matrices and geometry. Called directly rather than through
+// loadSharedDL, which would also bind the textures again.
+void on_bgp_draw_simple_post(ModContext*, void* args, void*, void*) {
     g_inBgpMaterial = false;
+    if (!g_replayActive || !g_stampedInPacket) {
+        return;
+    }
+    g_stampedInPacket = false;
+    auto* unit = mods::arg<dBgp_c::modelMaterial_c*>(args, 0);
+    J3DMaterial* material = unit != nullptr ? unit->getMaterial() : nullptr;
+    J3DDisplayListObj* dl = material != nullptr ? material->getSharedDisplayListObj() : nullptr;
+    if (dl != nullptr && !j3dSys.checkFlag(2)) {
+        dl->callDL();
+        end_as_captured(material);
+    }
 }
 
 void on_material_shared_dl_post(ModContext*, void* args, void*, void*) {
@@ -839,18 +951,50 @@ bool was_held_back(const J3DMatPacket* packet) {
     return std::find(begin, end, packet) != end;
 }
 
+// The terrain materials dKy_bg_MAxx_proc treats as ground, by the polygon code at name positions
+// 3..6: MA00, MA01, MA04 and MA16, the materials that carry the cloud shadow (it writes the
+// cloud-shadow density into their TEV constant colour 1). While the camera is above water it turns
+// MA01 into an overlay that writes no depth (l_zmodeUpDisable), drawn over the terrain it lies on,
+// such as a road. An overlay on the surface below it, under the same room fog, needs no hold-back:
+// both layers have the same fog factor f, and a * fog(O) + (1 - a) * fog(G) == fog(a * O + (1 - a)
+// * G), so the fog pass fogs the composite as the game fogs each layer. Drawn after the fog pass
+// instead, the overlay would inherit whatever the last draw left in the state its material does
+// not set itself, not what the terrain draw before it left. GX light 1 is one: terrain materials
+// get their own lights in slots 0 and 2-7 (setLightTevColorType_MAJI_sub), and every room, map
+// unit and grass draw reloads slot 1 with its own room and light ratio (dKy_GlobalLight_set).
+bool is_terrain_overlay(J3DMatPacket* packet) {
+    J3DMaterial* material = packet->getMaterial();
+    J3DShapePacket* shape = packet->getShapePacket();
+    J3DModel* model = shape != nullptr ? shape->getModel() : nullptr;
+    J3DModelData* data = model != nullptr ? model->getModelData() : nullptr;
+    JUTNameTab* names = data != nullptr ? data->getMaterialName() : nullptr;
+    const char* name =
+        names != nullptr && material != nullptr ? names->getName(material->getIndex()) : nullptr;
+    if (name == nullptr || std::strlen(name) < 7) {
+        return false;
+    }
+    static constexpr const char* kGroundCodes[] = {"MA00", "MA01", "MA04", "MA16"};
+    for (const char* code : kGroundCodes) {
+        if (std::memcmp(name + 3, code, 4) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // J3DMatPacket::draw loads a material and draws every shape that uses it. Inside the scope, a
 // see-through layer's packet is recorded and skipped; draw_held_back_layers draws it after the fog
 // pass. The replay skips the same packets, so they take no part in which configuration the pixels
 // behind them get.
 HookAction on_mat_packet_draw_pre(ModContext*, void* args, void*, void*) {
-    if (g_drawingHeldBack || (!g_scopeActive && !g_replayActive) ||
-        g_seeThroughMode == SeeThroughMode::InPlace)
-    {
+    g_stampedInPacket = false;
+    if (g_drawingHeldBack || (!g_scopeActive && !g_replayActive)) {
         return HOOK_CONTINUE;
     }
     auto* packet = mods::arg<J3DMatPacket*>(args, 0);
-    if (packet == nullptr || !is_see_through_layer(packet->getMaterial())) {
+    if (packet == nullptr || !is_see_through_layer(packet->getMaterial()) ||
+        is_terrain_overlay(packet))
+    {
         return HOOK_CONTINUE;
     }
     if (g_replayActive) {
@@ -865,17 +1009,27 @@ HookAction on_mat_packet_draw_pre(ModContext*, void* args, void*, void*) {
     return HOOK_SKIP_ORIGINAL;
 }
 
+// After a stamped draw in the replay, re-issues the packet's display lists, so the next draw finds
+// the GPU as the same draw left it in the frame.
+void on_mat_packet_draw_post(ModContext*, void* args, void*, void*) {
+    if (!g_replayActive || !g_stampedInPacket) {
+        return;
+    }
+    g_stampedInPacket = false;
+    auto* packet = mods::arg<J3DMatPacket*>(args, 0);
+    if (packet != nullptr) {
+        restore_packet_state(packet);
+    }
+}
+
 // Draws the held-back layers in their original order, as drawOpaDrawList would. The scope is
 // closed, so each draws with its own fog over the fogged image, depth-tested against the opaque
-// world. The Hidden diagnostic drops them instead.
+// world.
 void draw_held_back_layers() {
     if (!g_heldBackPending) {
         return;
     }
     g_heldBackPending = false;
-    if (g_seeThroughMode == SeeThroughMode::Hidden) {
-        return;
-    }
     J3DShape::resetVcdVatCache();
     j3dSys.setDrawModeOpaTexEdge();
     g_drawingHeldBack = true;
@@ -1256,21 +1410,10 @@ void log_fog_configs() {
     }
 }
 
-const char* see_through_label() {
-    switch (g_seeThroughMode) {
-    case SeeThroughMode::InPlace:
-        return "held back (drawn in place)";
-    case SeeThroughMode::Hidden:
-        return "hidden";
-    default:
-        return "held back";
-    }
-}
-
 void update_status_line() {
     if (g_frameConfigCount == 0) {
         std::snprintf(g_statusText, sizeof(g_statusText),
-            "No fogged draws in view (%u see-through %s)", g_heldBackCount, see_through_label());
+            "No fogged draws in view (%u see-through held back)", g_heldBackCount);
         return;
     }
     char merged[32] = "";
@@ -1282,11 +1425,11 @@ void update_status_line() {
         std::snprintf(overflow, sizeof(overflow), " (+%u in place)", g_heldBackOverflow);
     }
     std::snprintf(g_statusText, sizeof(g_statusText),
-        "Deferring fog (%u draws, %u config%s%s%s; %u see-through %s%s; %u shared-DL, "
+        "Deferring fog (%u draws, %u config%s%s%s; %u see-through held back%s; %u shared-DL, "
         "%u fog-off (%u markable, %u by alpha/%u no-Z/%u unmarkable), %u additive/%u no-Z)",
         g_capturedDrawCount, g_frameConfigCount, g_frameConfigCount == 1 ? "" : "s", merged,
         needs_id_buffer() && g_configIdView == nullptr ? ", replay failed" : "", g_heldBackCount,
-        see_through_label(), overflow, g_sharedDlFogCount, g_fogOffCount, fog_off_markable(),
+        overflow, g_sharedDlFogCount, g_fogOffCount, fog_off_markable(),
         g_fogOffAlphaTested, g_fogOffNoDepth, g_fogOffUnmarkable, g_overUnityCount,
         g_overUnityNoDepth);
 }
@@ -1323,8 +1466,6 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
         return;
     }
     g_skipUnfogged = get_bool_option(g_cvarSkipUnfogged, false);
-    g_seeThroughMode = static_cast<SeeThroughMode>(
-        std::clamp<int64_t>(get_int_option(g_cvarSeeThrough, 0), 0, 2));
     g_debugView = static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0,
         static_cast<int64_t>(kDebugReplayCoverage)));
     g_sensesExempt = wolf_senses_active() && !get_bool_option(g_cvarDeferInSenses, false);
@@ -1503,22 +1644,6 @@ ModResult build_controls_tab(
         "markable draw.",
         g_cvarSkipUnfogged);
 
-    static const char* kSeeThroughModes[] = {"Draw After Fog", "Draw In Place", "Hide"};
-    UiControlDesc seeThrough = UI_CONTROL_DESC_INIT;
-    seeThrough.kind = UI_CONTROL_SELECT;
-    seeThrough.label = "See-Through Layers (diagnostic)";
-    seeThrough.help_rml =
-        "Model layers that blend with what is behind them or write no depth (domes, glows, "
-        "decals).<br/><b>Draw After Fog</b>: held back and drawn after the fog pass with their own "
-        "fog, as the game composites them over a fogged image.<br/><b>Draw In Place</b>: drawn "
-        "where the game draws them; the fog pass then fogs their pixels with whatever is behind "
-        "them.<br/><b>Hide</b>: held back and not drawn, to show which surfaces are held back.";
-    seeThrough.binding = UI_BINDING_CONFIG_VAR;
-    seeThrough.config_var = g_cvarSeeThrough;
-    seeThrough.options = kSeeThroughModes;
-    seeThrough.option_count = 3;
-    add_control(left, seeThrough);
-
     static const char* kDebugViews[] = {"Off", "Fog Factor", "Config IDs", "Replay Coverage"};
     UiControlDesc control = UI_CONTROL_DESC_INIT;
     control.kind = UI_CONTROL_SELECT;
@@ -1642,6 +1767,7 @@ void install_hooks() {
     require_pre<FlowerPacketDraw>(on_self_drawn_packet_pre, "dFlower_packet_c::draw");
     require_post<FlowerPacketDraw>(on_self_drawn_packet_post, "dFlower_packet_c::draw");
     require_pre<MatPacketDraw>(on_mat_packet_draw_pre, "J3DMatPacket::draw");
+    require_post<MatPacketDraw>(on_mat_packet_draw_post, "J3DMatPacket::draw");
     require_pre<XluListBGDraw>(on_xlu_list_bg_pre, "dComIfGd_drawXluListBG");
     g_hooksOk = g_missingHook == nullptr;
     if (!g_hooksOk) {
@@ -1678,8 +1804,7 @@ ModResult init(ModError* error) {
         register_bool("fogSkipUnfogged", false, g_cvarSkipUnfogged) != MOD_OK ||
         register_bool("fogDeferInSenses", false, g_cvarDeferInSenses) != MOD_OK ||
         register_int("fogDebug", 0, g_cvarDebugView) != MOD_OK ||
-        register_bool("fogLogConfigs", false, g_cvarLogConfigs) != MOD_OK ||
-        register_int("fogSeeThrough", 0, g_cvarSeeThrough) != MOD_OK)
+        register_bool("fogLogConfigs", false, g_cvarLogConfigs) != MOD_OK)
     {
         return mods::set_error(error, MOD_ERROR, "could not register options");
     }
@@ -1715,8 +1840,7 @@ void shutdown() {
     svc_resource->free(mod_ctx, &g_shaderSource);
     release_pipelines();
     g_cvarEnabled = g_cvarSkipUnfogged = g_cvarDeferInSenses = g_cvarDebugView = 0;
-    g_cvarLogConfigs = g_cvarSeeThrough = 0;
-    g_seeThroughMode = SeeThroughMode::AfterFog;
+    g_cvarLogConfigs = 0;
     g_drawType = g_sceneBeginHook = g_sceneAfterOpaqueHook = 0;
     g_controlsWindow = 0;
     g_hooksOk = false;
