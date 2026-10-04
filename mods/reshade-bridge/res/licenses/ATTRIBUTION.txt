@@ -1,0 +1,23 @@
+ReShade Bridge for Dusklight - provenance
+=========================================
+
+This release has two parts: the Dusklight mod (reshade_bridge.dusk) and a
+ReShade add-on (dusklight_reshade_bridge.addon64). Both are this project's own
+code. The add-on is compiled against two sets of third-party headers:
+
+ReShade add-on API headers
+--------------------------
+reshade.hpp, reshade_api*.hpp, reshade_events.hpp and reshade_overlay.hpp from
+ReShade (https://github.com/crosire/reshade, tag v6.8.0), copyright 2014
+Patrick Mours, available under the BSD 3-Clause license (reproduced in
+RESHADE-BSD-3.txt) or the MIT license, at the user's option.
+
+Dear ImGui headers
+------------------
+imgui.h and imconfig.h from Dear ImGui 1.92.5
+(https://github.com/ocornut/imgui), copyright 2014-2025 Omar Cornut, under the
+MIT license (reproduced in IMGUI-MIT.txt). The add-on draws its overlay tab
+through ReShade's own copy of Dear ImGui; no ImGui code is compiled into it.
+
+This project is not made by or affiliated with the ReShade project. ReShade
+itself and ReShade effects are not included; users install their own.

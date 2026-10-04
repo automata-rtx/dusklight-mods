@@ -46,24 +46,13 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/FetchDusklight.cmake")
 add_subdirectory("${DUSKLIGHT_DIR}/sdk" dusklight-sdk EXCLUDE_FROM_ALL)
 
 # Which mods build. CI packages whatever lands in build/mods, so this list is the release set.
-# No mod in it imports another, so order does not matter.
-add_subdirectory(mods/vbao)
-add_subdirectory(mods/smaa)
-add_subdirectory(mods/deferred_fog)
+#
+# This branch (claude/reshade-bridge-*) builds only the ReShade Bridge: the Dusklight mod
+# (reshade_bridge.dusk, game-linked) and, on Windows x64, its ReShade add-on
+# (dusklight_reshade_bridge.addon64), both from mods/reshade-bridge. The other mods' sources are
+# main's, untouched and not built here; build them from main.
+add_subdirectory(mods/reshade-bridge)
 
-# deferred_fog is game-linked: after any pin bump, re-check its ten DEFINE_HOOK targets by name in
-# the new tree and test it in-game; a clean compile does not prove the hooks resolve.
-
-# Unreleased mods, kept out of the build until ported to this platform (docs/unreleased/README.md):
-#   ssilvb, realtime_sun_shadows  still use the retired depth_to_normal service (their include path
-#                                 points at a graphics_hub/ directory that no longer exists); they
-#                                 need the gfx_normal_compat.h normals and the layout-key pipeline
-#                                 rebuild first.
-#   celestial_orbit, effect_remover
-#                                 game-linked; their hook targets have not been re-checked against
-#                                 this pin.
-# Re-enable them one at a time.
-# add_subdirectory(mods/celestial_orbit)
-# add_subdirectory(mods/ssilvb)
-# add_subdirectory(mods/realtime_sun_shadows)
-# add_subdirectory(mods/effect_remover)
+# reshade-bridge is game-linked: after any pin bump, re-check its DEFINE_HOOK target
+# (dComIfGd_drawXluListDark) by name in the new tree and test it in-game; a clean compile does not
+# prove the hook resolves.

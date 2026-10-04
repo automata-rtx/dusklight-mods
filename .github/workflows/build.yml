@@ -95,11 +95,14 @@ jobs:
       - name: Build
         run: cmake --build build --parallel
 
+      # The windows-amd64 leg also builds the ReShade Bridge's ReShade add-on (*.addon64).
       - name: Upload platform bundles
         uses: actions/upload-artifact@v7
         with:
           name: mods-${{matrix.platform}}
-          path: build/mods/*.dusk
+          path: |
+            build/mods/*.dusk
+            build/mods/*.addon64
           if-no-files-found: error
 
   combine:
@@ -135,15 +138,30 @@ jobs:
           done
           ls -l combined
 
+      # ReShade add-ons are Windows x64 only and ship as they are, next to the .dusk files.
+      - name: Collect ReShade add-ons
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          addons=(dist/mods-windows-amd64/*.addon64)
+          if [ -d mods/reshade-bridge ] && [ ${#addons[@]} -eq 0 ]; then
+            echo "::error::the windows-amd64 leg produced no ReShade add-on"
+            exit 1
+          fi
+          for addon in "${addons[@]}"; do cp "$addon" combined/; done
+          ls -l combined
+
       - name: Upload combined bundles
         uses: actions/upload-artifact@v7
         with:
           name: mods-combined
-          path: combined/*.dusk
+          path: |
+            combined/*.dusk
+            combined/*.addon64
           if-no-files-found: error
 
       - name: Attach to release (on tag)
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{github.token}}
-        run: gh release create "$GITHUB_REF_NAME" combined/*.dusk --verify-tag --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" combined/* --verify-tag --generate-notes
