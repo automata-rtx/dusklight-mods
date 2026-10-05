@@ -46,14 +46,12 @@
 #include "d/d_com_inf_game.h"
 #include "dolphin/gf/GFPixel.h"
 #include "dolphin/gx/GXAurora.h"
-#include "dolphin/gx/GXBump.h"
 #include "dolphin/gx/GXCull.h"
 #include "dolphin/gx/GXDispList.h"
-#include "dolphin/gx/GXGeometry.h"
+#include "dolphin/gx/GXEnum.h"
 #include "dolphin/gx/GXGet.h"
-#include "dolphin/gx/GXLighting.h"
 #include "dolphin/gx/GXPixel.h"
-#include "dolphin/gx/GXTev.h"
+#include "dolphin/gx/GXTransform.h"
 
 #include "gfx_scene_pass.h"
 #include "mods/service.hpp"
@@ -832,12 +830,12 @@ bool replay_config_ids(uint32_t width, uint32_t height) {
     // The viewport and scissor are restored only now, with the game's framebuffer current again.
     // Aurora maps a logical viewport to render pixels by the ratio of the current target to the
     // logical framebuffer (map_logical_viewport), and inside an offscreen pass it takes the target
-    // itself as the logical size (logical_fb_size), so the ratio is 1. A viewport restored before
-    // resolve_pass (which applies the queued GX commands while the pass is still current) left
-    // aurora's render viewport at the logical width, a fraction of the screen's. Every later draw
-    // with range-adjusted fog (the game enables it) then took its per-column fog factors from a
-    // table built for that width (build_fog_range_lut): every column right of it was fogged
-    // several times over, and the light shafts drawn after the replay vanished.
+    // itself as the logical size (logical_fb_size), so the ratio is 1. Restored before resolve_pass
+    // (which applies the queued GX commands while the pass is still current), the viewport would
+    // leave aurora's render width at the logical width, a fraction of the screen's, and every
+    // later draw with range-adjusted fog (the game enables it) would take its per-column fog
+    // factors from a table built for that width (build_fog_range_lut): every column right of it
+    // fogged several times over.
     GXSetViewport(viewport[0], viewport[1], viewport[2], viewport[3], viewport[4], viewport[5]);
     GXSetScissor(scissor[0], scissor[1], scissor[2], scissor[3]);
 

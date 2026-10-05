@@ -101,9 +101,9 @@ actually caused problems here. `CONTRIBUTING.md` has the short version.
   resumes with its own viewport), but anything aurora derives from the render viewport is wrong:
   line and point widths, the LOD bias of replacement textures, and the per-column table of
   range-adjusted fog (`build_fog_range_lut`), which then fogs every column right of the logical
-  width several times over. Deferred Fog's replay did this up to 2.0.0-h, and every range-fogged
-  draw after it was over-fogged on most of the screen (light shafts disappeared). Issue the restore
-  after `resolve_pass` returns.
+  width several times over. Deferred Fog's replay did this before 2.0, and every range-fogged draw
+  after it was over-fogged on most of the screen (light shafts disappeared). Issue the restore after
+  `resolve_pass` returns.
 
 ## Config and UI
 

@@ -6,7 +6,7 @@ ambient occlusion darken the surfaces *under* the fog instead of darkening the f
 | | |
 | :-- | :-- |
 | Mod id | `dev.automata.deferred_fog` (`mods/deferred_fog/`) |
-| Version | `2.0.0-i`, a test build (see `mods/deferred_fog/mod.json`) |
+| Version | `2.0.0-rc`, the 2.0 release candidate (see `mods/deferred_fog/mod.json`) |
 | Kind | **Game-linked**: includes game headers, calls game functions and hooks eleven of them. It must be built against the game build it runs on |
 | Game build | Dusklight `v2.0.0` |
 
@@ -99,8 +99,8 @@ clouds' (see [The sky](#the-sky)).
 
 Held-back see-through layers draw after the fog pass, so they appear over every debug view in their
 normal colours, as translucent geometry does. In every view, **red** pixels are ones Skip Unfogged
-leaves unfogged. If a debug view shows the normal
-scene, the fog pass did not draw this frame; an all-black view means it drew and computed no fog.
+leaves unfogged. If a debug view shows the normal scene, the fog pass did not draw this frame; an
+all-black view means it drew and computed no fog.
 
 ### Log messages
 
@@ -191,13 +191,13 @@ Unfogged would unfog what shows through it.
 So the mod holds such layers back. A J3D material that is depth-tested and either blends with what
 is behind it (`GX_BM_BLEND` or `GX_BM_SUBTRACT`) or writes no depth is a see-through layer
 (`is_see_through_layer`). One drawn without the depth test stays in place: drawn late, it would
-cover opaque geometry the game drew over it. Inside the scope, the pre-hook on `J3DMatPacket::draw`, which loads one
-material and draws every shape that uses it, records such a packet and skips it
+cover opaque geometry the game drew over it. Inside the scope, the pre-hook on `J3DMatPacket::draw`,
+which loads one material and draws every shape that uses it, records such a packet and skips it
 (`on_mat_packet_draw_pre`). After the fog pass, `draw_held_back_layers` draws the recorded packets
-in their original order. The scope is closed by then, so each draws with its own fog over the
-fogged image, depth-tested against the opaque world, as in the game. The replay skips the same
-packets, so they take no part in which configuration the pixels behind them get. The layers are
-drawn every frame they were held back, whether or not the fog pass ran.
+in their original order. The scope is closed by then, so each draws with its own fog over the fogged
+image, depth-tested against the opaque world, as in the game. The replay skips the same packets, so
+they take no part in which configuration the pixels behind them get. The layers are drawn every
+frame they were held back, whether or not the fog pass ran.
 
 **Overlays on the terrain stay in place** (`is_terrain_overlay`). The terrain materials
 `dKy_bg_MAxx_proc` treats as ground, by the polygon code at name positions 3..6 (`MA00`, `MA01`,
@@ -210,15 +210,14 @@ draw. Drawn late, a layer inherits whatever the draw before it left in the GPU s
 does not set itself, not what the terrain draw before it left. GX light 1 is one such piece of
 state: `setLightTevColorType_MAJI_sub` gives terrain materials their own lights in slots 0 and 2–7,
 never 1, and each room, map unit and grass draw reloads slot 1 with its own room and light ratio
-(`dKy_setLight_nowroom_common` → `dKy_GlobalLight_set`). In 2.0.0-f, which held the road back, it
-came out darker than in the game. That build also had the replay's viewport defect (below), which
-over-fogs late draws whenever the replay runs, so which of the two darkened the road was not
-measured. In the replay the overlay is drawn like any other material and stamps its own
-configuration, the same as the terrain's.
+(`dKy_setLight_nowroom_common` → `dKy_GlobalLight_set`). A test build that held the road back drew
+it darker than the game; it also had the replay's viewport defect (below), so which of the two
+darkened it was not measured. In the replay the overlay is drawn like any other material and stamps
+its own configuration, the same as the terrain's.
 
-The list holds 512 packets; a layer that does not fit is drawn in place, as before this mechanism
-(`+O in place` on the Status line). Map units (`dBgp_c`) and the self-drawing packets do not draw
-through `J3DMatPacket::draw` and are not held back.
+The list holds 512 packets; a layer that does not fit is drawn in place (`+O in place` on the Status
+line). Map units (`dBgp_c`) and the self-drawing packets do not draw through `J3DMatPacket::draw`
+and are not held back.
 
 ### The sky
 
@@ -272,22 +271,20 @@ pixel's configuration.
   (`restore_packet_state`; the material's shared display list for a map unit) and switch its fog off
   as the capture did, so each draw ends with the GPU as the same draw left it in the frame. The
   replay draws the frame's own lists in the frame's order, so it ends with the state the opaque
-  world ended with, and nothing is reset afterwards: `J3DSys::reinitGX` (used up to 2.0.0-g) would
-  leave J3D defaults (a null texture in every texture slot, alpha writes off, black ambient colours)
-  under everything the game draws later in the frame.
+  world ended with, and nothing is reset afterwards: `J3DSys::reinitGX` would leave J3D defaults (a
+  null texture in every texture slot, alpha writes off, black ambient colours) under everything the
+  game draws later in the frame.
 - **The viewport is restored after the offscreen pass has ended.** Aurora maps a logical viewport to
   render pixels by the ratio of the current target to the logical framebuffer
   (`map_logical_viewport`), and inside an offscreen pass it takes the target itself as the logical
   size (`logical_fb_size`), so the ratio is 1. GX calls are queued and applied when the next pass
   operation drains them, so a `GXSetViewport` issued before `resolve_pass` is applied while the
-  replay's pass is still current. Up to 2.0.0-h the replay did that, which left aurora's render
-  viewport at the logical width, a fraction of the screen's. Every later draw with range-adjusted
-  fog (the game enables it) then took its per-column fog factors from a table built for that width
-  (`build_fog_range_lut`): every column right of it was fogged several times over. That is why the
-  fake light shafts vanished with Skip Unfogged on: they draw after the replay, and in a
-  one-configuration frame only Skip Unfogged (or the Replay Coverage view) runs it. In frames with
-  several configurations the replay always runs, so every range-fogged draw after it was over-fogged
-  there with Skip Unfogged off as well.
+  replay's pass is still current. That leaves aurora's render viewport at the logical width, a
+  fraction of the screen's, and every later draw with range-adjusted fog (the game enables it) then
+  takes its per-column fog factors from a table built for that width (`build_fog_range_lut`): every
+  column right of it is fogged several times over. Before 2.0 the replay did exactly that, so
+  translucent effects drawn after it, such as the fake light shafts, were lost to fog on most of the
+  screen.
 - Some draws write nothing (`stamp_nothing`), so their pixels keep the ID of the surface whose depth
   the fog pass uses there: the barrier (below) and fog-off draws that write no depth. They use a
   blend that keeps the destination.
@@ -297,10 +294,10 @@ pixel's configuration.
 ### Skip Unfogged
 
 A material's fog block can have type 0 (`GX_FOG_NONE`): the game then draws it with no fog at any
-distance, while the fog pass would fog it like everything else. With Skip Unfogged on (off by default; experimental),
-the replay writes the no-fog mark (red 216) for such a material instead of a configuration, and the
-fog pass leaves the marked pixels alone. A frame with a markable fog-off draw runs the replay even
-with one configuration.
+distance, while the fog pass would fog it like everything else. With Skip Unfogged on (off by
+default; experimental), the replay writes the no-fog mark (red 216) for such a material instead of a
+configuration, and the fog pass leaves the marked pixels alone. A frame with a markable fog-off draw
+runs the replay even with one configuration.
 
 - Only a material that writes its own depth is marked. A J3D material that writes none, or blends,
   is a see-through layer and is held back (above), so it keeps its own fog-off look over the fogged
@@ -396,11 +393,11 @@ its own fog. The log names each missing hook and the Status line names the first
 `deferring` field is true when the frame armed the fog pass at `SCENE_AFTER_OPAQUE`. Before that
 stage in a frame it holds the previous frame's value, and it stays true if the depth snapshot then
 fails. It is false while the mod is off, inactive or leaving Wolf Senses to the game, in a frame
-whose sky-depth snapshot failed, and in a frame with no fogged draws. A mod that composites at `SCENE_AFTER_OPAQUE` is
-already under the fog without importing it, and an overlay that must sit on top of the fog can draw
-at `GFX_STAGE_FRAME_AFTER_HUD`. Importing the service only matters for ordering inside one stage:
-hooks on a stage run in registration order, which follows load order, and an import makes the
-importer load later. Nothing imports it today.
+whose sky-depth snapshot failed, and in a frame with no fogged draws. A mod that composites at
+`SCENE_AFTER_OPAQUE` is already under the fog without importing it, and an overlay that must sit on
+top of the fog can draw at `GFX_STAGE_FRAME_AFTER_HUD`. Importing the service only matters for
+ordering inside one stage: hooks on a stage run in registration order, which follows load order, and
+an import makes the importer load later. Nothing imports it today.
 
 ## Limitations
 
@@ -410,9 +407,8 @@ What one fullscreen pass over the finished opaque image cannot reproduce exactly
   writes depth therefore no longer hides opaque geometry the game drew behind it later in the
   frame; that geometry now shows through it.
 - **See-through surfaces that are not held back** (map units, self-drawing packets, layers drawn
-  without the depth test): the game fogs
-  each fragment at its own depth before blending, the fog pass fogs each pixel once at the depth
-  the depth buffer holds.
+  without the depth test): the game fogs each fragment at its own depth before blending, the fog
+  pass fogs each pixel once at the depth the depth buffer holds.
   - A see-through surface that writes depth fogs what is behind it at its own, nearer, depth.
   - A surface that writes no depth is fogged at the depth of what is behind it, and over the sky
     not at all.

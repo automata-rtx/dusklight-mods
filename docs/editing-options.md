@@ -110,10 +110,9 @@ mods/<mod>/res/banner.png
 ```
 
 Those are the paths the loader looks for by default. To use other names, set `"icon"` / `"banner"`
-in `mod.json` to a path inside the bundle. VBAO does this. Deferred Fog ships
-`res/Deferred Fog Logo.png` and `res/Deferred Fog Banner.png`, and SMAA ships `res/SMAA Logo.png`,
-but neither sets `icon` or `banner`, so they currently show none. Anything under `res/` is packaged
-automatically.
+in `mod.json` to a path inside the bundle. VBAO and Deferred Fog do this (`res/<Mod> Logo.png` and
+`res/<Mod> Banner.png`). SMAA ships `res/SMAA Logo.png` but does not set `icon`, so it currently
+shows none. Anything under `res/` is packaged automatically.
 
 ---
 
