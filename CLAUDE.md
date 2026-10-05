@@ -59,15 +59,18 @@ and `docs/authored_normals.md` (the normal buffer), `docs/japanese-naming.md` (g
   with their own fog). Whatever is held back must be drawn that frame; `draw_held_back_layers` runs
   from `on_xlu_list_bg_pre` unconditionally. Overlays on the terrain (`MA00`/`MA01`/`MA04`/`MA16`,
   `is_terrain_overlay`) stay in place: there the fog pass is exact, and drawn late they inherit
-  other draws' state (GX light 1) and came out darker.
+  other draws' state (GX light 1).
 - **The replay overrides GX state after a material's display list has loaded it.** Stamp with
   display lists, never the GX API, and set every field of a packed GX register (`put_gen_mode`,
   both stages of a TEV-order pair): aurora's API rebuilds the register from its own copy, which
   display lists do not update, and a stale field crashed the game (`docs/mod-api-notes.md`,
   "Changing GX state on top of a display list").
 - **The replay leaves no trace.** Each stamped draw's own display lists are re-issued after it
-  (`restore_packet_state`), and nothing is reset at the end: `J3DSys::reinitGX` there made the
-  held-back light shafts vanish with Skip Unfogged on.
+  (`restore_packet_state`), nothing is reset at the end (no `J3DSys::reinitGX`), and the GX viewport
+  is restored only after `resolve_pass` has ended the offscreen pass. Restored inside it, aurora
+  kept the logical width as its render width, and every later range-fogged draw was fully fogged
+  right of it: the held-back light shafts vanished with Skip Unfogged on
+  (`docs/mod-api-notes.md`, "Restore the GX viewport only after an offscreen pass has ended").
 - **For a visual difference from vanilla, get per-pixel evidence before proposing a cause** (the Fog
   Factor, Config IDs and Replay Coverage debug views). A per-frame Status count shows that a mechanism is *present*
   in the view, not that it is what the view *looks like*. Method: `docs/deferred_fog.md`

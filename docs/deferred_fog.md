@@ -6,7 +6,7 @@ ambient occlusion darken the surfaces *under* the fog instead of darkening the f
 | | |
 | :-- | :-- |
 | Mod id | `dev.automata.deferred_fog` (`mods/deferred_fog/`) |
-| Version | `2.0.0-h`, a test build (see `mods/deferred_fog/mod.json`) |
+| Version | `2.0.0-i`, a test build (see `mods/deferred_fog/mod.json`) |
 | Kind | **Game-linked**: includes game headers, calls game functions and hooks eleven of them. It must be built against the game build it runs on |
 | Game build | Dusklight `v2.0.0` |
 
@@ -199,20 +199,22 @@ fogged image, depth-tested against the opaque world, as in the game. The replay 
 packets, so they take no part in which configuration the pixels behind them get. The layers are
 drawn every frame they were held back, whether or not the fog pass ran.
 
-**Overlays on the terrain stay in place** (`is_terrain_overlay`). A layer drawn late inherits
-whatever the draw before it left in the GPU state its material does not set itself, which in the
-game's order is the state the terrain draw before it left. GX light 1 is one such piece of state:
-`setLightTevColorType_MAJI_sub` gives terrain materials their own lights in slots 0 and 2–7, never
-1. Slot 1 holds the effect light nearest the camera, loaded globally (`dKy_setLight_nowroom_common`
-→ `dKy_GlobalLight_set`) by each room, map unit and grass draw with its own room and light ratio.
-Held back, a road drawn over the terrain came out darker than in the game. The terrain materials
+**Overlays on the terrain stay in place** (`is_terrain_overlay`). The terrain materials
 `dKy_bg_MAxx_proc` treats as ground, by the polygon code at name positions 3..6 (`MA00`, `MA01`,
-`MA04`, `MA16`: the materials that carry the cloud shadow), are therefore never held back. While the
-camera is above water it turns `MA01` into an overlay that writes no depth (`l_zmodeUpDisable`).
-Such an overlay lies on the terrain under it, under the same room fog, so both layers have the same
-fog factor *f* and `a·fog(O) + (1 − a)·fog(G) = fog(a·O + (1 − a)·G)`: the fog pass fogs the
-composite exactly as the game fogs each layer. In the replay it is drawn like any other material and
-stamps its own configuration, the same as the terrain's.
+`MA04`, `MA16`: the materials that carry the cloud shadow), are never held back. While the camera is
+above water it turns `MA01` into an overlay that writes no depth (`l_zmodeUpDisable`), such as a
+road over the ground. Such an overlay lies on the terrain under it, under the same room fog, so both
+layers have the same fog factor *f* and `a·fog(O) + (1 − a)·fog(G) = fog(a·O + (1 − a)·G)`: the fog
+pass fogs the composite exactly as the game fogs each layer, and nothing about it needs the late
+draw. Drawn late, a layer inherits whatever the draw before it left in the GPU state its material
+does not set itself, not what the terrain draw before it left. GX light 1 is one such piece of
+state: `setLightTevColorType_MAJI_sub` gives terrain materials their own lights in slots 0 and 2–7,
+never 1, and each room, map unit and grass draw reloads slot 1 with its own room and light ratio
+(`dKy_setLight_nowroom_common` → `dKy_GlobalLight_set`). In 2.0.0-f, which held the road back, it
+came out darker than in the game. That build also had the replay's viewport defect (below), which
+over-fogs late draws whenever the replay runs, so which of the two darkened the road was not
+measured. In the replay the overlay is drawn like any other material and stamps its own
+configuration, the same as the terrain's.
 
 The list holds 512 packets; a layer that does not fit is drawn in place, as before this mechanism
 (`+O in place` on the Status line). Map units (`dBgp_c`) and the self-drawing packets do not draw
@@ -270,10 +272,22 @@ pixel's configuration.
   (`restore_packet_state`; the material's shared display list for a map unit) and switch its fog off
   as the capture did, so each draw ends with the GPU as the same draw left it in the frame. The
   replay draws the frame's own lists in the frame's order, so it ends with the state the opaque
-  world ended with, and nothing is reset afterwards. Ending it with `J3DSys::reinitGX` (as 2.0.0-g
-  did) left J3D defaults under everything the game drew later in the frame (a null texture in every
-  texture slot, alpha writes off, black ambient colours), and the held-back layers drawn right after
-  it lost their look: with Skip Unfogged on, the fake light shafts disappeared.
+  world ended with, and nothing is reset afterwards: `J3DSys::reinitGX` (used up to 2.0.0-g) would
+  leave J3D defaults (a null texture in every texture slot, alpha writes off, black ambient colours)
+  under everything the game draws later in the frame.
+- **The viewport is restored after the offscreen pass has ended.** Aurora maps a logical viewport to
+  render pixels by the ratio of the current target to the logical framebuffer
+  (`map_logical_viewport`), and inside an offscreen pass it takes the target itself as the logical
+  size (`logical_fb_size`), so the ratio is 1. GX calls are queued and applied when the next pass
+  operation drains them, so a `GXSetViewport` issued before `resolve_pass` is applied while the
+  replay's pass is still current. Up to 2.0.0-h the replay did that, which left aurora's render
+  viewport at the logical width, a fraction of the screen's. Every later draw with range-adjusted
+  fog (the game enables it) then took its per-column fog factors from a table built for that width
+  (`build_fog_range_lut`): every column right of it was fogged several times over. That is why the
+  fake light shafts vanished with Skip Unfogged on: they draw after the replay, and in a
+  one-configuration frame only Skip Unfogged (or the Replay Coverage view) runs it. In frames with
+  several configurations the replay always runs, so every range-fogged draw after it was over-fogged
+  there with Skip Unfogged off as well.
 - Some draws write nothing (`stamp_nothing`), so their pixels keep the ID of the surface whose depth
   the fog pass uses there: the barrier (below) and fog-off draws that write no depth. They use a
   blend that keeps the destination.
@@ -438,7 +452,7 @@ count shows that a mechanism is present in the view, not that it is what a given
 | A surface is blue in Replay Coverage | Its depth comes from something the replay does not draw (a particle, a shadow, a directly drawn packet); it takes the fallback configuration |
 | A surface the game leaves unfogged is fogged, and is not red with Skip Unfogged on | It is not a fog-off material the replay reaches: check whether it draws in the sky lists (black in the debug views) or through a path the capture does not see |
 | `see-through held back` rises with a surface in view | That surface is drawn after the fog pass with its own fog. A difference in its shading (not its fog) is state it inherited from the draws before it, which differ from the game's order: see the terrain-overlay exception in [See-through layers](#see-through-layers) |
-| A difference appears only with Skip Unfogged on | The replay runs in that frame; it must leave the GPU state as the opaque world left it (see the replay section) |
+| A difference appears only with Skip Unfogged on | The replay runs in that frame; it must leave the GPU state, and aurora's viewport, as the opaque world left them (see the replay section) |
 | `additive` > 0 | Additive or subtractive blends that are not held back (map units, other paths) |
 | `replay failed` or `merged` | The frame fell back to configuration 0 in places |
 
@@ -462,6 +476,8 @@ count shows that a mechanism is present in the view, not that it is what a given
 - The replay must leave no trace: stamp with display lists, restore each stamped draw's own
   display lists after it, and never reset GX state afterwards (no `J3DSys::reinitGX`, no GX API
   calls on packed registers).
+- Restore the GX viewport and scissor only after `resolve_pass` has ended the replay's offscreen
+  pass, never inside it.
 - The uniform structs (`FogUniforms` 112 bytes, `MixedFogUniforms` 336 bytes, `FogRangeUniform`
   64 bytes) are mirrored in `fog.wgsl`; keep the `static_assert`s true.
 - After a pin bump, re-check every `DEFINE_HOOK` target by name in the new tree (see

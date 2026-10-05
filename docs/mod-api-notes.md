@@ -89,8 +89,21 @@ actually caused problems here. `CONTRIBUTING.md` has the short version.
   everything the game draws later in the frame. Undo each change after the draw it was for, by
   re-issuing that draw's own display lists (Deferred Fog's `restore_packet_state`), and do not end
   with `J3DSys::reinitGX`: it leaves J3D defaults (a null texture in all eight texture slots, alpha
-  writes off, black ambient colours, no fog) that the game never had there. Deferred Fog's
-  configuration-ID replay ending that way made held-back layers drawn after it lose their look.
+  writes off, black ambient colours, no fog) that the game never had there.
+- **Restore the GX viewport only after an offscreen pass has ended.** GX calls are queued and
+  applied when the next pass operation (`create_pass`, `resolve_pass`, `push_draw`) drains them.
+  Aurora maps a logical viewport to render pixels by the ratio of the current target to the logical
+  framebuffer (`map_logical_viewport`), and inside an offscreen pass it takes the target itself as
+  the logical size (`logical_fb_size`), so the ratio is 1. A `GXSetViewport` issued before the
+  `resolve_pass` that ends a mod's offscreen pass is therefore applied inside it, and leaves
+  aurora's render viewport at the logical width, a fraction of the screen's, until the game next
+  sets a different viewport. The game's own draws keep rasterising correctly (the framebuffer pass
+  resumes with its own viewport), but anything aurora derives from the render viewport is wrong:
+  line and point widths, the LOD bias of replacement textures, and the per-column table of
+  range-adjusted fog (`build_fog_range_lut`), which then fogs every column right of the logical
+  width several times over. Deferred Fog's replay did this up to 2.0.0-h, and every range-fogged
+  draw after it was over-fogged on most of the screen (light shafts disappeared). Issue the restore
+  after `resolve_pass` returns.
 
 ## Config and UI
 

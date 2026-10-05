@@ -822,14 +822,26 @@ bool replay_config_ids(uint32_t width, uint32_t height) {
     g_replayActive = false;
     j3dSys.setModel(savedModel);
     J3DShape::resetVcdVatCache();
-    GXSetViewport(viewport[0], viewport[1], viewport[2], viewport[3], viewport[4], viewport[5]);
-    GXSetScissor(scissor[0], scissor[1], scissor[2], scissor[3]);
 
     GfxResolveDesc desc = GFX_RESOLVE_DESC_INIT;
     desc.color = true;
     desc.depth = false;
     GfxResolvedTargets resolved = GFX_RESOLVED_TARGETS_INIT;
-    if (svc_gfx->resolve_pass(mod_ctx, &desc, &resolved) != MOD_OK) {
+    const bool resolvedOk = svc_gfx->resolve_pass(mod_ctx, &desc, &resolved) == MOD_OK;
+
+    // The viewport and scissor are restored only now, with the game's framebuffer current again.
+    // Aurora maps a logical viewport to render pixels by the ratio of the current target to the
+    // logical framebuffer (map_logical_viewport), and inside an offscreen pass it takes the target
+    // itself as the logical size (logical_fb_size), so the ratio is 1. A viewport restored before
+    // resolve_pass (which applies the queued GX commands while the pass is still current) left
+    // aurora's render viewport at the logical width, a fraction of the screen's. Every later draw
+    // with range-adjusted fog (the game enables it) then took its per-column fog factors from a
+    // table built for that width (build_fog_range_lut): every column right of it was fogged
+    // several times over, and the light shafts drawn after the replay vanished.
+    GXSetViewport(viewport[0], viewport[1], viewport[2], viewport[3], viewport[4], viewport[5]);
+    GXSetScissor(scissor[0], scissor[1], scissor[2], scissor[3]);
+
+    if (!resolvedOk) {
         return false;
     }
     g_configIdView = resolved.color;
