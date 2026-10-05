@@ -105,11 +105,16 @@ DEFINE_HOOK(dComIfGd_drawXluListBG, XluListBGDraw);
 // Options
 // ---------------------------------------------------------------------------------------------
 
+// The released UI is three toggles: Enabled, Skip Unfogged Geometry and Enable Exceptions. The
+// diagnostics (the Status line, the debug views and the diagnostic log lines, with the window
+// that holds them) stay in the code but are not registered or shown; true brings them back.
+constexpr bool kShowDiagnostics = false;
+
 ConfigVarHandle g_cvarEnabled = 0;        // fogEnabled, default on
-ConfigVarHandle g_cvarSkipUnfogged = 0;   // fogSkipUnfogged, default off
-ConfigVarHandle g_cvarDeferInSenses = 0;  // fogDeferInSenses, default off
-ConfigVarHandle g_cvarDebugView = 0;      // fogDebug, default 0
-ConfigVarHandle g_cvarLogConfigs = 0;     // fogLogConfigs, default off
+ConfigVarHandle g_cvarSkipUnfogged = 0;   // fogSkipUnfogged, default on
+ConfigVarHandle g_cvarExceptions = 0;     // fogExceptions, default on
+ConfigVarHandle g_cvarDebugView = 0;      // fogDebug, default 0 (kShowDiagnostics only)
+ConfigVarHandle g_cvarLogConfigs = 0;     // fogLogConfigs, default off (kShowDiagnostics only)
 
 int64_t get_int_option(ConfigVarHandle handle, int64_t fallback) {
     int64_t value = fallback;
@@ -125,6 +130,12 @@ bool get_bool_option(ConfigVarHandle handle, bool fallback) {
         return fallback;
     }
     return value;
+}
+
+// Whether to write the diagnostic log lines (fogLogConfigs, registered only with
+// kShowDiagnostics). Failures and the missing-hook errors are logged regardless.
+bool diagnostic_logging() {
+    return get_bool_option(g_cvarLogConfigs, false);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -468,8 +479,8 @@ bool needs_id_buffer() {
 // composite such as AO gives the same image under the game's fog as under this mod's:
 // m * (1 - f) * x == (1 - f) * (m * x). The mod therefore leaves senses fog to the game, which also
 // avoids the fog pass's one-depth-per-pixel limits where the fog reaches black within a short
-// range. checkNowWolfPowerUp() is the game's own test for the senses fog; it reads the player, so
-// the player is checked first.
+// range. This is the exception Enable Exceptions (fogExceptions) controls. checkNowWolfPowerUp() is
+// the game's own test for the senses fog; it reads the player, so the player is checked first.
 bool wolf_senses_active() {
     return dComIfGp_getLinkPlayer() != nullptr && daPy_py_c::checkNowWolfPowerUp();
 }
@@ -1383,7 +1394,7 @@ void push_fog_quad() {
 char g_lastLogSignature[256] = "";
 
 void log_fog_configs() {
-    if (!get_bool_option(g_cvarLogConfigs, false)) {
+    if (!diagnostic_logging()) {
         g_lastLogSignature[0] = '\0';
         return;
     }
@@ -1475,13 +1486,15 @@ void on_scene_begin(ModContext*, const GfxStageContext*, void*) {
         std::snprintf(g_statusText, sizeof(g_statusText), "Off: the game's own fog is used");
         return;
     }
-    g_skipUnfogged = get_bool_option(g_cvarSkipUnfogged, false);
+    g_skipUnfogged = get_bool_option(g_cvarSkipUnfogged, true);
     g_debugView = static_cast<uint32_t>(std::clamp<int64_t>(get_int_option(g_cvarDebugView, 0), 0,
         static_cast<int64_t>(kDebugReplayCoverage)));
-    g_sensesExempt = wolf_senses_active() && !get_bool_option(g_cvarDeferInSenses, false);
+    g_sensesExempt = wolf_senses_active() && get_bool_option(g_cvarExceptions, true);
     if (g_sensesExempt != g_wasSensesExempt) {
-        svc_log->info(mod_ctx, g_sensesExempt ? "Wolf Senses: the game's own fog is used"
-                                              : "Wolf Senses over: deferring fog");
+        if (diagnostic_logging()) {
+            svc_log->info(mod_ctx, g_sensesExempt ? "Wolf Senses: the game's own fog is used"
+                                                  : "Wolf Senses over: deferring fog");
+        }
         g_wasSensesExempt = g_sensesExempt;
     }
     if (g_sensesExempt) {
@@ -1554,7 +1567,7 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
     }
 
     const bool replaying = g_quadArmed && needs_id_buffer();
-    if (replaying != g_wasReplaying) {
+    if (replaying != g_wasReplaying && diagnostic_logging()) {
         char line[128];
         if (replaying) {
             std::snprintf(line, sizeof(line),
@@ -1564,8 +1577,8 @@ void on_scene_after_opaque(ModContext*, const GfxStageContext*, void*) {
             std::snprintf(line, sizeof(line), "per-pixel replay off");
         }
         svc_log->info(mod_ctx, line);
-        g_wasReplaying = replaying;
     }
+    g_wasReplaying = replaying;
 
     update_status_line();
     log_fog_configs();
@@ -1638,22 +1651,18 @@ void add_status_line(UiElementHandle parent) {
     add_control(parent, control);
 }
 
+constexpr const char* kSkipUnfoggedHelp =
+    "The game draws some surfaces with fog switched off, so they keep their own colour at any "
+    "distance. On: they stay unfogged, as the game draws them. Off: they are fogged like "
+    "everything else. Costs one extra pass over the world's geometry in frames that have such "
+    "surfaces.";
+
+constexpr const char* kExceptionsHelp =
+    "Enables exceptions to the mod's functionality where deemed necessary. Leave this on.";
+
+// The diagnostics window (kShowDiagnostics): the debug views and the diagnostic log lines.
 ModResult build_controls_tab(
     ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle, void*, ModError*) {
-    add_toggle(left, "Enabled", kEnabledHelp, g_cvarEnabled);
-
-    add_toggle(left, "Skip Unfogged Geometry (experimental)",
-        "The game draws some materials with fog switched off, so they keep their own colour at any "
-        "distance. The fog pass cannot tell that from depth, so with this on those surfaces are "
-        "marked in a per-pixel buffer and left unfogged, as the game draws them. Off: they are "
-        "fogged like everything else. Experimental: it has left surfaces unfogged that the game "
-        "fogs.<br/>A surface can be marked if it writes its own depth: the "
-        "Status line's <i>markable</i> count shows how many draws in view qualify. An alpha-tested "
-        "one is marked through its own alpha, so only its visible part is marked.<br/>Runs the "
-        "per-pixel replay, one extra pass over the world's geometry, in every frame with a "
-        "markable draw.",
-        g_cvarSkipUnfogged);
-
     static const char* kDebugViews[] = {"Off", "Fog Factor", "Config IDs", "Replay Coverage"};
     UiControlDesc control = UI_CONTROL_DESC_INIT;
     control.kind = UI_CONTROL_SELECT;
@@ -1678,19 +1687,12 @@ ModResult build_controls_tab(
     control.option_count = 4;
     add_control(left, control);
 
-    add_toggle(left, "Log Fog Configs",
+    add_toggle(left, "Log Diagnostics",
         "Writes the fog configurations in view to the log (each one's type, colour, and start, "
         "end, near and far distances) when their number, a start or end distance, or the main "
-        "configuration's type or colour changes.",
+        "configuration's type or colour changes, and notes when the per-pixel replay starts or "
+        "stops and when Wolf Senses starts or ends.",
         g_cvarLogConfigs);
-
-    add_toggle(left, "Defer Fog During Wolf Senses (diagnostic)",
-        "Leave off for play. During Wolf Senses the game uses a short black fog. Taking it over "
-        "gains nothing, because black fog darkens other mods' effects and the scenery alike, so "
-        "the mod leaves it to the game. This makes the mod take it over anyway, for examination "
-        "with the Debug View; the result can then differ from the game's own look wherever the fog "
-        "pass's one depth per pixel does not match the surface.",
-        g_cvarDeferInSenses);
     return MOD_OK;
 }
 
@@ -1703,27 +1705,32 @@ void on_open_controls(ModContext*, void*) {
         return;
     }
     UiTabDesc tabs[1] = {UI_TAB_DESC_INIT};
-    tabs[0].title = "Deferred Fog";
+    tabs[0].title = "Deferred Fog Diagnostics";
     tabs[0].build = build_controls_tab;
     UiWindowDesc desc = UI_WINDOW_DESC_INIT;
     desc.tabs = tabs;
     desc.tab_count = 1;
     desc.on_closed = on_controls_window_closed;
     if (svc_ui->window_push(mod_ctx, &desc, &g_controlsWindow) != MOD_OK) {
-        svc_log->error(mod_ctx, "could not open the Deferred Fog controls window");
+        svc_log->error(mod_ctx, "could not open the Deferred Fog diagnostics window");
     }
 }
 
-// The mod's section in the shared Mods panel: Enabled, Status and a button for the controls window.
+// The mod's section in the shared Mods panel: its three options, and with kShowDiagnostics the
+// Status line and a button for the diagnostics window.
 ModResult build_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     svc_ui->pane_add_section(mod_ctx, panel, "Deferred Fog");
     add_toggle(panel, "Enabled", kEnabledHelp, g_cvarEnabled);
-    add_status_line(panel);
-    UiControlDesc control = UI_CONTROL_DESC_INIT;
-    control.kind = UI_CONTROL_BUTTON;
-    control.label = "Open Fog Controls";
-    control.on_pressed = on_open_controls;
-    add_control(panel, control);
+    add_toggle(panel, "Skip Unfogged Geometry", kSkipUnfoggedHelp, g_cvarSkipUnfogged);
+    add_toggle(panel, "Enable Exceptions", kExceptionsHelp, g_cvarExceptions);
+    if constexpr (kShowDiagnostics) {
+        add_status_line(panel);
+        UiControlDesc control = UI_CONTROL_DESC_INIT;
+        control.kind = UI_CONTROL_BUTTON;
+        control.label = "Open Fog Diagnostics";
+        control.on_pressed = on_open_controls;
+        add_control(panel, control);
+    }
     return MOD_OK;
 }
 
@@ -1811,12 +1818,17 @@ ModResult init(ModError* error) {
     }
     // Defaults are the second argument; see docs/editing-options.md.
     if (register_bool("fogEnabled", true, g_cvarEnabled) != MOD_OK ||
-        register_bool("fogSkipUnfogged", false, g_cvarSkipUnfogged) != MOD_OK ||
-        register_bool("fogDeferInSenses", false, g_cvarDeferInSenses) != MOD_OK ||
-        register_int("fogDebug", 0, g_cvarDebugView) != MOD_OK ||
-        register_bool("fogLogConfigs", false, g_cvarLogConfigs) != MOD_OK)
+        register_bool("fogSkipUnfogged", true, g_cvarSkipUnfogged) != MOD_OK ||
+        register_bool("fogExceptions", true, g_cvarExceptions) != MOD_OK)
     {
         return mods::set_error(error, MOD_ERROR, "could not register options");
+    }
+    if constexpr (kShowDiagnostics) {
+        if (register_int("fogDebug", 0, g_cvarDebugView) != MOD_OK ||
+            register_bool("fogLogConfigs", false, g_cvarLogConfigs) != MOD_OK)
+        {
+            return mods::set_error(error, MOD_ERROR, "could not register options");
+        }
     }
     if (svc_gfx->get_device_info(mod_ctx, &g_deviceInfo) != MOD_OK) {
         return mods::set_error(error, MOD_ERROR, "could not query the graphics device");
@@ -1849,7 +1861,7 @@ ModResult init(ModError* error) {
 void shutdown() {
     svc_resource->free(mod_ctx, &g_shaderSource);
     release_pipelines();
-    g_cvarEnabled = g_cvarSkipUnfogged = g_cvarDeferInSenses = g_cvarDebugView = 0;
+    g_cvarEnabled = g_cvarSkipUnfogged = g_cvarExceptions = g_cvarDebugView = 0;
     g_cvarLogConfigs = 0;
     g_drawType = g_sceneBeginHook = g_sceneAfterOpaqueHook = 0;
     g_controlsWindow = 0;

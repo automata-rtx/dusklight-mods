@@ -159,13 +159,14 @@ function signature at compile time, but the symbol is looked up by name at load.
 4. Each mod's options are in its pane in the Mods menu; the larger option sets open in a separate
    controls window. Option values are saved in the game's `config.json`.
 5. Log output (`svc_log->info/warn/error`) goes to the game's console, prefixed with the mod id.
-   Every mod here logs its state changes, and Deferred Fog also shows a live **Status** line in its
-   pane.
+   Every mod here logs its state changes. Deferred Fog's diagnostics (a live **Status** line and its
+   detailed log lines) are compiled out of the released UI; see below.
 
 Each mod has **debug views** (a "Debug View" selector in its controls) that show intermediate
 results: VBAO's raw AO, normals and depth; Deferred Fog's fog factor and per-pixel fog config;
-SMAA's edges and blend weights. Use them before guessing. The per-mod docs list what each view
-shows and what a broken one means.
+SMAA's edges and blend weights. Deferred Fog's are hidden in release builds: set `kShowDiagnostics`
+to `true` in `mods/deferred_fog/src/mod.cpp` to get them back. Use them before guessing. The per-mod
+docs list what each view shows and what a broken one means.
 
 Things that change what you see and are easy to forget:
 
@@ -175,7 +176,8 @@ Things that change what you see and are easy to forget:
   VBAO then disables itself and says so in the log (it needs D3D12, Vulkan or Metal); SMAA falls
   back to luma-only edges. The renderer would also refuse the attachment with MSAA on, but the
   current game build never enables MSAA, so that case cannot occur today.
-- **Wolf Senses.** Deferred Fog deliberately does nothing while Wolf Link's senses are active.
+- **Wolf Senses.** Deferred Fog deliberately does nothing while Wolf Link's senses are active
+  (unless its Enable Exceptions option is off).
 
 ## How a mod here works
 

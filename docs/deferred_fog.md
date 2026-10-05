@@ -6,7 +6,7 @@ ambient occlusion darken the surfaces *under* the fog instead of darkening the f
 | | |
 | :-- | :-- |
 | Mod id | `dev.automata.deferred_fog` (`mods/deferred_fog/`) |
-| Version | `2.0.0-rc`, the 2.0 release candidate (see `mods/deferred_fog/mod.json`) |
+| Version | `2.0.0` (see `mods/deferred_fog/mod.json`) |
 | Kind | **Game-linked**: includes game headers, calls game functions and hooks eleven of them. It must be built against the game build it runs on |
 | Game build | Dusklight `v2.0.0` |
 
@@ -37,23 +37,28 @@ Key functions in `mod.cpp`: `on_scene_begin`, `on_set_fog_pre`, `on_shape_draw_p
 
 ### Options
 
-The mod's pane in the Mods menu has **Enabled**, a read-only **Status** line and an **Open Fog
-Controls** button. The controls window repeats Enabled and holds the rest.
+The mod's pane in the Mods menu has three toggles:
 
 | Config key | UI label | Default | Meaning |
 | :-- | :-- | :-- | :-- |
 | `fogEnabled` | Enabled | on | Off: the game draws its own fog |
-| `fogSkipUnfogged` | Skip Unfogged Geometry (experimental) | off | Leave unfogged the pixels of materials the game draws with fog switched off, as the game does. Runs the configuration-ID replay in every frame with a markable fog-off draw. Experimental: it has left surfaces unfogged that the game fogs. See [Skip Unfogged](#skip-unfogged) |
-| `fogDebug` | Debug View | 0 | 0 off, 1 Fog Factor, 2 Config IDs, 3 Replay Coverage. See [Debug views](#debug-views) |
-| `fogLogConfigs` | Log Fog Configs | off | Log the frame's fog configurations when their number, any start or end distance, or configuration 0's type or colour changes |
-| `fogDeferInSenses` | Defer Fog During Wolf Senses (diagnostic) | off | Take over the fog during Wolf Senses as well. For examination only; see [Wolf Senses](#wolf-senses) |
+| `fogSkipUnfogged` | Skip Unfogged Geometry | on | Leave unfogged the pixels of materials the game draws with fog switched off, as the game does. Runs the configuration-ID replay in every frame with a markable fog-off draw. See [Skip Unfogged](#skip-unfogged) |
+| `fogExceptions` | Enable Exceptions | on | Keep the mod's exceptions, where it leaves the fog to the game. Today that is Wolf Senses; see [Wolf Senses](#wolf-senses). Off is for examination only |
 
 Config keys are stored as `mod.dev.automata.deferred_fog.<key>` in the game's `config.json`. The
 defaults are the second argument of the `register_bool` / `register_int` calls in `init()`.
 
-### Status line
+**Diagnostics.** The Status line, the debug views and the diagnostic log lines below are in the
+code but not in the released UI: `kShowDiagnostics` in `mod.cpp` is `false`, so their options
+(`fogDebug`, `fogLogConfigs`) are not registered and their controls are not shown. Set it to `true`
+and rebuild to get a Status line in the pane and an **Open Fog Diagnostics** button, whose window
+holds the **Debug View** selector (`fogDebug`, 0 off, 1 Fog Factor, 2 Config IDs, 3 Replay
+Coverage) and **Log Diagnostics** (`fogLogConfigs`). Both builds compile from the same source.
 
-Rebuilt every frame in `on_scene_after_opaque`. The working state reads:
+### Status line (diagnostics)
+
+Shown with `kShowDiagnostics`. Rebuilt every frame in `on_scene_after_opaque`. The working state
+reads:
 
 ```
 Deferring fog (N draws, K configs[, M merged][, replay failed]; H see-through held back[ (+O in place)]; A shared-DL, B fog-off (P markable, T by alpha/Z no-Z/U unmarkable), C additive/D no-Z)
@@ -84,12 +89,12 @@ Other states:
 | `Sky depth snapshot failed: the game's own fog is used` | The depth snapshot at `SCENE_BEGIN` failed, so the scope stayed closed this frame; see [The sky](#the-sky) |
 | `Inactive: <function> could not be hooked in this game build; the game's own fog is used` | A required hook failed to attach at load; see [Hooks](#hooks) |
 
-### Debug views
+### Debug views (diagnostics)
 
-Each replaces the image with what the fog pass computes, drawn opaque where the fog pass draws.
-Anything the game draws after that point (translucent geometry, particles) still draws over it.
-Pixels left to the sky's own fog are black: depth 0, and depth the sky lists wrote, such as the
-clouds' (see [The sky](#the-sky)).
+Shown with `kShowDiagnostics`. Each replaces the image with what the fog pass computes, drawn opaque
+where the fog pass draws. Anything the game draws after that point (translucent geometry, particles)
+still draws over it. Pixels left to the sky's own fog are black: depth 0, and depth the sky lists
+wrote, such as the clouds' (see [The sky](#the-sky)).
 
 | `fogDebug` | View | Shows |
 | :-- | :-- | :-- |
@@ -104,15 +109,20 @@ all-black view means it drew and computed no fog.
 
 ### Log messages
 
+Always:
+
 - `ready` on load, or `inactive: a required game hook is missing` together with one
   `could not hook <function> in this game build` error per missing hook.
-- `Wolf Senses: the game's own fog is used` and `Wolf Senses over: deferring fog`.
-- `per-pixel replay on: K fog configurations, P markable fog-off draws in view` and
-  `per-pixel replay off` when the replay starts or stops running (`P` is 0 with Skip Unfogged off).
 - One-time warnings: `sky depth snapshot failed; such frames use the game's own fog`,
   `configuration-ID replay failed; such frames use one fog configuration` and
   `depth snapshot failed; no fog pass this frame`.
-- With Log Fog Configs on, the configuration table when it changes.
+
+With Log Diagnostics on (`kShowDiagnostics` builds only, `diagnostic_logging`):
+
+- `Wolf Senses: the game's own fog is used` and `Wolf Senses over: deferring fog`.
+- `per-pixel replay on: K fog configurations, P markable fog-off draws in view` and
+  `per-pixel replay off` when the replay starts or stops running (`P` is 0 with Skip Unfogged off).
+- The configuration table when it changes.
 
 ## How it works
 
@@ -294,10 +304,10 @@ pixel's configuration.
 ### Skip Unfogged
 
 A material's fog block can have type 0 (`GX_FOG_NONE`): the game then draws it with no fog at any
-distance, while the fog pass would fog it like everything else. With Skip Unfogged on (off by
-default; experimental), the replay writes the no-fog mark (red 216) for such a material instead of a
-configuration, and the fog pass leaves the marked pixels alone. A frame with a markable fog-off draw
-runs the replay even with one configuration.
+distance, while the fog pass would fog it like everything else. With Skip Unfogged on (the default),
+the replay writes the no-fog mark (red 216) for such a material instead of a configuration, and the
+fog pass leaves the marked pixels alone. A frame with a markable fog-off draw runs the replay even
+with one configuration.
 
 - Only a material that writes its own depth is marked. A J3D material that writes none, or blends,
   is a see-through layer and is held back (above), so it keeps its own fog-off look over the fogged
@@ -339,9 +349,9 @@ composite such as AO gives the same image under the game's fog as under this mod
 one-depth-per-pixel limits (below), which matter most when the fog reaches black within a short
 distance. An additive composite would differ, but none is built.
 
-`fogDeferInSenses` makes the mod take over the senses fog anyway, for examination with the debug
-views. The result can then differ from the game's own look wherever the fog pass's single depth per
-pixel does not match the surface.
+Enable Exceptions (`fogExceptions`, default on) controls this exemption. Off makes the mod take over
+the senses fog anyway, for examination with the debug views. The result can then differ from the
+game's own look wherever the fog pass's single depth per pixel does not match the surface.
 
 ### Fog math and range adjustment
 
@@ -385,7 +395,8 @@ The mod hooks eleven game functions, all of them required:
 
 `install_hooks` attempts all of them. If any fails to attach (a game build this mod was not compiled
 for), the capture scope never opens, the hooks that did attach have nothing to do, and the game draws
-its own fog. The log names each missing hook and the Status line names the first.
+its own fog. The log names each missing hook (and, in a diagnostics build, the Status line names
+the first).
 
 ### The exported service
 
@@ -428,6 +439,7 @@ What one fullscreen pass over the finished opaque image cannot reproduce exactly
 
 Compare against the mod off, then take per-pixel evidence before proposing a cause: a per-frame
 count shows that a mechanism is present in the view, not that it is what a given pixel looks like.
+The tools below need a diagnostics build (`kShowDiagnostics = true`; see [Options](#options)).
 
 1. Read the Status line in the view.
 2. **Fog Factor**: where the fog lands per pixel. A surface that keeps its own colours through the
@@ -438,7 +450,7 @@ count shows that a mechanism is present in the view, not that it is what a given
    (green, or orange on a see-through surface that writes depth), configuration 0 for a reason
    (yellow merged, cyan fog-off not marked, magenta no fog block), the no-fog mark (red) or nothing
    (blue).
-5. **Log Fog Configs**: the configurations themselves.
+5. **Log Diagnostics**: the configurations themselves.
 
 | Reading | Meaning |
 | :-- | :-- |
@@ -460,6 +472,8 @@ count shows that a mechanism is present in the view, not that it is what a given
   `SCENE_AFTER_OPAQUE` stage.
 - Every hook is required. Keep `install_hooks` all-or-nothing.
 - Keep `needs_id_buffer()` as the single test for both building and using the replay.
+- Release builds keep `kShowDiagnostics` false: the pane shows Enabled, Skip Unfogged Geometry and
+  Enable Exceptions only. Keep the diagnostics compiling with it set either way.
 - The scope opens only with the sky-depth snapshot in hand; without it the fog pass would fog what
   the sky lists drew depth for.
 - Keep `is_barrier_fog` an exact match.

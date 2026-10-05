@@ -72,9 +72,10 @@ and `docs/authored_normals.md` (the normal buffer), `docs/japanese-naming.md` (g
   right of it: the held-back light shafts vanished with Skip Unfogged on
   (`docs/mod-api-notes.md`, "Restore the GX viewport only after an offscreen pass has ended").
 - **For a visual difference from vanilla, get per-pixel evidence before proposing a cause** (the Fog
-  Factor, Config IDs and Replay Coverage debug views). A per-frame Status count shows that a mechanism is *present*
-  in the view, not that it is what the view *looks like*. Method: `docs/deferred_fog.md`
-  "Diagnosing a difference from vanilla".
+  Factor, Config IDs and Replay Coverage debug views; they, the Status line and the diagnostic log
+  are hidden in releases, so build with `kShowDiagnostics = true` in `mod.cpp` to use them). A
+  per-frame Status count shows that a mechanism is *present* in the view, not that it is what the
+  view *looks like*. Method: `docs/deferred_fog.md` "Diagnosing a difference from vanilla".
 
 ## Hard constraints
 

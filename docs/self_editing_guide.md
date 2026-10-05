@@ -69,10 +69,11 @@ Search for the option name, for example `"fogEnabled"`. The default is the secon
 
 ```cpp
     if (register_bool("fogEnabled", true, g_cvarEnabled) != MOD_OK ||   //  <-- true or false
-        register_int("fogDebug", 0, g_cvarDebugView) != MOD_OK ||       //  <-- a whole number
+        register_bool("fogSkipUnfogged", true, g_cvarSkipUnfogged) != MOD_OK ||
 ```
 
-All five are together in `init()`.
+The three options are together in `init()`. (`fogDebug` and `fogLogConfigs`, just below them, are
+diagnostics that are only registered when `kShowDiagnostics` is `true`.)
 
 ### Rules
 
@@ -99,11 +100,11 @@ Do Recipe A, then stop showing the control so nobody changes it. Controls are ad
 ```
 
 One control is one call, which may continue over the next few lines; comment out every line of that
-call, up to its closing `);`. The one exception is Deferred Fog's Debug View selector, a short block
-ending in `add_control(left, control);`; commenting out that last line is enough.
+call, up to its closing `);`. Deferred Fog has no controls window: its three toggles are added in
+`build_panel`, one `add_toggle(panel, ...)` line each.
 
-The **Enabled** switch appears twice per mod: in the controls window and in the mod's own pane
-(`build_panel`). Hide both if you hide one.
+In VBAO and SMAA the **Enabled** switch appears twice: in the controls window and in the mod's own
+pane (`build_panel`). Hide both if you hide one.
 
 ### B2: replace the option with a constant
 
@@ -154,4 +155,4 @@ displayed.
   `localContrast`, `useNormalEdges`, `normalThreshold`, `depthThreshold`, `maxSearchSteps`,
   `debugMode`.
 - **Deferred Fog** (`mods/deferred_fog/src/mod.cpp`): `fogEnabled`, `fogSkipUnfogged`,
-  `fogDeferInSenses`, `fogDebug`, `fogLogConfigs`.
+  `fogExceptions` (and, in diagnostics builds only, `fogDebug` and `fogLogConfigs`).

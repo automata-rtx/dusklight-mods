@@ -59,11 +59,11 @@ control back is a one-line revert.
   // add_number(left, "Depth Bias", g_cvarDepthBias, "...", 0, 20, 1, nullptr);
   ```
 
-- **Deferred Fog**: in `build_controls_tab` each toggle is one `add_toggle(left, ...)` call;
-  comment out every line of it, up to its closing `);`. The Debug View selector is a short block
-  ending in `add_control(left, control);`; commenting out that last line is enough.
+- **Deferred Fog**: its three toggles are added in `build_panel`, one `add_toggle(panel, ...)` line
+  each; there is no controls window. (Its diagnostics window, `build_controls_tab`, exists only in
+  builds with `kShowDiagnostics` set to `true`.)
 
-The **Enabled** toggle appears twice in each mod: in the mod's pane (`build_panel`) and in the
+In VBAO and SMAA the **Enabled** toggle appears twice: in the mod's pane (`build_panel`) and in the
 controls window. Hide both if you hide one.
 
 ## Remove an option completely

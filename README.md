@@ -6,7 +6,7 @@ PC/mobile port. Built on the official [Dusklight mod template](https://github.co
 | Mod | Package | What it does |
 | :-- | :-- | :-- |
 | **VBAO** | `vbao.dusk` | Ambient occlusion using a per-slice visibility bitmask (Therrien et al. 2023), so gaps between occluders and thin geometry such as grass do not over-darken the way horizon-based AO does. Temporal accumulation, half-resolution upsampling, an edge-aware denoiser, and a large set of options. Uses the game's own surface normals. Works across game updates without a rebuild |
-| **Deferred Fog** | `deferred_fog.dusk` | Removes the game's fog from the opaque world while it draws and re-applies the same fog afterwards in one pass, before the game's translucency, screen effects and bloom. AO then darkens the world *under* the fog instead of darkening the fog itself. Install it alongside VBAO. Hooks game code, so it must match the game build. The current build, `2.0.0-rc`, is the 2.0 release candidate |
+| **Deferred Fog** | `deferred_fog.dusk` | Removes the game's fog from the opaque world while it draws and re-applies the same fog afterwards in one pass, before the game's translucency, screen effects and bloom. AO then darkens the world *under* the fog instead of darkening the fog itself. Install it alongside VBAO. Hooks game code, so it must match the game build. The current version is `2.0.0` |
 | **SMAA** | `smaa.dusk` | Post-process antialiasing (SMAA 1x). Detects edges from brightness and from the game's surface normals and depth, so it also catches silhouettes and creases with little brightness contrast. Runs before the game's bloom and translucency. Works across game updates without a rebuild |
 
 Each `.dusk` is a single cross-platform bundle for Windows (x64, arm64), macOS (arm64, x64), Linux
@@ -35,12 +35,13 @@ the normals; the first frame or two after start-up simply run without them.
 
 **Matching the game build.** Deferred Fog hooks game functions by name when it loads, so it must be
 built for the exact game version you run; a mismatch can stop it loading. If it loads but a game
-function it needs is missing, it stays inactive, the game draws its own fog, and its Status line
-names the missing function. VBAO and SMAA only use the mod API, so they keep working on newer game
+function it needs is missing, it stays inactive, the game draws its own fog, and the log names the
+missing function. VBAO and SMAA only use the mod API, so they keep working on newer game
 builds that still provide the same API.
 
-**Wolf Senses.** Deferred Fog leaves the fog to the game while Wolf Link's senses are active. The
-senses fog is black, which looks the same with AO whichever of the two applies it.
+**Wolf Senses.** Deferred Fog leaves the fog to the game while Wolf Link's senses are active (its
+**Enable Exceptions** option, on by default). The senses fog is black, which looks the same with AO
+whichever of the two applies it.
 
 ## For developers
 
