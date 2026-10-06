@@ -1,7 +1,10 @@
 # ReShade Bridge
 
-**Status: first iteration, not yet tested in-game.** Built only on branch
-`claude/reshade-bridge-dndsck`, where it is the only mod CI builds.
+**Status: works in-game** (the maintainer's test: an ambient-occlusion effect at *Before
+transparency* and other effects, seamless). Version 0.2.0 hands the frame to ReShade at ReShade's
+screen size when the game renders at another internal resolution ("Resolution", below); that part
+is new and untested in-game. Built only on branch `claude/reshade-bridge-dndsck`, where it is the
+only mod CI builds.
 
 ReShade Bridge lets a normally installed ReShade run its techniques *inside* Dusklight's frame
 instead of over the finished image. Each technique is assigned to one of four points of the frame:
@@ -21,7 +24,8 @@ bridge only decides *where in the frame* that work happens.
 | `dusklight_reshade_bridge.addon64` | A ReShade add-on. Runs the techniques when the mod hands the frame over. | Next to ReShade's DLL |
 
 Both come from the same CI run, in the `mods-combined` artifact. Use the two files from one run
-together; they agree on a private protocol (`mods/reshade-bridge/include/drb_protocol.hpp`).
+together; they agree on a private protocol (`mods/reshade-bridge/include/drb_protocol.hpp`), and
+two files from builds with different protocol versions refuse each other (both sides say so).
 Either one without the other does nothing: without the add-on the mod stays idle; without the mod,
 ReShade runs as it always does.
 
@@ -95,16 +99,71 @@ ReShade (that definition itself must stay at 1000; see above).
 At **Before HUD** and **After HUD** the depth is the same world depth (particles and the HUD have
 none). On screens without the 3D world (menus), effects see "far" everywhere.
 
+## Resolution
+
+Dusklight can render at an internal resolution other than the window's (Settings > Graphics,
+internal resolution: a multiple of the game's 448-line base; *Auto* is the window's size) and
+scales the finished frame to the window at the very end, after the HUD (Aurora,
+`resample_present_source`). Every bridge point is before that, so the frame there is at the
+internal resolution.
+
+ReShade's effects only work on frames of ReShade's screen size (the window's). ReShade compiles an
+extra copy of an effect for every other size it is handed (`BUFFER_WIDTH`/`BUFFER_HEIGHT` follow),
+but the effect's own textures are shared by name with the screen-size copy compiled at start-up
+and keep the screen's size (`create_effect` in ReShade 6.8's `source/runtime.cpp`). A frame of
+another size is processed into textures of the wrong size: before 0.2.0, with the internal
+resolution above the window's, debug views showed the top-left part of the image stretched over the
+screen. `ReShade.log` names the affected effects ("already created a texture with the same name
+but different dimensions").
+
+So the bridge hands every frame over at the screen's size:
+
+1. **Down.** The frame is scaled to the screen with an area average (each frame pixel weighted by
+   how much of the screen pixel it covers; Dusklight's *Area* resampler), placed where Dusklight's
+   present puts it (black bars when the aspect ratios differ). Depth takes the frame pixel under
+   each screen pixel's centre, never an average: an average across a silhouette is a surface that
+   is not there. ReShade sees what a game running natively at the window's size would give it, and
+   effects tuned in screen pixels (sample radii, sharpening) look as their authors intended.
+2. **ReShade runs** at the screen's size.
+3. **Up.** Only what ReShade *changed* (its result minus what it was handed) is scaled back up and
+   added to the full-resolution frame. Where an effect changed nothing, the frame keeps its full
+   internal-resolution detail; the game then draws the rest of the frame (water, particles, the
+   HUD) at full resolution over it, and Dusklight's own scaling at the end brings it to the window.
+
+**Scale-up** (mod option): how the change is spread over the frame's pixels.
+
+- **Edge-aware** (default). Each frame pixel compares its own depth with the depths of the four
+  nearest screen pixels. If they agree (within 5%), it takes their bilinear blend; if one does not
+  (a silhouette runs between them), it takes the change of the screen pixel whose depth is closest
+  to its own. Ambient occlusion computed for a shoulder stays on the shoulder instead of darkening a
+  fringe of the wall behind it. Points without this frame's depth fall back to Simple.
+- **Simple.** Plain bilinear, for comparison: along silhouettes the change bleeds up to about one
+  screen pixel onto the other side.
+
+**Debug view** (mod option): *Change layer* at one point draws only what ReShade changed there,
+scaled up exactly as it is applied (same textures, same Scale-up), over the whole finished frame:
+mid-grey where nothing changed, darker where ReShade darkened, brighter where it brightened. It is
+drawn at the end of the frame so that nothing drawn after the point (water, the game's bloom and
+depth of field, the HUD) hides it. Compare the two Scale-up settings along silhouettes here.
+
+What is not exact: an effect's change is computed at the screen's size, and the trip up to the
+internal resolution and back down through Dusklight's scaling softens changes that are themselves
+pixel-sized (sharpening, post-process antialiasing) when the internal resolution is not an exact
+multiple of the window's (with the 448-line base it rarely is). Smooth changes (ambient occlusion,
+colour grading, fog, bloom) come through essentially exactly. When the frame is the screen's size
+(*Auto*), the change added back is exactly ReShade's.
+
 ## Status and diagnostics
 
 Three places report what the bridge is doing:
 
-- **Dusklight, Mods > ReShade Bridge:** one status line (add-on found? ReShade started? effects on?),
-  then, per point in use: *frames sent* (by the mod), *received* (by the add-on) and *technique
-  runs*. Warnings for Generic Depth being on, depth definitions not applied, and the hook for
-  *Before particles* having failed.
-- **ReShade, Dusklight tab > Hand-over statistics:** the same counters from the add-on's side, and
-  the number of techniques at each point.
+- **Dusklight, Mods > ReShade Bridge:** one status line (add-on found? ReShade started? effects on?
+  the game's resolution and the size ReShade gets the frame at), then, per point in use: *frames
+  sent* (by the mod), *received* (by the add-on) and *technique runs*. Warnings for Generic Depth
+  being on, depth definitions not applied, the hook for *Before particles* having failed, and the
+  two files coming from different builds. With a debug view on, whether it is shown.
+- **ReShade, Dusklight tab > Hand-over statistics:** the hand-over size (ReShade's screen), the same
+  counters from the add-on's side, and the number of techniques at each point.
 - **`ReShade.log`:** lines starting `Dusklight bridge:` (attachment to the effect runtime, the first
   technique run at each point).
 
@@ -140,12 +199,14 @@ handle; they meet in that copy event.
 At each point with work (`src/mod.cpp` `run_point`, `src/bridge_gpu.cpp` `record_point`), the mod:
 
 1. takes GfxService snapshots of the scene colour and depth (`resolve_pass`);
-2. copies the colour into a texture of its own (one per point), and converts the depth into a
-   shared R32Float texture (encoding below);
-3. records two one-texel copies: depth texture to a *depth marker*, then colour texture to a *colour
-   marker*. A marker is 1597 texels wide; its height encodes the point (11 + point for colour,
-   23 + point for depth);
-4. draws its colour texture back over the scene, RGB only (the game's alpha is kept).
+2. scales the colour to ReShade's screen size into a hand-over texture of its own (one per point)
+   and copies that to an *input* texture; converts the depth into a frame-size R32Float texture
+   (encoding below) and samples it to a screen-size one, shared by all points ("Resolution");
+3. records two one-texel copies: screen-size depth to a *depth marker*, then hand-over texture to a
+   *colour marker*. A marker is 1597 texels wide; its height encodes the point (11 + point for
+   colour, 23 + point for depth);
+4. draws ReShade's change (hand-over minus input) scaled up over the scene, RGB only (the game's
+   alpha is kept).
 
 When Dawn records those copies, the add-on (`addon/bridge_addon.cpp`) recognises the markers by
 their size. On the depth marker it notes the depth resource. On the colour marker it transitions
@@ -154,10 +215,11 @@ ReShade's `DEPTH` semantic, calls ReShade's `render_technique` for every enabled
 to that point, transitions both back, and restores Dawn's command-list state. Both marker copies
 are skipped: they carry no data.
 
-Which points have work flows back the other way: the add-on publishes a bit mask of points with
-enabled techniques in a small named shared-memory block (`Local\DusklightReShadeBridge.<pid>`,
-`include/drb_protocol.hpp`), and the mod only snapshots and composites at those points. Either side
-creates the block; neither depends on the other staying loaded.
+Which points have work, and the screen size, flow back the other way: the add-on publishes a bit
+mask of points with enabled techniques and ReShade's screen size in a small named shared-memory
+block (`Local\DusklightReShadeBridge.<pid>`, `include/drb_protocol.hpp`), and the mod only snapshots
+and composites at those points. Either side creates the block; neither depends on the other staying
+loaded.
 
 ### Restoring Dawn's state
 
@@ -194,13 +256,16 @@ comes from the game's reversed-Z depth through the camera's projection (`fs_dept
 
 ## Limitations
 
-- **Untested in-game.** CI proves both parts compile; nothing has run against real ReShade yet.
+- **The scaling of 0.2.0 is untested in-game** (the rest works). The offline check runs its shaders
+  for real and checks their output, but only on test patterns.
 - **Windows x64, Direct3D 12, ReShade with full add-on support** only.
 - **State restore** is the main risk (above). If the frame corrupts after a hand-over point, note
   which point and which techniques.
-- **Effect size.** At *Before transparency* and *Before particles* effects run at the game's internal
-  render resolution; at the HUD points, at the size of the frame target there. ReShade compiles
-  each effect once per size and format it meets (a short pause the first time).
+- **Effect size.** Effects always run at ReShade's screen size ("Resolution"). ReShade still compiles
+  a second copy of each effect for the bridge's hand-over (it differs from the screen's back buffer
+  in colour space); a short pause the first time.
+- **Pixel-sized changes at in-frame points** (sharpening, post-process antialiasing) are slightly
+  softened when the internal resolution is not the window's ("Resolution", what is not exact).
 - **ReShade's per-effect GPU timings** in its overlay only cover techniques that happen to run at the
   back buffer's exact size and format.
 - **ReShade's screenshot key** captures the presented frame, so it includes the effects (and their
@@ -209,13 +274,40 @@ comes from the game's reversed-Z depth through the camera's projection (`fs_dept
 - **Changing the Dusklight graphics backend** needs a restart, as always; the add-on only attaches to
   a Direct3D 12 effect runtime.
 
+## Ideas for later
+
+Noted from the design discussion; none is built.
+
+- **An exact round trip.** Dusklight's final scaling is fixed, known arithmetic (the viewport and
+  the Bilinear or Area resampler). The composite could replicate it to check its own work before
+  the game draws on: scale the change up, scale the frame down the way Dusklight will, compare
+  with ReShade's result, and add the scaled-up difference, two or three times. The frame would
+  then scale down to exactly what ReShade produced wherever nothing is drawn over it, pixel-sized
+  changes included (except where the frame is already clipped at black or white). It needs the
+  player's Resampler setting, and a *residual* debug view (ReShade's result against what the frame
+  will scale down to) to prove it.
+- **After HUD on the real back buffer.** Run the *After HUD* techniques at present, on the
+  swapchain's image after Dusklight's own scaling, where plain ReShade runs: no conversion at all
+  for effects meant to touch the HUD.
+- **The HUD drawn after scaling (a Dusklight change).** If Dusklight scaled the 3D frame to the
+  window *before* the HUD and drew the HUD at the window's resolution, as many PC games do,
+  *Before HUD* would simply be the scaled, pre-HUD image and need no trip at all; the HUD would
+  also be cheaper to draw. A mod cannot do this: GfxService's `create_pass` can redirect the
+  HUD's drawing into a window-size target, but Dusklight only presents its full-resolution frame,
+  so the result would have to be scaled up into it and back down, HUD included.
+
 ## Offline check
 
 `mods/reshade-bridge/tools/bridge_check.cpp` drives the mod's GPU half on Dawn's null backend: every
-point in frame order, a resize, both scene colour formats, a multisampled scene pass with a normal
-attachment, and a compatibility-mode device. Any WebGPU error fails it (it would be fatal in
-Aurora). It also checks the depth encoding against ReShade's decode. It cannot check anything on
-the Direct3D 12 side.
+point in frame order, both scale-up modes and the debug view, a resize, both scene colour formats,
+a multisampled scene pass with a normal attachment, frames larger than, equal to, smaller than and
+of another aspect ratio than the screen, and a compatibility-mode device. Any WebGPU error fails it
+(it would be fatal in Aurora). It also checks the depth encoding against ReShade's decode and the
+frame's placement against Aurora's present. With a Vulkan adapter (on Linux, Mesa's lavapipe:
+`apt-get install mesa-vulkan-drivers`) it runs the scaling shaders for real on test patterns: the
+scale-down and screen depth against a CPU reference, an exact round trip at the screen's size, and
+a silhouette where edge-aware keeps the change on its side and simple bleeds. It cannot check
+anything on the Direct3D 12 side.
 
 ```sh
 cmake -B build                              # fetches the prebuilt Dawn

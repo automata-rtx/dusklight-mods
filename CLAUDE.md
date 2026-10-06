@@ -10,8 +10,10 @@ whichever is wrong in the same change.
 **This branch (`claude/reshade-bridge-*`) builds only the ReShade Bridge** (`mods/reshade-bridge/`,
 doc `docs/reshade_bridge.md`): a game-linked Dusklight mod plus a ReShade add-on (`.addon64`, built
 by the windows-amd64 CI leg and shipped in `mods-combined`), which together run an installed
-ReShade's techniques at chosen points inside the frame. First iteration, untested in-game. The
-released mods below keep main's sources here, unbuilt; work on them on main.
+ReShade's techniques at chosen points inside the frame. Works in-game (maintainer-tested); 0.2.0's
+hand-over at ReShade's screen size when the internal resolution differs (doc "Resolution") is not
+yet tested, and the doc's "Ideas for later" holds the agreed next steps. The released mods below
+keep main's sources here, unbuilt; work on them on main.
 
 | Released mod | Kind | Doc |
 | :-- | :-- | :-- |

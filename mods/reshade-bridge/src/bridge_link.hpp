@@ -11,5 +11,8 @@ namespace rsb {
 // until close_shared_state(), so the pointer stays valid whatever the add-on does.
 drb::SharedState* open_shared_state();
 void close_shared_state();
+// The last open_shared_state() failed because the add-on that created the block speaks another
+// protocol version (the two files come from different builds).
+bool shared_state_mismatch();
 
 } // namespace rsb

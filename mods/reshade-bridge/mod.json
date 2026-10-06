@@ -1,7 +1,7 @@
 {
   "id": "dev.automata.reshade_bridge",
   "name": "ReShade Bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "automata.",
   "description": "Runs your installed ReShade's effects inside the game's frame: under the HUD, before the game's own post-processing if you like, with the game's real depth. Needs ReShade with full add-on support and the bundled dusklight_reshade_bridge.addon64 (Windows, Direct3D 12)."
 }

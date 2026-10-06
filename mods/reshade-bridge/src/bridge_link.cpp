@@ -19,6 +19,7 @@ namespace rsb {
 namespace {
 HANDLE g_mapping = nullptr;
 drb::SharedState* g_state = nullptr;
+bool g_mismatch = false;
 } // namespace
 
 drb::SharedState* open_shared_state() {
@@ -37,7 +38,8 @@ drb::SharedState* open_shared_state() {
         return nullptr;
     }
     auto* state = static_cast<drb::SharedState*>(view);
-    if (!drb::claim(state)) {
+    g_mismatch = !drb::claim(state);
+    if (g_mismatch) {
         UnmapViewOfFile(view);
         CloseHandle(g_mapping);
         g_mapping = nullptr;
@@ -46,6 +48,8 @@ drb::SharedState* open_shared_state() {
     g_state = state;
     return g_state;
 }
+
+bool shared_state_mismatch() { return g_mismatch; }
 
 void close_shared_state() {
     if (g_state != nullptr) {
@@ -62,6 +66,7 @@ void close_shared_state() {
 
 drb::SharedState* open_shared_state() { return nullptr; }
 void close_shared_state() {}
+bool shared_state_mismatch() { return false; }
 
 #endif
 

@@ -13,8 +13,10 @@
 //                  ReShade's own technique order) on the colour texture, transition both back, and
 //                  restore the Dawn command-list state ReShade's work disturbed (state_restore.cpp)
 //
-// Both marker copies are skipped (they carry no data). The mod then composites the colour texture
-// back into the frame. While the mod's bridge is on, ReShade's normal end-of-frame effect pass is
+// Both marker copies are skipped (they carry no data). The mod then composites ReShade's change
+// back into the frame. The colour texture is always the size of ReShade's screen, which this
+// add-on publishes (SharedState::screen_width/height): ReShade's effects size their own textures
+// for that screen, so the mod scales the game's frame to it, whatever the game renders at. While the mod's bridge is on, ReShade's normal end-of-frame effect pass is
 // suppressed (render_effects with no target, which also updates the timer and frame-count
 // uniforms), so each technique runs exactly once per frame, where the user put it.
 //
@@ -69,6 +71,7 @@ static_assert(sizeof(kPointNames) / sizeof(kPointNames[0]) == drb::kPointCount);
 HANDLE g_mapping = nullptr;
 drb::SharedState* g_shared = nullptr;
 drb::SharedState g_localState; // stands in if the shared block cannot be mapped (never read by the mod)
+bool g_protocolMismatch = false; // the block exists but belongs to a mod from another build
 
 drb::SharedState& shared() { return g_shared != nullptr ? *g_shared : g_localState; }
 
@@ -84,6 +87,7 @@ void open_shared_state() {
         g_shared = static_cast<drb::SharedState*>(view);
         return;
     }
+    g_protocolMismatch = view != nullptr;
     if (view != nullptr) {
         UnmapViewOfFile(view);
     }
@@ -349,6 +353,17 @@ bool generic_depth_enabled() {
 
 void log_info(const std::string& message) { reshade::log::message(reshade::log::level::info, message.c_str()); }
 
+// ReShade's screen size: the size its effects' own textures have, so the size every hand-over must
+// have (the mod scales the game's frame to it).
+void publish_screen_size(effect_runtime* rt) {
+    uint32_t w = 0, h = 0;
+    if (rt != nullptr) {
+        rt->get_screenshot_width_and_height(&w, &h);
+    }
+    shared().screen_width.store(w);
+    shared().screen_height.store(h);
+}
+
 // --- The hand-over (Dawn's submitting thread) ------------------------------------------------------
 
 void run_point(command_list* cmd_list, uint32_t point, resource color) {
@@ -474,6 +489,7 @@ void on_reshade_present(effect_runtime* rt) {
     ++g_presents;
     s.present_count.store(g_presents, std::memory_order_relaxed);
     s.effects_enabled.store(rt->get_effects_state() ? 1u : 0u);
+    publish_screen_size(rt);
 
     uint32_t mask = 0;
     for (uint32_t p = 0; p < drb::kPointCount; ++p) {
@@ -514,6 +530,7 @@ void on_init_effect_runtime(effect_runtime* rt) {
     shared().generic_depth_enabled.store(g_genericDepth ? 1u : 0u);
     shared().blocked.store(drb::kNotBlocked);
     apply_depth_definitions(rt);
+    publish_screen_size(rt);
     shared().runtime_ready.store(1);
     log_info("Dusklight bridge: attached to the Direct3D 12 effect runtime");
 }
@@ -525,6 +542,7 @@ void on_destroy_effect_runtime(effect_runtime* rt) {
     }
     shared().runtime_ready.store(0);
     shared().points_mask.store(0);
+    publish_screen_size(nullptr);
     g_depthBound = false; // the runtime's tables go with it
     if (g_depth.res.handle != 0) {
         g_retiredDepth.push_back({g_depth, 0});
@@ -569,7 +587,11 @@ void draw_status(effect_runtime* rt) {
         ImGui::TextWrapped("This ReShade instance is not the one the bridge drives (it needs Direct3D 12).");
         return;
     }
-    if (s.mod_attached.load() == 0) {
+    if (g_protocolMismatch) {
+        ImGui::TextColored(warn, "The ReShade Bridge mod in Dusklight is from a different build of the bridge.");
+        ImGui::TextWrapped("Use reshade_bridge.dusk and %s from the same download. Until then ReShade runs as usual, "
+                           "over the finished frame.", drb::kAddonFileName);
+    } else if (s.mod_attached.load() == 0) {
         ImGui::TextColored(warn, "The ReShade Bridge mod is not running in Dusklight.");
         ImGui::TextWrapped("Install reshade_bridge.dusk in Dusklight's mod manager and enable it. Until then "
                            "ReShade runs as usual, over the finished frame.");
@@ -590,6 +612,8 @@ void draw_status(effect_runtime* rt) {
         ImGui::TextWrapped("%s", g_definitionsNote.c_str());
     }
     if (ImGui::CollapsingHeader("Hand-over statistics", ImGuiTreeNodeFlags_None)) {
+        ImGui::Text("Hand-over size: %ux%u (ReShade's screen; Dusklight scales its frame to it)", s.screen_width.load(),
+            s.screen_height.load());
         for (uint32_t p = 0; p < drb::kPointCount; ++p) {
             ImGui::Text("%s: %u technique(s); %llu frames sent, %llu received, %llu technique runs", kPointNames[p],
                 g_pointTechniqueCount[p], static_cast<unsigned long long>(s.markers_recorded[p].load()),

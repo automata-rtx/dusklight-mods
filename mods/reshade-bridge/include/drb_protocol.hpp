@@ -10,6 +10,12 @@
 // The two never exchange GPU handles: the mod only has WebGPU objects and the add-on only D3D12
 // ones. A marker is a one-texel copy from the mod's colour (or depth) texture into a small texture
 // whose size encodes the insertion point; the add-on reads both resources from the copy itself.
+//
+// Sizes. ReShade sizes its effects' own textures for its screen (the swapchain's back buffer) and
+// shares them, by name, with the copies of an effect it compiles for other sizes, so an effect only
+// works on a frame of exactly that size. The add-on therefore publishes the screen size
+// (SharedState::screen_width/height) and the mod hands every frame over at that size, placed the
+// way Dusklight's own present places it, whatever the game's internal resolution.
 // Everything else goes through SharedState, a small block of named shared memory that either side
 // creates and both map, so neither depends on the other staying loaded (Dusklight reloads mods;
 // ReShade unloads add-ons with its last device).
@@ -22,7 +28,7 @@
 
 namespace drb {
 
-constexpr uint32_t kProtocolVersion = 1;
+constexpr uint32_t kProtocolVersion = 2;
 
 // Insertion points, in frame order. The add-on persists them by value; append only.
 constexpr uint32_t kPointCount = 4;
@@ -90,6 +96,8 @@ struct SharedState {
     std::atomic<uint64_t> markers_seen[kPointCount];       // colour markers recognised
     std::atomic<uint64_t> depth_markers_seen[kPointCount]; // depth markers recognised
     std::atomic<uint64_t> techniques_run[kPointCount];     // render_technique calls made
+    std::atomic<uint32_t> screen_width;  // ReShade's screen (back buffer) size: every hand-over is
+    std::atomic<uint32_t> screen_height; // made at this size; 0 until an effect runtime exists
 
     // Written by the mod.
     std::atomic<uint32_t> mod_attached;  // the mod is loaded
